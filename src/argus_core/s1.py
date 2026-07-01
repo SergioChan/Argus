@@ -121,6 +121,34 @@ class SubagentReport:
     warnings: tuple[str, ...] = ()
 
 
+@dataclass(frozen=True)
+class SubagentDescriptor:
+    subagent_id: str
+    contract_version: str
+    subtopics: tuple[str, ...]
+    required_adapters: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class JobEnvelope:
+    job_id: str
+    envelope_version: str
+    subtopic: str
+    required_adapters: tuple[str, ...] = ()
+    allowed_adapters: tuple[str, ...] = ()
+    verifier_profile_ref: str | None = None
+    estimated_cost: float = 0.0
+    budget_cost: float = 0.0
+
+
+@dataclass(frozen=True)
+class Acceptance:
+    accepted: bool
+    reason: str | None
+    state: LifecycleState
+    estimated_cost: float = 0.0
+
+
 class LifecycleStore:
     """In-memory event-sourced lifecycle store."""
 
@@ -183,7 +211,68 @@ class LifecycleStore:
                     category="POLICY",
                     message=f"{method} cannot transition {from_state.value} to {to_state.value}",
                 )
-            )
+        )
+
+
+class SubagentRuntime:
+    """Small S1 runtime facade for default accept gate and idempotency."""
+
+    def __init__(
+        self,
+        *,
+        descriptor: SubagentDescriptor,
+        store: LifecycleStore | None = None,
+    ) -> None:
+        self.descriptor = descriptor
+        self.store = store or LifecycleStore()
+        self.gate_invocations = 0
+        self._acceptance_cache: dict[str, tuple[str, Acceptance]] = {}
+
+    def accept(self, envelope: JobEnvelope) -> Acceptance:
+        request_hash = hash_json(envelope.__dict__)
+        cached = self._acceptance_cache.get(envelope.job_id)
+        if cached is not None:
+            cached_hash, cached_acceptance = cached
+            if cached_hash != request_hash:
+                raise LifecyclePolicyError(
+                    ErrorEnvelope(
+                        code="IDEMPOTENCY_CONFLICT",
+                        category="POLICY",
+                        message="same job_id accepted with a different envelope",
+                    )
+                )
+            return cached_acceptance
+
+        self.gate_invocations += 1
+        self.store.create_job(envelope.job_id)
+        acceptance = default_accept(self.descriptor, envelope)
+        self.store.apply_method(envelope.job_id, "accept" if acceptance.accepted else "refuse")
+        self._acceptance_cache[envelope.job_id] = (request_hash, acceptance)
+        return acceptance
+
+
+def default_accept(descriptor: SubagentDescriptor, envelope: JobEnvelope) -> Acceptance:
+    if _semver_major(descriptor.contract_version) != _semver_major(envelope.envelope_version):
+        return Acceptance(False, "VERSION_UNSUPPORTED", LifecycleState.REJECTED)
+    if envelope.subtopic not in set(descriptor.subtopics):
+        return Acceptance(False, "OUT_OF_SCOPE", LifecycleState.REJECTED)
+    descriptor_adapters = set(descriptor.required_adapters)
+    allowed_adapters = set(envelope.allowed_adapters)
+    for adapter_ref in envelope.required_adapters:
+        if adapter_ref not in descriptor_adapters or adapter_ref not in allowed_adapters:
+            return Acceptance(False, "MISSING_ADAPTER", LifecycleState.REJECTED)
+    if envelope.verifier_profile_ref is None:
+        return Acceptance(False, "NO_VERIFIER", LifecycleState.REJECTED)
+    if envelope.budget_cost and envelope.estimated_cost > envelope.budget_cost:
+        return Acceptance(False, "BUDGET_TOO_SMALL", LifecycleState.REJECTED, estimated_cost=envelope.estimated_cost)
+    return Acceptance(True, None, LifecycleState.ACCEPTED, estimated_cost=envelope.estimated_cost)
+
+
+def _semver_major(version: str) -> int:
+    try:
+        return int(version.split(".", 1)[0])
+    except (ValueError, IndexError) as exc:
+        raise ValueError(f"invalid semver: {version}") from exc
 
 
 def reduce_lifecycle(events: tuple[LifecycleEvent, ...], *, job_id: str) -> JobCurrent:

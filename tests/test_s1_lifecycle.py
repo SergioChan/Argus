@@ -8,11 +8,15 @@ from argus_core import (
     C3ReportVerifier,
     ExecContext,
     InMemoryVerifierTrustStore,
+    JobEnvelope,
     LifecyclePolicyError,
     LifecycleState,
     LifecycleStore,
+    SubagentDescriptor,
+    SubagentRuntime,
     build_subagent_report,
     canonical_json_bytes,
+    default_accept,
     reduce_lifecycle,
 )
 
@@ -135,6 +139,81 @@ class S1TierRelayTests(unittest.TestCase):
             "debate_ref": "c4://debate/ewpt-toy/example",
         }
         return deepcopy(report)
+
+
+class S1AcceptGateTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.descriptor = SubagentDescriptor(
+            subagent_id="subagent-1",
+            contract_version="1.0.0",
+            subtopics=("ewpt",),
+            required_adapters=("adapter:bounce",),
+        )
+
+    def test_default_accept_happy_path(self) -> None:
+        acceptance = default_accept(self.descriptor, self._envelope())
+
+        self.assertTrue(acceptance.accepted)
+        self.assertIsNone(acceptance.reason)
+        self.assertEqual(acceptance.state, LifecycleState.ACCEPTED)
+
+    def test_default_accept_refuses_missing_adapter_no_verifier_and_major_version(self) -> None:
+        missing_adapter = default_accept(
+            self.descriptor,
+            self._envelope(required_adapters=("adapter:missing",)),
+        )
+        no_verifier = default_accept(self.descriptor, self._envelope(verifier_profile_ref=None))
+        major_mismatch = default_accept(self.descriptor, self._envelope(envelope_version="2.0.0"))
+
+        self.assertEqual(missing_adapter.reason, "MISSING_ADAPTER")
+        self.assertEqual(no_verifier.reason, "NO_VERIFIER")
+        self.assertEqual(major_mismatch.reason, "VERSION_UNSUPPORTED")
+        self.assertFalse(missing_adapter.accepted)
+        self.assertFalse(no_verifier.accepted)
+        self.assertFalse(major_mismatch.accepted)
+
+    def test_runtime_accept_is_idempotent_for_same_envelope(self) -> None:
+        runtime = SubagentRuntime(descriptor=self.descriptor)
+        envelope = self._envelope()
+
+        first = runtime.accept(envelope)
+        second = runtime.accept(envelope)
+
+        self.assertEqual(first, second)
+        self.assertEqual(runtime.gate_invocations, 1)
+        self.assertEqual(len(runtime.store.events(envelope.job_id)), 1)
+        self.assertEqual(runtime.store.current(envelope.job_id).state, LifecycleState.ACCEPTED)
+
+    def test_runtime_accept_rejects_same_job_different_envelope(self) -> None:
+        runtime = SubagentRuntime(descriptor=self.descriptor)
+        runtime.accept(self._envelope(job_id="job-1"))
+
+        with self.assertRaises(LifecyclePolicyError) as raised:
+            runtime.accept(self._envelope(job_id="job-1", subtopic="other"))
+
+        self.assertEqual(raised.exception.envelope.code, "IDEMPOTENCY_CONFLICT")
+        self.assertEqual(runtime.gate_invocations, 1)
+
+    def _envelope(
+        self,
+        *,
+        job_id: str = "job-1",
+        envelope_version: str = "1.0.0",
+        subtopic: str = "ewpt",
+        required_adapters: tuple[str, ...] = ("adapter:bounce",),
+        allowed_adapters: tuple[str, ...] = ("adapter:bounce",),
+        verifier_profile_ref: str | None = "c4://profile/ewpt/v1",
+    ) -> JobEnvelope:
+        return JobEnvelope(
+            job_id=job_id,
+            envelope_version=envelope_version,
+            subtopic=subtopic,
+            required_adapters=required_adapters,
+            allowed_adapters=allowed_adapters,
+            verifier_profile_ref=verifier_profile_ref,
+            estimated_cost=1,
+            budget_cost=2,
+        )
 
 
 if __name__ == "__main__":
