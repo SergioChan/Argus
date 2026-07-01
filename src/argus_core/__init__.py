@@ -31,6 +31,13 @@ from .s1 import (
     default_accept,
     reduce_lifecycle,
 )
+from .s2 import (
+    BaselineBuilder,
+    BuildPlan,
+    BuildResult,
+    S2Error,
+    SelfGradeError,
+)
 from .s3 import (
     CheckResult,
     InsensitivityFlag,
@@ -117,6 +124,9 @@ from .s8 import (
 __all__ = [
     "AuditEvent",
     "BLAKE3_PREFIX",
+    "BaselineBuilder",
+    "BuildPlan",
+    "BuildResult",
     "C3ReportSigner",
     "C3ReportVerifier",
     "C3SignatureVerification",
@@ -180,6 +190,7 @@ __all__ = [
     "ResourceCeilings",
     "S1Error",
     "S10Error",
+    "S2Error",
     "S3Error",
     "S3Verifier",
     "S7Error",
@@ -189,6 +200,7 @@ __all__ = [
     "ScopeGrant",
     "ScopeToken",
     "ScopeWideningError",
+    "SelfGradeError",
     "SignatureInvalidError",
     "SimpleAdapter",
     "StoreWriterBroker",
