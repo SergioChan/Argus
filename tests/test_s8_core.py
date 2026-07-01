@@ -2,7 +2,18 @@ from __future__ import annotations
 
 import unittest
 
-from argus_core import BLAKE3_PREFIX, canonical_json_bytes, hash_bytes, hash_json
+from argus_core import (
+    BLAKE3_PREFIX,
+    HashMismatchError,
+    IllegalTierError,
+    InMemoryArtifactStore,
+    IncompleteLineageError,
+    Lineage,
+    Producer,
+    canonical_json_bytes,
+    hash_bytes,
+    hash_json,
+)
 
 
 class CanonicalJsonTests(unittest.TestCase):
@@ -27,6 +38,63 @@ class Blake3HashTests(unittest.TestCase):
 
         self.assertEqual(left, right)
         self.assertTrue(left.startswith(BLAKE3_PREFIX))
+
+
+class InMemoryArtifactStoreTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.store = InMemoryArtifactStore()
+        self.producer = Producer(subsystem="S2", version="0.0.0")
+        self.lineage = Lineage(
+            input_refs=("c4://dataset/example",),
+            code_ref="git:example",
+            environment_digest="oci:sha256-example",
+            seeds=("seed-1",),
+        )
+
+    def test_create_artifact_commits_complete_lineage(self) -> None:
+        record = self.store.create_artifact(
+            kind="model",
+            payload={"weights": [1, 2, 3]},
+            producer=self.producer,
+            lineage=self.lineage,
+        )
+
+        self.assertEqual(record.claim_tier, "ran-toy")
+        self.assertEqual(len(self.store), 1)
+        self.assertEqual(self.store.get_record(record.artifact_ref), record)
+
+    def test_incomplete_lineage_fails_closed(self) -> None:
+        with self.assertRaises(IncompleteLineageError):
+            self.store.create_artifact(
+                kind="model",
+                payload={"weights": [1]},
+                producer=self.producer,
+                lineage=Lineage(input_refs=(), code_ref="", environment_digest="oci:sha256-example"),
+            )
+
+        self.assertEqual(len(self.store), 0)
+
+    def test_promoted_tier_requires_validation_report(self) -> None:
+        with self.assertRaises(IllegalTierError):
+            self.store.create_artifact(
+                kind="model",
+                payload={"weights": [1]},
+                producer=self.producer,
+                lineage=self.lineage,
+                claim_tier="recapitulated-known",
+            )
+
+    def test_verify_on_read_detects_tampering(self) -> None:
+        record = self.store.create_artifact(
+            kind="model",
+            payload={"weights": [1]},
+            producer=self.producer,
+            lineage=self.lineage,
+        )
+        self.store._objects[record.artifact_ref] = b'{"weights":[2]}'
+
+        with self.assertRaises(HashMismatchError):
+            self.store.get_artifact(record.artifact_ref)
 
 
 if __name__ == "__main__":
