@@ -11,6 +11,7 @@ from uuid import uuid4
 
 from .canonical import canonical_json_bytes
 from .hashing import BLAKE3_PREFIX, hash_json
+from .s8 import ArtifactRecord, InMemoryArtifactStore, Lineage, Producer
 
 
 SIGNATURE_PREFIX = "hmac-sha256:"
@@ -30,6 +31,10 @@ class TokenMintUnavailableError(S10Error):
 
 class ScopeWideningError(S10Error):
     """Raised when attenuation attempts to widen a capability."""
+
+
+class ScopeDeniedError(S10Error):
+    """Raised when a brokered action is outside the granted scope."""
 
 
 class BudgetExceededError(S10Error):
@@ -191,6 +196,7 @@ class SandboxHandle:
     policy_bundle_version: str
     seccomp_profile_hash: str
     state: str
+    launch_provenance_ref: str | None = None
 
 
 @dataclass(frozen=True)
@@ -568,6 +574,56 @@ class InMemoryAuditLedger:
         return f"{BLAKE3_PREFIX}{'0' * 64}"
 
 
+class StoreWriterBroker:
+    """Brokered S8 write path for sandbox-origin artifacts."""
+
+    def __init__(
+        self,
+        *,
+        token_service: InMemoryTokenService,
+        artifact_store: InMemoryArtifactStore,
+        audit_ledger: InMemoryAuditLedger,
+    ) -> None:
+        self._token_service = token_service
+        self._artifact_store = artifact_store
+        self._audit_ledger = audit_ledger
+
+    def put_artifact(
+        self,
+        *,
+        scope_token: ScopeToken,
+        kind: str,
+        payload: Any,
+        producer: Producer,
+        lineage: Lineage,
+        claim_tier: str = "ran-toy",
+        validation_report_ref: str | None = None,
+    ) -> ArtifactRecord:
+        verification = self._token_service.verify_scope(scope_token)
+        if not verification.valid:
+            self._audit_ledger.append(
+                "token.verify_fail",
+                {"token": "scope", "reason": verification.reason, "audience": "store"},
+            )
+            raise TokenInvalidError(verification.reason or "invalid scope token")
+        if "store" not in scope_token.scopes.broker_audiences:
+            self._audit_ledger.append("secret.denied", {"audience": "store", "reason": "scope_denied"})
+            raise ScopeDeniedError("scope does not allow store broker audience")
+        record = self._artifact_store.create_artifact(
+            kind=kind,
+            payload=payload,
+            producer=producer,
+            lineage=lineage,
+            claim_tier=claim_tier,
+            validation_report_ref=validation_report_ref,
+        )
+        self._audit_ledger.append(
+            "secret.brokered",
+            {"audience": "store", "op": "put_artifact", "artifact_ref": record.artifact_ref},
+        )
+        return record
+
+
 class InMemorySandboxOrchestrator:
     """Admission-only sandbox orchestrator for M0 S10 contract semantics."""
 
@@ -578,11 +634,13 @@ class InMemorySandboxOrchestrator:
         quota_ledger: InMemoryQuotaLedger,
         audit_ledger: InMemoryAuditLedger,
         policy_bundle: PolicyBundle,
+        artifact_store: InMemoryArtifactStore | None = None,
     ) -> None:
         self._token_service = token_service
         self._quota_ledger = quota_ledger
         self._audit_ledger = audit_ledger
         self._policy_bundle = policy_bundle
+        self._artifact_store = artifact_store
         self._handles: dict[str, SandboxHandle] = {}
 
     def launch(self, request: LaunchRequest) -> SandboxHandle:
@@ -602,6 +660,7 @@ class InMemorySandboxOrchestrator:
             self._audit_ledger.append("budget.reject", {"budget_id": request.budget_token.budget_id})
             raise
 
+        launch_provenance_ref = self._emit_launch_provenance(request, verdict)
         handle = SandboxHandle(
             sandbox_id=str(uuid4()),
             job_id=request.job_id,
@@ -610,6 +669,7 @@ class InMemorySandboxOrchestrator:
             policy_bundle_version=self._policy_bundle.bundle_version,
             seccomp_profile_hash=self._policy_bundle.seccomp_profile_hash,
             state="ADMITTED",
+            launch_provenance_ref=launch_provenance_ref,
         )
         self._handles[handle.sandbox_id] = handle
         self._audit_ledger.append(
@@ -636,3 +696,27 @@ class InMemorySandboxOrchestrator:
                 {"token": "scope", "reason": scope_verification.reason, "job_id": request.job_id},
             )
             raise TokenInvalidError(scope_verification.reason or "invalid scope token")
+
+    def _emit_launch_provenance(self, request: LaunchRequest, verdict: PolicyVerdict) -> str | None:
+        if self._artifact_store is None:
+            return None
+        payload = {
+            "image_digest": request.image,
+            "runtime": verdict.runtime_class or "gvisor",
+            "seccomp_profile_hash": self._policy_bundle.seccomp_profile_hash,
+            "cgroup_limits": asdict(request.requested_envelope),
+            "policy_bundle_version": self._policy_bundle.bundle_version,
+            "node_kernel_caps_dropped": ["ALL"],
+        }
+        record = self._artifact_store.create_artifact(
+            kind="container",
+            payload=payload,
+            producer=Producer(subsystem="S10", version=self._policy_bundle.bundle_version),
+            lineage=Lineage(
+                input_refs=(),
+                code_ref=request.image,
+                environment_digest=hash_json(payload),
+                seeds=(request.trace_id,),
+            ),
+        )
+        return record.artifact_ref
