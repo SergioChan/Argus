@@ -1,6 +1,15 @@
 """Core utilities shared by the Argus implementation."""
 
 from .canonical import canonical_json_bytes
+from .c3 import (
+    C3ReportSigner,
+    C3ReportVerifier,
+    C3SignatureVerification,
+    C3_SIGNATURE_ALGORITHM,
+    C3_SIGNATURE_PREFIX,
+    InMemoryVerifierTrustStore,
+    VerifierKey,
+)
 from .hashing import BLAKE3_PREFIX, hash_bytes, hash_json
 from .s10 import (
     AuditEvent,
@@ -49,12 +58,18 @@ from .s8 import (
     LineageEdge,
     LineageGraph,
     Producer,
+    SignatureInvalidError,
     WriteOnceViolationError,
 )
 
 __all__ = [
     "AuditEvent",
     "BLAKE3_PREFIX",
+    "C3ReportSigner",
+    "C3ReportVerifier",
+    "C3SignatureVerification",
+    "C3_SIGNATURE_ALGORITHM",
+    "C3_SIGNATURE_PREFIX",
     "AuditCheckpoint",
     "AuditLeaf",
     "AuditSlice",
@@ -75,6 +90,7 @@ __all__ = [
     "InMemoryQuotaLedger",
     "InMemorySandboxOrchestrator",
     "InMemoryTokenService",
+    "InMemoryVerifierTrustStore",
     "IncompleteLineageError",
     "LaunchEnvelope",
     "LaunchRequest",
@@ -93,10 +109,12 @@ __all__ = [
     "ScopeGrant",
     "ScopeToken",
     "ScopeWideningError",
+    "SignatureInvalidError",
     "StoreWriterBroker",
     "TokenInvalidError",
     "TokenMintUnavailableError",
     "TokenVerification",
+    "VerifierKey",
     "WriteOnceViolationError",
     "canonical_json_bytes",
     "decide_policy",

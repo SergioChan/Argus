@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+import json
 from typing import Any
 
 from .canonical import canonical_json_bytes
+from .c3 import C3ReportVerifier
 from .hashing import BLAKE3_PREFIX, hash_bytes, hash_json
 
 
@@ -27,6 +29,10 @@ class HashMismatchError(S8Error):
 
 class WriteOnceViolationError(S8Error):
     """Raised when an existing artifact ref would be overwritten."""
+
+
+class SignatureInvalidError(S8Error):
+    """Raised when a C3 report signature is missing, unknown, revoked, or invalid."""
 
 
 class CycleDetectedError(S8Error):
@@ -102,7 +108,7 @@ class AuditVerification:
 class InMemoryArtifactStore:
     """A small write-once C4 store for exercising S8 invariants."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, report_verifier: C3ReportVerifier | None = None) -> None:
         self._objects: dict[str, bytes] = {}
         self._records: dict[str, ArtifactRecord] = {}
         self._record_hashes: dict[str, str] = {}
@@ -110,6 +116,7 @@ class InMemoryArtifactStore:
         self._children: dict[str, set[str]] = {}
         self._edge_types: dict[tuple[str, str], set[str]] = {}
         self._audit_leaves: list[AuditLeaf] = []
+        self._report_verifier = report_verifier
 
     def create_artifact(
         self,
@@ -123,9 +130,10 @@ class InMemoryArtifactStore:
         validation_report_ref: str | None = None,
     ) -> ArtifactRecord:
         self._assert_lineage_complete(lineage)
-        self._assert_tier_coupled(claim_tier, validation_report_ref)
 
         payload_bytes = canonical_json_bytes(payload)
+        self._assert_report_payload_if_present(kind, payload)
+        self._assert_tier_coupled(claim_tier, validation_report_ref)
         content_hash = hash_bytes(payload_bytes)
         record_hash = self._compute_record_hash(
             kind=kind,
@@ -283,10 +291,54 @@ class InMemoryArtifactStore:
         if not lineage.environment_digest:
             raise IncompleteLineageError("lineage.environment_digest is required")
 
-    @staticmethod
-    def _assert_tier_coupled(claim_tier: str, validation_report_ref: str | None) -> None:
+    def _assert_report_payload_if_present(self, kind: str, payload: Any) -> None:
+        if kind == "report" and isinstance(payload, dict) and "signature" in payload:
+            self._verify_report_payload(payload)
+
+    def _assert_tier_coupled(self, claim_tier: str, validation_report_ref: str | None) -> None:
         if claim_tier != "ran-toy" and not validation_report_ref:
             raise IllegalTierError("tier above ran-toy requires validation_report_ref")
+        if claim_tier == "ran-toy":
+            return
+        report_payload = self._report_payload(validation_report_ref or "")
+        verification = self._verify_report_payload(report_payload)
+        if verification.claim_tier != claim_tier:
+            raise IllegalTierError("tier must match validation report claim_tier")
+        if verification.aggregate_passed is not True:
+            raise IllegalTierError("tier-bearing validation report must pass")
+        if claim_tier == "novel-needs-human":
+            self._assert_novel_report_requirements(report_payload)
+
+    def _report_payload(self, validation_report_ref: str) -> dict[str, Any]:
+        if validation_report_ref not in self._records:
+            raise IllegalTierError("validation_report_ref does not exist")
+        payload = json.loads(self.get_artifact(validation_report_ref).decode("utf-8"))
+        if not isinstance(payload, dict):
+            raise IllegalTierError("validation_report_ref does not point to a report object")
+        return payload
+
+    def _verify_report_payload(self, report_payload: dict[str, Any]):
+        if self._report_verifier is None:
+            raise SignatureInvalidError("C3 report verifier unavailable")
+        verification = self._report_verifier.verify(report_payload)
+        if not verification.valid:
+            raise SignatureInvalidError(verification.reason or "signature_invalid")
+        return verification
+
+    @staticmethod
+    def _assert_novel_report_requirements(report_payload: dict[str, Any]) -> None:
+        checks = report_payload.get("checks")
+        if not isinstance(checks, list):
+            raise IllegalTierError("novel report requires checks")
+        statuses = {
+            check.get("check"): check.get("status")
+            for check in checks
+            if isinstance(check, dict) and isinstance(check.get("check"), str)
+        }
+        if statuses.get("LEAKAGE") != "PASS":
+            raise IllegalTierError("novel tier requires LEAKAGE PASS")
+        if statuses.get("CROSS_CODE") != "PASS":
+            raise IllegalTierError("novel tier requires CROSS_CODE PASS")
 
     @staticmethod
     def _compute_record_hash(
