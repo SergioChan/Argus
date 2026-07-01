@@ -41,6 +41,18 @@ C3_V11_FIELDS = {
     "debate_ref",
 }
 
+C1_REQUIRED_DEFS = {
+    "Acceptance",
+    "BuildResult",
+    "Heartbeat",
+    "LifecycleEvent",
+    "Plan",
+    "SubagentEnvelope",
+    "SubagentReport",
+    "TypedError",
+    "ValidationRequest",
+}
+
 
 def fail(message: str) -> None:
     print(f"ERROR: {message}", file=sys.stderr)
@@ -116,6 +128,22 @@ def validate_contract_schema(entry: dict) -> None:
         missing_required = sorted(C3_V11_FIELDS - required)
         if missing_required:
             fail(f"C3 ValidationReport does not require v1.1 fields: {missing_required}")
+
+    if contract_id == "C1":
+        definitions = schema.get("$defs", {})
+        missing_defs = sorted(C1_REQUIRED_DEFS - set(definitions))
+        if missing_defs:
+            fail(f"C1 schema missing canonical public definitions: {missing_defs}")
+        lifecycle_states = set(definitions.get("LifecycleState", {}).get("enum", []))
+        if "REJECTED" not in lifecycle_states:
+            fail("C1 LifecycleState must include REJECTED")
+        if "REFUSED" in lifecycle_states:
+            fail("C1 LifecycleState must not use REFUSED; refusal is represented by Acceptance.accepted=false and state REJECTED")
+        method_values = set(definitions.get("LifecycleMethod", {}).get("enum", []))
+        required_methods = {"register", "accept", "refuse", "plan", "build", "validate", "report", "heartbeat", "cancel"}
+        missing_methods = sorted(required_methods - method_values)
+        if missing_methods:
+            fail(f"C1 LifecycleMethod missing public methods: {missing_methods}")
 
     example_path = EXAMPLES / f"{contract_id.lower()}.example.json"
     if not example_path.is_file():
