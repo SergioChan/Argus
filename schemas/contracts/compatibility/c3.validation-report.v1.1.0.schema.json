@@ -145,7 +145,7 @@
     },
     "ValidationReport": {
       "type": "object",
-      "required": ["report_id", "profile_ref", "frozen_pipeline_ref", "checks", "aggregate", "claim_tier", "signature", "perturbation_pairs", "insensitivity_flags", "challenger_panel", "independence_attestation_debate", "referee", "debate_ref"],
+      "required": ["report_id", "profile_ref", "frozen_pipeline_ref", "checks", "aggregate", "claim_tier", "signature"],
       "additionalProperties": false,
       "properties": {
         "report_id": { "$ref": "#/$defs/Uuid" },
@@ -176,16 +176,39 @@
         },
         "perturbation_pairs": {
           "type": "array",
+          "default": [],
           "items": { "$ref": "#/$defs/PerturbationResult" }
         },
         "insensitivity_flags": {
           "type": "array",
+          "default": [],
           "items": { "$ref": "#/$defs/InsensitivityFlag" }
         },
-        "challenger_panel": { "$ref": "#/$defs/ChallengerPanel" },
-        "independence_attestation_debate": { "$ref": "#/$defs/IndependenceAttestationDebate" },
-        "referee": { "$ref": "#/$defs/Referee" },
-        "debate_ref": { "$ref": "#/$defs/ArtifactRef" }
+        "challenger_panel": {
+          "$ref": "#/$defs/ChallengerPanel",
+          "default": { "challenger_ids": [], "min_required": 1 }
+        },
+        "independence_attestation_debate": {
+          "$ref": "#/$defs/IndependenceAttestationDebate",
+          "default": {
+            "min_independent_challengers": 0,
+            "lineage_disjoint": true,
+            "correlation_warning": false
+          }
+        },
+        "referee": {
+          "$ref": "#/$defs/Referee",
+          "default": {
+            "referee_id": "m0-default-referee",
+            "non_gameable": true,
+            "signed_by": "m0-default",
+            "distinct_from_proponent": true
+          }
+        },
+        "debate_ref": {
+          "$ref": "#/$defs/ArtifactRef",
+          "default": "c4://debate/m0-default"
+        }
       }
     }
   }

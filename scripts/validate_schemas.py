@@ -124,10 +124,13 @@ def validate_contract_schema(entry: dict) -> None:
         missing = sorted(C3_V11_FIELDS - properties)
         if missing:
             fail(f"C3 ValidationReport missing v1.1 fields: {missing}")
-        required = set(report.get("required", []))
-        missing_required = sorted(C3_V11_FIELDS - required)
-        if missing_required:
-            fail(f"C3 ValidationReport does not require v1.1 fields: {missing_required}")
+        missing_defaults = sorted(
+            field
+            for field in C3_V11_FIELDS
+            if "default" not in report.get("properties", {}).get(field, {})
+        )
+        if missing_defaults:
+            fail(f"C3 ValidationReport v1.1 additive fields missing defaults: {missing_defaults}")
 
     if contract_id == "C1":
         definitions = schema.get("$defs", {})

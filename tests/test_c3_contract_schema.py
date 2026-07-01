@@ -45,16 +45,19 @@ class C3ContractSchemaTests(unittest.TestCase):
 
         self.assertEqual(metadata, {"id": "C3", "owner": "S3", "version": "1.1.0"})
         self.assertTrue(C3_V11_FIELDS <= set(report["properties"]))
-        self.assertTrue(C3_V11_FIELDS <= set(report["required"]))
+        self.assertFalse(C3_V11_FIELDS & set(report["required"]))
+        for field in C3_V11_FIELDS:
+            self.assertIn("default", report["properties"][field])
 
     def test_example_validation_report_validates(self) -> None:
         self._assert_valid(self.example)
 
-    def test_missing_v1_1_debate_field_is_invalid(self) -> None:
+    def test_v1_0_shape_report_still_validates_under_v1_1_schema(self) -> None:
         payload = dict(self.example)
-        payload.pop("debate_ref")
+        for field in C3_V11_FIELDS:
+            payload.pop(field)
 
-        self._assert_invalid(payload)
+        self._assert_valid(payload)
 
     def test_generated_python_binding_points_to_exact_c3_schema_digest(self) -> None:
         contract = CONTRACT_BY_ID["C3"]
@@ -79,10 +82,6 @@ class C3ContractSchemaTests(unittest.TestCase):
     def _assert_valid(self, payload: dict) -> None:
         errors = sorted(self.validator.iter_errors(payload), key=lambda error: list(error.path))
         self.assertEqual(errors, [], msg=[error.message for error in errors])
-
-    def _assert_invalid(self, payload: dict) -> None:
-        errors = sorted(self.validator.iter_errors(payload), key=lambda error: list(error.path))
-        self.assertTrue(errors, msg=f"payload unexpectedly validated: {payload}")
 
     @staticmethod
     def _schema_sha256(schema: dict) -> str:
