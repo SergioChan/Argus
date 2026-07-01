@@ -8,6 +8,7 @@ export interface Contract {
   owner: string;
   version: string;
   schema: string;
+  schema_sha256: string;
   consumers: readonly string[];
 }
 
@@ -25,7 +26,8 @@ export const contracts = [
       "S5",
       "S11",
       "S12"
-    ]
+    ],
+    "schema_sha256": "sha256:bec647eec1f70625af766a1dd67f6bf81990d80d1b414b4c74f4254ca62ff7ab"
   },
   {
     "id": "C2",
@@ -43,7 +45,8 @@ export const contracts = [
       "S10",
       "S11",
       "S12"
-    ]
+    ],
+    "schema_sha256": "sha256:62695e9f6e4cda8ab9f9089d595f36ca3cf395e0f40100be35938a838b334360"
   },
   {
     "id": "C3",
@@ -61,7 +64,8 @@ export const contracts = [
       "S9",
       "S11",
       "S12"
-    ]
+    ],
+    "schema_sha256": "sha256:b52d35db62b758fa9cd84cfa77574ce65fb50e63658de83b0135add3752da068"
   },
   {
     "id": "C4",
@@ -81,7 +85,8 @@ export const contracts = [
       "S10",
       "S11",
       "S12"
-    ]
+    ],
+    "schema_sha256": "sha256:0bda7896cbe41192da3a5d995414ed64cd3f00b78f7a162b808ac4f621c8d985"
   },
   {
     "id": "C5",
@@ -99,7 +104,8 @@ export const contracts = [
       "S9",
       "S10",
       "S11"
-    ]
+    ],
+    "schema_sha256": "sha256:250713686bbebeb2ee5b146678a97bfabf9170b953a3368209f5cc40c2bef2c8"
   },
   {
     "id": "C6",
@@ -116,7 +122,8 @@ export const contracts = [
       "S10",
       "S11",
       "S12"
-    ]
+    ],
+    "schema_sha256": "sha256:6291976b487382ae1652dcd6166d2252f6b1aa00234b89f373a83b67639d406c"
   }
 ] as const satisfies readonly Contract[];
 

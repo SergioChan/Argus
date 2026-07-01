@@ -4,13 +4,15 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import sys
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-MANIFEST_PATH = ROOT / "schemas" / "contracts" / "manifest.json"
+CONTRACTS_DIR = ROOT / "schemas" / "contracts"
+MANIFEST_PATH = CONTRACTS_DIR / "manifest.json"
 PYTHON_CONTRACTS = ROOT / "bindings" / "python" / "argus_contracts" / "contracts.py"
 PYTHON_INIT = ROOT / "bindings" / "python" / "argus_contracts" / "__init__.py"
 TYPESCRIPT_PACKAGE = ROOT / "bindings" / "typescript" / "package.json"
@@ -27,7 +29,19 @@ def load_manifest() -> dict:
 
 
 def contracts() -> list[dict]:
-    return sorted(load_manifest()["contracts"], key=lambda item: item["id"])
+    items = []
+    for raw in load_manifest()["contracts"]:
+        item = dict(raw)
+        item["schema_sha256"] = schema_sha256(CONTRACTS_DIR / item["schema"])
+        items.append(item)
+    return sorted(items, key=lambda item: item["id"])
+
+
+def schema_sha256(path: Path) -> str:
+    with path.open(encoding="utf-8") as handle:
+        value = json.load(handle)
+    canonical = json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return "sha256:" + hashlib.sha256(canonical).hexdigest()
 
 
 def py_repr(value: object) -> str:
@@ -44,6 +58,7 @@ def render_python_contracts(items: list[dict]) -> str:
             f'owner="{item["owner"]}", '
             f'version="{item["version"]}", '
             f'schema="{item["schema"]}", '
+            f'schema_sha256="{item["schema_sha256"]}", '
             f"consumers={py_repr(item['consumers'])}"
             ")"
         )
@@ -63,6 +78,7 @@ def render_python_contracts(items: list[dict]) -> str:
             "    owner: str",
             "    version: str",
             "    schema: str",
+            "    schema_sha256: str",
             "    consumers: list[str]",
             "",
             "",
@@ -117,6 +133,7 @@ def render_typescript_contracts(items: list[dict]) -> str:
             "  owner: string;",
             "  version: string;",
             "  schema: string;",
+            "  schema_sha256: string;",
             "  consumers: readonly string[];",
             "}",
             "",
@@ -160,6 +177,7 @@ def render_rust_lib(items: list[dict]) -> str:
             f'owner: "{item["owner"]}", '
             f'version: "{item["version"]}", '
             f'schema: "{item["schema"]}", '
+            f'schema_sha256: "{item["schema_sha256"]}", '
             f"consumers: {rust_array(item['consumers'])} "
             "},"
         )
@@ -174,6 +192,7 @@ def render_rust_lib(items: list[dict]) -> str:
             "    pub owner: &'static str,",
             "    pub version: &'static str,",
             "    pub schema: &'static str,",
+            "    pub schema_sha256: &'static str,",
             "    pub consumers: &'static [&'static str],",
             "}",
             "",
