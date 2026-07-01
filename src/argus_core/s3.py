@@ -7,6 +7,12 @@ from typing import Any
 from uuid import uuid4
 
 from .c3 import C3ReportSigner
+from .s6 import (
+    CapabilityDescriptor,
+    ContaminationIndex,
+    FrozenContaminationSnapshot,
+    IndependenceAttestation,
+)
 
 
 class S3Error(Exception):
@@ -63,6 +69,7 @@ class S3Verifier:
         proponent_id: str,
         perturbation_outcome: PerturbationPairOutcome | None = None,
         challenger_ids: tuple[str, ...] = (),
+        independence_attestation: IndependenceAttestation | None = None,
         debate_ref: str = "c4://debate/not-run",
     ) -> dict[str, Any]:
         referee = build_referee_block(
@@ -71,6 +78,7 @@ class S3Verifier:
             proponent_id=proponent_id,
         )
         perturbation_outcome = perturbation_outcome or PerturbationPairOutcome((), ())
+        independence_attestation = independence_attestation or _default_independence_attestation(challenger_ids)
         aggregate_passed = _aggregate_passed(checks, perturbation_outcome)
         claim_tier = tier_from_checks(checks) if aggregate_passed else "ran-toy"
         report = {
@@ -96,9 +104,9 @@ class S3Verifier:
                 "min_required": len(challenger_ids) if challenger_ids else 1,
             },
             "independence_attestation_debate": {
-                "min_independent_challengers": len(set(challenger_ids)),
-                "lineage_disjoint": len(set(challenger_ids)) == len(challenger_ids),
-                "correlation_warning": len(set(challenger_ids)) != len(challenger_ids),
+                "min_independent_challengers": independence_attestation.min_independent,
+                "lineage_disjoint": independence_attestation.lineage_disjoint,
+                "correlation_warning": independence_attestation.correlation_warning,
             },
             "referee": referee,
             "debate_ref": debate_ref,
@@ -169,6 +177,100 @@ def build_referee_block(*, referee_id: str, signer_key_id: str, proponent_id: st
     }
 
 
+def run_leakage_check(
+    *,
+    contamination_index: ContaminationIndex,
+    snapshot: FrozenContaminationSnapshot,
+    candidate_text: str,
+    threshold: float,
+) -> CheckResult:
+    result = contamination_index.query(snapshot=snapshot, text=candidate_text, threshold=threshold)
+    return CheckResult(
+        check="LEAKAGE",
+        status="FAIL" if result.leakage else "PASS",
+        metrics={
+            "snapshot_ref": result.snapshot_ref,
+            "max_overlap": result.max_overlap,
+            "matched_doc_id": result.matched_doc_id,
+            "threshold": threshold,
+        },
+    )
+
+
+def run_calibration_check(*, nominal_coverage: float, empirical_coverage: float, tolerance: float) -> CheckResult:
+    error = abs(empirical_coverage - nominal_coverage)
+    return CheckResult(
+        check="CALIBRATION",
+        status="PASS" if error <= tolerance else "FAIL",
+        metrics={
+            "nominal_coverage": nominal_coverage,
+            "empirical_coverage": empirical_coverage,
+            "absolute_error": error,
+            "tolerance": tolerance,
+        },
+    )
+
+
+def run_cross_code_check(
+    *,
+    observed: tuple[float, ...],
+    independent: tuple[float, ...],
+    combined_uncertainty: tuple[float, ...],
+    extrapolation_flags: tuple[bool, ...] = (),
+    z_max: float = 3.0,
+) -> CheckResult:
+    if len(observed) != len(independent) or len(observed) != len(combined_uncertainty):
+        raise ValueError("observed, independent, and combined_uncertainty lengths must match")
+    if any(uncertainty <= 0 for uncertainty in combined_uncertainty):
+        raise ValueError("combined_uncertainty values must be positive")
+    flags = extrapolation_flags or tuple(False for _ in observed)
+    if len(flags) != len(observed):
+        raise ValueError("extrapolation_flags length must match observed")
+    if any(flags):
+        return CheckResult(
+            check="CROSS_CODE",
+            status="INCONCLUSIVE",
+            metrics={"excluded_fraction": sum(1 for flag in flags if flag) / len(flags)},
+        )
+    z_scores = tuple(
+        abs(left - right) / uncertainty
+        for left, right, uncertainty in zip(observed, independent, combined_uncertainty)
+    )
+    max_z = max(z_scores) if z_scores else 0.0
+    return CheckResult(
+        check="CROSS_CODE",
+        status="PASS" if max_z <= z_max else "FAIL",
+        metrics={"max_z": max_z, "z_max": z_max},
+    )
+
+
+def attest_challenger_independence(
+    *,
+    challengers: tuple[CapabilityDescriptor, ...],
+    min_independent: int,
+    excluded_tags: tuple[str, ...] = (),
+) -> IndependenceAttestation:
+    excluded = set(excluded_tags)
+    selected: list[CapabilityDescriptor] = []
+    used_tags: set[str] = set()
+    for challenger in sorted(challengers, key=lambda item: item.entity_id):
+        tags = set(challenger.independence_tags)
+        if tags & excluded:
+            continue
+        if tags and tags.isdisjoint(used_tags):
+            selected.append(challenger)
+            used_tags.update(tags)
+    selected_ids = tuple(challenger.entity_id for challenger in selected)
+    return IndependenceAttestation(
+        candidate_ids=tuple(challenger.entity_id for challenger in challengers),
+        selected_entity_ids=selected_ids,
+        min_independent=min_independent,
+        lineage_disjoint=len(selected_ids) >= min_independent,
+        correlation_warning=len(selected_ids) < min_independent,
+        excluded_tags=tuple(sorted(excluded_tags)),
+    )
+
+
 def tier_from_checks(checks: tuple[CheckResult, ...]) -> str:
     statuses = {check.check: check.status for check in checks}
     recap_required = ("INJECTION", "NULL_CONTROL", "PHYSICAL_CONSISTENCY", "CALIBRATION")
@@ -201,3 +303,14 @@ def _check_to_contract(check: CheckResult) -> dict[str, Any]:
     if check.metrics is not None:
         payload["metrics"] = check.metrics
     return payload
+
+
+def _default_independence_attestation(challenger_ids: tuple[str, ...]) -> IndependenceAttestation:
+    return IndependenceAttestation(
+        candidate_ids=challenger_ids,
+        selected_entity_ids=tuple(dict.fromkeys(challenger_ids)),
+        min_independent=len(challenger_ids) if challenger_ids else 1,
+        lineage_disjoint=len(set(challenger_ids)) == len(challenger_ids),
+        correlation_warning=len(set(challenger_ids)) != len(challenger_ids),
+        excluded_tags=(),
+    )

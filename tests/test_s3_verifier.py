@@ -5,11 +5,19 @@ import unittest
 from argus_core import (
     C3ReportSigner,
     C3ReportVerifier,
+    CapabilityDescriptor,
     CheckResult,
+    ContaminationIndex,
+    InMemoryArtifactStore,
     InMemoryVerifierTrustStore,
     RefereePolicyError,
     S3Verifier,
+    SourceDocument,
+    attest_challenger_independence,
     build_referee_block,
+    run_calibration_check,
+    run_cross_code_check,
+    run_leakage_check,
     run_perturbation_pair,
     tier_from_checks,
 )
@@ -134,6 +142,97 @@ class S3VerifierReportTests(unittest.TestCase):
         self.assertFalse(report["aggregate"]["passed"])
         self.assertEqual(report["claim_tier"], "ran-toy")
         self.assertEqual(len(report["insensitivity_flags"]), 1)
+
+    def test_m3_leakage_check_consumes_frozen_contamination_snapshot(self) -> None:
+        store = InMemoryArtifactStore()
+        index = ContaminationIndex(artifact_store=store)
+        snapshot = index.freeze(
+            version="2026-07-01",
+            documents=(
+                SourceDocument(
+                    doc_id="paper-1",
+                    text="electroweak phase transition gravitational wave spectrum",
+                    source_ref="c4://source/paper-1",
+                ),
+            ),
+        )
+
+        check = run_leakage_check(
+            contamination_index=index,
+            snapshot=snapshot,
+            candidate_text="electroweak phase transition gravitational wave spectrum",
+            threshold=0.8,
+        )
+
+        self.assertEqual(check.check, "LEAKAGE")
+        self.assertEqual(check.status, "FAIL")
+        self.assertEqual(check.metrics["matched_doc_id"], "paper-1")
+
+    def test_m3_calibration_and_cross_code_checks(self) -> None:
+        calibration = run_calibration_check(nominal_coverage=0.9, empirical_coverage=0.88, tolerance=0.03)
+        cross_code = run_cross_code_check(
+            observed=(1.0, 2.0),
+            independent=(1.1, 2.1),
+            combined_uncertainty=(0.2, 0.2),
+            z_max=1.0,
+        )
+        extrapolated = run_cross_code_check(
+            observed=(1.0,),
+            independent=(1.0,),
+            combined_uncertainty=(0.1,),
+            extrapolation_flags=(True,),
+        )
+
+        self.assertEqual(calibration.status, "PASS")
+        self.assertEqual(cross_code.status, "PASS")
+        self.assertEqual(extrapolated.status, "INCONCLUSIVE")
+
+    def test_challenger_independence_attestation_populates_signed_report(self) -> None:
+        challengers = (
+            self._challenger("challenger-a", tags=("impl-a",)),
+            self._challenger("challenger-b", tags=("impl-b",)),
+            self._challenger("challenger-c", tags=("impl-b",)),
+        )
+        attestation = attest_challenger_independence(challengers=challengers, min_independent=2)
+
+        report = self.verifier.build_report(
+            profile_ref="c4://profile/ewpt/v1",
+            frozen_pipeline_ref="c4://pipeline/ewpt/baseline",
+            proponent_id="builder",
+            checks=(
+                CheckResult("INJECTION", "PASS"),
+                CheckResult("NULL_CONTROL", "PASS"),
+                CheckResult("PHYSICAL_CONSISTENCY", "PASS"),
+                CheckResult("CALIBRATION", "PASS"),
+                CheckResult("CROSS_CODE", "PASS"),
+                CheckResult("LEAKAGE", "PASS"),
+            ),
+            challenger_ids=tuple(challenger.entity_id for challenger in challengers),
+            independence_attestation=attestation,
+        )
+
+        self.assertTrue(attestation.lineage_disjoint)
+        self.assertEqual(attestation.selected_entity_ids, ("challenger-a", "challenger-b"))
+        self.assertTrue(C3ReportVerifier(self.trust_store).verify(report).valid)
+        self.assertEqual(report["claim_tier"], "novel-needs-human")
+        self.assertEqual(report["independence_attestation_debate"]["min_independent_challengers"], 2)
+        self.assertFalse(report["independence_attestation_debate"]["correlation_warning"])
+
+    @staticmethod
+    def _challenger(entity_id: str, *, tags: tuple[str, ...]) -> CapabilityDescriptor:
+        return CapabilityDescriptor(
+            entity_id=entity_id,
+            revision=1,
+            kind="subagent",
+            owner_subsystem="S1",
+            contract_versions={"C1": "1.0.0", "C5": "1.0.0"},
+            trust_class="internal",
+            capability_scopes=("challenge",),
+            provenance_ref=f"c4://descriptor/{entity_id}",
+            subtopics=("ewpt",),
+            independence_tags=tags,
+            conformance_level="gold",
+        )
 
 
 if __name__ == "__main__":
