@@ -8,11 +8,16 @@ from argus_core import (
     BaselineBuilder,
     BuildPlan,
     EvalRequest,
+    HPOTrial,
     InMemoryArtifactStore,
+    MutationSpec,
     NormalizedQuantity,
     Quantity,
+    RewardSourceError,
     SelfGradeError,
     SimpleAdapter,
+    list_model_families,
+    select_hpo_winner,
 )
 
 
@@ -77,6 +82,56 @@ class S2BaselineBuilderTests(unittest.TestCase):
                 attempted_claim_tier="recapitulated-known",
             )
 
+    def test_model_family_registry_includes_deep_physics_informed_family(self) -> None:
+        families = {family.family_id: family for family in list_model_families()}
+
+        self.assertTrue(families["physics-informed-mlp"].differentiable)
+        self.assertTrue(families["physics-informed-mlp"].physics_informed)
+        self.assertEqual(families["tabular-baseline"].family_kind, "classical")
+
+    def test_hpo_selection_respects_calibration_and_cost_tiebreak(self) -> None:
+        selected = select_hpo_winner(
+            (
+                HPOTrial("overfit", score=0.99, calibration_error=0.3, cost=1.0, parameters={"lr": 1.0}),
+                HPOTrial("expensive", score=0.9, calibration_error=0.01, cost=10.0, parameters={"lr": 0.1}),
+                HPOTrial("cheap", score=0.9, calibration_error=0.01, cost=2.0, parameters={"lr": 0.05}),
+            ),
+            max_calibration_error=0.05,
+        )
+
+        self.assertEqual(selected.trial_id, "cheap")
+        self.assertEqual(selected.parameters, {"lr": 0.05})
+
+    def test_build_variant_links_base_pipeline_and_exposes_no_score(self) -> None:
+        base = self.builder.build(self._plan(job_id="base"))
+
+        variant = self.builder.build_variant(
+            base_pipeline_ref=base.frozen_pipeline_ref,
+            plan=self._plan(job_id="variant"),
+            mutation=MutationSpec(
+                variant_id="variant-1",
+                model_family="physics-informed-mlp",
+                parameters={"layers": 3},
+            ),
+        )
+        model_lineage = self.store.get_lineage(variant.model_ref, direction="ancestors")
+
+        self.assertEqual(variant.base_pipeline_ref, base.frozen_pipeline_ref)
+        self.assertEqual(variant.diagnostics["reward_source"], "c3-only")
+        self.assertFalse(hasattr(variant, "score"))
+        self.assertIn(base.frozen_pipeline_ref, {node.artifact_ref for node in model_lineage.nodes})
+
+    def test_build_variant_rejects_fabricated_score(self) -> None:
+        base = self.builder.build(self._plan(job_id="base"))
+
+        with self.assertRaises(RewardSourceError):
+            self.builder.build_variant(
+                base_pipeline_ref=base.frozen_pipeline_ref,
+                plan=self._plan(job_id="variant"),
+                mutation=MutationSpec(variant_id="variant-1", model_family="physics-informed-mlp", parameters={}),
+                fabricated_score=1.0,
+            )
+
     @staticmethod
     def _adapter() -> SimpleAdapter:
         descriptor = AdapterDescriptor(
@@ -90,6 +145,22 @@ class S2BaselineBuilderTests(unittest.TestCase):
             differentiable=True,
         )
         return SimpleAdapter(descriptor, S2BaselineBuilderTests._evaluate)
+
+    @staticmethod
+    def _plan(job_id: str) -> BuildPlan:
+        return BuildPlan(
+            job_id=job_id,
+            input_refs=(),
+            adapter_request=EvalRequest(
+                adapter_id="gw_spectrum_surrogate",
+                inputs={
+                    "T_n": Quantity(value=100, units="GeV"),
+                    "alpha": Quantity(value=0.2, units="dimensionless"),
+                    "v_w": Quantity(value=0.7, units="dimensionless"),
+                },
+                seed=7,
+            ),
+        )
 
     @staticmethod
     def _evaluate(inputs: dict[str, NormalizedQuantity], _seed: int | None) -> dict[str, Quantity]:
