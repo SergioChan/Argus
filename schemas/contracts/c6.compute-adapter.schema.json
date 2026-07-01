@@ -1,0 +1,96 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://argus.local/schemas/contracts/c6.compute-adapter.schema.json",
+  "title": "C6 Compute Adapter Tool Interface",
+  "description": "Descriptor and result contracts for units-tagged, uncertainty-tagged physics compute adapters.",
+  "x-argus-contract": {
+    "id": "C6",
+    "owner": "S7",
+    "version": "1.0.0"
+  },
+  "oneOf": [
+    { "$ref": "#/$defs/AdapterDescriptor" },
+    { "$ref": "#/$defs/EvalRequest" },
+    { "$ref": "#/$defs/EvalResult" }
+  ],
+  "$defs": {
+    "ArtifactRef": {
+      "type": "string",
+      "pattern": "^c4://[A-Za-z0-9._:-]+$"
+    },
+    "Quantity": {
+      "type": "object",
+      "required": ["value", "units"],
+      "additionalProperties": false,
+      "properties": {
+        "value": { "type": ["number", "array"] },
+        "units": { "type": "string", "minLength": 1 },
+        "uncertainty": { "type": "object" }
+      }
+    },
+    "AdapterDescriptor": {
+      "type": "object",
+      "required": ["adapter_id", "version", "methods", "units_schema", "validity_domain", "determinism", "cost_class", "provenance_ref"],
+      "additionalProperties": false,
+      "properties": {
+        "adapter_id": { "type": "string", "minLength": 1 },
+        "version": { "type": "string", "pattern": "^\\d+\\.\\d+\\.\\d+$" },
+        "methods": {
+          "type": "array",
+          "items": { "type": "string", "enum": ["describe", "evaluate", "grad", "batch_evaluate"] },
+          "uniqueItems": true
+        },
+        "units_schema": { "type": "object" },
+        "validity_domain": { "type": "object" },
+        "determinism": { "type": "string", "enum": ["deterministic", "seeded", "stochastic"] },
+        "differentiable": { "type": "boolean" },
+        "cost_class": { "type": "string", "enum": ["toy", "standard", "heavy", "flagship_hpc_disallowed"] },
+        "independence_tags": {
+          "type": "array",
+          "items": { "type": "string" },
+          "uniqueItems": true
+        },
+        "provenance_ref": { "$ref": "#/$defs/ArtifactRef" }
+      }
+    },
+    "EvalRequest": {
+      "type": "object",
+      "required": ["adapter_id", "inputs"],
+      "additionalProperties": false,
+      "properties": {
+        "adapter_id": { "type": "string", "minLength": 1 },
+        "inputs": {
+          "type": "object",
+          "additionalProperties": { "$ref": "#/$defs/Quantity" }
+        },
+        "seed": { "type": "integer" },
+        "budget_token_ref": { "type": "string" }
+      }
+    },
+    "EvalResult": {
+      "type": "object",
+      "required": ["adapter_id", "outputs", "in_validity_domain", "extrapolation_flag", "provenance_ref"],
+      "additionalProperties": false,
+      "properties": {
+        "adapter_id": { "type": "string", "minLength": 1 },
+        "outputs": {
+          "type": "object",
+          "additionalProperties": { "$ref": "#/$defs/Quantity" }
+        },
+        "in_validity_domain": { "type": "boolean" },
+        "extrapolation_flag": { "type": "boolean" },
+        "provenance_ref": { "$ref": "#/$defs/ArtifactRef" },
+        "error": {
+          "type": "object",
+          "properties": {
+            "category": {
+              "type": "string",
+              "enum": ["UNITS_MISMATCH", "OUT_OF_DOMAIN", "PROVENANCE_UNAVAILABLE", "BUDGET", "ADAPTER_ERROR"]
+            },
+            "message": { "type": "string" }
+          }
+        }
+      }
+    }
+  }
+}

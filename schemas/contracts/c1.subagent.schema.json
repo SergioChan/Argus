@@ -1,0 +1,84 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://argus.local/schemas/contracts/c1.subagent.schema.json",
+  "title": "C1 Subagent Contract",
+  "description": "Subagent lifecycle envelopes and shared typed errors.",
+  "x-argus-contract": {
+    "id": "C1",
+    "owner": "S1",
+    "version": "1.0.0"
+  },
+  "oneOf": [
+    { "$ref": "#/$defs/SubagentEnvelope" },
+    { "$ref": "#/$defs/SubagentReport" },
+    { "$ref": "#/$defs/TypedError" }
+  ],
+  "$defs": {
+    "Uuid": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "ArtifactRef": {
+      "type": "string",
+      "pattern": "^c4://[A-Za-z0-9._:-]+$"
+    },
+    "LifecycleState": {
+      "type": "string",
+      "enum": ["REGISTERED", "ACCEPTED", "REFUSED", "PLANNING", "BUILDING", "VALIDATING", "REPORTED", "FAILED", "CANCELLED", "QUARANTINED"]
+    },
+    "ClaimTier": {
+      "type": "string",
+      "enum": ["ran-toy", "recapitulated-known", "novel-needs-human"]
+    },
+    "TypedError": {
+      "type": "object",
+      "required": ["category", "code", "message", "retryable"],
+      "additionalProperties": false,
+      "properties": {
+        "category": {
+          "type": "string",
+          "enum": ["POLICY", "SANDBOX", "BUDGET", "RETRYABLE", "PERMANENT", "VALIDATION", "VERSION_UNSUPPORTED", "QUARANTINE"]
+        },
+        "code": { "type": "string", "minLength": 1 },
+        "message": { "type": "string", "minLength": 1 },
+        "retryable": { "type": "boolean" },
+        "retry_after_seconds": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "SubagentEnvelope": {
+      "type": "object",
+      "required": ["contract_version", "method", "job_id", "trace_id", "state", "idempotency_key"],
+      "additionalProperties": false,
+      "properties": {
+        "contract_version": { "type": "string", "pattern": "^1\\.\\d+\\.\\d+$" },
+        "method": {
+          "type": "string",
+          "enum": ["register", "accept", "plan", "build", "validate", "report", "heartbeat", "cancel"]
+        },
+        "job_id": { "$ref": "#/$defs/Uuid" },
+        "trace_id": { "type": "string", "minLength": 1 },
+        "state": { "$ref": "#/$defs/LifecycleState" },
+        "idempotency_key": { "type": "string", "minLength": 1 },
+        "capability_descriptor_ref": { "$ref": "#/$defs/ArtifactRef" },
+        "job_envelope_ref": { "$ref": "#/$defs/ArtifactRef" },
+        "payload": { "type": "object" }
+      }
+    },
+    "SubagentReport": {
+      "type": "object",
+      "required": ["job_id", "status", "claim_tier", "artifact_refs"],
+      "additionalProperties": false,
+      "properties": {
+        "job_id": { "$ref": "#/$defs/Uuid" },
+        "status": { "$ref": "#/$defs/LifecycleState" },
+        "claim_tier": { "$ref": "#/$defs/ClaimTier" },
+        "artifact_refs": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/ArtifactRef" }
+        },
+        "validation_report_ref": { "$ref": "#/$defs/ArtifactRef" },
+        "error": { "$ref": "#/$defs/TypedError" }
+      }
+    }
+  }
+}

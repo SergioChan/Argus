@@ -1,0 +1,71 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://argus.local/schemas/contracts/c5.capability-descriptor.schema.json",
+  "title": "C5 Registry Capability Descriptor",
+  "description": "Immutable registry descriptor for subagents, adapters, verifiers, datasets, and federated entities.",
+  "x-argus-contract": {
+    "id": "C5",
+    "owner": "S6/S12",
+    "version": "1.0.0"
+  },
+  "$ref": "#/$defs/CapabilityDescriptor",
+  "$defs": {
+    "ArtifactRef": {
+      "type": "string",
+      "pattern": "^c4://[A-Za-z0-9._:-]+$"
+    },
+    "CapabilityDescriptor": {
+      "type": "object",
+      "required": ["entity_id", "revision", "kind", "owner_subsystem", "contract_versions", "trust_class", "capability_scopes", "provenance_ref"],
+      "additionalProperties": false,
+      "properties": {
+        "entity_id": { "type": "string", "minLength": 1 },
+        "revision": { "type": "integer", "minimum": 1 },
+        "kind": {
+          "type": "string",
+          "enum": ["subagent", "adapter", "verifier", "dataset", "contamination_index", "federated_subagent", "federated_adapter"]
+        },
+        "owner_subsystem": { "type": "string", "pattern": "^S\\d+$" },
+        "subtopics": {
+          "type": "array",
+          "items": { "type": "string" },
+          "uniqueItems": true
+        },
+        "contract_versions": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "trust_class": {
+          "type": "string",
+          "enum": ["internal", "federated", "suspended"]
+        },
+        "capability_scopes": {
+          "type": "array",
+          "items": { "type": "string" },
+          "uniqueItems": true
+        },
+        "independence_tags": {
+          "type": "array",
+          "items": { "type": "string" },
+          "uniqueItems": true
+        },
+        "conformance": {
+          "type": "object",
+          "properties": {
+            "level": { "type": "string", "enum": ["bronze", "silver", "gold"] },
+            "suite_version": { "type": "string" },
+            "evidence_ref": { "$ref": "#/$defs/ArtifactRef" },
+            "expires_at": { "type": "string", "format": "date-time" }
+          }
+        },
+        "provenance_ref": { "$ref": "#/$defs/ArtifactRef" },
+        "status": {
+          "type": "string",
+          "enum": ["active", "deprecated", "revoked", "suspended"]
+        }
+      }
+    }
+  }
+}
