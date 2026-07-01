@@ -5,6 +5,9 @@ description = "Verifier-gated, agent-operated ML foundry for theoretical particl
 readme = "docs/README.md"
 requires-python = ">=3.11"
 license = { text = "Proprietary" }
+dependencies = [
+  "jsonschema>=4.25,<5"
+]
 
 [tool.project-argus]
 roadmap = "docs/Roadmap.md"

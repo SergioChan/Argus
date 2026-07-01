@@ -7,9 +7,12 @@ import json
 import sys
 from pathlib import Path
 
+from jsonschema import Draft202012Validator
+
 
 ROOT = Path(__file__).resolve().parents[1]
 CONTRACTS = ROOT / "schemas" / "contracts"
+EXAMPLES = CONTRACTS / "examples"
 
 EXPECTED_CONTRACT_CONSUMERS = {
     "C1": {"S2", "S3", "S4", "S5", "S11", "S12"},
@@ -88,6 +91,10 @@ def validate_contract_schema(entry: dict) -> None:
         fail(f"{path.relative_to(ROOT)} must use JSON Schema draft 2020-12")
     if "$id" not in schema:
         fail(f"{path.relative_to(ROOT)} must declare $id")
+    try:
+        Draft202012Validator.check_schema(schema)
+    except Exception as exc:
+        fail(f"{path.relative_to(ROOT)} failed JSON Schema meta-validation: {exc}")
 
     metadata = schema.get("x-argus-contract")
     if not isinstance(metadata, dict):
@@ -109,6 +116,17 @@ def validate_contract_schema(entry: dict) -> None:
         missing_required = sorted(C3_V11_FIELDS - required)
         if missing_required:
             fail(f"C3 ValidationReport does not require v1.1 fields: {missing_required}")
+
+    example_path = EXAMPLES / f"{contract_id.lower()}.example.json"
+    if not example_path.is_file():
+        fail(f"{contract_id} example file does not exist: {example_path.relative_to(ROOT)}")
+    example = load_json(example_path)
+    validator = Draft202012Validator(schema)
+    errors = sorted(validator.iter_errors(example), key=lambda error: list(error.path))
+    if errors:
+        first = errors[0]
+        location = ".".join(str(part) for part in first.path) or "<root>"
+        fail(f"{example_path.relative_to(ROOT)} does not validate against {contract_id} at {location}: {first.message}")
 
 
 def main() -> int:

@@ -1,0 +1,64 @@
+{
+  "report_id": "33333333-3333-4333-8333-333333333333",
+  "profile_ref": "c4://profile/ewpt-toy/v1",
+  "frozen_pipeline_ref": "c4://pipeline/ewpt-toy/baseline",
+  "checks": [
+    {
+      "check": "INJECTION",
+      "status": "PASS",
+      "metrics": {
+        "recovery_rate": 0.98
+      },
+      "evidence_refs": ["c4://evidence/injection/example"]
+    }
+  ],
+  "aggregate": {
+    "passed": true,
+    "score": 0.98
+  },
+  "claim_tier": "recapitulated-known",
+  "claim_tier_is_candidate": false,
+  "signature": {
+    "algorithm": "ed25519",
+    "key_id": "s3-example-key",
+    "value": "example-signature"
+  },
+  "perturbation_pairs": [
+    {
+      "perturbation_id": "must-react-1",
+      "kind": "must_react",
+      "verdict": "pass",
+      "amplitude_linearity": {
+        "slope": 1.0,
+        "intercept": 0.0
+      }
+    },
+    {
+      "perturbation_id": "must-not-react-1",
+      "kind": "must_not_react",
+      "verdict": "pass",
+      "observed_degradation": {
+        "signal": 0.0
+      }
+    }
+  ],
+  "insensitivity_flags": [],
+  "challenger_panel": {
+    "challenger_ids": ["challenger-a", "challenger-b"],
+    "min_required": 2,
+    "attack_types": ["signal_injection", "null_noise"]
+  },
+  "independence_attestation_debate": {
+    "min_independent_challengers": 2,
+    "lineage_disjoint": true,
+    "correlation_warning": false,
+    "evidence_refs": ["c4://evidence/independence/example"]
+  },
+  "referee": {
+    "referee_id": "s3-referee",
+    "non_gameable": true,
+    "signed_by": "s3-example-key",
+    "distinct_from_proponent": true
+  },
+  "debate_ref": "c4://debate/ewpt-toy/example"
+}

@@ -1,0 +1,15 @@
+{
+  "adapter_id": "adapter:toy-bounce",
+  "outputs": {
+    "action": {
+      "value": 42.0,
+      "units": "dimensionless",
+      "uncertainty": {
+        "stddev": 0.1
+      }
+    }
+  },
+  "in_validity_domain": true,
+  "extrapolation_flag": false,
+  "provenance_ref": "c4://adapter-call/toy-bounce/example"
+}

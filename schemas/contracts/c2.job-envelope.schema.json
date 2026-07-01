@@ -19,7 +19,7 @@
     },
     "ArtifactRef": {
       "type": "string",
-      "pattern": "^c4://[A-Za-z0-9._:-]+$"
+      "pattern": "^c4://[A-Za-z0-9._:/-]+$"
     },
     "ClaimTier": {
       "type": "string",
