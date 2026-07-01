@@ -1,0 +1,104 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://argus.local/schemas/contracts/c2.job-envelope.schema.json",
+  "title": "C2 Task Job Envelope",
+  "description": "Immutable task, DAG, budget, scope, and result envelopes owned by S5.",
+  "x-argus-contract": {
+    "id": "C2",
+    "owner": "S5",
+    "version": "1.0.0"
+  },
+  "oneOf": [
+    { "$ref": "#/$defs/JobEnvelope" },
+    { "$ref": "#/$defs/JobResult" }
+  ],
+  "$defs": {
+    "Uuid": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "ArtifactRef": {
+      "type": "string",
+      "pattern": "^c4://[A-Za-z0-9._:/-]+$"
+    },
+    "ClaimTier": {
+      "type": "string",
+      "enum": ["ran-toy", "recapitulated-known", "novel-needs-human"]
+    },
+    "Budget": {
+      "type": "object",
+      "required": ["max_usd", "max_wallclock_seconds"],
+      "additionalProperties": false,
+      "properties": {
+        "max_usd": { "type": "number", "minimum": 0 },
+        "max_wallclock_seconds": { "type": "integer", "minimum": 1 },
+        "max_gpu_seconds": { "type": "number", "minimum": 0 },
+        "max_model_tokens": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "CapabilityScopes": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "allowed_adapters": {
+          "type": "array",
+          "items": { "type": "string" },
+          "uniqueItems": true
+        },
+        "allowed_datasets": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/ArtifactRef" },
+          "uniqueItems": true
+        },
+        "allowed_egress": {
+          "type": "array",
+          "items": { "type": "string" },
+          "uniqueItems": true
+        }
+      }
+    },
+    "JobEnvelope": {
+      "type": "object",
+      "required": ["contract_version", "job_id", "root_request_id", "trace_id", "subtopic", "required_claim_tier_max", "budget", "capability_scopes", "verifier_profile_ref"],
+      "additionalProperties": false,
+      "properties": {
+        "contract_version": { "type": "string", "pattern": "^1\\.\\d+\\.\\d+$" },
+        "job_id": { "$ref": "#/$defs/Uuid" },
+        "root_request_id": { "$ref": "#/$defs/Uuid" },
+        "parent_job_id": { "$ref": "#/$defs/Uuid" },
+        "trace_id": { "type": "string", "minLength": 1 },
+        "subtopic": { "type": "string", "minLength": 1 },
+        "problem_spec": { "type": "object" },
+        "required_claim_tier_max": { "$ref": "#/$defs/ClaimTier" },
+        "verifier_profile_ref": { "$ref": "#/$defs/ArtifactRef" },
+        "contamination_index_version": { "type": "string" },
+        "budget": { "$ref": "#/$defs/Budget" },
+        "capability_scopes": { "$ref": "#/$defs/CapabilityScopes" },
+        "input_artifact_refs": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/ArtifactRef" }
+        }
+      }
+    },
+    "JobResult": {
+      "type": "object",
+      "required": ["job_id", "status", "artifact_refs", "cost_actual"],
+      "additionalProperties": false,
+      "properties": {
+        "job_id": { "$ref": "#/$defs/Uuid" },
+        "status": {
+          "type": "string",
+          "enum": ["SUCCEEDED", "FAILED", "REFUSED", "CANCELLED", "QUARANTINED", "PARTIAL"]
+        },
+        "artifact_refs": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/ArtifactRef" }
+        },
+        "validation_report_ref": { "$ref": "#/$defs/ArtifactRef" },
+        "claim_tier": { "$ref": "#/$defs/ClaimTier" },
+        "cost_actual": { "type": "number", "minimum": 0 },
+        "error": { "type": "object" }
+      }
+    }
+  }
+}

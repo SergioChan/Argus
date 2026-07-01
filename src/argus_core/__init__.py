@@ -101,6 +101,8 @@ from .s5 import (
     BudgetLedger,
     BudgetLedgerEntry,
     BudgetState,
+    C2ContractError,
+    C2JobEnvelope,
     ControlTower,
     ConcurrencyGovernor,
     DAG,
@@ -123,6 +125,7 @@ from .s5 import (
     S5SchedulingError,
     TypedNodeError,
     WorkItem,
+    parse_c2_job_envelope,
     topological_order,
 )
 from .s6 import (
@@ -324,6 +327,8 @@ __all__ = [
     "C3SignatureVerification",
     "C3_SIGNATURE_ALGORITHM",
     "C3_SIGNATURE_PREFIX",
+    "C2ContractError",
+    "C2JobEnvelope",
     "CONFORMANCE_LEVEL_ORDER",
     "CanaryResult",
     "CapabilityDescriptor",
@@ -569,6 +574,7 @@ __all__ = [
     "planted_exploit_catch_rate",
     "precondition_gate",
     "parse_job_envelope",
+    "parse_c2_job_envelope",
     "publish_adapter_capability",
     "reduce_lifecycle",
     "recommend_pause",

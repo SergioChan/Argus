@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 from decimal import Decimal
-from typing import Callable
+from typing import Any, Callable, Mapping
 
 from .hashing import hash_json
 from .s8 import InMemoryArtifactStore
@@ -36,6 +36,31 @@ class S5SchedulingError(S5Error):
 
 class S5ReviewError(S5Error):
     """Raised when S5 review wait-state transitions are invalid."""
+
+
+class C2ContractError(S5Error):
+    """Raised when a C2 envelope cannot be accepted by this runtime."""
+
+    def __init__(self, error: "TypedNodeError") -> None:
+        super().__init__(error.message or error.code)
+        self.error = error
+
+
+@dataclass(frozen=True)
+class C2JobEnvelope:
+    contract_version: str
+    job_id: str
+    root_request_id: str
+    trace_id: str
+    subtopic: str
+    required_claim_tier_max: str
+    verifier_profile_ref: str
+    budget: dict[str, Any]
+    capability_scopes: dict[str, Any]
+    parent_job_id: str | None = None
+    problem_spec: dict[str, Any] | None = None
+    contamination_index_version: str | None = None
+    input_artifact_refs: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -160,8 +185,50 @@ class BackPressureSignal:
 Handler = Callable[[DAGNode, tuple[NodeResult, ...]], NodeResult]
 
 
+def parse_c2_job_envelope(payload: Mapping[str, Any], *, runtime_version: str = "1.0.0") -> C2JobEnvelope:
+    contract_version = str(payload.get("contract_version", ""))
+    if _semver_major(contract_version) != _semver_major(runtime_version):
+        raise C2ContractError(
+            TypedNodeError(
+                category="PERMANENT",
+                code="VERSION_UNSUPPORTED",
+                message=f"C2 major version {contract_version!r} is not supported by runtime {runtime_version}",
+            )
+        )
+
+    values = {name: payload[name] for name in C2_JOB_ENVELOPE_FIELDS if name in payload}
+    if "input_artifact_refs" in values:
+        values["input_artifact_refs"] = tuple(values["input_artifact_refs"])
+    try:
+        return C2JobEnvelope(**values)
+    except TypeError as exc:
+        raise C2ContractError(
+            TypedNodeError(
+                category="PERMANENT",
+                code="SCHEMA_INVALID",
+                message=f"invalid C2 JobEnvelope payload: {exc}",
+            )
+        ) from exc
+
+
+C2_JOB_ENVELOPE_FIELDS = frozenset(C2JobEnvelope.__dataclass_fields__)
+
+
 def money(value: Decimal | int | float | str) -> Decimal:
     return value if isinstance(value, Decimal) else Decimal(str(value))
+
+
+def _semver_major(version: str) -> int:
+    try:
+        return int(version.split(".", 1)[0])
+    except (ValueError, IndexError) as exc:
+        raise C2ContractError(
+            TypedNodeError(
+                category="PERMANENT",
+                code="VERSION_UNSUPPORTED",
+                message=f"invalid C2 semver: {version}",
+            )
+        ) from exc
 
 
 class BudgetLedger:
