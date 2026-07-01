@@ -3,8 +3,12 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
-from typing import Any
+import hashlib
+import json
+from pathlib import Path
+from typing import Any, Mapping
 
+from .s5 import C2VersionPolicy, parse_c2_job_envelope
 from .s7 import AdapterBroker, EvalRequest, EvalResult
 from .s8 import ArtifactRecord, InMemoryArtifactStore, Lineage, Producer
 
@@ -19,6 +23,69 @@ class SelfGradeError(S2Error):
 
 class RewardSourceError(S2Error):
     """Raised when S2 is asked to accept a non-C3 score or reward."""
+
+
+class S2ContractModelError(S2Error):
+    """Raised when S2's contract-bound model surface is missing or drifting."""
+
+
+S2_REQUIRED_CONTRACT_IDS = ("C1", "C2", "C4", "C6")
+
+
+@dataclass(frozen=True)
+class S2ContractBinding:
+    contract_id: str
+    version: str
+    schema: str
+    schema_sha256: str
+
+
+@dataclass(frozen=True)
+class S2ContractModelSet:
+    bindings: tuple[S2ContractBinding, ...]
+
+    def by_id(self, contract_id: str) -> S2ContractBinding:
+        for binding in self.bindings:
+            if binding.contract_id == contract_id:
+                return binding
+        raise S2ContractModelError(f"S2 contract binding missing: {contract_id}")
+
+
+@dataclass(frozen=True)
+class FieldSpec:
+    name: str
+    units: str
+    role: str = "feature"
+
+    def __post_init__(self) -> None:
+        if not self.name:
+            raise S2ContractModelError("S2 field specs require a name")
+        if not self.units:
+            raise S2ContractModelError(f"S2 field {self.name!r} requires units")
+
+
+@dataclass(frozen=True)
+class BuildBudget:
+    max_usd: float
+    max_wallclock_seconds: int
+    max_gpu_seconds: float | None = None
+    max_model_tokens: int | None = None
+
+
+@dataclass(frozen=True)
+class BuildSpec:
+    job_id: str
+    trace_id: str
+    subtopic: str
+    task_type: str
+    target_observable: str
+    required_claim_tier_max: str
+    verifier_profile_ref: str
+    budget: BuildBudget
+    input_artifact_refs: tuple[str, ...]
+    allowed_adapters: tuple[str, ...]
+    allowed_datasets: tuple[str, ...]
+    fields: tuple[FieldSpec, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -85,6 +152,78 @@ class VariantBuildResult:
     artifact_refs: tuple[str, ...]
     base_pipeline_ref: str
     diagnostics: dict[str, Any]
+
+
+def validate_s2_contract_model_set(
+    contract_by_id: Mapping[str, Any],
+    *,
+    schema_root: str | Path,
+) -> S2ContractModelSet:
+    root = Path(schema_root)
+    bindings: list[S2ContractBinding] = []
+    for contract_id in S2_REQUIRED_CONTRACT_IDS:
+        contract = contract_by_id.get(contract_id)
+        if contract is None:
+            raise S2ContractModelError(f"S2 generated bindings missing {contract_id}")
+        consumers = tuple(_contract_value(contract, "consumers"))
+        if "S2" not in consumers:
+            raise S2ContractModelError(f"{contract_id} generated binding does not list S2 as a consumer")
+        schema_name = str(_contract_value(contract, "schema"))
+        schema_path = root / schema_name
+        if not schema_path.is_file():
+            raise S2ContractModelError(f"{contract_id} canonical schema file is missing: {schema_name}")
+        schema = json.loads(schema_path.read_text(encoding="utf-8"))
+        metadata = schema.get("x-argus-contract", {})
+        if metadata.get("id") != contract_id:
+            raise S2ContractModelError(f"{schema_name} declares {metadata.get('id')!r}, expected {contract_id}")
+        if metadata.get("version") != _contract_value(contract, "version"):
+            raise S2ContractModelError(f"{contract_id} generated binding version is stale")
+        digest = _schema_sha256(schema)
+        if digest != _contract_value(contract, "schema_sha256"):
+            raise S2ContractModelError(f"{contract_id} generated binding digest is stale")
+        bindings.append(
+            S2ContractBinding(
+                contract_id=contract_id,
+                version=str(_contract_value(contract, "version")),
+                schema=schema_name,
+                schema_sha256=digest,
+            )
+        )
+    return S2ContractModelSet(bindings=tuple(bindings))
+
+
+def compile_build_spec_from_c2_envelope(
+    payload: Mapping[str, Any],
+    *,
+    runtime_version: str = "1.0.0",
+    version_policy: C2VersionPolicy | None = None,
+    now: int = 0,
+) -> BuildSpec:
+    envelope = parse_c2_job_envelope(
+        payload,
+        runtime_version=runtime_version,
+        version_policy=version_policy,
+        now=now,
+    )
+    problem_spec = dict(envelope.problem_spec or {})
+    target_observable = str(problem_spec.get("target_observable") or problem_spec.get("observable") or "")
+    if not target_observable:
+        raise S2ContractModelError("C2 problem_spec must declare observable or target_observable for S2")
+
+    return BuildSpec(
+        job_id=envelope.job_id,
+        trace_id=envelope.trace_id,
+        subtopic=envelope.subtopic,
+        task_type=str(problem_spec.get("task_type", "regression")),
+        target_observable=target_observable,
+        required_claim_tier_max=envelope.required_claim_tier_max,
+        verifier_profile_ref=envelope.verifier_profile_ref,
+        budget=_build_budget(envelope.budget),
+        input_artifact_refs=tuple(envelope.input_artifact_refs),
+        allowed_adapters=tuple(envelope.capability_scopes.get("allowed_adapters", ())),
+        allowed_datasets=tuple(envelope.capability_scopes.get("allowed_datasets", ())),
+        fields=_field_specs(problem_spec),
+    )
 
 
 class BaselineBuilder:
@@ -235,3 +374,41 @@ def select_hpo_winner(trials: tuple[HPOTrial, ...], *, max_calibration_error: fl
         calibration_error=selected.calibration_error,
         cost=selected.cost,
     )
+
+
+def _build_budget(value: Mapping[str, Any]) -> BuildBudget:
+    return BuildBudget(
+        max_usd=float(value["max_usd"]),
+        max_wallclock_seconds=int(value["max_wallclock_seconds"]),
+        max_gpu_seconds=float(value["max_gpu_seconds"]) if "max_gpu_seconds" in value else None,
+        max_model_tokens=int(value["max_model_tokens"]) if "max_model_tokens" in value else None,
+    )
+
+
+def _field_specs(problem_spec: Mapping[str, Any]) -> tuple[FieldSpec, ...]:
+    fields = problem_spec.get("inputs_schema", ())
+    parsed = []
+    for field in fields:
+        if not isinstance(field, Mapping):
+            raise S2ContractModelError("S2 input field specs must be objects")
+        if "name" not in field or "units" not in field:
+            raise S2ContractModelError("S2 input field specs require name and units")
+        parsed.append(
+            FieldSpec(
+                name=str(field["name"]),
+                units=str(field["units"]),
+                role=str(field.get("role", "feature")),
+            )
+        )
+    return tuple(parsed)
+
+
+def _contract_value(contract: Any, name: str) -> Any:
+    if isinstance(contract, Mapping):
+        return contract[name]
+    return getattr(contract, name)
+
+
+def _schema_sha256(schema: Mapping[str, Any]) -> str:
+    canonical = json.dumps(schema, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return "sha256:" + hashlib.sha256(canonical).hexdigest()
