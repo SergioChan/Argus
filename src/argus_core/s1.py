@@ -10,6 +10,69 @@ from .c3 import C3ReportVerifier
 from .hashing import hash_json
 
 
+ERROR_CATEGORIES = frozenset(
+    {
+        "RETRYABLE",
+        "PERMANENT",
+        "BUDGET",
+        "POLICY",
+        "VERIFIER_UNAVAILABLE",
+        "SANDBOX",
+        "VALIDATION",
+        "VERSION_UNSUPPORTED",
+        "QUARANTINE",
+        "NOT_FOUND",
+    }
+)
+
+
+@dataclass(frozen=True)
+class ErrorBehavior:
+    retryable: bool
+    terminal_status: str
+    quarantine: bool = False
+
+
+ERROR_BEHAVIORS: dict[str, ErrorBehavior] = {
+    "RETRYABLE": ErrorBehavior(retryable=True, terminal_status="RETRYING"),
+    "POLICY": ErrorBehavior(retryable=False, terminal_status="QUARANTINED", quarantine=True),
+    "SANDBOX": ErrorBehavior(retryable=False, terminal_status="QUARANTINED", quarantine=True),
+    "BUDGET": ErrorBehavior(retryable=False, terminal_status="QUARANTINED", quarantine=True),
+    "QUARANTINE": ErrorBehavior(retryable=False, terminal_status="QUARANTINED", quarantine=True),
+    "VERSION_UNSUPPORTED": ErrorBehavior(retryable=False, terminal_status="REJECTED"),
+    "VERIFIER_UNAVAILABLE": ErrorBehavior(retryable=False, terminal_status="REJECTED"),
+    "PERMANENT": ErrorBehavior(retryable=False, terminal_status="FAILED"),
+    "VALIDATION": ErrorBehavior(retryable=False, terminal_status="FAILED"),
+    "NOT_FOUND": ErrorBehavior(retryable=False, terminal_status="FAILED"),
+}
+
+
+def error_behavior(category: str) -> ErrorBehavior:
+    try:
+        return ERROR_BEHAVIORS[category]
+    except KeyError as exc:
+        raise ValueError(f"unknown C1 error category: {category}") from exc
+
+
+def build_error_envelope(
+    *,
+    category: str,
+    code: str,
+    message: str,
+    retry_after_seconds: int | None = None,
+    provenance_ref: str | None = None,
+) -> "ErrorEnvelope":
+    behavior = error_behavior(category)
+    return ErrorEnvelope(
+        code=code,
+        category=category,
+        message=message,
+        retryable=behavior.retryable,
+        retry_after_seconds=retry_after_seconds,
+        provenance_ref=provenance_ref,
+    )
+
+
 class LifecycleState(str, Enum):
     REGISTERED = "REGISTERED"
     ACCEPTED = "ACCEPTED"
@@ -66,8 +129,39 @@ class ErrorEnvelope:
     code: str
     category: str
     message: str
+    retryable: bool = False
     retry_after_seconds: int | None = None
     provenance_ref: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.category not in ERROR_CATEGORIES:
+            raise ValueError(f"unknown C1 error category: {self.category}")
+        behavior = error_behavior(self.category)
+        if self.retryable != behavior.retryable:
+            raise ValueError(f"{self.category} retryable must be {behavior.retryable}")
+        if self.retryable and self.retry_after_seconds is None:
+            raise ValueError("RETRYABLE errors must carry retry_after_seconds")
+        if not self.retryable and self.retry_after_seconds is not None:
+            raise ValueError(f"{self.category} errors must not carry retry_after_seconds")
+        if self.retry_after_seconds is not None and self.retry_after_seconds < 0:
+            raise ValueError("retry_after_seconds cannot be negative")
+
+    @property
+    def behavior(self) -> ErrorBehavior:
+        return error_behavior(self.category)
+
+    def as_c1_payload(self) -> dict[str, object]:
+        payload: dict[str, object] = {
+            "category": self.category,
+            "code": self.code,
+            "message": self.message,
+            "retryable": self.retryable,
+        }
+        if self.retry_after_seconds is not None:
+            payload["retry_after_seconds"] = self.retry_after_seconds
+        if self.provenance_ref is not None:
+            payload["provenance_ref"] = self.provenance_ref
+        return payload
 
 
 class LifecyclePolicyError(S1Error):
