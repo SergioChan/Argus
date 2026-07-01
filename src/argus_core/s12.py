@@ -11,6 +11,7 @@ from .canonical import canonical_json_bytes
 from .hashing import hash_bytes, hash_json
 from .s6 import CapabilityDescriptor, InMemoryRegistry
 from .s8 import ArtifactRecord, InMemoryArtifactStore, Lineage, Producer
+from .schema_compat import BREAKING_MAJOR, classify_json_schema_change, schema_version_declares_change
 
 
 FEDERATION_DEFAULT_SCOPES = (
@@ -474,31 +475,19 @@ class Taxonomy:
 
 
 def classify_schema_change(old_schema: dict[str, Any], new_schema: dict[str, Any]) -> str:
-    old_props = set(old_schema.get("properties", {}))
-    new_props = set(new_schema.get("properties", {}))
-    old_required = set(old_schema.get("required", ()))
-    new_required = set(new_schema.get("required", ()))
-    if old_required - new_props or old_required - new_required:
-        return "breaking-major"
-    added_required = new_required - old_required
-    if added_required:
-        return "breaking-major"
-    if new_props - old_props:
-        return "additive-minor"
-    return "patch-compatible"
+    result = classify_json_schema_change(old_schema, new_schema)
+    if result.classification == "unchanged":
+        return "patch-compatible"
+    return result.classification
 
 
 def assert_declared_semver_bump(*, old_version: str, new_version: str, classification: str) -> None:
-    old = _semver(old_version)
-    new = _semver(new_version)
-    ok = False
-    if classification == "breaking-major":
-        ok = new[0] > old[0]
-    elif classification == "additive-minor":
-        ok = new[0] > old[0] or (new[0] == old[0] and new[1] > old[1])
-    else:
-        ok = new > old
-    if not ok:
+    normalized_classification = BREAKING_MAJOR if classification == "MAJOR" else classification
+    if not schema_version_declares_change(
+        old_version=old_version,
+        new_version=new_version,
+        classification=normalized_classification,
+    ):
         raise SemverCompatibilityError(f"{new_version} under-declares {classification}")
 
 

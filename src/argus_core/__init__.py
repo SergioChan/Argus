@@ -29,6 +29,7 @@ from .s1 import (
     TERMINAL_STATES,
     build_subagent_report,
     default_accept,
+    parse_job_envelope,
     reduce_lifecycle,
 )
 from .s2 import (
@@ -259,6 +260,17 @@ from .s12 import (
     verify_conformance_record,
     verify_submission_bundle,
 )
+from .schema_compat import (
+    ADDITIVE_MINOR,
+    BREAKING_MAJOR,
+    PATCH_COMPATIBLE,
+    UNCHANGED,
+    SchemaCompatibilityError,
+    SchemaCompatibilityResult,
+    assert_schema_version_declares_change,
+    classify_json_schema_change,
+    schema_version_declares_change,
+)
 from .s8 import (
     AuditCheckpoint,
     AuditLeaf,
@@ -294,7 +306,9 @@ from .s9 import (
 
 __all__ = [
     "AuditEvent",
+    "ADDITIVE_MINOR",
     "BLAKE3_PREFIX",
+    "BREAKING_MAJOR",
     "BaselineBuilder",
     "BuildPlan",
     "BuildResult",
@@ -417,6 +431,7 @@ __all__ = [
     "NodeResult",
     "NoveltyResult",
     "OutOfDomainError",
+    "PATCH_COMPATIBLE",
     "PlatformEvent",
     "PolicyBundle",
     "PolicyDeniedError",
@@ -458,6 +473,8 @@ __all__ = [
     "S4Error",
     "S5BudgetError",
     "S5BudgetExceededError",
+    "SchemaCompatibilityError",
+    "SchemaCompatibilityResult",
     "S3Verifier",
     "S5Error",
     "S5ReviewError",
@@ -504,6 +521,7 @@ __all__ = [
     "TraceSummary",
     "TransparencyDetector",
     "TrustDigest",
+    "UNCHANGED",
     "UNIT_REGISTRY_VERSION",
     "UnitsMismatchError",
     "VerifierKey",
@@ -513,6 +531,7 @@ __all__ = [
     "adapter_capability_descriptor",
     "assemble_trust_digest",
     "assert_declared_semver_bump",
+    "assert_schema_version_declares_change",
     "attest_challenger_independence",
     "admit_signed_reward",
     "build_subagent_report",
@@ -521,6 +540,7 @@ __all__ = [
     "challenge_conformance_record",
     "challenge_verdict_from_report",
     "classify_schema_change",
+    "classify_json_schema_change",
     "classify_validity",
     "decide_policy",
     "default_accept",
@@ -538,6 +558,7 @@ __all__ = [
     "normalize_quantity",
     "planted_exploit_catch_rate",
     "precondition_gate",
+    "parse_job_envelope",
     "publish_adapter_capability",
     "reduce_lifecycle",
     "recommend_pause",
@@ -549,6 +570,7 @@ __all__ = [
     "run_planted_spurious_model_harness",
     "run_perturbation_pair",
     "screen_challenger_collusion",
+    "schema_version_declares_change",
     "select_adapter_version",
     "select_challenger_panel",
     "select_hpo_winner",

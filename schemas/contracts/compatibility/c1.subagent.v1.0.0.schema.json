@@ -1,0 +1,428 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://argus.local/schemas/contracts/c1.subagent.schema.json",
+  "title": "C1 Subagent Contract",
+  "description": "Canonical SLHA-for-agents subagent lifecycle, method payloads, reports, and shared typed errors.",
+  "x-argus-contract": {
+    "id": "C1",
+    "owner": "S1",
+    "version": "1.0.0"
+  },
+  "oneOf": [
+    { "$ref": "#/$defs/SubagentEnvelope" },
+    { "$ref": "#/$defs/Acceptance" },
+    { "$ref": "#/$defs/Plan" },
+    { "$ref": "#/$defs/BuildResult" },
+    { "$ref": "#/$defs/ValidationRequest" },
+    { "$ref": "#/$defs/SubagentReport" },
+    { "$ref": "#/$defs/LifecycleEvent" },
+    { "$ref": "#/$defs/Heartbeat" },
+    { "$ref": "#/$defs/TypedError" }
+  ],
+  "$defs": {
+    "Uuid": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "NonEmptyString": {
+      "type": "string",
+      "minLength": 1
+    },
+    "ArtifactRef": {
+      "type": "string",
+      "pattern": "^c4://[A-Za-z0-9._:/-]+$"
+    },
+    "HashRef": {
+      "type": "string",
+      "pattern": "^(blake3|c4):[A-Za-z0-9._:/-]+$"
+    },
+    "LifecycleState": {
+      "type": "string",
+      "enum": [
+        "REGISTERED",
+        "ACCEPTED",
+        "PLANNING",
+        "BUILDING",
+        "VALIDATING",
+        "REPORTED",
+        "FAILED",
+        "REJECTED",
+        "CANCELLED",
+        "QUARANTINED"
+      ]
+    },
+    "LifecycleMethod": {
+      "type": "string",
+      "enum": [
+        "register",
+        "accept",
+        "refuse",
+        "plan",
+        "build",
+        "validate",
+        "report",
+        "heartbeat",
+        "cancel",
+        "fail",
+        "quarantine"
+      ]
+    },
+    "ClaimTier": {
+      "type": "string",
+      "enum": ["ran-toy", "recapitulated-known", "novel-needs-human"]
+    },
+    "CostEstimate": {
+      "type": "object",
+      "required": ["cost_usd"],
+      "additionalProperties": false,
+      "properties": {
+        "compute_units": { "type": "number", "minimum": 0 },
+        "gpu_seconds": { "type": "number", "minimum": 0 },
+        "model_tokens": { "type": "number", "minimum": 0 },
+        "cost_usd": { "type": "number", "minimum": 0 }
+      }
+    },
+    "UncertaintySummary": {
+      "type": "object",
+      "required": ["representation", "value"],
+      "additionalProperties": false,
+      "properties": {
+        "representation": {
+          "type": "string",
+          "enum": ["covariance", "interval", "samples", "conformal", "ensemble", "none"]
+        },
+        "value": { "type": "object" }
+      }
+    },
+    "SelfCheck": {
+      "type": "object",
+      "required": ["type", "status", "advisory"],
+      "additionalProperties": false,
+      "properties": {
+        "type": { "$ref": "#/$defs/NonEmptyString" },
+        "status": { "type": "string", "enum": ["PASS", "FAIL", "INCONCLUSIVE"] },
+        "advisory": { "type": "boolean" },
+        "evidence_ref": { "$ref": "#/$defs/ArtifactRef" }
+      }
+    },
+    "TypedError": {
+      "type": "object",
+      "required": ["category", "code", "message", "retryable"],
+      "additionalProperties": false,
+      "properties": {
+        "category": {
+          "type": "string",
+          "enum": [
+            "RETRYABLE",
+            "PERMANENT",
+            "BUDGET",
+            "POLICY",
+            "VERIFIER_UNAVAILABLE",
+            "SANDBOX",
+            "VALIDATION",
+            "VERSION_UNSUPPORTED",
+            "QUARANTINE",
+            "NOT_FOUND"
+          ]
+        },
+        "code": { "$ref": "#/$defs/NonEmptyString" },
+        "message": { "$ref": "#/$defs/NonEmptyString" },
+        "retryable": { "type": "boolean" },
+        "retry_after_seconds": { "type": "integer", "minimum": 0 },
+        "provenance_ref": { "$ref": "#/$defs/ArtifactRef" }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "retryable": { "const": true } },
+            "required": ["retryable"]
+          },
+          "then": {
+            "required": ["retry_after_seconds"]
+          }
+        }
+      ]
+    },
+    "SubagentEnvelope": {
+      "type": "object",
+      "required": ["contract_version", "method", "job_id", "trace_id", "state", "idempotency_key"],
+      "additionalProperties": false,
+      "properties": {
+        "contract_version": { "type": "string", "pattern": "^1\\.\\d+\\.\\d+$" },
+        "method": { "$ref": "#/$defs/LifecycleMethod" },
+        "job_id": { "$ref": "#/$defs/Uuid" },
+        "trace_id": { "$ref": "#/$defs/NonEmptyString" },
+        "state": { "$ref": "#/$defs/LifecycleState" },
+        "idempotency_key": { "$ref": "#/$defs/NonEmptyString" },
+        "capability_descriptor_ref": { "$ref": "#/$defs/ArtifactRef" },
+        "job_envelope_ref": { "$ref": "#/$defs/ArtifactRef" },
+        "payload": { "type": "object" }
+      }
+    },
+    "Acceptance": {
+      "type": "object",
+      "required": ["job_id", "accepted", "state", "idempotency_key"],
+      "additionalProperties": false,
+      "properties": {
+        "job_id": { "$ref": "#/$defs/Uuid" },
+        "accepted": { "type": "boolean" },
+        "reason": {
+          "type": ["string", "null"],
+          "enum": [
+            "OUT_OF_SCOPE",
+            "MISSING_ADAPTER",
+            "BUDGET_TOO_SMALL",
+            "NO_VERIFIER",
+            "VERSION_UNSUPPORTED",
+            "POLICY",
+            null
+          ]
+        },
+        "state": { "type": "string", "enum": ["ACCEPTED", "REJECTED"] },
+        "estimated_cost": { "$ref": "#/$defs/CostEstimate" },
+        "plan_eta_seconds": { "type": "integer", "minimum": 0 },
+        "idempotency_key": { "$ref": "#/$defs/NonEmptyString" }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "accepted": { "const": false } },
+            "required": ["accepted"]
+          },
+          "then": {
+            "required": ["reason"],
+            "properties": { "state": { "const": "REJECTED" } }
+          }
+        },
+        {
+          "if": {
+            "properties": { "accepted": { "const": true } },
+            "required": ["accepted"]
+          },
+          "then": {
+            "properties": { "reason": { "const": null }, "state": { "const": "ACCEPTED" } }
+          }
+        }
+      ]
+    },
+    "PlanStep": {
+      "type": "object",
+      "required": ["step_id", "kind", "description", "est_cost"],
+      "additionalProperties": false,
+      "properties": {
+        "step_id": { "$ref": "#/$defs/NonEmptyString" },
+        "kind": { "type": "string", "enum": ["feature", "train", "eval", "selfcheck", "freeze"] },
+        "description": { "$ref": "#/$defs/NonEmptyString" },
+        "est_cost": { "$ref": "#/$defs/CostEstimate" }
+      }
+    },
+    "Plan": {
+      "type": "object",
+      "required": [
+        "job_id",
+        "steps",
+        "adapters_required",
+        "datasets_required",
+        "verifier_profile_ref",
+        "budget_breakdown",
+        "risk_notes",
+        "plan_hash"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "job_id": { "$ref": "#/$defs/Uuid" },
+        "steps": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/PlanStep" }
+        },
+        "adapters_required": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/NonEmptyString" }
+        },
+        "datasets_required": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/ArtifactRef" }
+        },
+        "verifier_profile_ref": { "$ref": "#/$defs/ArtifactRef" },
+        "budget_breakdown": {
+          "type": "object",
+          "required": ["total"],
+          "additionalProperties": false,
+          "properties": {
+            "per_step": {
+              "type": "array",
+              "items": { "$ref": "#/$defs/CostEstimate" }
+            },
+            "total": { "$ref": "#/$defs/CostEstimate" }
+          }
+        },
+        "risk_notes": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "plan_hash": { "$ref": "#/$defs/HashRef" }
+      }
+    },
+    "BuildResult": {
+      "type": "object",
+      "required": ["job_id", "artifact_refs", "diagnostics", "self_checks", "uncertainty_summary"],
+      "additionalProperties": false,
+      "properties": {
+        "job_id": { "$ref": "#/$defs/Uuid" },
+        "artifact_refs": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/ArtifactRef" }
+        },
+        "training_log_ref": { "$ref": "#/$defs/ArtifactRef" },
+        "diagnostics": { "type": "object" },
+        "self_checks": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/SelfCheck" }
+        },
+        "uncertainty_summary": { "$ref": "#/$defs/UncertaintySummary" }
+      }
+    },
+    "ValidationRequest": {
+      "type": "object",
+      "required": [
+        "job_id",
+        "frozen_pipeline_ref",
+        "artifact_refs",
+        "profile_ref",
+        "blind_dataset_handle",
+        "budget_token_ref",
+        "trace_id"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "job_id": { "$ref": "#/$defs/Uuid" },
+        "frozen_pipeline_ref": { "$ref": "#/$defs/ArtifactRef" },
+        "artifact_refs": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/ArtifactRef" }
+        },
+        "profile_ref": { "$ref": "#/$defs/ArtifactRef" },
+        "blind_dataset_handle": { "$ref": "#/$defs/NonEmptyString" },
+        "budget_token_ref": { "$ref": "#/$defs/NonEmptyString" },
+        "trace_id": { "$ref": "#/$defs/NonEmptyString" }
+      }
+    },
+    "SubagentReport": {
+      "type": "object",
+      "required": [
+        "job_id",
+        "subagent_id",
+        "status",
+        "claim_tier",
+        "artifact_refs",
+        "cost_actual",
+        "reproducibility_manifest"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "job_id": { "$ref": "#/$defs/Uuid" },
+        "subagent_id": { "$ref": "#/$defs/NonEmptyString" },
+        "status": { "type": "string", "enum": ["REPORTED", "FAILED", "REJECTED", "CANCELLED", "QUARANTINED"] },
+        "claim_tier": { "$ref": "#/$defs/ClaimTier" },
+        "artifact_refs": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/ArtifactRef" }
+        },
+        "validation_report_ref": { "$ref": "#/$defs/ArtifactRef" },
+        "uncertainty_summary": { "$ref": "#/$defs/UncertaintySummary" },
+        "cost_actual": { "$ref": "#/$defs/CostEstimate" },
+        "reproducibility_manifest": {
+          "type": "object",
+          "required": ["lineage_ref", "environment_digest", "code_ref", "seeds"],
+          "additionalProperties": true,
+          "properties": {
+            "lineage_ref": { "$ref": "#/$defs/ArtifactRef" },
+            "environment_digest": { "$ref": "#/$defs/NonEmptyString" },
+            "code_ref": { "$ref": "#/$defs/NonEmptyString" },
+            "seeds": {
+              "type": "array",
+              "items": { "$ref": "#/$defs/NonEmptyString" }
+            }
+          }
+        },
+        "error": { "$ref": "#/$defs/TypedError" }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "claim_tier": { "enum": ["recapitulated-known", "novel-needs-human"] }
+            },
+            "required": ["claim_tier"]
+          },
+          "then": {
+            "required": ["validation_report_ref"]
+          }
+        }
+      ]
+    },
+    "LifecycleEvent": {
+      "type": "object",
+      "required": [
+        "event_id",
+        "job_id",
+        "root_request_id",
+        "seq",
+        "from_state",
+        "to_state",
+        "method",
+        "trigger",
+        "payload_hash",
+        "trace_id",
+        "idempotency_key"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "event_id": { "$ref": "#/$defs/Uuid" },
+        "job_id": { "$ref": "#/$defs/Uuid" },
+        "root_request_id": { "$ref": "#/$defs/Uuid" },
+        "seq": { "type": "integer", "minimum": 1 },
+        "from_state": { "$ref": "#/$defs/LifecycleState" },
+        "to_state": { "$ref": "#/$defs/LifecycleState" },
+        "method": { "$ref": "#/$defs/LifecycleMethod" },
+        "trigger": { "type": "string", "enum": ["S5", "S4", "internal", "cancel"] },
+        "payload_hash": { "$ref": "#/$defs/HashRef" },
+        "spend_delta": { "$ref": "#/$defs/CostEstimate" },
+        "trace_id": { "$ref": "#/$defs/NonEmptyString" },
+        "idempotency_key": { "$ref": "#/$defs/NonEmptyString" }
+      }
+    },
+    "Heartbeat": {
+      "type": "object",
+      "required": ["job_id", "status", "progress", "spend_so_far", "last_heartbeat_at"],
+      "additionalProperties": false,
+      "properties": {
+        "job_id": { "$ref": "#/$defs/Uuid" },
+        "status": { "$ref": "#/$defs/LifecycleState" },
+        "progress": { "type": "number", "minimum": 0, "maximum": 1 },
+        "spend_so_far": { "$ref": "#/$defs/CostEstimate" },
+        "last_heartbeat_at": {
+          "type": "string",
+          "format": "date-time"
+        }
+      }
+    },
+    "ExecContext": {
+      "type": "object",
+      "required": ["job_id", "capabilities"],
+      "additionalProperties": false,
+      "properties": {
+        "job_id": { "$ref": "#/$defs/Uuid" },
+        "capabilities": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": ["submit_sandbox_job", "emit_artifact", "call_adapter", "read_dataset", "log", "span"]
+          }
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,9 @@
+{
+  "contracts": [
+    {
+      "id": "C1",
+      "baseline_version": "1.0.0",
+      "baseline_schema": "compatibility/c1.subagent.v1.0.0.schema.json"
+    }
+  ]
+}

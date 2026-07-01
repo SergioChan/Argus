@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any
+from typing import Any, Mapping
 
 from .c3 import C3ReportVerifier
 from .hashing import hash_json
@@ -141,12 +141,26 @@ class JobEnvelope:
     budget_cost: float = 0.0
 
 
+JOB_ENVELOPE_FIELDS = frozenset(JobEnvelope.__dataclass_fields__)
+
+
 @dataclass(frozen=True)
 class Acceptance:
     accepted: bool
     reason: str | None
     state: LifecycleState
     estimated_cost: float = 0.0
+
+
+def parse_job_envelope(payload: Mapping[str, Any]) -> JobEnvelope:
+    values = {name: payload[name] for name in JOB_ENVELOPE_FIELDS if name in payload}
+    for tuple_field in ("required_adapters", "allowed_adapters"):
+        if tuple_field in values:
+            values[tuple_field] = tuple(values[tuple_field])
+    try:
+        return JobEnvelope(**values)
+    except TypeError as exc:
+        raise ValueError(f"invalid C1 JobEnvelope payload: {exc}") from exc
 
 
 class LifecycleStore:
