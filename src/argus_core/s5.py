@@ -64,6 +64,64 @@ class C2JobEnvelope:
 
 
 @dataclass(frozen=True)
+class C2MigrationWindow:
+    """Temporary dual-serve policy for one legacy C2 major during a runtime upgrade."""
+
+    legacy_major: int
+    runtime_major: int
+    opens_at: int = 0
+    hard_cutoff_at: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.legacy_major < 0 or self.runtime_major < 0:
+            raise ValueError("C2 major versions must be non-negative")
+        if self.legacy_major == self.runtime_major:
+            raise ValueError("C2 migration windows must bridge different major versions")
+        if self.hard_cutoff_at is not None and self.hard_cutoff_at <= self.opens_at:
+            raise ValueError("C2 hard cutoff must be later than the window opening")
+
+    def supports(self, *, contract_major: int, runtime_major: int, now: int) -> bool:
+        return (
+            contract_major == self.legacy_major
+            and runtime_major == self.runtime_major
+            and self.opens_at <= now
+            and (self.hard_cutoff_at is None or now < self.hard_cutoff_at)
+        )
+
+
+@dataclass(frozen=True)
+class C2VersionPolicy:
+    """Runtime C2 version compatibility rules.
+
+    Same-major C2 envelopes are always accepted. Cross-major envelopes require an
+    explicit migration window and are rejected once the window reaches hard cutoff.
+    """
+
+    migration_windows: tuple[C2MigrationWindow, ...] = ()
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "migration_windows", tuple(self.migration_windows))
+
+    def supports(self, contract_version: str, *, runtime_version: str, now: int = 0) -> bool:
+        contract_major = _semver_major(contract_version)
+        runtime_major = _semver_major(runtime_version)
+        if contract_major == runtime_major:
+            return True
+        return any(
+            window.supports(contract_major=contract_major, runtime_major=runtime_major, now=now)
+            for window in self.migration_windows
+        )
+
+    def require_supported(self, contract_version: str, *, runtime_version: str, now: int = 0) -> None:
+        if not self.supports(contract_version, runtime_version=runtime_version, now=now):
+            raise _unsupported_c2_version_error(
+                contract_version,
+                runtime_version,
+                detail="outside active C2 migration window",
+            )
+
+
+@dataclass(frozen=True)
 class DAGNode:
     node_id: str
     handler: str
@@ -185,16 +243,16 @@ class BackPressureSignal:
 Handler = Callable[[DAGNode, tuple[NodeResult, ...]], NodeResult]
 
 
-def parse_c2_job_envelope(payload: Mapping[str, Any], *, runtime_version: str = "1.0.0") -> C2JobEnvelope:
+def parse_c2_job_envelope(
+    payload: Mapping[str, Any],
+    *,
+    runtime_version: str = "1.0.0",
+    version_policy: C2VersionPolicy | None = None,
+    now: int = 0,
+) -> C2JobEnvelope:
     contract_version = str(payload.get("contract_version", ""))
-    if _semver_major(contract_version) != _semver_major(runtime_version):
-        raise C2ContractError(
-            TypedNodeError(
-                category="PERMANENT",
-                code="VERSION_UNSUPPORTED",
-                message=f"C2 major version {contract_version!r} is not supported by runtime {runtime_version}",
-            )
-        )
+    policy = version_policy or C2VersionPolicy()
+    policy.require_supported(contract_version, runtime_version=runtime_version, now=now)
 
     values = {name: payload[name] for name in C2_JOB_ENVELOPE_FIELDS if name in payload}
     if "input_artifact_refs" in values:
@@ -229,6 +287,17 @@ def _semver_major(version: str) -> int:
                 message=f"invalid C2 semver: {version}",
             )
         ) from exc
+
+
+def _unsupported_c2_version_error(contract_version: str, runtime_version: str, *, detail: str = "") -> C2ContractError:
+    suffix = f": {detail}" if detail else ""
+    return C2ContractError(
+        TypedNodeError(
+            category="PERMANENT",
+            code="VERSION_UNSUPPORTED",
+            message=f"C2 major version {contract_version!r} is not supported by runtime {runtime_version}{suffix}",
+        )
+    )
 
 
 class BudgetLedger:
