@@ -1,0 +1,22 @@
+{
+  "contract_version": "1.0.0",
+  "job_id": "22222222-2222-4222-8222-222222222222",
+  "root_request_id": "22222222-2222-4222-8222-222222222223",
+  "trace_id": "trace-c2-example",
+  "subtopic": "ewpt-toy",
+  "problem_spec": {
+    "observable": "toy_order_parameter"
+  },
+  "required_claim_tier_max": "recapitulated-known",
+  "verifier_profile_ref": "c4://profile/ewpt-toy/v1",
+  "contamination_index_version": "contam-2026-07-01",
+  "budget": {
+    "max_usd": 10.0,
+    "max_wallclock_seconds": 600
+  },
+  "capability_scopes": {
+    "allowed_adapters": ["adapter:toy-bounce"],
+    "allowed_egress": []
+  },
+  "input_artifact_refs": []
+}

@@ -1,0 +1,192 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://argus.local/schemas/contracts/c3.validation-report.schema.json",
+  "title": "C3 Verifier Interface and Validation Report",
+  "description": "Verifier profile, request, signed validation report, and C3 v1.1 debate fields.",
+  "x-argus-contract": {
+    "id": "C3",
+    "owner": "S3",
+    "version": "1.1.0"
+  },
+  "oneOf": [
+    { "$ref": "#/$defs/VerificationRequest" },
+    { "$ref": "#/$defs/VerifierProfile" },
+    { "$ref": "#/$defs/ValidationReport" }
+  ],
+  "$defs": {
+    "Uuid": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "ArtifactRef": {
+      "type": "string",
+      "pattern": "^c4://[A-Za-z0-9._:/-]+$"
+    },
+    "ClaimTier": {
+      "type": "string",
+      "enum": ["ran-toy", "recapitulated-known", "novel-needs-human"]
+    },
+    "CheckStatus": {
+      "type": "string",
+      "enum": ["PASS", "FAIL", "INCONCLUSIVE", "REFUSED"]
+    },
+    "VerificationRequest": {
+      "type": "object",
+      "required": ["request_id", "job_id", "profile_ref", "frozen_pipeline_ref", "blind_data_handle"],
+      "additionalProperties": false,
+      "properties": {
+        "request_id": { "$ref": "#/$defs/Uuid" },
+        "job_id": { "$ref": "#/$defs/Uuid" },
+        "profile_ref": { "$ref": "#/$defs/ArtifactRef" },
+        "frozen_pipeline_ref": { "$ref": "#/$defs/ArtifactRef" },
+        "blind_data_handle": { "type": "string", "minLength": 1 },
+        "budget_token_ref": { "type": "string" },
+        "scope_token_ref": { "type": "string" }
+      }
+    },
+    "VerifierProfile": {
+      "type": "object",
+      "required": ["profile_id", "revision", "subtopic", "checks", "cost_estimate"],
+      "additionalProperties": false,
+      "properties": {
+        "profile_id": { "type": "string", "minLength": 1 },
+        "revision": { "type": "integer", "minimum": 1 },
+        "subtopic": { "type": "string", "minLength": 1 },
+        "checks": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": ["INJECTION", "NULL_CONTROL", "CROSS_CODE", "PHYSICAL_CONSISTENCY", "LEAKAGE", "CALIBRATION", "PERTURBATION_PAIR", "INSENSITIVITY"]
+          },
+          "uniqueItems": true
+        },
+        "cost_estimate": { "type": "object" }
+      }
+    },
+    "CheckResult": {
+      "type": "object",
+      "required": ["check", "status"],
+      "additionalProperties": false,
+      "properties": {
+        "check": { "type": "string", "minLength": 1 },
+        "status": { "$ref": "#/$defs/CheckStatus" },
+        "metrics": { "type": "object" },
+        "evidence_refs": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/ArtifactRef" }
+        },
+        "degradation": { "type": "string" }
+      }
+    },
+    "PerturbationResult": {
+      "type": "object",
+      "required": ["perturbation_id", "kind", "verdict"],
+      "additionalProperties": false,
+      "properties": {
+        "perturbation_id": { "type": "string", "minLength": 1 },
+        "kind": { "type": "string", "enum": ["must_react", "must_not_react"] },
+        "verdict": { "type": "string", "enum": ["pass", "fail", "inconclusive"] },
+        "amplitude_linearity": { "type": "object" },
+        "observed_degradation": { "type": "object" }
+      }
+    },
+    "InsensitivityFlag": {
+      "type": "object",
+      "required": ["perturbation_id", "reason"],
+      "additionalProperties": false,
+      "properties": {
+        "perturbation_id": { "type": "string", "minLength": 1 },
+        "reason": { "type": "string", "minLength": 1 },
+        "severity": { "type": "string", "enum": ["warning", "fail"] }
+      }
+    },
+    "ChallengerPanel": {
+      "type": "object",
+      "required": ["challenger_ids", "min_required"],
+      "additionalProperties": false,
+      "properties": {
+        "challenger_ids": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "uniqueItems": true
+        },
+        "min_required": { "type": "integer", "minimum": 1 },
+        "attack_types": {
+          "type": "array",
+          "items": { "type": "string" },
+          "uniqueItems": true
+        }
+      }
+    },
+    "IndependenceAttestationDebate": {
+      "type": "object",
+      "required": ["min_independent_challengers", "lineage_disjoint", "correlation_warning"],
+      "additionalProperties": false,
+      "properties": {
+        "min_independent_challengers": { "type": "integer", "minimum": 0 },
+        "lineage_disjoint": { "type": "boolean" },
+        "correlation_warning": { "type": "boolean" },
+        "evidence_refs": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/ArtifactRef" }
+        }
+      }
+    },
+    "Referee": {
+      "type": "object",
+      "required": ["referee_id", "non_gameable", "signed_by", "distinct_from_proponent"],
+      "additionalProperties": false,
+      "properties": {
+        "referee_id": { "type": "string", "minLength": 1 },
+        "non_gameable": { "type": "boolean", "const": true },
+        "signed_by": { "type": "string", "minLength": 1 },
+        "distinct_from_proponent": { "type": "boolean", "const": true }
+      }
+    },
+    "ValidationReport": {
+      "type": "object",
+      "required": ["report_id", "profile_ref", "frozen_pipeline_ref", "checks", "aggregate", "claim_tier", "signature", "perturbation_pairs", "insensitivity_flags", "challenger_panel", "independence_attestation_debate", "referee", "debate_ref"],
+      "additionalProperties": false,
+      "properties": {
+        "report_id": { "$ref": "#/$defs/Uuid" },
+        "profile_ref": { "$ref": "#/$defs/ArtifactRef" },
+        "frozen_pipeline_ref": { "$ref": "#/$defs/ArtifactRef" },
+        "checks": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/CheckResult" }
+        },
+        "aggregate": {
+          "type": "object",
+          "required": ["passed"],
+          "properties": {
+            "passed": { "type": "boolean" },
+            "score": { "type": "number" }
+          }
+        },
+        "claim_tier": { "$ref": "#/$defs/ClaimTier" },
+        "claim_tier_is_candidate": { "type": "boolean" },
+        "signature": {
+          "type": "object",
+          "required": ["algorithm", "key_id", "value"],
+          "properties": {
+            "algorithm": { "type": "string" },
+            "key_id": { "type": "string" },
+            "value": { "type": "string" }
+          }
+        },
+        "perturbation_pairs": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/PerturbationResult" }
+        },
+        "insensitivity_flags": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/InsensitivityFlag" }
+        },
+        "challenger_panel": { "$ref": "#/$defs/ChallengerPanel" },
+        "independence_attestation_debate": { "$ref": "#/$defs/IndependenceAttestationDebate" },
+        "referee": { "$ref": "#/$defs/Referee" },
+        "debate_ref": { "$ref": "#/$defs/ArtifactRef" }
+      }
+    }
+  }
+}

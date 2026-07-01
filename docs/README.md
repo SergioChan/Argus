@@ -45,11 +45,11 @@ The six contracts are the decoupling seams: subsystems couple **only** through t
 | Contract | Name | Owner | Consumers (post-fix) |
 |----------|------|-------|----------------------|
 | **C1** | Subagent Contract ("SLHA-for-agents") | S1 | S5, S2, S3, S4, S11, S12 *(S9 removed — was over-declared)* |
-| **C2** | Task / Job Envelope | S5 | S1, S2, S3, S4, S7, S9, S10, S11 *(S6, S8 removed — were over-declared)* |
-| **C3** (**v1.1**) | Verifier Interface + Validation Report | S3 | S1, S2, S4, S5, S8, S9, S11 |
+| **C2** | Task / Job Envelope | S5 | S1, S2, S3, S4, S7, S9, S10, S11, S12 *(S6, S8 removed — were over-declared)* |
+| **C3** (**v1.1**) | Verifier Interface + Validation Report | S3 | S1, S2, S4, S5, S7, S8, S9, S11, S12 |
 | **C4** | Artifact + Provenance Record | S8 | S1, S2, S3, S4, S5, S6, S7, S9, S10, S11, S12 |
-| **C5** | Registry / Capability Descriptor | S6 / S12 | S1, S5, S7, S9, S11, S12 |
-| **C6** | Compute-Adapter Tool Interface | S7 | S1, S2, S3, S5, S8, S11, S12 *(S4 removed — C5-mediated, not direct; S12 added — was omitted)* |
+| **C5** | Registry / Capability Descriptor | S6 / S12 | S1, S2, S3, S4, S5, S7, S9, S10, S11 |
+| **C6** | Compute-Adapter Tool Interface | S7 | S1, S2, S3, S5, S6, S10, S11, S12 *(S4 removed — C5-mediated, not direct; S12 added — was omitted)* |
 
 **C3 is at v1.1** (additive, backward-compatible; frozen at v1.1 from M0 — pre-implementation, no migration). v1.1 folds **Adversarial Red-Blue Debate Evolution** into verification and adds six ValidationReport fields: `perturbation_pairs`, `insensitivity_flags`, `challenger_panel`, `independence_attestation_debate`, `referee`, and `debate_ref` (a pointer into the C4 provenance `DebateLedger`). C3 also documents the **C3↔S7 extrapolation reciprocity**: S7 emits an extrapolation / out-of-validity flag in its C6 tool result, and S3 consumes that flag and sets the affected check to `INCONCLUSIVE`.
 
@@ -98,6 +98,7 @@ The six contracts are the decoupling seams: subsystems couple **only** through t
 - **Nothing emits without S9.** No external-facing artifact leaves Argus without a recorded human sign-off; surviving the red-blue debate never bypasses the S9 gate.
 - **Implement in milestone order.** Follow M0→M6; respect the critical path and coverage ledger in the Roadmap.
 - **Each subtask has acceptance criteria in the Backlog and cases in the TestPlan.** Do not consider a subtask done until its Backlog acceptance criteria pass and its TestPlan cases (including the relevant `-PR` / `-DB` semantic cases and integration scenarios X-14..X-16) are green.
+- **Keep the design set mechanically consistent.** Run `python3 scripts/validate_docs.py` after editing the docs; it checks roadmap coverage, estimate accounting, contract consumer maps, and stable test IDs.
 
 ---
 

@@ -1,0 +1,54 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://argus.local/schemas/contracts/manifest.schema.json",
+  "title": "Argus Contract Manifest",
+  "type": "object",
+  "required": ["schema_version", "contracts"],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "pattern": "^\\d+\\.\\d+\\.\\d+$"
+    },
+    "contracts": {
+      "type": "array",
+      "minItems": 6,
+      "maxItems": 6,
+      "items": {
+        "type": "object",
+        "required": ["id", "name", "owner", "version", "schema", "consumers"],
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "type": "string",
+            "enum": ["C1", "C2", "C3", "C4", "C5", "C6"]
+          },
+          "name": {
+            "type": "string",
+            "minLength": 1
+          },
+          "owner": {
+            "type": "string",
+            "minLength": 1
+          },
+          "version": {
+            "type": "string",
+            "pattern": "^\\d+\\.\\d+\\.\\d+$"
+          },
+          "schema": {
+            "type": "string",
+            "pattern": "^c[1-6]\\..*\\.schema\\.json$"
+          },
+          "consumers": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "pattern": "^S\\d+$"
+            },
+            "uniqueItems": true
+          }
+        }
+      }
+    }
+  }
+}

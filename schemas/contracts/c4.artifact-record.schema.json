@@ -1,0 +1,66 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://argus.local/schemas/contracts/c4.artifact-record.schema.json",
+  "title": "C4 Artifact and Provenance Record",
+  "description": "Content-addressed artifact metadata and complete provenance lineage.",
+  "x-argus-contract": {
+    "id": "C4",
+    "owner": "S8",
+    "version": "1.0.0"
+  },
+  "$ref": "#/$defs/ArtifactRecord",
+  "$defs": {
+    "ArtifactRef": {
+      "type": "string",
+      "pattern": "^c4://[A-Za-z0-9._:/-]+$"
+    },
+    "ClaimTier": {
+      "type": "string",
+      "enum": ["ran-toy", "recapitulated-known", "novel-needs-human"]
+    },
+    "ArtifactRecord": {
+      "type": "object",
+      "required": ["artifact_ref", "kind", "content_hash", "hash_algorithm", "size_bytes", "created_at", "producer", "lineage"],
+      "additionalProperties": false,
+      "properties": {
+        "artifact_ref": { "$ref": "#/$defs/ArtifactRef" },
+        "kind": { "type": "string", "minLength": 1 },
+        "content_hash": {
+          "type": "string",
+          "pattern": "^blake3:[a-f0-9]{64}$"
+        },
+        "hash_algorithm": { "type": "string", "const": "BLAKE3" },
+        "size_bytes": { "type": "integer", "minimum": 0 },
+        "created_at": { "type": "string", "format": "date-time" },
+        "producer": {
+          "type": "object",
+          "required": ["subsystem", "version"],
+          "properties": {
+            "subsystem": { "type": "string", "pattern": "^S\\d+$" },
+            "version": { "type": "string" }
+          }
+        },
+        "lineage": {
+          "type": "object",
+          "required": ["input_refs", "code_ref", "environment_digest", "seeds"],
+          "properties": {
+            "input_refs": {
+              "type": "array",
+              "items": { "$ref": "#/$defs/ArtifactRef" }
+            },
+            "code_ref": { "type": "string", "minLength": 1 },
+            "environment_digest": { "type": "string", "minLength": 1 },
+            "seeds": {
+              "type": "array",
+              "items": { "type": "string" }
+            }
+          }
+        },
+        "claim_tier": { "$ref": "#/$defs/ClaimTier" },
+        "validation_report_ref": { "$ref": "#/$defs/ArtifactRef" },
+        "schema_ref": { "type": "string" },
+        "retention": { "type": "object" }
+      }
+    }
+  }
+}

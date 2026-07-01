@@ -638,11 +638,11 @@ Layer 4 (observation & federation):       S11  S12
 | Contract | Owner | Consumed by |
 |----------|-------|-------------|
 | [C1](#c1--subagent-contract-slha-for-agents) | S1 | S5, S2, S3, S4, S11, S12 |
-| [C2](#c2--taskjob-envelope) | S5 | S1, S2, S3, S4, S7, S9, S10, S11 |
-| [C3](#c3--verifier-interface--validation-report) | S3 | S1, S2, S4, S5, S8, S9, S11 |
+| [C2](#c2--taskjob-envelope) | S5 | S1, S2, S3, S4, S7, S9, S10, S11, S12 |
+| [C3](#c3--verifier-interface--validation-report) | S3 | S1, S2, S4, S5, S7, S8, S9, S11, S12 |
 | [C4](#c4--artifact--provenance-record) | S8 | S1, S2, S3, S4, S5, S6, S7, S9, S10, S11, S12 |
-| [C5](#c5--registry--capability-descriptor) | S6 / S12 | S1, S5, S7, S9, S11, S12 |
-| [C6](#c6--compute-adapter-tool-interface) | S7 | S1, S2, S3, S5, S8, S11, S12 |
+| [C5](#c5--registry--capability-descriptor) | S6 / S12 | S1, S2, S3, S4, S5, S7, S9, S10, S11 |
+| [C6](#c6--compute-adapter-tool-interface) | S7 | S1, S2, S3, S5, S6, S10, S11, S12 |
 
 ### 10.2 Principle → enforcement map
 

@@ -1,0 +1,21 @@
+{
+  "entity_id": "subagent-ewpt-toy",
+  "revision": 1,
+  "kind": "subagent",
+  "owner_subsystem": "S1",
+  "subtopics": ["ewpt-toy"],
+  "contract_versions": {
+    "C1": "1.0.0",
+    "C4": "1.0.0"
+  },
+  "trust_class": "internal",
+  "capability_scopes": ["build", "validate"],
+  "independence_tags": ["ewpt-toy-impl-a"],
+  "conformance": {
+    "level": "silver",
+    "suite_version": "1.0.0",
+    "evidence_ref": "c4://conformance/subagent-ewpt-toy/silver"
+  },
+  "provenance_ref": "c4://descriptor/subagent-ewpt-toy/r1",
+  "status": "active"
+}

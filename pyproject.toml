@@ -1,0 +1,23 @@
+[project]
+name = "project-argus"
+version = "0.0.0"
+description = "Verifier-gated, agent-operated ML foundry for theoretical particle physics workflows."
+readme = "docs/README.md"
+requires-python = ">=3.11"
+license = { text = "Proprietary" }
+dependencies = [
+  "blake3>=0.4,<2",
+  "jsonschema>=4.25,<5"
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.project-argus]
+roadmap = "docs/Roadmap.md"
+backlog = "docs/Backlog-and-Interfaces.md"
+test_plan = "docs/TestPlan.md"

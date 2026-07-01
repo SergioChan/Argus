@@ -1,0 +1,20 @@
+{
+  "artifact_ref": "c4://artifact/example-model",
+  "kind": "model",
+  "content_hash": "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "hash_algorithm": "BLAKE3",
+  "size_bytes": 128,
+  "created_at": "2026-07-01T00:00:00Z",
+  "producer": {
+    "subsystem": "S2",
+    "version": "0.0.0"
+  },
+  "lineage": {
+    "input_refs": ["c4://dataset/example"],
+    "code_ref": "git:example",
+    "environment_digest": "oci:sha256-example",
+    "seeds": ["seed-1"]
+  },
+  "claim_tier": "ran-toy",
+  "schema_ref": "https://argus.local/schemas/contracts/c4.artifact-record.schema.json"
+}
