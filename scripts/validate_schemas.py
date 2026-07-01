@@ -53,6 +53,16 @@ C1_REQUIRED_DEFS = {
     "ValidationRequest",
 }
 
+C4_REQUIRED_DEFS = {
+    "ArtifactRecord",
+    "ArtifactRef",
+    "ClaimTier",
+    "HashRef",
+    "Lineage",
+    "Producer",
+    "RetentionPolicy",
+}
+
 C6_REQUIRED_DEFS = {
     "AdapterDescriptor",
     "EvalRequest",
@@ -155,6 +165,28 @@ def validate_contract_schema(entry: dict) -> None:
         missing_methods = sorted(required_methods - method_values)
         if missing_methods:
             fail(f"C1 LifecycleMethod missing public methods: {missing_methods}")
+
+    if contract_id == "C4":
+        definitions = schema.get("$defs", {})
+        missing_defs = sorted(C4_REQUIRED_DEFS - set(definitions))
+        if missing_defs:
+            fail(f"C4 schema missing canonical public definitions: {missing_defs}")
+        for definition_name in ("Producer", "Lineage", "RetentionPolicy", "ArtifactRecord"):
+            definition = definitions.get(definition_name, {})
+            if definition.get("additionalProperties") is not False:
+                fail(f"C4 {definition_name} must set additionalProperties=false")
+        lineage_required = set(definitions.get("Lineage", {}).get("required", []))
+        for field in ("input_refs", "code_ref", "environment_digest", "seeds"):
+            if field not in lineage_required:
+                fail(f"C4 Lineage missing required field: {field}")
+        artifact_record = definitions.get("ArtifactRecord", {})
+        has_tier_coupling = any(
+            "validation_report_ref" in rule.get("then", {}).get("required", [])
+            for rule in artifact_record.get("allOf", [])
+            if isinstance(rule, dict)
+        )
+        if not has_tier_coupling:
+            fail("C4 ArtifactRecord must require validation_report_ref for promoted tiers")
 
     if contract_id == "C6":
         definitions = schema.get("$defs", {})

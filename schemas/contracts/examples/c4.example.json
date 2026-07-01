@@ -7,7 +7,7 @@
   "created_at": "2026-07-01T00:00:00Z",
   "producer": {
     "subsystem": "S2",
-    "version": "0.0.0"
+    "version": "1.0.0"
   },
   "lineage": {
     "input_refs": ["c4://dataset/example"],
