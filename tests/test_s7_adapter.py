@@ -6,8 +6,10 @@ from argus_core import (
     AdapterBroker,
     AdapterConformanceError,
     AdapterDescriptor,
+    AdapterVersionError,
     EvalRequest,
     InMemoryArtifactStore,
+    InMemoryRegistry,
     NormalizedQuantity,
     OutOfDomainError,
     ProvenanceUnavailableError,
@@ -15,8 +17,11 @@ from argus_core import (
     SimpleAdapter,
     UNIT_REGISTRY_VERSION,
     UnitsMismatchError,
+    publish_adapter_capability,
     derive_seed,
     normalize_quantity,
+    resolve_independent_adapter_capabilities,
+    select_adapter_version,
 )
 
 
@@ -126,22 +131,73 @@ class S7UnitsAndAdapterTests(unittest.TestCase):
         self.assertEqual(first, second)
         self.assertNotEqual(first, other)
 
+    def test_adapter_capability_publishes_to_c5_registry(self) -> None:
+        registry = InMemoryRegistry()
+
+        published = publish_adapter_capability(registry, self._descriptor(domain_policy="flag"), subtopics=("ewpt",))
+        resolution = registry.resolve(kind="adapter", subtopic="ewpt", required_scope="grad")
+
+        self.assertEqual(published.kind, "adapter")
+        self.assertEqual(published.owner_subsystem, "S7")
+        self.assertIn("gw-surrogate-a", published.independence_tags)
+        self.assertEqual([descriptor.entity_id for descriptor in resolution.descriptors], ["gw_spectrum_surrogate"])
+
+    def test_independent_adapter_resolution_excludes_revoked_and_same_lineage(self) -> None:
+        registry = InMemoryRegistry()
+        first = self._descriptor(domain_policy="flag", adapter_id="gw_a", tags=("impl-a",))
+        second = self._descriptor(domain_policy="flag", adapter_id="gw_b", tags=("impl-b",))
+        revoked = self._descriptor(domain_policy="flag", adapter_id="gw_c", tags=("impl-c",))
+        publish_adapter_capability(registry, first, subtopics=("ewpt",))
+        publish_adapter_capability(registry, second, subtopics=("ewpt",))
+        publish_adapter_capability(registry, revoked, subtopics=("ewpt",))
+        registry.revoke("gw_c")
+
+        attestation = resolve_independent_adapter_capabilities(
+            registry,
+            subtopic="ewpt",
+            excluded_independence_tags=("impl-a",),
+            min_independent=1,
+        )
+
+        self.assertTrue(attestation.lineage_disjoint)
+        self.assertEqual(attestation.selected_entity_ids, ("gw_b",))
+        self.assertNotIn("gw_c", attestation.candidate_ids)
+
+    def test_select_adapter_version_uses_highest_compatible_major(self) -> None:
+        descriptors = (
+            self._descriptor(domain_policy="flag", adapter_id="gw", version="1.0.0"),
+            self._descriptor(domain_policy="flag", adapter_id="gw", version="1.2.0"),
+            self._descriptor(domain_policy="flag", adapter_id="gw", version="2.0.0"),
+        )
+
+        selected = select_adapter_version(descriptors, requested_major=1)
+
+        self.assertEqual(selected.selected_version, "1.2.0")
+        with self.assertRaises(AdapterVersionError):
+            select_adapter_version(descriptors, requested_major=3)
+
     def _adapter(self, *, domain_policy: str) -> SimpleAdapter:
         return SimpleAdapter(self._descriptor(domain_policy=domain_policy), self._evaluate)
 
     @staticmethod
-    def _descriptor(*, domain_policy: str) -> AdapterDescriptor:
+    def _descriptor(
+        *,
+        domain_policy: str,
+        adapter_id: str = "gw_spectrum_surrogate",
+        version: str = "1.0.0",
+        tags: tuple[str, ...] = ("gw-surrogate-a",),
+    ) -> AdapterDescriptor:
         return AdapterDescriptor(
-            adapter_id="gw_spectrum_surrogate",
-            version="1.0.0",
+            adapter_id=adapter_id,
+            version=version,
             input_units={"T_n": "GeV", "alpha": "dimensionless", "v_w": "dimensionless"},
             output_units={"omega": "dimensionless"},
             validity_domain={"v_w": (0.4, 0.95)},
             determinism="deterministic",
-            provenance_ref="c4://adapter/gw_spectrum_surrogate/v1",
+            provenance_ref=f"c4://adapter/{adapter_id}/v{version}",
             domain_policy=domain_policy,
             differentiable=True,
-            independence_tags=("gw-surrogate-a",),
+            independence_tags=tags,
         )
 
     @staticmethod

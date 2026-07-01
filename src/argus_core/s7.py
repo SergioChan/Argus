@@ -6,6 +6,7 @@ from dataclasses import asdict, dataclass
 from typing import Any, Callable
 
 from .hashing import hash_json
+from .s6 import CapabilityDescriptor, InMemoryRegistry, IndependenceAttestation
 from .s8 import InMemoryArtifactStore, Lineage, Producer
 
 
@@ -57,6 +58,13 @@ class AdapterConformanceError(S7Error):
         super().__init__("ADAPTER_ERROR", message)
 
 
+class AdapterVersionError(S7Error):
+    """Raised when adapter version negotiation cannot find a compatible version."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__("VERSION_UNSUPPORTED", message)
+
+
 @dataclass(frozen=True)
 class Quantity:
     value: float
@@ -103,6 +111,13 @@ class EvalResult:
     provenance_ref: str
     violated_fields: tuple[str, ...] = ()
     cache_hit: bool = False
+
+
+@dataclass(frozen=True)
+class AdapterVersionSelection:
+    requested_major: int
+    selected_adapter_id: str
+    selected_version: str
 
 
 class SimpleAdapter:
@@ -230,3 +245,91 @@ def derive_seed(*, job_seed: int, dag_node_id: str, call_index: int, adapter_id:
         }
     ).removeprefix("blake3:")
     return int(digest[:16], 16)
+
+
+def adapter_capability_descriptor(
+    descriptor: AdapterDescriptor,
+    *,
+    subtopics: tuple[str, ...],
+    revision: int = 1,
+    trust_class: str = "internal",
+    status: str = "active",
+) -> CapabilityDescriptor:
+    scopes = ["describe", "evaluate", "batch_evaluate"]
+    if descriptor.differentiable:
+        scopes.append("grad")
+    return CapabilityDescriptor(
+        entity_id=descriptor.adapter_id,
+        revision=revision,
+        kind="adapter",
+        owner_subsystem="S7",
+        contract_versions={"C5": "1.0.0", "C6": "1.0.0"},
+        trust_class=trust_class,
+        capability_scopes=tuple(scopes),
+        provenance_ref=descriptor.provenance_ref,
+        subtopics=subtopics,
+        independence_tags=descriptor.independence_tags,
+        conformance_level="gold",
+        status=status,
+    )
+
+
+def publish_adapter_capability(
+    registry: InMemoryRegistry,
+    descriptor: AdapterDescriptor,
+    *,
+    subtopics: tuple[str, ...],
+    revision: int = 1,
+) -> CapabilityDescriptor:
+    return registry.publish(
+        adapter_capability_descriptor(
+            descriptor,
+            subtopics=subtopics,
+            revision=revision,
+        )
+    )
+
+
+def resolve_independent_adapter_capabilities(
+    registry: InMemoryRegistry,
+    *,
+    subtopic: str,
+    excluded_independence_tags: tuple[str, ...],
+    min_independent: int,
+) -> IndependenceAttestation:
+    return registry.attest_independence(
+        kind="adapter",
+        subtopic=subtopic,
+        excluded_independence_tags=excluded_independence_tags,
+        min_independent=min_independent,
+    )
+
+
+def select_adapter_version(
+    descriptors: tuple[AdapterDescriptor, ...],
+    *,
+    requested_major: int,
+) -> AdapterVersionSelection:
+    compatible = tuple(
+        descriptor
+        for descriptor in descriptors
+        if _parse_semver(descriptor.version)[0] == requested_major
+    )
+    if not compatible:
+        raise AdapterVersionError(f"no adapter version compatible with major {requested_major}")
+    selected = max(compatible, key=lambda descriptor: _parse_semver(descriptor.version))
+    return AdapterVersionSelection(
+        requested_major=requested_major,
+        selected_adapter_id=selected.adapter_id,
+        selected_version=selected.version,
+    )
+
+
+def _parse_semver(version: str) -> tuple[int, int, int]:
+    parts = version.split(".")
+    if len(parts) != 3:
+        raise AdapterVersionError(f"invalid adapter semver: {version}")
+    try:
+        return (int(parts[0]), int(parts[1]), int(parts[2]))
+    except ValueError as exc:
+        raise AdapterVersionError(f"invalid adapter semver: {version}") from exc
