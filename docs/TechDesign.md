@@ -3868,10 +3868,10 @@ This section is assembled from every subsystem's declared `interfaces_produced` 
 |----------|----------|-------------------|
 | **C1** Subagent Contract (SLHA-for-agents) | S1 | S5, S2 (via build), S3 (validate handoff), S4, S11, S12 |
 | **C2** Task/Job Envelope + JobResult | S5 | S1, S2, S3, S4, S7, S9, S10, S11, S12 |
-| **C3** Verifier Interface + Validation Report (v1.1) | S3 | S1, S2 (presence-only), S4, S5, S8, S9, S11, S12 (mocked) |
+| **C3** Verifier Interface + Validation Report (v1.1) | S3 | S1, S2 (presence-only), S4, S5, S7, S8, S9, S11, S12 (mocked) |
 | **C4** Artifact + Provenance Record | S8 | S1, S2, S3, S4, S5, S6, S7, S9, S10, S11, S12 |
-| **C5** Registry / Capability Descriptor | S6 + S12 (co-owned) | S1, S3, S4, S5, S7, S9, S10, S11 |
-| **C6** Compute-Adapter Tool Interface | S7 | S1, S2, S3, S5 (refs/errors), S10 (broker), S11 (read), S12 |
+| **C5** Registry / Capability Descriptor | S6 + S12 (co-owned) | S1, S2, S3, S4, S5, S7, S9, S10, S11 |
+| **C6** Compute-Adapter Tool Interface | S7 | S1, S2, S3, S5 (refs/errors), S6, S10 (broker), S11 (read), S12 |
 
 ### X.2 Produced interfaces (by subsystem)
 
