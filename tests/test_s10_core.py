@@ -23,6 +23,7 @@ from argus_core import (
     TokenInvalidError,
     canonical_json_bytes,
     decide_policy,
+    materialize_sandbox_env,
 )
 
 
@@ -193,6 +194,16 @@ class S10PolicyAndEgressTests(unittest.TestCase):
             "sni_mismatch",
         )
 
+    def test_env_materialization_strips_unlisted_and_rejects_secret_shaped_values(self) -> None:
+        materialized = materialize_sandbox_env(
+            {"SAFE": "visible", "UNLISTED": "ignored"},
+            ("SAFE",),
+        )
+        self.assertEqual(materialized, {"SAFE": "visible"})
+
+        with self.assertRaises(PolicyDeniedError):
+            materialize_sandbox_env({"SAFE": "api_key=sk-abcdefghijklmnop"}, ("SAFE",))
+
     def _launch_request(self, envelope: LaunchEnvelope | None = None) -> LaunchRequest:
         budget = self.tokens.mint_budget(
             caps=BudgetCaps(
@@ -303,6 +314,20 @@ class S10OrchestratorAndAuditTests(unittest.TestCase):
             self.orchestrator.launch(tampered_request)
 
         self.assertEqual(self.audit.events()[-1].event_type, "token.verify_fail")
+
+    def test_launch_rejects_secret_shaped_env_before_reserving_budget(self) -> None:
+        request = replace(
+            self._launch_request(max_cost_usd=10, estimated_cost_usd=2),
+            env={"SAFE": "password=supersecretvalue"},
+            env_allowlist=("SAFE",),
+        )
+
+        with self.assertRaises(PolicyDeniedError):
+            self.orchestrator.launch(request)
+
+        with self.assertRaises(KeyError):
+            self.quota.state(request.budget_token.budget_id)
+        self.assertEqual(self.audit.events()[-1].event_type, "env.denied")
 
     def test_audit_chain_detects_payload_tampering(self) -> None:
         self.audit.append("token.mint", {"token_id": "t1"})

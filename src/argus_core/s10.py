@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hmac
+import re
 import time
 from dataclasses import asdict, dataclass, replace
 from hashlib import sha256
@@ -15,6 +16,12 @@ from .s8 import ArtifactRecord, InMemoryArtifactStore, Lineage, Producer
 
 
 SIGNATURE_PREFIX = "hmac-sha256:"
+SECRET_VALUE_PATTERNS = (
+    re.compile(r"-----BEGIN [A-Z ]+PRIVATE KEY-----"),
+    re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
+    re.compile(r"\bsk-[A-Za-z0-9_-]{16,}\b"),
+    re.compile(r"(?i)(password|secret|api[_-]?key|token)=?[A-Za-z0-9_./+=:-]{8,}"),
+)
 
 
 class S10Error(Exception):
@@ -510,6 +517,23 @@ def decide_policy(bundle: PolicyBundle, request: LaunchRequest) -> PolicyVerdict
     return PolicyVerdict(True, runtime_class, egress_acl)
 
 
+def materialize_sandbox_env(env: dict[str, str], env_allowlist: tuple[str, ...]) -> dict[str, str]:
+    """Return allowlisted env values, failing closed on secret-shaped material."""
+    allowed_keys = set(env_allowlist)
+    materialized: dict[str, str] = {}
+    for key, value in env.items():
+        if key not in allowed_keys:
+            continue
+        if _looks_secret_shaped(value):
+            raise PolicyDeniedError(f"secret-shaped env value rejected for {key}")
+        materialized[key] = value
+    return materialized
+
+
+def _looks_secret_shaped(value: str) -> bool:
+    return any(pattern.search(value) for pattern in SECRET_VALUE_PATTERNS)
+
+
 class EgressProxy:
     """Default-deny egress decision helper."""
 
@@ -649,6 +673,14 @@ class InMemorySandboxOrchestrator:
         if not verdict.allowed:
             self._audit_ledger.append("sandbox.denied", {"reason": verdict.deny_reason, "job_id": request.job_id})
             raise PolicyDeniedError(verdict.deny_reason or "policy denied")
+        try:
+            materialize_sandbox_env(request.env, request.env_allowlist)
+        except PolicyDeniedError as exc:
+            self._audit_ledger.append(
+                "env.denied",
+                {"job_id": request.job_id, "env_keys": sorted(set(request.env) & set(request.env_allowlist))},
+            )
+            raise PolicyDeniedError("env contains secret-shaped value") from exc
         if "@sha256:" not in request.image:
             self._audit_ledger.append("image.verify_fail", {"image": request.image, "job_id": request.job_id})
             raise PolicyDeniedError("image must be digest-pinned")

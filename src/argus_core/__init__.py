@@ -42,6 +42,7 @@ from .s10 import (
     TokenMintUnavailableError,
     TokenVerification,
     decide_policy,
+    materialize_sandbox_env,
 )
 from .s8 import (
     AuditCheckpoint,
@@ -120,4 +121,5 @@ __all__ = [
     "decide_policy",
     "hash_bytes",
     "hash_json",
+    "materialize_sandbox_env",
 ]
