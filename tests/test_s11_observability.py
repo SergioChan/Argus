@@ -1,24 +1,35 @@
 from __future__ import annotations
 
 from decimal import Decimal
+import json
 import unittest
 
 from argus_core import (
+    CanaryResult,
     C3ReportSigner,
     C3ReportVerifier,
-    CanaryResult,
+    EvalHarness,
+    EvalTask,
+    EvalVault,
     InMemoryArtifactStore,
     InMemoryVerifierTrustStore,
     KPIProcessor,
     Lineage,
     PlatformEvent,
+    PlantedExploitRecord,
     Producer,
     ReRunCanary,
+    SpuriousModelProbe,
     TelemetryScrubber,
     TelemetrySpan,
     TraceAssembler,
     TransparencyDetector,
+    assemble_trust_digest,
+    detect_cost_anomaly,
     detect_reward_hacking,
+    planted_exploit_catch_rate,
+    recommend_pause,
+    run_planted_spurious_model_harness,
 )
 from argus_core.s8 import ArtifactRecord
 
@@ -200,6 +211,191 @@ class S11CanaryAndDetectorTests(unittest.TestCase):
             claim_tier=claim_tier,
             validation_report_ref=validation_report_ref,
         )
+
+
+class S11EvalHarnessTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.store = InMemoryArtifactStore()
+        self.task_input = self.store.create_artifact(
+            kind="dataset",
+            payload={"features": [1, 2, 3]},
+            producer=Producer(subsystem="S6", version="0.0.0"),
+            lineage=Lineage(input_refs=(), code_ref="git:eval-fixture", environment_digest="oci:eval-fixture"),
+        )
+        self.physics_input = self.store.create_artifact(
+            kind="dataset",
+            payload={"subtopic": "ewpt", "blind": True},
+            producer=Producer(subsystem="S6", version="0.0.0"),
+            lineage=Lineage(input_refs=(), code_ref="git:physics-fixture", environment_digest="oci:physics-fixture"),
+        )
+        self.vault = EvalVault(
+            (
+                EvalTask(
+                    task_id="mle-1",
+                    harness="mle_bench",
+                    input_ref=self.task_input.artifact_ref,
+                    expected_value=Decimal("0.80"),
+                    tolerance=Decimal("0.10"),
+                ),
+                EvalTask(
+                    task_id="physics-1",
+                    harness="physics_recap",
+                    input_ref=self.physics_input.artifact_ref,
+                    expected_value=Decimal("1.50"),
+                    tolerance=Decimal("0.05"),
+                    expected_tier="recapitulated-known",
+                ),
+            )
+        )
+        self.harness = EvalHarness(vault=self.vault)
+
+    def test_eval_vault_blind_payload_excludes_labels_and_denies_sandbox_read(self) -> None:
+        payload = self.vault.blind_payload("physics-1")
+        finding = self.vault.sandbox_label_read(task_id="physics-1", sandbox_identity="sandbox:s2")
+
+        self.assertEqual(payload.input_ref, self.physics_input.artifact_ref)
+        self.assertFalse(hasattr(payload, "expected_value"))
+        self.assertEqual(finding.kind, "eval_vault_access_denied")
+        self.assertEqual(finding.severity, "S1")
+
+    def test_mle_bench_scorecard_is_reproducible_and_written_to_c4(self) -> None:
+        previous = self.harness.run_scorecard(
+            harness="mle_bench",
+            suite_version="2026.07",
+            platform_build="git:prev",
+            run_id="run-prev",
+            outputs={"mle-1": Decimal("0.80")},
+        )
+
+        first = self.harness.run_scorecard(
+            harness="mle_bench",
+            suite_version="2026.07",
+            platform_build="git:new",
+            run_id="run-new",
+            outputs={"mle-1": Decimal("0.75")},
+            previous=previous,
+        )
+        second = self.harness.run_scorecard(
+            harness="mle_bench",
+            suite_version="2026.07",
+            platform_build="git:new",
+            run_id="run-new",
+            outputs={"mle-1": Decimal("0.75")},
+            previous=previous,
+        )
+        record = self.harness.write_scorecard(store=self.store, scorecard=first)
+        payload = json.loads(self.store.get_artifact(record.artifact_ref).decode("utf-8"))
+
+        self.assertEqual(first.scorecard_id, second.scorecard_id)
+        self.assertEqual(record.kind, "eval_scorecard")
+        self.assertEqual(record.lineage.input_refs, (self.task_input.artifact_ref,))
+        self.assertLess(first.regression_vs_prev, 0)
+        self.assertEqual(payload["scorecard_id"], first.scorecard_id)
+
+    def test_physics_recap_checks_tier_consistency_and_false_novel(self) -> None:
+        recovered = self.harness.run_scorecard(
+            harness="physics_recap",
+            suite_version="2026.07",
+            platform_build="git:recap",
+            run_id="run-recap",
+            outputs={"physics-1": Decimal("1.52")},
+            observed_tiers={"physics-1": "recapitulated-known"},
+        )
+        false_novel = self.harness.run_scorecard(
+            harness="physics_recap",
+            suite_version="2026.07",
+            platform_build="git:false-novel",
+            run_id="run-false-novel",
+            outputs={"physics-1": Decimal("1.52")},
+            observed_tiers={"physics-1": "novel-needs-human"},
+        )
+
+        self.assertTrue(recovered.task_results[0].recovered)
+        self.assertTrue(recovered.task_results[0].passed)
+        self.assertFalse(false_novel.task_results[0].passed)
+        self.assertEqual(false_novel.task_results[0].finding.kind, "transparency_failure")
+
+    def test_planted_exploit_rate_excludes_planted_events_from_real_kpis(self) -> None:
+        records = (
+            PlantedExploitRecord("leaked-label", "leaked_label", caught=True),
+            PlantedExploitRecord("replay", "replayable_report", caught=True),
+            PlantedExploitRecord("collapsed-cross-code", "independence_collapse", caught=True),
+        )
+        rate = planted_exploit_catch_rate(records)
+        pass_rate = KPIProcessor().validation_pass_rate(
+            (
+                PlatformEvent("e1", "validation.report_issued", {"report_id": "real", "passed": True}),
+                PlatformEvent("e2", "validation.report_issued", {"report_id": "planted", "passed": False, "planted": True}),
+            )
+        )
+
+        self.assertEqual(rate.value, Decimal("1"))
+        self.assertEqual(pass_rate.denominator, Decimal("1"))
+        self.assertEqual(pass_rate.value, Decimal("1"))
+
+    def test_planted_spurious_model_harness_requires_insensitivity_catch(self) -> None:
+        results, kpi = run_planted_spurious_model_harness(
+            (
+                SpuriousModelProbe(
+                    scenario_id="constant-headline",
+                    candidate_ref="c4://candidate/spurious",
+                    insensitivity_detected=True,
+                    survived_pre_human_gate=False,
+                ),
+            )
+        )
+
+        self.assertTrue(results[0].caught)
+        self.assertIsNone(results[0].finding)
+        self.assertEqual(kpi.name, "insensitivity_catch_rate")
+        self.assertEqual(kpi.value, Decimal("1"))
+
+    def test_cost_anomaly_is_advisory_only_and_digest_summarizes(self) -> None:
+        finding = detect_cost_anomaly(
+            subject_ref="s4-job-1",
+            cost_usd="50.00",
+            score_delta="0.001",
+            min_cost_usd="10.00",
+            max_score_delta="0.01",
+        )
+        recommendation = recommend_pause(finding)
+        canary = CanaryResult(
+            artifact_ref="c4://artifact/model",
+            verdict="non_reproducible",
+            comparator="hash_equal",
+            expected_hash="c4:a",
+            rederived_hash="c4:b",
+        )
+        scorecard = self.harness.run_scorecard(
+            harness="mle_bench",
+            suite_version="2026.07",
+            platform_build="git:digest",
+            run_id="run-digest",
+            outputs={"mle-1": Decimal("0.70")},
+            previous=self.harness.run_scorecard(
+                harness="mle_bench",
+                suite_version="2026.07",
+                platform_build="git:prev",
+                run_id="run-prev",
+                outputs={"mle-1": Decimal("0.80")},
+            ),
+        )
+        digest = assemble_trust_digest(
+            digest_date="2026-07-01",
+            kpis=(KPIProcessor().cost_per_verified_artifact(spend_usd="100", verified_artifact_count=4),),
+            findings=(finding,),
+            canaries=(canary,),
+            scorecards=(scorecard,),
+            quarantined_jobs=("job-b", "job-a"),
+        )
+
+        self.assertEqual(finding.kind, "cost_anomaly")
+        self.assertTrue(recommendation.recommended)
+        self.assertEqual(recommendation.authority, "advisory_only")
+        self.assertEqual(digest.findings_by_severity, {"S2": 1})
+        self.assertEqual(digest.canary_summary, {"non_reproducible": 1})
+        self.assertEqual(digest.eval_regressions, (scorecard.scorecard_id,))
+        self.assertEqual(digest.quarantined_jobs, ("job-a", "job-b"))
 
 
 if __name__ == "__main__":
