@@ -4,6 +4,8 @@ import unittest
 from decimal import Decimal
 
 from argus_core import (
+    BackPressureGovernor,
+    BackPressureSignal,
     BudgetBreachDecision,
     BudgetGovernor,
     BudgetHeartbeat,
@@ -13,13 +15,16 @@ from argus_core import (
     DAG,
     DAGCycleError,
     DAGNode,
+    GuardrailScreen,
     InMemoryArtifactStore,
     Lineage,
     NodeResult,
     Producer,
     ProvenanceGateError,
+    ReviewCoordinator,
     RetryPolicy,
     S5BudgetExceededError,
+    S5ReviewError,
     TypedNodeError,
     WorkItem,
     topological_order,
@@ -249,6 +254,66 @@ class S5ControlTowerTests(unittest.TestCase):
 
         self.assertEqual(ledger.state().reserved_usd, Decimal("0"))
         self.assertEqual(ledger.state().spent_usd, Decimal("0"))
+
+    def test_guardrail_blocks_empirical_claim_before_running(self) -> None:
+        decision = GuardrailScreen().screen(
+            objective_nl="Empirically confirm a new theory from this autonomous run."
+        )
+
+        self.assertFalse(decision.passed)
+        self.assertEqual(decision.rule_id, "NO_EMPIRICAL_CLAIM")
+        self.assertIsNotNone(decision.event)
+        self.assertEqual(decision.event.action, "BLOCK")
+
+    def test_guardrail_blocks_autonomous_paper_submission_action(self) -> None:
+        decision = GuardrailScreen().screen(
+            objective_nl="Build a recapitulation model.",
+            attempted_action="submit paper to arxiv",
+        )
+
+        self.assertFalse(decision.passed)
+        self.assertEqual(decision.rule_id, "NO_AUTO_PAPER_SUBMIT")
+
+    def test_review_wait_state_pauses_and_resumes_on_approval(self) -> None:
+        coordinator = ReviewCoordinator()
+        wait = coordinator.open_wait(
+            node_id="novel-node",
+            reason="NOVEL_CANDIDATE",
+            artifact_refs=("c4://artifact/a", "c4://artifact/b"),
+        )
+        duplicate = coordinator.open_wait(
+            node_id="novel-node",
+            reason="NOVEL_CANDIDATE",
+            artifact_refs=("c4://artifact/b", "c4://artifact/a"),
+        )
+
+        self.assertEqual(wait, duplicate)
+        self.assertEqual(wait.status, "PENDING")
+
+        resolved = coordinator.resolve(wait.wait_id, approved=True)
+
+        self.assertEqual(resolved.status, "APPROVED")
+        self.assertTrue(resolved.resume_signal_sent)
+        with self.assertRaises(S5ReviewError):
+            coordinator.resolve(wait.wait_id, approved=True)
+
+    def test_review_rejection_prunes_branch_without_resume_signal(self) -> None:
+        coordinator = ReviewCoordinator()
+        wait = coordinator.open_wait(node_id="novel-node", reason="NOVEL_CANDIDATE")
+
+        resolved = coordinator.resolve(wait.wait_id, approved=False)
+
+        self.assertEqual(resolved.status, "REJECTED")
+        self.assertFalse(resolved.resume_signal_sent)
+
+    def test_backpressure_throttles_review_bound_work_only(self) -> None:
+        governor = BackPressureGovernor(review_queue_threshold=10, retry_after_seconds=60)
+
+        review_signal = governor.decide(review_queue_depth=10, requires_review=True)
+        ordinary_signal = governor.decide(review_queue_depth=10, requires_review=False)
+
+        self.assertEqual(review_signal, BackPressureSignal(active=True, reason="THROTTLED", retry_after_seconds=60))
+        self.assertEqual(ordinary_signal, BackPressureSignal(active=False))
 
 
 if __name__ == "__main__":

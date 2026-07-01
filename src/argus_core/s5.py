@@ -34,6 +34,10 @@ class S5SchedulingError(S5Error):
     """Raised when scheduler policy is invalid."""
 
 
+class S5ReviewError(S5Error):
+    """Raised when S5 review wait-state transitions are invalid."""
+
+
 @dataclass(frozen=True)
 class DAGNode:
     node_id: str
@@ -118,6 +122,39 @@ class WorkItem:
     priority: int = 0
     submitted_at: int = 0
     deadline_at: int | None = None
+
+
+@dataclass(frozen=True)
+class GuardrailEvent:
+    rule_id: str
+    action: str
+    reason: str
+    objective_nl: str
+
+
+@dataclass(frozen=True)
+class GuardrailDecision:
+    passed: bool
+    rule_id: str | None = None
+    reason: str | None = None
+    event: GuardrailEvent | None = None
+
+
+@dataclass(frozen=True)
+class ReviewWaitState:
+    wait_id: str
+    node_id: str
+    reason: str
+    status: str
+    artifact_refs: tuple[str, ...] = ()
+    resume_signal_sent: bool = False
+
+
+@dataclass(frozen=True)
+class BackPressureSignal:
+    active: bool
+    reason: str = "OK"
+    retry_after_seconds: int = 0
 
 
 Handler = Callable[[DAGNode, tuple[NodeResult, ...]], NodeResult]
@@ -271,6 +308,107 @@ class ConcurrencyGovernor:
         deadline = item.deadline_at if item.deadline_at is not None else 10**18
         urgent = item.deadline_at is not None and item.deadline_at - now <= self._deadline_slack_seconds
         return (0 if urgent else 1, deadline, -item.priority, item.submitted_at, item.node_id)
+
+
+class GuardrailScreen:
+    """Deterministic S5 non-goal guardrail screen for intake and execution."""
+
+    _RULES: tuple[tuple[str, tuple[str, ...], str], ...] = (
+        (
+            "NO_EMPIRICAL_CLAIM",
+            ("empirically confirm", "empirical validation", "confirm a new theory"),
+            "autonomous empirical validation is out of scope",
+        ),
+        (
+            "NO_AUTO_PAPER_SUBMIT",
+            ("submit paper", "paper submission", "submit to arxiv", "arxiv submission"),
+            "autonomous paper submission is out of scope",
+        ),
+        (
+            "NO_FLAGSHIP_HPC",
+            ("flagship hpc", "frontier supercomputer", "exascale run"),
+            "flagship HPC execution is out of scope",
+        ),
+    )
+
+    def screen(self, *, objective_nl: str, attempted_action: str | None = None) -> GuardrailDecision:
+        text = f"{objective_nl} {attempted_action or ''}".lower()
+        for rule_id, needles, reason in self._RULES:
+            if any(needle in text for needle in needles):
+                return GuardrailDecision(
+                    passed=False,
+                    rule_id=rule_id,
+                    reason=reason,
+                    event=GuardrailEvent(
+                        rule_id=rule_id,
+                        action="BLOCK",
+                        reason=reason,
+                        objective_nl=objective_nl,
+                    ),
+                )
+        return GuardrailDecision(passed=True)
+
+
+class ReviewCoordinator:
+    """S9-compatible in-memory wait-state coordinator used by M2 S5 stubs."""
+
+    def __init__(self) -> None:
+        self._waits: dict[str, ReviewWaitState] = {}
+        self._wait_ids_by_key: dict[tuple[str, str, tuple[str, ...]], str] = {}
+
+    def open_wait(self, *, node_id: str, reason: str, artifact_refs: tuple[str, ...] = ()) -> ReviewWaitState:
+        key = (node_id, reason, tuple(sorted(artifact_refs)))
+        if key in self._wait_ids_by_key:
+            return self._waits[self._wait_ids_by_key[key]]
+        wait_id = "s5-review-" + hash_json({"node_id": node_id, "reason": reason, "artifact_refs": key[2]})[:16]
+        wait = ReviewWaitState(
+            wait_id=wait_id,
+            node_id=node_id,
+            reason=reason,
+            status="PENDING",
+            artifact_refs=key[2],
+        )
+        self._wait_ids_by_key[key] = wait_id
+        self._waits[wait_id] = wait
+        return wait
+
+    def resolve(self, wait_id: str, *, approved: bool) -> ReviewWaitState:
+        if wait_id not in self._waits:
+            raise S5ReviewError(f"unknown review wait state: {wait_id}")
+        wait = self._waits[wait_id]
+        if wait.status != "PENDING":
+            raise S5ReviewError(f"review wait state already resolved: {wait_id}")
+        resolved = ReviewWaitState(
+            wait_id=wait.wait_id,
+            node_id=wait.node_id,
+            reason=wait.reason,
+            status="APPROVED" if approved else "REJECTED",
+            artifact_refs=wait.artifact_refs,
+            resume_signal_sent=approved,
+        )
+        self._waits[wait_id] = resolved
+        return resolved
+
+
+class BackPressureGovernor:
+    """Review-capacity gate that throttles review-bound work while allowing ordinary nodes."""
+
+    def __init__(self, *, review_queue_threshold: int, retry_after_seconds: int) -> None:
+        if review_queue_threshold < 0:
+            raise S5SchedulingError("review queue threshold cannot be negative")
+        if retry_after_seconds < 0:
+            raise S5SchedulingError("retry_after_seconds cannot be negative")
+        self._review_queue_threshold = review_queue_threshold
+        self._retry_after_seconds = retry_after_seconds
+
+    def decide(self, *, review_queue_depth: int, requires_review: bool) -> BackPressureSignal:
+        if requires_review and review_queue_depth >= self._review_queue_threshold:
+            return BackPressureSignal(
+                active=True,
+                reason="THROTTLED",
+                retry_after_seconds=self._retry_after_seconds,
+            )
+        return BackPressureSignal(active=False)
 
 
 class ControlTower:
