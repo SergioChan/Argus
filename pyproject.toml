@@ -6,8 +6,16 @@ readme = "docs/README.md"
 requires-python = ">=3.11"
 license = { text = "Proprietary" }
 dependencies = [
+  "blake3>=0.4,<2",
   "jsonschema>=4.25,<5"
 ]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
 
 [tool.project-argus]
 roadmap = "docs/Roadmap.md"

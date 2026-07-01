@@ -20,7 +20,9 @@ jobs:
           python-version: "3.11"
 
       - name: Install Python dependencies
-        run: python3 -m pip install --upgrade pip 'jsonschema>=4.25,<5'
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install -e .
 
       - name: Run checks
         run: python3 scripts/check.py
