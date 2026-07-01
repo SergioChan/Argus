@@ -53,6 +53,14 @@ C1_REQUIRED_DEFS = {
     "ValidationRequest",
 }
 
+C6_REQUIRED_DEFS = {
+    "AdapterDescriptor",
+    "EvalRequest",
+    "EvalResult",
+    "OutputQuantity",
+    "Quantity",
+}
+
 
 def fail(message: str) -> None:
     print(f"ERROR: {message}", file=sys.stderr)
@@ -147,6 +155,23 @@ def validate_contract_schema(entry: dict) -> None:
         missing_methods = sorted(required_methods - method_values)
         if missing_methods:
             fail(f"C1 LifecycleMethod missing public methods: {missing_methods}")
+
+    if contract_id == "C6":
+        definitions = schema.get("$defs", {})
+        missing_defs = sorted(C6_REQUIRED_DEFS - set(definitions))
+        if missing_defs:
+            fail(f"C6 schema missing canonical public definitions: {missing_defs}")
+        output_quantity_required = set(definitions.get("OutputQuantity", {}).get("required", []))
+        if "uncertainty" not in output_quantity_required:
+            fail("C6 OutputQuantity must require uncertainty")
+        eval_result_outputs = (
+            definitions.get("EvalResult", {})
+            .get("properties", {})
+            .get("outputs", {})
+            .get("additionalProperties", {})
+        )
+        if eval_result_outputs.get("$ref") != "#/$defs/OutputQuantity":
+            fail("C6 EvalResult.outputs must reference OutputQuantity")
 
     example_path = EXAMPLES / f"{contract_id.lower()}.example.json"
     if not example_path.is_file():

@@ -19,6 +19,11 @@
       "id": "C3",
       "baseline_version": "1.1.0",
       "baseline_schema": "compatibility/c3.validation-report.v1.1.0.schema.json"
+    },
+    {
+      "id": "C6",
+      "baseline_version": "1.0.0",
+      "baseline_schema": "compatibility/c6.compute-adapter.v1.0.0.schema.json"
     }
   ]
 }
