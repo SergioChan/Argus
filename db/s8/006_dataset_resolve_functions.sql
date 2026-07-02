@@ -129,7 +129,7 @@ BEGIN
         INTO dataset
         FROM s8.dataset_registry
         WHERE dataset_id = p_dataset_id
-        ORDER BY created_at DESC, version DESC
+        ORDER BY s8.dataset_version_sort_key(version) DESC, version DESC
         LIMIT 1;
     ELSE
         SELECT *

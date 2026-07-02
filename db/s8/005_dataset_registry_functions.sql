@@ -10,6 +10,22 @@ CREATE TABLE IF NOT EXISTS s8.dataset_registry (
     PRIMARY KEY (dataset_id, version)
 );
 
+CREATE OR REPLACE FUNCTION s8.dataset_version_sort_key(p_version text)
+RETURNS text
+LANGUAGE sql
+IMMUTABLE
+STRICT
+AS $$
+    SELECT CASE
+        WHEN p_version ~ '^[0-9]+(\.[0-9]+)*$' THEN
+            '0:' || (
+                SELECT string_agg(lpad(part, 12, '0'), '.' ORDER BY ordinality)
+                FROM unnest(string_to_array(p_version, '.')) WITH ORDINALITY AS parts(part, ordinality)
+            )
+        ELSE '1:' || p_version
+    END;
+$$;
+
 DROP TRIGGER IF EXISTS dataset_registry_append_only ON s8.dataset_registry;
 CREATE TRIGGER dataset_registry_append_only
     BEFORE UPDATE OR DELETE ON s8.dataset_registry
@@ -191,7 +207,7 @@ BEGIN
         INTO dataset
         FROM s8.dataset_registry
         WHERE dataset_id = p_dataset_id
-        ORDER BY created_at DESC, version DESC
+        ORDER BY s8.dataset_version_sort_key(version) DESC, version DESC
         LIMIT 1;
     ELSE
         SELECT *
@@ -248,11 +264,13 @@ AS $$
     SELECT dataset.version
     FROM s8.dataset_registry AS dataset
     WHERE dataset.dataset_id = p_dataset_id
-    ORDER BY dataset.created_at, dataset.version;
+    ORDER BY s8.dataset_version_sort_key(dataset.version), dataset.version;
 $$;
 
 REVOKE ALL ON s8.dataset_registry FROM PUBLIC;
 REVOKE ALL ON s8.dataset_registry FROM argus_s8_reader, argus_s8_ledger_writer;
+
+REVOKE ALL ON FUNCTION s8.dataset_version_sort_key(text) FROM PUBLIC;
 
 REVOKE ALL ON FUNCTION s8.assert_dataset_splits_valid(jsonb) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION s8.assert_dataset_splits_valid(jsonb)

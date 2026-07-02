@@ -963,6 +963,63 @@ class S8PostgresSchemaTests(unittest.TestCase):
         self.assertIn("append-only table dataset_registry", update.stderr)
         self.assertEqual(row_count.stdout.strip(), "2")
 
+    def test_dataset_latest_uses_numeric_semver_ordering(self) -> None:
+        splits = [
+            {
+                "split_id": "train",
+                "role": "train",
+                "content_hash": "blake3:train",
+                "row_count": 10,
+                "schema_ref": "c4://schema/ewpt/v1",
+                "access_scope": "agent-readable",
+            }
+        ]
+        self._commit_record("c4://dataset/ewpt/1.10.0", sequence=1, kind="dataset")
+        self._commit_record("c4://dataset/ewpt/1.9.0", sequence=2, kind="dataset")
+
+        self._psql(
+            f"""
+            SET ROLE argus_s8_ledger_writer;
+            SELECT s8.register_dataset(
+                'semver-corpus',
+                '1.10.0',
+                'c4://dataset/ewpt/1.10.0',
+                {_jsonb_literal(splits)},
+                'contam-2026-07-10'
+            );
+            SELECT s8.register_dataset(
+                'semver-corpus',
+                '1.9.0',
+                'c4://dataset/ewpt/1.9.0',
+                {_jsonb_literal(splits)},
+                'contam-2026-07-09'
+            );
+            """
+        )
+        latest = self._psql(
+            """
+            SET ROLE argus_s8_reader;
+            SELECT s8.get_dataset('semver-corpus', NULL)->>'version';
+            """
+        )
+        versions = self._psql(
+            """
+            SET ROLE argus_s8_reader;
+            SELECT string_agg(version, ',')
+            FROM s8.list_dataset_versions('semver-corpus');
+            """
+        )
+        latest_resolved = self._psql(
+            """
+            SET ROLE argus_s8_reader;
+            SELECT s8.resolve_split('semver-corpus', NULL, 'train', 'agent')->>'version';
+            """
+        )
+
+        self.assertEqual(latest.stdout.strip(), "1.10.0")
+        self.assertEqual(versions.stdout.strip(), "1.9.0,1.10.0")
+        self.assertEqual(latest_resolved.stdout.strip(), "1.10.0")
+
     def test_resolve_split_denies_non_verifier_labels_and_audits_verifier_resolution(self) -> None:
         splits = [
             {

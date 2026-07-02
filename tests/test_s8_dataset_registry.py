@@ -75,6 +75,23 @@ class DatasetRegistryTests(unittest.TestCase):
         self.assertEqual(internal_by_id["blind"].content_hash, "blake3:blind")
         self.assertEqual(internal_by_id["blind"].label_seal_ref, "c4://labels/blind")
 
+    def test_latest_version_uses_numeric_semver_ordering(self) -> None:
+        self.registry.register(
+            dataset_id="ewpt-corpus",
+            version="1.10.0",
+            splits=(self._split("train-110", "train"),),
+            contamination_index_version="contam-2026-07-10",
+        )
+        self.registry.register(
+            dataset_id="ewpt-corpus",
+            version="1.9.0",
+            splits=(self._split("train-190", "train"),),
+            contamination_index_version="contam-2026-07-09",
+        )
+
+        self.assertEqual(self.registry.list_versions("ewpt-corpus"), ("1.9.0", "1.10.0"))
+        self.assertEqual(self.registry.get("ewpt-corpus").version, "1.10.0")
+
     def test_register_is_idempotent_but_conflicting_version_is_rejected(self) -> None:
         first = self.registry.register(
             dataset_id="ewpt-corpus",
