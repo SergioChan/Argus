@@ -57,7 +57,7 @@ services:
       timeout: 3s
       retries: 20
     volumes:
-      - s8-data:/var/lib/argus/s8
+      - ${ARGUS_M0_S8_DATA_DIR:-s8-data}:/var/lib/argus/s8
 
   s10-supervisor:
     build:
@@ -65,6 +65,7 @@ services:
       dockerfile: deploy/argus-m0/python-service.Dockerfile
     command: ["python", "-m", "argus_runtime.s10_supervisor_service"]
     environment:
+      ARGUS_S8_DATA_DIR: /var/lib/argus/s8
       ARGUS_S10_PORT: "8080"
       ARGUS_S10_SIGNING_KEY: argus-m0-dev-signing-key
     ports:
@@ -79,6 +80,8 @@ services:
       interval: 5s
       timeout: 3s
       retries: 20
+    volumes:
+      - ${ARGUS_M0_S8_DATA_DIR:-s8-data}:/var/lib/argus/s8
 
 volumes:
   postgres-data:

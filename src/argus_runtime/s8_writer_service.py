@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import asdict
 import os
+from pathlib import Path
 from typing import Any
 
 from argus_core import FileSystemArtifactStore, Lineage, Producer
@@ -12,8 +13,9 @@ from .http_json import JsonHttpApp, JsonRequest, serve_json_app
 
 
 class S8WriterApp:
-    def __init__(self, store: FileSystemArtifactStore) -> None:
+    def __init__(self, store: FileSystemArtifactStore, *, data_dir: str | os.PathLike[str] | None = None) -> None:
         self.store = store
+        self._data_dir = Path(data_dir) if data_dir is not None else None
         self.http = JsonHttpApp()
         self._register_routes()
 
@@ -32,18 +34,25 @@ class S8WriterApp:
         return asdict(record)
 
     def get_artifact_record(self, ref: str) -> dict[str, Any]:
+        self._refresh_store()
         return asdict(self.store.get_artifact_record(ref))
 
     def get_lineage(self, ref: str, *, direction: str) -> dict[str, Any]:
+        self._refresh_store()
         graph = self.store.get_lineage(ref, direction=direction)
         return {
             "nodes": [asdict(node) for node in graph.nodes],
             "edges": [asdict(edge) for edge in graph.edges],
         }
 
+    def _refresh_store(self) -> None:
+        if self._data_dir is not None:
+            self.store = FileSystemArtifactStore(self._data_dir)
+
     def _register_routes(self) -> None:
         @self.http.route("GET", "/healthz")
         def health(_: JsonRequest) -> tuple[int, Any]:
+            self._refresh_store()
             return 200, {"service": "s8-writer", "status": "ok", "record_count": self.store.record_count}
 
         @self.http.route("POST", "/v1/artifacts")
@@ -78,7 +87,7 @@ class S8WriterApp:
 
 def build_app_from_env() -> S8WriterApp:
     data_dir = os.environ.get("ARGUS_S8_DATA_DIR", "/var/lib/argus/s8")
-    return S8WriterApp(FileSystemArtifactStore(data_dir))
+    return S8WriterApp(FileSystemArtifactStore(data_dir), data_dir=data_dir)
 
 
 def main() -> None:
@@ -110,4 +119,3 @@ def _normalize_lineage(value: dict[str, Any]) -> dict[str, Any]:
 
 if __name__ == "__main__":
     main()
-

@@ -9,7 +9,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from argus_core import BudgetCaps, BudgetToken, FileSystemArtifactStore, ScopeGrant, ScopeToken
+from argus_core import BudgetCaps, BudgetToken, FileSystemArtifactStore, Lineage, Producer, ScopeGrant, ScopeToken
 from argus_runtime.s10_supervisor_service import S10SupervisorApp
 from argus_runtime.s8_writer_service import S8WriterApp
 
@@ -39,6 +39,21 @@ class ArgusM0RuntimeServiceTests(unittest.TestCase):
             self.assertEqual(fetched["content_hash"], record["content_hash"])
             self.assertEqual(reloaded.store.record_count, 1)
             self.assertEqual(reloaded.store.get_artifact(record["artifact_ref"]), b'{"weights":[1,2,3]}')
+
+    def test_s8_writer_service_refreshes_file_ledger_before_reads(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            app = S8WriterApp(FileSystemArtifactStore(tmp), data_dir=tmp)
+            external = FileSystemArtifactStore(tmp).create_artifact(
+                kind="model",
+                payload={"weights": [3, 2, 1]},
+                producer=Producer(subsystem="S2", version="0.0.0"),
+                lineage=Lineage(input_refs=(), code_ref="git:model", environment_digest="oci:model"),
+            )
+
+            fetched = app.get_artifact_record(external.artifact_ref)
+
+            self.assertEqual(fetched["artifact_ref"], external.artifact_ref)
+            self.assertEqual(app.store.record_count, 1)
 
     def test_s10_supervisor_service_mints_verifiable_tokens(self) -> None:
         app = S10SupervisorApp(signing_key=b"test-key")
@@ -85,6 +100,43 @@ class ArgusM0RuntimeServiceTests(unittest.TestCase):
         self.assertTrue(app.tokens.verify_budget(budget_token).valid)
         self.assertTrue(app.tokens.verify_scope(scope_token).valid)
 
+    def test_s10_supervisor_broker_writes_shared_s8_records(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            app = S10SupervisorApp(
+                signing_key=b"test-key",
+                artifact_store=FileSystemArtifactStore(tmp),
+                artifact_store_path=tmp,
+            )
+            scope = app.mint_scope(
+                {
+                    "job_id": "job-1",
+                    "scopes": {
+                        "broker_audiences": ["store"],
+                        "producer_subsystems": ["S2"],
+                    },
+                }
+            )
+
+            record = app.broker_put_artifact(
+                {
+                    "scope_token": scope,
+                    "kind": "model",
+                    "payload": {"weights": [1, 2, 3]},
+                    "producer": {"subsystem": "S2", "version": "0.0.0"},
+                    "lineage": {
+                        "input_refs": [],
+                        "code_ref": "git:model",
+                        "environment_digest": "oci:model",
+                    },
+                }
+            )
+            s8 = S8WriterApp(FileSystemArtifactStore(tmp), data_dir=tmp)
+            fetched = s8.get_artifact_record(record["artifact_ref"])
+
+            self.assertEqual(fetched["artifact_ref"], record["artifact_ref"])
+            self.assertEqual(fetched["producer"]["job_id"], "job-1")
+            self.assertEqual(fetched["lineage"]["job_id"], "job-1")
+
 
 class ArgusM0ComposeTests(unittest.TestCase):
     def test_compose_config_declares_argus_m0_services(self) -> None:
@@ -108,6 +160,7 @@ class ArgusM0ComposeTests(unittest.TestCase):
         self.assertTrue(services["minio"]["image"].startswith("minio/minio@sha256:"))
         self.assertEqual(services["s8-writer"]["command"], ["python", "-m", "argus_runtime.s8_writer_service"])
         self.assertEqual(services["s10-supervisor"]["command"], ["python", "-m", "argus_runtime.s10_supervisor_service"])
+        self.assertIn("/var/lib/argus/s8", services["s10-supervisor"]["volumes"][0]["target"])
         self.assertIn("s8-data", rendered["volumes"])
 
     def _skip_or_fail(self, reason: str) -> None:
