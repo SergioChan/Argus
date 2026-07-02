@@ -243,31 +243,65 @@ class InMemoryArtifactStoreTests(unittest.TestCase):
         dataset = self.store.create_artifact(
             kind="dataset",
             payload={"rows": [1]},
-            producer=Producer(subsystem="S6", version="0.0.0"),
-            lineage=Lineage(input_refs=(), code_ref="git:data", environment_digest="oci:data"),
+            producer=Producer(subsystem="S6", version="0.0.0", actor_id="ingest-agent"),
+            lineage=Lineage(
+                input_refs=(),
+                code_ref="git:data",
+                environment_digest="oci:data",
+                job_id="job-42",
+                contamination_index_version="contam-v1",
+            ),
+            created_at="2026-07-02T00:00:00Z",
         )
         report = self.store.create_artifact(
             kind="report",
             payload={"report": "unsigned-test-report"},
             producer=Producer(subsystem="S3", version="0.0.0"),
-            lineage=Lineage(input_refs=(), code_ref="git:verify", environment_digest="oci:verify"),
+            lineage=Lineage(
+                input_refs=(),
+                code_ref="git:verify",
+                environment_digest="oci:verify",
+                actor_id="verifier-lineage",
+            ),
+            created_at="2026-07-02T00:05:00Z",
         )
         model = self.store.create_artifact(
             kind="model",
             payload={"weights": [1]},
-            producer=self.producer,
+            producer=Producer(subsystem="S2", version="0.0.0", actor_id="builder-a"),
             lineage=Lineage(
                 input_refs=(dataset.artifact_ref,),
                 code_ref="git:model",
                 environment_digest="oci:model",
+                job_id="job-42",
+                contamination_index_version="contam-v1",
             ),
             validation_report_ref=report.artifact_ref,
+            created_at="2026-07-02T01:00:00Z",
         )
 
         self.assertEqual(self.store.query_artifacts({"kind": "model"}), (model,))
         self.assertEqual(self.store.query_artifacts({"content_hash": dataset.content_hash}), (dataset,))
         self.assertEqual(self.store.query_artifacts(ArtifactQueryFilter(producer_subsystem="S6")), (dataset,))
         self.assertEqual(self.store.query_artifacts({"validation_report_ref": report.artifact_ref}), (model,))
+        self.assertEqual(self.store.query_artifacts({"actor_id": "ingest-agent"}), (dataset,))
+        self.assertEqual(self.store.query_artifacts({"actor_id": "verifier-lineage"}), (report,))
+        self.assertEqual(
+            {record.artifact_ref for record in self.store.query_artifacts({"job_id": "job-42"})},
+            {dataset.artifact_ref, model.artifact_ref},
+        )
+        self.assertEqual(
+            {
+                record.artifact_ref
+                for record in self.store.query_artifacts({"contamination_index_version": "contam-v1"})
+            },
+            {dataset.artifact_ref, model.artifact_ref},
+        )
+        self.assertEqual(self.store.query_artifacts({"created_after": "2026-07-02T00:30:00Z"}), (model,))
+        self.assertEqual(
+            {record.artifact_ref for record in self.store.query_artifacts({"created_before": "2026-07-02T00:30:00Z"})},
+            {dataset.artifact_ref, report.artifact_ref},
+        )
         with self.assertRaises(ValueError):
             self.store.query_artifacts({"unsupported": "filter"})
 

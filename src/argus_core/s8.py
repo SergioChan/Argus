@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, replace
+from datetime import UTC, datetime
 import json
 from pathlib import Path
 from typing import Any, Callable, Mapping, Protocol
@@ -102,6 +103,8 @@ class S8ScopeDeniedError(S8Error):
 class Producer:
     subsystem: str
     version: str
+    actor_id: str | None = None
+    job_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -110,6 +113,9 @@ class Lineage:
     code_ref: str
     environment_digest: str
     seeds: tuple[str, ...] = ()
+    actor_id: str | None = None
+    job_id: str | None = None
+    contamination_index_version: str | None = None
 
 
 @dataclass(frozen=True)
@@ -133,6 +139,7 @@ class ArtifactRecord:
     lineage: Lineage
     claim_tier: str = "ran-toy"
     validation_report_ref: str | None = None
+    created_at: str = ""
 
 
 @dataclass(frozen=True)
@@ -622,6 +629,10 @@ def _object_field(value: object, field_name: str) -> Any | None:
     return getattr(value, field_name, None)
 
 
+def _utc_now_iso() -> str:
+    return datetime.now(UTC).isoformat().replace("+00:00", "Z")
+
+
 class InMemoryArtifactStore:
     """A small write-once C4 store for exercising S8 invariants."""
 
@@ -654,6 +665,7 @@ class InMemoryArtifactStore:
         artifact_ref: str | None = None,
         claim_tier: str = "ran-toy",
         validation_report_ref: str | None = None,
+        created_at: str | None = None,
     ) -> ArtifactRecord:
         self._assert_lineage_complete(
             lineage,
@@ -696,6 +708,7 @@ class InMemoryArtifactStore:
             lineage=lineage,
             claim_tier=claim_tier,
             validation_report_ref=validation_report_ref,
+            created_at=created_at or _utc_now_iso(),
         )
         self._object_store.put(
             content_hash,
@@ -1255,6 +1268,7 @@ class FileSystemArtifactStore(InMemoryArtifactStore):
         artifact_ref: str | None = None,
         claim_tier: str = "ran-toy",
         validation_report_ref: str | None = None,
+        created_at: str | None = None,
     ) -> ArtifactRecord:
         previous_sequence = self._latest_checkpoint().sequence
         record = super().create_artifact(
@@ -1265,6 +1279,7 @@ class FileSystemArtifactStore(InMemoryArtifactStore):
             artifact_ref=artifact_ref,
             claim_tier=claim_tier,
             validation_report_ref=validation_report_ref,
+            created_at=created_at,
         )
         if not self._replaying_ledger and self._latest_checkpoint().sequence > previous_sequence:
             self._append_ledger_event(record)
@@ -1289,6 +1304,7 @@ class FileSystemArtifactStore(InMemoryArtifactStore):
                         lineage=record.lineage,
                         claim_tier=record.claim_tier,
                         validation_report_ref=record.validation_report_ref,
+                        created_at=record.created_at,
                     )
                     self._assert_replayed_event(event, replayed)
                 except Exception as exc:
@@ -1721,17 +1737,30 @@ def _record_from_ledger_event(event: Mapping[str, Any]) -> ArtifactRecord:
         kind=str(record["kind"]),
         content_hash=str(record["content_hash"]),
         size_bytes=int(record["size_bytes"]),
-        producer=Producer(subsystem=str(producer["subsystem"]), version=str(producer["version"])),
+        producer=Producer(
+            subsystem=str(producer["subsystem"]),
+            version=str(producer["version"]),
+            actor_id=str(producer["actor_id"]) if producer.get("actor_id") is not None else None,
+            job_id=str(producer["job_id"]) if producer.get("job_id") is not None else None,
+        ),
         lineage=Lineage(
             input_refs=tuple(lineage.get("input_refs", ())),
             code_ref=str(lineage["code_ref"]),
             environment_digest=str(lineage["environment_digest"]),
             seeds=tuple(lineage.get("seeds", ())),
+            actor_id=str(lineage["actor_id"]) if lineage.get("actor_id") is not None else None,
+            job_id=str(lineage["job_id"]) if lineage.get("job_id") is not None else None,
+            contamination_index_version=(
+                str(lineage["contamination_index_version"])
+                if lineage.get("contamination_index_version") is not None
+                else None
+            ),
         ),
         claim_tier=str(record.get("claim_tier", "ran-toy")),
         validation_report_ref=(
             str(record["validation_report_ref"]) if record.get("validation_report_ref") is not None else None
         ),
+        created_at=str(record.get("created_at", "")),
     )
 
 
