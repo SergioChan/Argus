@@ -176,13 +176,18 @@ class SubprocessRustLedgerWriter:
         db_role: str | None,
         checkpoint_signer_url: str,
         checkpoint_signer_auth_token: str,
+        allow_insecure_checkpoint_signer: bool = False,
     ) -> None:
         self._command = command
         self._dsn = dsn
         self._db_role = db_role
         self._checkpoint_signer_url = checkpoint_signer_url
         self._checkpoint_signer_auth_token = checkpoint_signer_auth_token
-        self.checkpoint_signer_kind = "s10-http"
+        self._allow_insecure_checkpoint_signer = allow_insecure_checkpoint_signer
+        self.checkpoint_signer_kind = _checkpoint_signer_kind(
+            checkpoint_signer_url,
+            allow_insecure_checkpoint_signer=allow_insecure_checkpoint_signer,
+        )
 
     def commit_record(self, record: ArtifactRecord) -> dict[str, Any]:
         env = {
@@ -191,6 +196,10 @@ class SubprocessRustLedgerWriter:
             "ARGUS_S8_CHECKPOINT_SIGNER_URL": self._checkpoint_signer_url,
             "ARGUS_S8_CHECKPOINT_SIGNER_AUTH_TOKEN": self._checkpoint_signer_auth_token,
         }
+        if self._allow_insecure_checkpoint_signer:
+            env["ARGUS_S8_ALLOW_INSECURE_CHECKPOINT_SIGNER"] = "1"
+        else:
+            env.pop("ARGUS_S8_ALLOW_INSECURE_CHECKPOINT_SIGNER", None)
         env.pop("ARGUS_S8_CHECKPOINT_SIGNING_KEY", None)
         env.pop("ARGUS_S8_CHECKPOINT_SIGNER_KEY_ID", None)
         if self._db_role:
@@ -604,6 +613,29 @@ def _rust_ledger_writer_from_env(
         db_role=db_role,
         checkpoint_signer_url=_required_env(env, "ARGUS_S8_CHECKPOINT_SIGNER_URL"),
         checkpoint_signer_auth_token=_required_env(env, "ARGUS_S8_CHECKPOINT_SIGNER_AUTH_TOKEN"),
+        allow_insecure_checkpoint_signer=_env_flag(env.get("ARGUS_S8_ALLOW_INSECURE_CHECKPOINT_SIGNER")),
+    )
+
+
+def _env_flag(value: str | None) -> bool:
+    return value is not None and value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _checkpoint_signer_kind(url: str, *, allow_insecure_checkpoint_signer: bool) -> str:
+    if url.startswith("http://"):
+        if allow_insecure_checkpoint_signer:
+            return "s10-http-insecure-local"
+        raise RuntimeError(
+            "ARGUS_S8_ALLOW_INSECURE_CHECKPOINT_SIGNER=1 is required for http:// checkpoint signer URLs"
+        )
+    if url.startswith("https://"):
+        raise RuntimeError(
+            "https:// checkpoint signer URLs require a TLS/mTLS-capable Rust ledger writer; "
+            "the current writer only permits explicit local http:// overrides"
+        )
+    raise RuntimeError(
+        "ARGUS_S8_CHECKPOINT_SIGNER_URL must use https://, or http:// only with "
+        "ARGUS_S8_ALLOW_INSECURE_CHECKPOINT_SIGNER=1 for local M0"
     )
 
 

@@ -151,6 +151,7 @@ class ArgusM0RuntimeServiceTests(unittest.TestCase):
             "json.load(sys.stdin);"
             "assert os.environ['ARGUS_S8_CHECKPOINT_SIGNER_URL'] == 'http://s10/sign';"
             "assert os.environ['ARGUS_S8_CHECKPOINT_SIGNER_AUTH_TOKEN'] == 'signer-token';"
+            "assert os.environ['ARGUS_S8_ALLOW_INSECURE_CHECKPOINT_SIGNER'] == '1';"
             "assert 'ARGUS_S8_CHECKPOINT_SIGNING_KEY' not in os.environ;"
             "assert 'ARGUS_S8_CHECKPOINT_SIGNER_KEY_ID' not in os.environ;"
             "print('{\"status\":\"ok\",\"checkpoint\":null}')"
@@ -161,6 +162,7 @@ class ArgusM0RuntimeServiceTests(unittest.TestCase):
             db_role="argus_s8_ledger_writer",
             checkpoint_signer_url="http://s10/sign",
             checkpoint_signer_auth_token="signer-token",
+            allow_insecure_checkpoint_signer=True,
         )
         record = ArtifactRecord(
             artifact_ref="c4://s8/signer-env",
@@ -174,8 +176,18 @@ class ArgusM0RuntimeServiceTests(unittest.TestCase):
 
         result = writer.commit_record(record)
 
-        self.assertEqual(writer.checkpoint_signer_kind, "s10-http")
+        self.assertEqual(writer.checkpoint_signer_kind, "s10-http-insecure-local")
         self.assertEqual(result, {"status": "ok", "checkpoint": None})
+
+    def test_subprocess_rust_ledger_writer_rejects_plain_http_without_local_override(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "ARGUS_S8_ALLOW_INSECURE_CHECKPOINT_SIGNER=1"):
+            SubprocessRustLedgerWriter(
+                command=["python3", "-c", "raise SystemExit('must not run')"],
+                dsn="postgresql://argus@example/argus",
+                db_role="argus_s8_ledger_writer",
+                checkpoint_signer_url="http://s10/sign",
+                checkpoint_signer_auth_token="signer-token",
+            )
 
     def test_s8_postgres_env_requires_rust_ledger_writer(self) -> None:
         with self.assertRaisesRegex(RuntimeError, "ARGUS_S8_RUST_LEDGER_WRITER_CMD"):
@@ -184,6 +196,27 @@ class ArgusM0RuntimeServiceTests(unittest.TestCase):
                 dsn="postgresql://argus@example/argus",
                 db_role=None,
             )
+        with self.assertRaisesRegex(RuntimeError, "ARGUS_S8_ALLOW_INSECURE_CHECKPOINT_SIGNER=1"):
+            _rust_ledger_writer_from_env(
+                {
+                    "ARGUS_S8_RUST_LEDGER_WRITER_CMD": "argus-s8-ledger-writer",
+                    "ARGUS_S8_CHECKPOINT_SIGNER_URL": "http://s10/sign",
+                    "ARGUS_S8_CHECKPOINT_SIGNER_AUTH_TOKEN": "signer-token",
+                },
+                dsn="postgresql://argus@example/argus",
+                db_role=None,
+            )
+        writer = _rust_ledger_writer_from_env(
+            {
+                "ARGUS_S8_RUST_LEDGER_WRITER_CMD": "argus-s8-ledger-writer",
+                "ARGUS_S8_CHECKPOINT_SIGNER_URL": "http://s10/sign",
+                "ARGUS_S8_CHECKPOINT_SIGNER_AUTH_TOKEN": "signer-token",
+                "ARGUS_S8_ALLOW_INSECURE_CHECKPOINT_SIGNER": "1",
+            },
+            dsn="postgresql://argus@example/argus",
+            db_role=None,
+        )
+        self.assertEqual(writer.checkpoint_signer_kind, "s10-http-insecure-local")
         with self.assertRaisesRegex(RuntimeError, "ARGUS_S8_CHECKPOINT_SIGNER_URL"):
             _rust_ledger_writer_from_env(
                 {
@@ -1069,6 +1102,10 @@ class ArgusM0ComposeTests(unittest.TestCase):
         self.assertEqual(
             services["s8-writer"]["environment"]["ARGUS_S8_CHECKPOINT_SIGNER_AUTH_TOKEN"],
             CHECKPOINT_SIGNER_AUTH_TOKEN,
+        )
+        self.assertEqual(
+            services["s8-writer"]["environment"]["ARGUS_S8_ALLOW_INSECURE_CHECKPOINT_SIGNER"],
+            "1",
         )
         self.assertNotIn("ARGUS_S8_CHECKPOINT_SIGNING_KEY", services["s8-writer"]["environment"])
         self.assertNotIn("ARGUS_S8_CHECKPOINT_SIGNER_KEY_ID", services["s8-writer"]["environment"])

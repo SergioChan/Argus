@@ -497,8 +497,8 @@ def _battery_runtime_auth_required(
         raise AssertionError(f"unexpected health payloads: s8={s8_health}, s10={s10_health}")
     if s8_health.get("ledger_writer") != "rust-subprocess":
         raise AssertionError(f"S8 did not activate the Rust ledger writer boundary: {s8_health}")
-    if s8_health.get("checkpoint_signer") != "s10-http":
-        raise AssertionError(f"S8 did not delegate checkpoint signing to S10: {s8_health}")
+    if s8_health.get("checkpoint_signer") != "s10-http-insecure-local":
+        raise AssertionError(f"S8 did not declare the local checkpoint signer transport policy: {s8_health}")
     if s8_health.get("report_verifier") != "argusverify":
         raise AssertionError(f"S8 did not activate the C3 report verifier: {s8_health}")
     if s10_health.get("checkpoint_signer") != "s10-kms":
@@ -512,6 +512,7 @@ def _battery_runtime_auth_required(
             "s8_health": s8_health["status"],
             "s8_ledger_writer": s8_health["ledger_writer"],
             "s8_checkpoint_signer": s8_health["checkpoint_signer"],
+            "s8_checkpoint_signer_transport_policy": "explicit-local-insecure-override",
             "s8_report_verifier": s8_health["report_verifier"],
             "s10_health": s10_health["status"],
             "s10_checkpoint_signer": s10_health["checkpoint_signer"],

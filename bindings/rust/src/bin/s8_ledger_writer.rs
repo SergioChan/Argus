@@ -102,9 +102,22 @@ impl HttpCheckpointSigner {
 
 fn checkpoint_signer_from_env() -> Result<HttpCheckpointSigner, Box<dyn Error>> {
     Ok(HttpCheckpointSigner {
-        endpoint: HttpEndpoint::parse(&required_env("ARGUS_S8_CHECKPOINT_SIGNER_URL")?)?,
+        endpoint: HttpEndpoint::parse(
+            &required_env("ARGUS_S8_CHECKPOINT_SIGNER_URL")?,
+            env_flag("ARGUS_S8_ALLOW_INSECURE_CHECKPOINT_SIGNER"),
+        )?,
         auth_token: required_env("ARGUS_S8_CHECKPOINT_SIGNER_AUTH_TOKEN")?,
     })
+}
+
+fn env_flag(name: &str) -> bool {
+    match env::var(name) {
+        Ok(value) => matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        ),
+        Err(_) => false,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -115,10 +128,21 @@ struct HttpEndpoint {
 }
 
 impl HttpEndpoint {
-    fn parse(url: &str) -> Result<Self, Box<dyn Error>> {
+    fn parse(url: &str, allow_insecure: bool) -> Result<Self, Box<dyn Error>> {
+        if url.starts_with("https://") {
+            return Err(
+                "https:// checkpoint signer URLs require a TLS/mTLS-capable ledger writer".into(),
+            );
+        }
         let rest = url
             .strip_prefix("http://")
-            .ok_or("checkpoint signer URL must use http://")?;
+            .ok_or("checkpoint signer URL must use https://, or http:// with ARGUS_S8_ALLOW_INSECURE_CHECKPOINT_SIGNER=1 for local M0")?;
+        if !allow_insecure {
+            return Err(
+                "ARGUS_S8_ALLOW_INSECURE_CHECKPOINT_SIGNER=1 is required for http:// checkpoint signer URLs"
+                    .into(),
+            );
+        }
         let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
         if authority.is_empty() {
             return Err("checkpoint signer URL host is required".into());
@@ -220,9 +244,36 @@ mod tests {
     use std::thread;
 
     #[test]
-    fn http_endpoint_parses_compose_service_url() -> Result<(), Box<dyn Error>> {
-        let endpoint =
-            HttpEndpoint::parse("http://s10-supervisor:8080/v1/internal/s8-checkpoint-signatures")?;
+    fn http_endpoint_rejects_insecure_url_without_local_override() {
+        let error = HttpEndpoint::parse(
+            "http://s10-supervisor:8080/v1/internal/s8-checkpoint-signatures",
+            false,
+        )
+        .expect_err("plain HTTP requires an explicit local override");
+
+        assert!(error
+            .to_string()
+            .contains("ARGUS_S8_ALLOW_INSECURE_CHECKPOINT_SIGNER=1"));
+    }
+
+    #[test]
+    fn http_endpoint_rejects_https_until_tls_writer_exists() {
+        let error = HttpEndpoint::parse(
+            "https://s10-supervisor/v1/internal/s8-checkpoint-signatures",
+            false,
+        )
+        .expect_err("this writer must not silently pretend to support TLS");
+
+        assert!(error.to_string().contains("TLS/mTLS-capable ledger writer"));
+    }
+
+    #[test]
+    fn http_endpoint_parses_compose_service_url_with_local_override() -> Result<(), Box<dyn Error>>
+    {
+        let endpoint = HttpEndpoint::parse(
+            "http://s10-supervisor:8080/v1/internal/s8-checkpoint-signatures",
+            true,
+        )?;
 
         assert_eq!(endpoint.host, "s10-supervisor");
         assert_eq!(endpoint.port, 8080);
@@ -260,7 +311,7 @@ mod tests {
                 .expect("write response");
         });
         let signer = HttpCheckpointSigner {
-            endpoint: HttpEndpoint::parse(&format!("http://127.0.0.1:{port}/sign"))?,
+            endpoint: HttpEndpoint::parse(&format!("http://127.0.0.1:{port}/sign"), true)?,
             auth_token: "signer-token".to_string(),
         };
 
