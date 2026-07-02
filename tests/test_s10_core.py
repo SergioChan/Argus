@@ -385,6 +385,7 @@ class S10OrchestratorAndAuditTests(unittest.TestCase):
         self.assertEqual(payload["exec_environment_digest"], exec_environment_digest)
         self.assertEqual(exec_environment["image_digest"], request.image)
         self.assertEqual(exec_environment["runtime_class"], "gvisor")
+        self.assertEqual(exec_environment["runtime_user"], "65532:65532")
         self.assertEqual(exec_environment["cgroup_limits"], asdict(request.requested_envelope))
         self.assertEqual(exec_environment["egress_acl"], [asdict(EgressRule("store.local", 443, "https"))])
         self.assertNotIn("seccomp_profile_hash", exec_environment)
@@ -521,7 +522,7 @@ class S10DockerSupervisorTests(unittest.TestCase):
     def test_launches_digest_pinned_container_with_no_network_route(self) -> None:
         request = self._launch_request(
             entrypoint=("/bin/sh",),
-            args=("-c", "cat /proc/net/route; printf '\\nARGUS_SAFE=%s\\n' \"$ARGUS_SAFE\""),
+            args=("-c", "cat /proc/net/route; printf '\\nARGUS_UID=%s\\nARGUS_SAFE=%s\\n' \"$(id -u)\" \"$ARGUS_SAFE\""),
             env={"ARGUS_SAFE": "visible", "ARGUS_SECRET": "hidden"},
             env_allowlist=("ARGUS_SAFE",),
             wallclock_s=5,
@@ -536,6 +537,7 @@ class S10DockerSupervisorTests(unittest.TestCase):
 
         self.assertFalse(result.timed_out)
         self.assertEqual(result.exit_code, 0, result.stderr)
+        self.assertIn("ARGUS_UID=65532", result.stdout)
         self.assertIn("ARGUS_SAFE=visible", result.stdout)
         self.assertNotIn("hidden", result.stdout)
         self.assertFalse(_has_default_route(result.stdout), result.stdout)
@@ -681,7 +683,7 @@ class S10DockerOrchestratorTests(unittest.TestCase):
 
     def test_admission_launches_real_container_and_records_final_state(self) -> None:
         request = self._launch_request(
-            args=("-c", "cat /proc/net/route; printf '\\nARGUS_SAFE=%s\\n' \"$ARGUS_SAFE\""),
+            args=("-c", "cat /proc/net/route; printf '\\nARGUS_UID=%s\\nARGUS_SAFE=%s\\n' \"$(id -u)\" \"$ARGUS_SAFE\""),
             env={"ARGUS_SAFE": "visible", "ARGUS_SECRET": "hidden"},
             env_allowlist=("ARGUS_SAFE",),
             wallclock_s=5,
@@ -692,6 +694,7 @@ class S10DockerOrchestratorTests(unittest.TestCase):
         self.assertEqual(result.handle.state, "SUCCEEDED", result.stderr)
         self.assertEqual(result.exit_code, 0, result.stderr)
         self.assertEqual(self.orchestrator.get(result.handle.sandbox_id).state, "SUCCEEDED")
+        self.assertIn("ARGUS_UID=65532", result.stdout)
         self.assertIn("ARGUS_SAFE=visible", result.stdout)
         self.assertNotIn("hidden", result.stdout)
         self.assertFalse(_has_default_route(result.stdout), result.stdout)
@@ -700,6 +703,7 @@ class S10DockerOrchestratorTests(unittest.TestCase):
         provenance_payload = json.loads(self.artifacts.get_artifact(provenance_ref).decode("utf-8"))
         self.assertEqual(provenance_record.kind, "container")
         self.assertEqual(provenance_payload["exec_environment"]["runtime_class"], "docker")
+        self.assertEqual(provenance_payload["exec_environment"]["runtime_user"], "65532:65532")
         self.assertNotIn("seccomp_profile_hash", provenance_payload["exec_environment"])
         self.assertFalse(hasattr(result.handle, "seccomp_profile_hash"))
         self.assertEqual(

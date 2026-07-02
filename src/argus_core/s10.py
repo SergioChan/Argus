@@ -19,6 +19,7 @@ from .s8 import ArtifactRecord, InMemoryArtifactStore, Lineage, Producer
 
 
 SIGNATURE_PREFIX = "hmac-sha256:"
+DOCKER_SANDBOX_USER = "65532:65532"
 SECRET_VALUE_PATTERNS = (
     re.compile(r"-----BEGIN [A-Z ]+PRIVATE KEY-----"),
     re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
@@ -917,6 +918,8 @@ class DockerSandboxSupervisor:
             "ALL",
             "--security-opt",
             "no-new-privileges",
+            "--user",
+            DOCKER_SANDBOX_USER,
             "--pids-limit",
             str(max(envelope.pids, 1)),
             "--memory",
@@ -1063,6 +1066,7 @@ def _launch_exec_environment(
     return {
         "image_digest": request.image,
         "runtime_class": verdict.runtime_class or "gvisor",
+        "runtime_user": DOCKER_SANDBOX_USER,
         "entrypoint": list(request.entrypoint),
         "args": list(request.args),
         "env_allowlist": sorted(request.env_allowlist),
