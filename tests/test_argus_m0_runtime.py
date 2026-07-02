@@ -15,11 +15,14 @@ from unittest.mock import patch
 from argus_core import (
     ArtifactRecord,
     BudgetCaps,
+    BudgetUsage,
+    DockerSandboxSupervisor,
     BudgetToken,
     FileSystemArtifactStore,
     InMemoryS10KmsCheckpointSigner,
     Lineage,
     Producer,
+    SandboxExecutionResult,
     ScopeGrant,
     ScopeToken,
 )
@@ -733,6 +736,73 @@ class ArgusM0RuntimeServiceTests(unittest.TestCase):
         self.assertEqual(scope["job_id"], "job-launch")
         self.assertEqual(scope["scopes"]["producer_subsystems"], ("S2",))
 
+    def test_s10_http_launches_sandbox_through_authenticated_daemon_route(self) -> None:
+        supervisor = _SuccessfulSupervisor()
+        app = S10SupervisorApp(signing_key=b"test-key", auth=_runtime_auth(), docker_supervisor=supervisor)
+        launch = _launch_body(app)
+
+        status, payload = app.http.handle(
+            JsonRequest(
+                method="POST",
+                path="/v1/sandboxes:launch",
+                query={},
+                body=launch,
+                headers=_auth_headers(),
+            )
+        )
+
+        self.assertEqual(status, 201)
+        self.assertEqual(payload["handle"]["state"], "SUCCEEDED")
+        self.assertEqual(payload["handle"]["job_id"], "job-auth")
+        self.assertIsNotNone(payload["handle"]["launch_provenance_ref"])
+        self.assertIn("no-default-route", payload["stdout"])
+        self.assertEqual(supervisor.calls[0]["materialized_env"], {"VISIBLE": "ok"})
+        provenance = app.artifacts.get_record(payload["handle"]["launch_provenance_ref"])
+        self.assertEqual(provenance.producer.subsystem, "S10")
+        self.assertEqual(provenance.producer.job_id, "job-auth")
+        self.assertIn("sandbox.started", [event.event_type for event in app.audit.events()])
+
+    def test_s10_http_launch_rejects_identity_bound_job_override(self) -> None:
+        supervisor = _SuccessfulSupervisor()
+        app = S10SupervisorApp(signing_key=b"test-key", auth=_runtime_auth(), docker_supervisor=supervisor)
+        launch = {**_launch_body(app), "job_id": "attacker-job"}
+
+        status, payload = app.http.handle(
+            JsonRequest(
+                method="POST",
+                path="/v1/sandboxes:launch",
+                query={},
+                body=launch,
+                headers=_auth_headers(),
+            )
+        )
+
+        self.assertEqual(status, 403)
+        self.assertEqual(payload["error"], "PermissionError")
+        self.assertIn("launch job_id", payload["message"])
+        self.assertEqual(supervisor.calls, [])
+
+    def test_s10_http_launch_budget_halt_returns_audit_and_provenance(self) -> None:
+        supervisor = _SuccessfulSupervisor(usage=BudgetUsage(compute_units=11, wallclock_s=1))
+        app = S10SupervisorApp(signing_key=b"test-key", auth=_runtime_auth(), docker_supervisor=supervisor)
+        launch = _launch_body(app)
+
+        status, payload = app.http.handle(
+            JsonRequest(
+                method="POST",
+                path="/v1/sandboxes:launch",
+                query={},
+                body=launch,
+                headers=_auth_headers(),
+            )
+        )
+
+        self.assertEqual(status, 403)
+        self.assertEqual(payload["error"], "BudgetExceededError")
+        self.assertEqual(payload["handle"]["state"], "BUDGET_HALTED")
+        self.assertIsNotNone(payload["handle"]["launch_provenance_ref"])
+        self.assertIn("budget.halt", payload["audit_events"])
+
     def test_s10_runtime_identity_mint_policy_rejects_overrides_unknown_callers_and_ttl_widening(self) -> None:
         app = S10SupervisorApp(
             signing_key=b"test-key",
@@ -1160,7 +1230,10 @@ class ArgusM0ComposeTests(unittest.TestCase):
             services["s10-supervisor"]["environment"]["ARGUS_S10_CHECKPOINT_SIGNER_AUTH_TOKEN"],
             CHECKPOINT_SIGNER_AUTH_TOKEN,
         )
-        self.assertNotIn("volumes", services["s10-supervisor"])
+        s10_volumes = services["s10-supervisor"].get("volumes", [])
+        self.assertEqual(len(s10_volumes), 1)
+        self.assertEqual(s10_volumes[0]["target"], "/var/run/docker.sock")
+        self.assertEqual(s10_volumes[0]["source"], "/var/run/docker.sock")
         self.assertNotIn("s8-data", rendered["volumes"])
         self.assertIn("postgres-data", rendered["volumes"])
         self.assertIn("minio-data", rendered["volumes"])
@@ -1254,6 +1327,64 @@ def _runtime_identity_mint_policy_json() -> str:
         separators=(",", ":"),
         sort_keys=True,
     )
+
+
+class _SuccessfulSupervisor(DockerSandboxSupervisor):
+    def __init__(
+        self,
+        *,
+        usage: BudgetUsage | None = None,
+        stdout: str = "Iface Destination Gateway\\nno-default-route\\nARGUS_UID=65532\\nVISIBLE=ok\\n",
+    ) -> None:
+        self.calls: list[dict[str, object]] = []
+        self._usage = usage or BudgetUsage(wallclock_s=0.1)
+        self._stdout = stdout
+
+    def run(self, *, handle, request, materialized_env):  # type: ignore[no-untyped-def]
+        self.calls.append({"handle": handle, "request": request, "materialized_env": dict(materialized_env)})
+        return SandboxExecutionResult(
+            handle=handle,
+            exit_code=0,
+            stdout=self._stdout,
+            stderr="",
+            timed_out=False,
+            duration_s=max(self._usage.wallclock_s, 0.1),
+            budget_usage=self._usage,
+        )
+
+
+def _launch_body(app: S10SupervisorApp) -> dict[str, object]:
+    budget_status, budget = app.http.handle(
+        JsonRequest(method="POST", path="/v1/budget-tokens", query={}, body={}, headers=_auth_headers())
+    )
+    scope_status, scope = app.http.handle(
+        JsonRequest(method="POST", path="/v1/scope-tokens", query={}, body={}, headers=_auth_headers())
+    )
+    if budget_status != 201 or scope_status != 201:
+        raise AssertionError(f"failed to mint launch tokens: {budget_status=} {scope_status=}")
+    return {
+        "job_id": "job-auth",
+        "subagent_id": "subagent-http",
+        "trace_id": "trace-http",
+        "budget_token": budget,
+        "scope_token": scope,
+        "image": "busybox@sha256:73aaf090f3d85aa34ee199857f03fa3a95c8ede2ffd4cc2cdb5b94e566b11662",
+        "entrypoint": ["/bin/sh"],
+        "args": ["-c", "echo no-default-route"],
+        "env": {"VISIBLE": "ok", "SECRET_TOKEN": "hidden"},
+        "env_allowlist": ["VISIBLE"],
+        "requested_envelope": {
+            "cpu_m": 500,
+            "mem_bytes": 64 * 1024 * 1024,
+            "gpu_count": 0,
+            "wallclock_s": 1,
+            "scratch_bytes": 1024 * 1024,
+            "pids": 16,
+            "estimated_cost_usd": 0,
+        },
+        "runtime_class_hint": "auto",
+        "policy_pin": None,
+    }
 
 
 def _auth_headers(token: str = AUTH_TOKEN) -> dict[str, str]:

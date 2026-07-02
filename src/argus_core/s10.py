@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import http.client as http_client
 import hmac
+import json
+import os
 import re
 import shutil
+import socket
 import subprocess
 import time
 from dataclasses import asdict, dataclass, replace
@@ -1203,6 +1207,8 @@ class DockerSandboxSupervisor:
         if not request.entrypoint:
             raise PolicyDeniedError("entrypoint is required")
         if shutil.which(self._docker_bin) is None and "/" not in self._docker_bin:
+            if os.path.exists("/var/run/docker.sock"):
+                return self._run_via_docker_api(handle=handle, request=request, materialized_env=materialized_env)
             raise SandboxRuntimeUnavailableError("docker runtime is unavailable")
 
         container_name = f"argus-{handle.sandbox_id.replace('-', '')[:24]}"
@@ -1283,6 +1289,170 @@ class DockerSandboxSupervisor:
             capture_output=True,
             text=True,
         )
+
+    def _run_via_docker_api(
+        self,
+        *,
+        handle: SandboxHandle,
+        request: LaunchRequest,
+        materialized_env: dict[str, str],
+    ) -> SandboxExecutionResult:
+        container_name = f"argus-{handle.sandbox_id.replace('-', '')[:24]}"
+        envelope = request.requested_envelope
+        container_id: str | None = None
+        started_at = time.monotonic()
+        try:
+            create_response = self._docker_api_request(
+                "POST",
+                f"/containers/create?name={container_name}",
+                {
+                    "Image": request.image,
+                    "Entrypoint": [request.entrypoint[0]],
+                    "Cmd": list(request.entrypoint[1:]) + list(request.args),
+                    "Env": [f"{key}={value}" for key, value in sorted(materialized_env.items())],
+                    "User": DOCKER_SANDBOX_USER,
+                    "NetworkDisabled": True,
+                    "HostConfig": {
+                        "AutoRemove": False,
+                        "ReadonlyRootfs": True,
+                        "CapDrop": ["ALL"],
+                        "SecurityOpt": ["no-new-privileges"],
+                        "NetworkMode": "none",
+                        "PidsLimit": max(envelope.pids, 1),
+                        "Memory": max(envelope.mem_bytes, 4 * 1024 * 1024),
+                        "NanoCpus": max(envelope.cpu_m, 1) * 1_000_000,
+                        "Tmpfs": {
+                            "/tmp": f"rw,noexec,nosuid,nodev,size={max(envelope.scratch_bytes, 1024 * 1024)}"
+                        },
+                    },
+                },
+                expected=(201,),
+            )
+            container_id = str(create_response.get("Id") or "")
+            if not container_id:
+                raise SandboxRuntimeUnavailableError("docker runtime did not return a container id")
+            self._docker_api_request("POST", f"/containers/{container_id}/start", expected=(204, 304))
+            try:
+                wait_response = self._docker_api_request(
+                    "POST",
+                    f"/containers/{container_id}/wait",
+                    expected=(200,),
+                    timeout=max(envelope.wallclock_s, 1) + 1,
+                )
+            except TimeoutError:
+                self._docker_api_request("POST", f"/containers/{container_id}/kill", expected=(204, 304, 404, 409))
+                stdout, stderr = self._docker_api_logs(container_id)
+                duration_s = time.monotonic() - started_at
+                return SandboxExecutionResult(
+                    handle=handle,
+                    exit_code=None,
+                    stdout=stdout,
+                    stderr=stderr,
+                    timed_out=True,
+                    duration_s=duration_s,
+                    budget_usage=_runtime_budget_usage(envelope, duration_s),
+                )
+            stdout, stderr = self._docker_api_logs(container_id)
+            duration_s = time.monotonic() - started_at
+            return SandboxExecutionResult(
+                handle=handle,
+                exit_code=int(wait_response.get("StatusCode", 1)),
+                stdout=stdout,
+                stderr=stderr,
+                timed_out=False,
+                duration_s=duration_s,
+                budget_usage=_runtime_budget_usage(envelope, duration_s),
+            )
+        finally:
+            if container_id:
+                self._docker_api_request("DELETE", f"/containers/{container_id}?force=true", expected=(204, 404))
+
+    def _docker_api_logs(self, container_id: str) -> tuple[str, str]:
+        raw = self._docker_api_request_bytes(
+            "GET",
+            f"/containers/{container_id}/logs?stdout=1&stderr=1",
+            expected=(200,),
+        )
+        stdout, stderr = _split_docker_log_stream(raw)
+        return stdout.decode("utf-8", errors="replace"), stderr.decode("utf-8", errors="replace")
+
+    def _docker_api_request(
+        self,
+        method: str,
+        path: str,
+        body: dict[str, Any] | None = None,
+        *,
+        expected: tuple[int, ...],
+        timeout: float = 10,
+    ) -> dict[str, Any]:
+        raw = self._docker_api_request_bytes(method, path, body, expected=expected, timeout=timeout)
+        if not raw:
+            return {}
+        return json.loads(raw.decode("utf-8"))
+
+    def _docker_api_request_bytes(
+        self,
+        method: str,
+        path: str,
+        body: dict[str, Any] | None = None,
+        *,
+        expected: tuple[int, ...],
+        timeout: float = 10,
+    ) -> bytes:
+        encoded = None if body is None else json.dumps(body, sort_keys=True).encode("utf-8")
+        connection = _UnixSocketHTTPConnection("/var/run/docker.sock", timeout=timeout)
+        try:
+            connection.request(
+                method,
+                path,
+                body=encoded,
+                headers={"Content-Type": "application/json"} if encoded is not None else {},
+            )
+            response = connection.getresponse()
+            payload = response.read()
+        except socket.timeout as exc:
+            raise TimeoutError("docker API request timed out") from exc
+        except OSError as exc:
+            raise SandboxRuntimeUnavailableError("docker runtime is unavailable") from exc
+        finally:
+            connection.close()
+        if response.status not in expected:
+            message = payload.decode("utf-8", errors="replace")
+            raise SandboxRuntimeUnavailableError(f"docker API {method} {path} returned {response.status}: {message}")
+        return payload
+
+
+class _UnixSocketHTTPConnection(http_client.HTTPConnection):
+    def __init__(self, socket_path: str, *, timeout: float) -> None:
+        super().__init__("localhost", timeout=timeout)
+        self._socket_path = socket_path
+
+    def connect(self) -> None:
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.settimeout(self.timeout)
+        sock.connect(self._socket_path)
+        self.sock = sock
+
+
+def _split_docker_log_stream(raw: bytes) -> tuple[bytes, bytes]:
+    stdout = bytearray()
+    stderr = bytearray()
+    index = 0
+    while index + 8 <= len(raw):
+        stream_type = raw[index]
+        size = int.from_bytes(raw[index + 4 : index + 8], "big")
+        index += 8
+        if index + size > len(raw):
+            return raw, b""
+        chunk = raw[index : index + size]
+        index += size
+        if stream_type == 2:
+            stderr.extend(chunk)
+        else:
+            stdout.extend(chunk)
+    if index != len(raw):
+        return raw, b""
+    return bytes(stdout), bytes(stderr)
 
 
 class InMemorySandboxOrchestrator:
@@ -1400,12 +1570,13 @@ class InMemorySandboxOrchestrator:
         record = self._artifact_store.create_artifact(
             kind="container",
             payload=payload,
-            producer=Producer(subsystem="S10", version=policy_bundle.bundle_version),
+            producer=Producer(subsystem="S10", version=policy_bundle.bundle_version, job_id=request.job_id),
             lineage=Lineage(
                 input_refs=(),
                 code_ref=request.image,
                 environment_digest=exec_environment_digest,
                 seeds=(request.trace_id,),
+                job_id=request.job_id,
             ),
         )
         return record.artifact_ref

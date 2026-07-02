@@ -97,6 +97,8 @@ services:
       ARGUS_M0_HEALTH_TOKEN: ${ARGUS_M0_HEALTH_TOKEN:?ARGUS_M0_HEALTH_TOKEN is required}
     ports:
       - "127.0.0.1:${ARGUS_M0_S10_PORT:-58081}:8080"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
     depends_on:
       s8-writer:
         condition: service_healthy

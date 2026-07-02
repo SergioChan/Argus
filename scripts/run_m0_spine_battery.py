@@ -27,14 +27,8 @@ sys.path.insert(0, str(ROOT / "src"))
 from argus_core import (
     ArtifactRecord,
     BudgetCaps,
-    BudgetExceededError,
-    BudgetToken,
-    DockerSandboxOrchestrator,
-    EgressRule,
-    InMemoryAuditLedger,
     InMemoryPolicyBundleTrustStore,
     InMemoryPolicyService,
-    InMemoryQuotaLedger,
     InMemoryTokenService,
     LaunchEnvelope,
     LaunchRequest,
@@ -45,8 +39,6 @@ from argus_core import (
     Producer,
     ResourceCeilings,
     ScopeGrant,
-    ScopeToken,
-    canonical_json_bytes,
     hash_json,
     s8_checkpoint_signature_payload,
 )
@@ -176,13 +168,12 @@ def main() -> int:
         )
         launch_result = _run_no_network_launch(
             image=args.image,
-            budget=_budget_token_from_json(budget_json),
-            scope=_scope_token_from_json(scope_json),
+            budget=budget_json,
+            scope=scope_json,
+            s10_url=s10_url,
+            token=auth_tokens["spine"],
             s8_url=s8_url,
-            s8_broker_write_key=runtime_secrets["s8_broker_write_key"].encode("utf-8"),
             read_token=auth_tokens["read"],
-            signing_key=runtime_secrets["s10_signing_key"].encode("utf-8"),
-            policy_signing_key=runtime_secrets["s10_policy_signing_key"].encode("utf-8"),
         )
         model_record = _post_json(
             f"{s10_url}/v1/store/artifacts",
@@ -284,9 +275,6 @@ def main() -> int:
             s8_url,
             token=auth_tokens["halt"],
             read_token=auth_tokens["read"],
-            s8_broker_write_key=runtime_secrets["s8_broker_write_key"].encode("utf-8"),
-            signing_key=runtime_secrets["s10_signing_key"].encode("utf-8"),
-            policy_signing_key=runtime_secrets["s10_policy_signing_key"].encode("utf-8"),
         )
         _battery_g_argusverify(evidence)
         _battery_real_persistence(
@@ -751,56 +739,6 @@ def _battery_deployed_report_verifier(
     )
 
 
-class S8InternalArtifactStoreClient:
-    def __init__(
-        self,
-        *,
-        s8_url: str,
-        broker_write_key: bytes,
-        scope_job_id: str,
-        producer_subsystems: tuple[str, ...],
-    ) -> None:
-        self._s8_url = s8_url.rstrip("/")
-        self._broker_write_key = broker_write_key
-        self._scope_job_id = scope_job_id
-        self._producer_subsystems = producer_subsystems
-
-    def create_artifact(
-        self,
-        *,
-        kind: str,
-        payload: Any,
-        producer: Producer,
-        lineage: Lineage,
-        artifact_ref: str | None = None,
-        claim_tier: str = "ran-toy",
-        validation_report_ref: str | None = None,
-    ) -> ArtifactRecord:
-        sealed_producer = replace(producer, job_id=producer.job_id or self._scope_job_id)
-        sealed_lineage = replace(lineage, job_id=lineage.job_id or self._scope_job_id)
-        body = {
-            "authorization": {
-                "audience": "store",
-                "scope_job_id": self._scope_job_id,
-                "producer_subsystems": list(self._producer_subsystems),
-            },
-            "kind": kind,
-            "payload": payload,
-            "producer": asdict(sealed_producer),
-            "lineage": asdict(sealed_lineage),
-            "artifact_ref": artifact_ref,
-            "claim_tier": claim_tier,
-            "validation_report_ref": validation_report_ref,
-        }
-        response = _post_json(
-            f"{self._s8_url}/v1/internal/brokered-artifacts",
-            body,
-            expected_status=201,
-            headers=_broker_write_headers(body, self._broker_write_key),
-        )
-        return _artifact_record_from_json(response)
-
-
 def _battery_real_persistence(
     evidence: dict[str, Any],
     ports: dict[str, str],
@@ -1119,9 +1057,6 @@ def _battery_e_budget_halt(
     *,
     token: str,
     read_token: str,
-    s8_broker_write_key: bytes,
-    signing_key: bytes,
-    policy_signing_key: bytes,
 ) -> None:
     budget_json = _post_json(
         f"{s10_url}/v1/budget-tokens",
@@ -1135,57 +1070,33 @@ def _battery_e_budget_halt(
         expected_status=201,
         token=token,
     )
-    tokens = InMemoryTokenService(signing_key=signing_key)
-    quota = InMemoryQuotaLedger()
-    audit = InMemoryAuditLedger()
-    orchestrator = DockerSandboxOrchestrator(
-        token_service=tokens,
-        quota_ledger=quota,
-        audit_ledger=audit,
-        policy_service=_policy_service(policy_signing_key),
-        artifact_store=S8InternalArtifactStoreClient(
-            s8_url=s8_url,
-            broker_write_key=s8_broker_write_key,
-            scope_job_id="m0-budget-halt-job",
-            producer_subsystems=("S10",),
-        ),
-    )
-    request_obj = LaunchRequest(
+    launch_body = _launch_request_json(
         job_id="m0-budget-halt-job",
-        subagent_id="m0-subagent",
-        trace_id=f"trace-{uuid4()}",
-        budget_token=_budget_token_from_json(budget_json),
-        scope_token=_scope_token_from_json(scope_json),
         image=image,
-        entrypoint=("sh",),
+        budget=budget_json,
+        scope=scope_json,
         args=("-c", "sleep 2"),
         env={},
         env_allowlist=(),
-        requested_envelope=LaunchEnvelope(
-            cpu_m=1000,
-            mem_bytes=32 * 1024 * 1024,
-            gpu_count=0,
-            wallclock_s=1,
-            scratch_bytes=1024 * 1024,
-            pids=16,
-            estimated_cost_usd=0,
-        ),
+        wallclock_s=1,
     )
-    try:
-        orchestrator.launch_and_wait(request_obj)
-    except BudgetExceededError:
-        if request_obj.job_id != "m0-budget-halt-job":
-            raise AssertionError("budget halt request job changed")
-        events = [event.event_type for event in audit.events()]
-        if "budget.halt" not in events:
-            raise AssertionError("budget halt event missing")
-        handle = next(iter(orchestrator._handles.values()))
-        if handle.launch_provenance_ref is None:
-            raise AssertionError("budget halt launch provenance missing")
-        _get_json(f"{s8_url}/v1/artifacts/{handle.launch_provenance_ref}/record", token=read_token)
-        _record(evidence, "e", "sandbox ran past budget and was halted with audit evidence", {"events": events})
-        return
-    raise AssertionError("budget halt launch unexpectedly completed without BudgetExceededError")
+    response = _post_json(
+        f"{s10_url}/v1/sandboxes:launch",
+        launch_body,
+        expected_status=403,
+        token=token,
+    )
+    if response.get("error") != "BudgetExceededError":
+        raise AssertionError(f"budget halt did not fail with BudgetExceededError: {response}")
+    events = response.get("audit_events") or []
+    if "budget.halt" not in events:
+        raise AssertionError(f"budget halt event missing from deployed S10 response: {events}")
+    handle = response.get("handle") or {}
+    launch_provenance_ref = handle.get("launch_provenance_ref")
+    if not isinstance(launch_provenance_ref, str) or not launch_provenance_ref:
+        raise AssertionError("budget halt launch provenance missing")
+    _get_json(f"{s8_url}/v1/artifacts/{launch_provenance_ref}/record", token=read_token)
+    _record(evidence, "e", "sandbox ran past budget and was halted with audit evidence", {"events": events})
 
 
 def _battery_g_argusverify(evidence: dict[str, Any]) -> None:
@@ -1370,40 +1281,57 @@ def _policy_hint_request(
     )
 
 
+def _launch_request_json(
+    *,
+    job_id: str,
+    image: str,
+    budget: dict[str, Any],
+    scope: dict[str, Any],
+    args: tuple[str, ...],
+    env: dict[str, str],
+    env_allowlist: tuple[str, ...],
+    wallclock_s: int,
+) -> dict[str, Any]:
+    return {
+        "job_id": job_id,
+        "subagent_id": "m0-subagent",
+        "trace_id": f"trace-{uuid4()}",
+        "budget_token": budget,
+        "scope_token": scope,
+        "image": image,
+        "entrypoint": ["sh"],
+        "args": list(args),
+        "env": env,
+        "env_allowlist": list(env_allowlist),
+        "requested_envelope": {
+            "cpu_m": 1000,
+            "mem_bytes": 32 * 1024 * 1024,
+            "gpu_count": 0,
+            "wallclock_s": wallclock_s,
+            "scratch_bytes": 1024 * 1024,
+            "pids": 16,
+            "estimated_cost_usd": 0,
+        },
+        "runtime_class_hint": "auto",
+        "policy_pin": None,
+    }
+
+
 def _run_no_network_launch(
     *,
     image: str,
-    budget: BudgetToken,
-    scope: ScopeToken,
+    budget: dict[str, Any],
+    scope: dict[str, Any],
+    s10_url: str,
+    token: str,
     s8_url: str,
-    s8_broker_write_key: bytes,
     read_token: str,
-    signing_key: bytes,
-    policy_signing_key: bytes,
 ) -> dict[str, Any]:
-    tokens = InMemoryTokenService(signing_key=signing_key)
-    quota = InMemoryQuotaLedger()
-    audit = InMemoryAuditLedger()
-    orchestrator = DockerSandboxOrchestrator(
-        token_service=tokens,
-        quota_ledger=quota,
-        audit_ledger=audit,
-        policy_service=_policy_service(policy_signing_key),
-        artifact_store=S8InternalArtifactStoreClient(
-            s8_url=s8_url,
-            broker_write_key=s8_broker_write_key,
-            scope_job_id="m0-spine-job",
-            producer_subsystems=("S10",),
-        ),
-    )
-    launch = LaunchRequest(
+    launch = _launch_request_json(
         job_id="m0-spine-job",
-        subagent_id="m0-subagent",
-        trace_id=f"trace-{uuid4()}",
-        budget_token=budget,
-        scope_token=scope,
         image=image,
-        entrypoint=("sh",),
+        budget=budget,
+        scope=scope,
         args=(
             "-c",
             "cat /proc/net/route; "
@@ -1413,31 +1341,28 @@ def _run_no_network_launch(
         ),
         env={"VISIBLE": "ok", "HIDDEN": "no"},
         env_allowlist=("VISIBLE",),
-        requested_envelope=LaunchEnvelope(
-            cpu_m=1000,
-            mem_bytes=32 * 1024 * 1024,
-            gpu_count=0,
-            wallclock_s=5,
-            scratch_bytes=1024 * 1024,
-            pids=16,
-            estimated_cost_usd=0,
-        ),
+        wallclock_s=5,
     )
-    result = orchestrator.launch_and_wait(launch)
-    final_handle = result.handle
-    stored_handle = orchestrator.get(result.handle.sandbox_id)
-    if result.exit_code != 0 or "no-default-route" not in result.stdout or "HIDDEN" in result.stdout:
-        raise AssertionError(f"no-network sandbox launch failed: exit={result.exit_code} stdout={result.stdout!r}")
-    if stored_handle.launch_provenance_ref is None:
+    result = _post_json(
+        f"{s10_url}/v1/sandboxes:launch",
+        launch,
+        expected_status=201,
+        token=token,
+    )
+    handle = result["handle"]
+    stdout = str(result.get("stdout", ""))
+    if result.get("exit_code") != 0 or "no-default-route" not in stdout or "HIDDEN" in stdout:
+        raise AssertionError(f"no-network sandbox launch failed: exit={result.get('exit_code')} stdout={stdout!r}")
+    if not handle.get("launch_provenance_ref"):
         raise AssertionError("launch provenance ref missing")
-    payload = _get_json(f"{s8_url}/v1/artifacts/{stored_handle.launch_provenance_ref}/payload", token=read_token)
+    payload = _get_json(f"{s8_url}/v1/artifacts/{handle['launch_provenance_ref']}/payload", token=read_token)
     return {
-        "stdout": result.stdout,
-        "launch_provenance_ref": stored_handle.launch_provenance_ref,
+        "stdout": stdout,
+        "launch_provenance_ref": handle["launch_provenance_ref"],
         "exec_environment_digest": payload["exec_environment_digest"],
-        "audit_events": [event.event_type for event in audit.events()],
-        "state": stored_handle.state,
-        "runtime_class": final_handle.runtime_class,
+        "audit_events": result.get("audit_events", ()),
+        "state": handle["state"],
+        "runtime_class": handle["runtime_class"],
     }
 
 
@@ -1475,47 +1400,6 @@ def _policy_service(
     )
 
 
-def _budget_token_from_json(value: dict[str, Any]) -> BudgetToken:
-    return BudgetToken(
-        budget_id=value["budget_id"],
-        job_id=value["job_id"],
-        root_request_id=value["root_request_id"],
-        budget_epoch=int(value["budget_epoch"]),
-        caps=BudgetCaps(**dict(value["caps"])),
-        risk_class=value["risk_class"],
-        issued_at=int(value["issued_at"]),
-        expires_at=int(value["expires_at"]),
-        ttl_s=int(value["ttl_s"]),
-        parent_budget_id=value.get("parent_budget_id"),
-        signer_key_id=value["signer_key_id"],
-        signature=value["signature"],
-    )
-
-
-def _scope_token_from_json(value: dict[str, Any]) -> ScopeToken:
-    scopes = dict(value["scopes"])
-    return ScopeToken(
-        scope_id=value["scope_id"],
-        job_id=value["job_id"],
-        scopes=ScopeGrant(
-            allowed_adapters=tuple(scopes.get("allowed_adapters") or ()),
-            allowed_datasets=tuple(scopes.get("allowed_datasets") or ()),
-            egress_allowlist=tuple(EgressRule(**rule) for rule in scopes.get("egress_allowlist") or ()),
-            broker_audiences=tuple(scopes.get("broker_audiences") or ()),
-            capabilities=tuple(scopes.get("capabilities") or ()),
-            producer_subsystems=tuple(scopes.get("producer_subsystems") or ()),
-            sandbox_risk_class=scopes.get("sandbox_risk_class", "standard"),
-            disallowed_actions=tuple(scopes.get("disallowed_actions") or ()),
-        ),
-        issued_at=int(value["issued_at"]),
-        expires_at=int(value["expires_at"]),
-        ttl_s=int(value["ttl_s"]),
-        parent_scope_id=value.get("parent_scope_id"),
-        signer_key_id=value["signer_key_id"],
-        signature=value["signature"],
-    )
-
-
 def _post_json(
     url: str,
     body: dict[str, Any],
@@ -1538,11 +1422,6 @@ def _auth_headers(token: str | None) -> dict[str, str]:
     if token is None:
         return {}
     return {"Authorization": f"Bearer {token}"}
-
-
-def _broker_write_headers(body: dict[str, Any], broker_write_key: bytes) -> dict[str, str]:
-    digest = hmac.new(broker_write_key, canonical_json_bytes(body), sha256).hexdigest()
-    return {"X-Argus-Store-Write-Signature": f"hmac-sha256:{digest}"}
 
 
 def _artifact_record_from_json(value: dict[str, Any]) -> ArtifactRecord:

@@ -14,7 +14,11 @@ from urllib import error, request
 from argus_core import (
     ArtifactRecord,
     BudgetCaps,
+    BudgetExceededError,
+    BudgetToken,
     EgressRule,
+    DockerSandboxOrchestrator,
+    DockerSandboxSupervisor,
     FileSystemArtifactStore,
     InMemoryArtifactStore,
     InMemoryAuditLedger,
@@ -23,11 +27,15 @@ from argus_core import (
     InMemoryS10KmsCheckpointSigner,
     InMemoryQuotaLedger,
     InMemoryTokenService,
+    LaunchEnvelope,
+    LaunchRequest,
     Lineage,
     PolicyBundle,
     PolicyBundleSigner,
+    PolicyDeniedError,
     Producer,
     ResourceCeilings,
+    SandboxRuntimeUnavailableError,
     ScopeDeniedError,
     ScopeGrant,
     ScopeToken,
@@ -104,6 +112,7 @@ class S10SupervisorApp:
         policy_service: InMemoryPolicyService | None = None,
         checkpoint_signer: InMemoryS10KmsCheckpointSigner | None = None,
         checkpoint_signer_auth_token: str | None = None,
+        docker_supervisor: DockerSandboxSupervisor | None = None,
     ) -> None:
         self.tokens = InMemoryTokenService(signing_key=signing_key)
         self.quota = InMemoryQuotaLedger()
@@ -117,11 +126,13 @@ class S10SupervisorApp:
         self.policy = self.policy_service.active_bundle
         self.checkpoint_signer = checkpoint_signer
         self._checkpoint_signer_auth_token = checkpoint_signer_auth_token
+        self._docker_supervisor = docker_supervisor
         self.broker = StoreWriterBroker(
             token_service=self.tokens,
             artifact_store=self.artifacts,
             audit_ledger=self.audit,
         )
+        self._docker_orchestrator = self._build_docker_orchestrator()
         self.http = JsonHttpApp()
         self._register_routes()
 
@@ -215,6 +226,24 @@ class S10SupervisorApp:
         ttl_s = _identity_mint_ttl(body, identity.max_ttl_s)
         return self.auth.mint_identity_token(identity, ttl_s=ttl_s)
 
+    def launch_sandbox_for_identity(self, identity: RuntimeIdentity, body: dict[str, Any]) -> dict[str, Any]:
+        _require_runtime_identity(identity)
+        launch = _launch_request_from_dict(body)
+        _require_launch_identity_binding(identity, launch)
+        self._refresh_artifacts()
+        result = self._docker_orchestrator.launch_and_wait(launch)
+        return asdict(result)
+
+    def _build_docker_orchestrator(self) -> DockerSandboxOrchestrator:
+        return DockerSandboxOrchestrator(
+            token_service=self.tokens,
+            quota_ledger=self.quota,
+            audit_ledger=self.audit,
+            policy_service=self.policy_service,
+            artifact_store=self.artifacts,
+            supervisor=self._docker_supervisor,
+        )
+
     def _refresh_artifacts(self) -> None:
         if self._artifact_store_path is not None:
             self.artifacts = FileSystemArtifactStore(self._artifact_store_path)
@@ -223,6 +252,7 @@ class S10SupervisorApp:
                 artifact_store=self.artifacts,
                 audit_ledger=self.audit,
             )
+            self._docker_orchestrator = self._build_docker_orchestrator()
 
     def _authenticate(self, request: JsonRequest) -> RuntimeIdentity:
         if self.auth is None:
@@ -334,12 +364,49 @@ class S10SupervisorApp:
             except Exception as exc:
                 return 400, {"error": type(exc).__name__, "message": str(exc)}
 
+        @self.http.route("POST", "/v1/sandboxes:launch")
+        def launch_sandbox(request: JsonRequest) -> tuple[int, Any]:
+            launch: LaunchRequest | None = None
+            try:
+                identity = self._authenticate(request)
+                if not isinstance(request.body, dict):
+                    return 400, {"error": "json_object_required"}
+                launch = _launch_request_from_dict(request.body)
+                return 201, self.launch_sandbox_for_identity(identity, request.body)
+            except UnauthorizedError as exc:
+                return 401, {"error": "Unauthorized", "message": str(exc)}
+            except TokenInvalidError as exc:
+                return 401, {"error": type(exc).__name__, "message": str(exc)}
+            except (BudgetExceededError, PermissionError, PolicyDeniedError, ScopeDeniedError) as exc:
+                return 403, self._launch_error_payload(exc, launch)
+            except SandboxRuntimeUnavailableError as exc:
+                return 503, self._launch_error_payload(exc, launch)
+            except Exception as exc:
+                return 400, {"error": type(exc).__name__, "message": str(exc)}
+
     def _authenticate_checkpoint_signer(self, request: JsonRequest) -> None:
         require_static_bearer_token(
             request,
             expected_token=self._checkpoint_signer_auth_token,
             purpose="checkpoint signer",
         )
+
+    def _launch_error_payload(self, exc: Exception, launch: LaunchRequest | None) -> dict[str, Any]:
+        handle = None
+        if launch is not None:
+            handles = [
+                asdict(candidate)
+                for candidate in self._docker_orchestrator._handles.values()
+                if candidate.job_id == launch.job_id
+            ]
+            if handles:
+                handle = handles[-1]
+        return {
+            "error": type(exc).__name__,
+            "message": str(exc),
+            "handle": handle,
+            "audit_events": [event.event_type for event in self.audit.events()[-10:]],
+        }
 
 
 def build_app_from_env() -> S10SupervisorApp:
@@ -518,6 +585,66 @@ class S8BrokeredArtifactStoreClient:
             _raise_s8_http_error(response_body)
         return _artifact_record_from_dict(response_body)
 
+    def create_artifact(
+        self,
+        *,
+        kind: str,
+        payload: Any,
+        producer: Producer,
+        lineage: Lineage,
+        artifact_ref: str | None = None,
+        claim_tier: str = "ran-toy",
+        validation_report_ref: str | None = None,
+    ) -> ArtifactRecord:
+        scope_job_id = _artifact_scope_job_id(payload=payload, producer=producer, lineage=lineage)
+        sealed_producer = Producer(
+            subsystem=producer.subsystem,
+            version=producer.version,
+            actor_id=producer.actor_id,
+            job_id=producer.job_id or scope_job_id,
+        )
+        sealed_lineage = Lineage(
+            input_refs=lineage.input_refs,
+            code_ref=lineage.code_ref,
+            environment_digest=lineage.environment_digest,
+            seeds=lineage.seeds,
+            actor_id=lineage.actor_id,
+            job_id=lineage.job_id or scope_job_id,
+            contamination_index_version=lineage.contamination_index_version,
+        )
+        body = {
+            "authorization": {
+                "audience": "store",
+                "scope_job_id": scope_job_id,
+                "producer_subsystems": [producer.subsystem],
+            },
+            "kind": kind,
+            "payload": payload,
+            "producer": asdict(sealed_producer),
+            "lineage": asdict(sealed_lineage),
+            "artifact_ref": artifact_ref,
+            "claim_tier": claim_tier,
+            "validation_report_ref": validation_report_ref,
+        }
+        encoded = canonical_json_bytes(body)
+        signature = "hmac-sha256:" + hmac.new(self._broker_write_key, encoded, sha256).hexdigest()
+        http_request = request.Request(
+            self._endpoint_url,
+            data=encoded,
+            method="POST",
+            headers={
+                "Content-Type": "application/json",
+                "X-Argus-Store-Write-Signature": signature,
+            },
+        )
+        try:
+            with request.urlopen(http_request, timeout=10) as response:
+                response_body = json.loads(response.read().decode("utf-8"))
+        except error.HTTPError as exc:
+            response_body = json.loads(exc.read().decode("utf-8"))
+            _raise_s8_http_error(response_body)
+        return _artifact_record_from_dict(response_body)
+
 
 def _required_str(body: dict[str, Any], field: str) -> str:
     value = body.get(field)
@@ -538,6 +665,18 @@ def _required_dict(body: dict[str, Any], field: str) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ValueError(f"{field} is required")
     return dict(value)
+
+
+def _artifact_scope_job_id(*, payload: Any, producer: Producer, lineage: Lineage) -> str:
+    if producer.job_id:
+        return producer.job_id
+    if lineage.job_id:
+        return lineage.job_id
+    if isinstance(payload, dict):
+        launch = payload.get("launch")
+        if isinstance(launch, dict) and isinstance(launch.get("job_id"), str) and launch["job_id"]:
+            return launch["job_id"]
+    raise ValueError("artifact job_id is required for brokered S10 provenance writes")
 
 
 def _raise_s8_http_error(payload: dict[str, Any]) -> None:
@@ -595,6 +734,63 @@ def _scope_grant_from_dict(value: dict[str, Any]) -> ScopeGrant:
     )
 
 
+def _budget_caps_from_dict(value: dict[str, Any]) -> BudgetCaps:
+    return BudgetCaps(
+        max_compute_units=value.get("max_compute_units", 0),
+        max_gpu_seconds=value.get("max_gpu_seconds", 0),
+        max_model_tokens=value.get("max_model_tokens", 0),
+        max_wallclock_s=value.get("max_wallclock_s", 0),
+        max_cost_usd=value.get("max_cost_usd", 0),
+    )
+
+
+def _budget_token_from_dict(value: dict[str, Any]) -> BudgetToken:
+    return BudgetToken(
+        budget_id=_required_str(value, "budget_id"),
+        job_id=_required_str(value, "job_id"),
+        root_request_id=_required_str(value, "root_request_id"),
+        budget_epoch=int(value["budget_epoch"]),
+        caps=_budget_caps_from_dict(_required_dict(value, "caps")),
+        risk_class=str(value.get("risk_class", "standard")),
+        issued_at=int(value["issued_at"]),
+        expires_at=int(value["expires_at"]),
+        ttl_s=int(value["ttl_s"]),
+        parent_budget_id=value.get("parent_budget_id") if isinstance(value.get("parent_budget_id"), str) else None,
+        signer_key_id=_required_str(value, "signer_key_id"),
+        signature=_required_str(value, "signature"),
+    )
+
+
+def _launch_envelope_from_dict(value: dict[str, Any]) -> LaunchEnvelope:
+    return LaunchEnvelope(
+        cpu_m=int(value["cpu_m"]),
+        mem_bytes=int(value["mem_bytes"]),
+        gpu_count=int(value["gpu_count"]),
+        wallclock_s=int(value["wallclock_s"]),
+        scratch_bytes=int(value["scratch_bytes"]),
+        pids=int(value["pids"]),
+        estimated_cost_usd=float(value.get("estimated_cost_usd", 0)),
+    )
+
+
+def _launch_request_from_dict(value: dict[str, Any]) -> LaunchRequest:
+    return LaunchRequest(
+        job_id=_required_str(value, "job_id"),
+        subagent_id=_required_str(value, "subagent_id"),
+        trace_id=_required_str(value, "trace_id"),
+        budget_token=_budget_token_from_dict(_required_dict(value, "budget_token")),
+        scope_token=_scope_token_from_dict(_required_dict(value, "scope_token")),
+        image=_required_str(value, "image"),
+        entrypoint=_string_tuple(value.get("entrypoint"), "entrypoint"),
+        args=_string_tuple(value.get("args"), "args"),
+        env=_string_dict(value.get("env"), "env"),
+        env_allowlist=_string_tuple(value.get("env_allowlist"), "env_allowlist"),
+        requested_envelope=_launch_envelope_from_dict(_required_dict(value, "requested_envelope")),
+        runtime_class_hint=str(value.get("runtime_class_hint", "auto")),
+        policy_pin=value.get("policy_pin") if isinstance(value.get("policy_pin"), str) else None,
+    )
+
+
 def _artifact_record_from_dict(value: dict[str, Any]) -> ArtifactRecord:
     return ArtifactRecord(
         artifact_ref=_required_str(value, "artifact_ref"),
@@ -642,6 +838,43 @@ def _scope_token_from_dict(value: dict[str, Any]) -> ScopeToken:
         signer_key_id=_required_str(value, "signer_key_id"),
         signature=_required_str(value, "signature"),
     )
+
+
+def _string_tuple(value: Any, field: str) -> tuple[str, ...]:
+    if not isinstance(value, list | tuple):
+        raise ValueError(f"{field} must be an array")
+    if any(not isinstance(item, str) for item in value):
+        raise ValueError(f"{field} entries must be strings")
+    return tuple(value)
+
+
+def _string_dict(value: Any, field: str) -> dict[str, str]:
+    if not isinstance(value, dict):
+        raise ValueError(f"{field} must be an object")
+    if any(not isinstance(key, str) or not isinstance(item, str) for key, item in value.items()):
+        raise ValueError(f"{field} must map strings to strings")
+    return dict(value)
+
+
+def _require_launch_identity_binding(identity: RuntimeIdentity, launch: LaunchRequest) -> None:
+    if launch.job_id != identity.job_id:
+        raise PermissionError("launch job_id is not bound to the authenticated runtime identity")
+    if launch.budget_token.job_id != identity.job_id:
+        raise PermissionError("budget token job_id is not bound to the authenticated runtime identity")
+    if launch.budget_token.root_request_id != identity.root_request_id:
+        raise PermissionError("budget token root_request_id is not bound to the authenticated runtime identity")
+    if launch.budget_token.risk_class != identity.scopes.sandbox_risk_class:
+        raise PermissionError("budget token risk_class is not bound to the authenticated runtime identity")
+    if launch.scope_token.job_id != identity.job_id:
+        raise PermissionError("scope token job_id is not bound to the authenticated runtime identity")
+    _require_budget_caps_subset(launch.budget_token.caps, identity.budget_caps)
+    _require_scope_subset(launch.scope_token.scopes, identity.scopes)
+
+
+def _require_budget_caps_subset(child: BudgetCaps, parent: BudgetCaps) -> None:
+    for field, child_value in asdict(child).items():
+        if child_value > getattr(parent, field):
+            raise PermissionError(f"budget token {field} exceeds authenticated identity")
 
 
 def _normalize_lineage(value: dict[str, Any]) -> dict[str, Any]:
