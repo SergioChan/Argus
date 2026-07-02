@@ -52,6 +52,36 @@ class ArgusM0RuntimeServiceTests(unittest.TestCase):
             self.assertEqual(reloaded.store.record_count, 1)
             self.assertEqual(reloaded.store.get_artifact(record["artifact_ref"]), b'{"weights":[1,2,3]}')
 
+    def test_s8_writer_http_reads_payload_through_verify_on_read(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            app = S8WriterApp(FileSystemArtifactStore(tmp), data_dir=tmp, auth=_runtime_auth())
+            record = app.create_artifact(
+                {
+                    "kind": "model",
+                    "payload": {"weights": [1, 2, 3]},
+                    "producer": {"subsystem": "S2", "version": "0.0.0"},
+                    "lineage": {
+                        "input_refs": [],
+                        "code_ref": "git:model",
+                        "environment_digest": "oci:model",
+                        "seeds": ["seed-1"],
+                    },
+                }
+            )
+
+            status, payload = app.http.handle(
+                JsonRequest(
+                    method="GET",
+                    path=f"/v1/artifacts/{record['artifact_ref']}/payload",
+                    query={},
+                    body=None,
+                    headers=_auth_headers(),
+                )
+            )
+
+            self.assertEqual(status, 200)
+            self.assertEqual(payload, {"weights": [1, 2, 3]})
+
     def test_s8_writer_service_refreshes_file_ledger_before_reads(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             app = S8WriterApp(FileSystemArtifactStore(tmp), data_dir=tmp)
@@ -461,9 +491,17 @@ class ArgusM0ComposeTests(unittest.TestCase):
         self.assertEqual(services["s8-writer"]["command"], ["python", "-m", "argus_runtime.s8_writer_service"])
         self.assertEqual(services["s10-supervisor"]["command"], ["python", "-m", "argus_runtime.s10_supervisor_service"])
         self.assertEqual(services["s8-writer"]["environment"]["ARGUS_S8_HOST"], "0.0.0.0")
+        self.assertEqual(
+            services["s8-writer"]["environment"]["ARGUS_S8_POSTGRES_DSN"],
+            "postgresql://argus:argus-dev-password@postgres:5432/argus",
+        )
+        self.assertEqual(services["s8-writer"]["environment"]["ARGUS_S8_MINIO_ENDPOINT"], "minio:9000")
+        self.assertEqual(services["s8-writer"]["environment"]["ARGUS_S8_MINIO_BUCKET"], "argus-s8-objects")
+        self.assertNotIn("ARGUS_S8_DATA_DIR", services["s8-writer"]["environment"])
         self.assertEqual(services["s10-supervisor"]["environment"]["ARGUS_S10_HOST"], "0.0.0.0")
         self.assertEqual(services["s8-writer"]["ports"][0]["host_ip"], "127.0.0.1")
         self.assertEqual(services["s10-supervisor"]["ports"][0]["host_ip"], "127.0.0.1")
+        self.assertNotIn("volumes", services["s8-writer"])
         self.assertIn("ARGUS_RUNTIME_BOOTSTRAP_TOKEN", services["s8-writer"]["environment"])
         self.assertIn("ARGUS_RUNTIME_IDENTITY_SIGNING_KEY", services["s8-writer"]["environment"])
         self.assertIn("ARGUS_RUNTIME_BOOTSTRAP_TOKEN", services["s10-supervisor"]["environment"])
@@ -476,7 +514,9 @@ class ArgusM0ComposeTests(unittest.TestCase):
         self.assertIn("ARGUS_S8_BROKER_WRITE_KEY", services["s10-supervisor"]["environment"])
         self.assertEqual(services["s10-supervisor"]["environment"]["ARGUS_S10_SIGNING_KEY"], "test-s10-signing-key")
         self.assertNotIn("volumes", services["s10-supervisor"])
-        self.assertIn("s8-data", rendered["volumes"])
+        self.assertNotIn("s8-data", rendered["volumes"])
+        self.assertIn("postgres-data", rendered["volumes"])
+        self.assertIn("minio-data", rendered["volumes"])
 
     def _skip_or_fail(self, reason: str) -> None:
         if os.environ.get("ARGUS_REQUIRE_DOCKER_TESTS") == "1":

@@ -5,6 +5,10 @@ from __future__ import annotations
 
 import argparse
 from contextlib import closing
+from dataclasses import asdict, replace
+from hashlib import sha256
+import hmac
+from io import BytesIO
 import json
 import os
 from pathlib import Path
@@ -12,7 +16,6 @@ import shutil
 import socket
 import subprocess
 import sys
-import tempfile
 import time
 from typing import Any
 from urllib import error, request
@@ -22,25 +25,25 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from argus_core import (
+    ArtifactRecord,
     BudgetCaps,
     BudgetExceededError,
     BudgetToken,
     DockerSandboxOrchestrator,
     EgressRule,
-    FileSystemArtifactStore,
     InMemoryAuditLedger,
     InMemoryQuotaLedger,
     InMemoryTokenService,
     LaunchEnvelope,
     LaunchRequest,
+    Lineage,
     PolicyBundle,
+    Producer,
     ResourceCeilings,
     ScopeGrant,
     ScopeToken,
-    SCRATCH_BUCKET,
-    WRITE_ONCE_BUCKET,
+    canonical_json_bytes,
 )
-from argus_core.s8 import LedgerReplayError
 from argusverify import C3ReportSigner, InMemoryVerifierTrustStore, verify_report
 
 
@@ -66,9 +69,6 @@ def main() -> int:
         "working_tree_dirty": _git_dirty(),
         "results": [],
     }
-    data_tmp = tempfile.TemporaryDirectory(prefix="argus-m0-s8-")
-    data_dir = Path(data_tmp.name)
-    _prepare_shared_data_dir(data_dir)
     runtime_secrets = _m0_runtime_secrets()
     ports = {
         "ARGUS_M0_POSTGRES_PORT": str(_free_port()),
@@ -80,7 +80,6 @@ def main() -> int:
     env = {
         **os.environ,
         **ports,
-        "ARGUS_M0_S8_DATA_DIR": str(data_dir),
         "ARGUS_RUNTIME_BOOTSTRAP_TOKEN": runtime_secrets["bootstrap_token"],
         "ARGUS_RUNTIME_IDENTITY_SIGNING_KEY": runtime_secrets["identity_signing_key"],
         "ARGUS_S10_SIGNING_KEY": runtime_secrets["s10_signing_key"],
@@ -92,8 +91,8 @@ def main() -> int:
         "compose_file": str(Path(args.compose_file).resolve()),
         "s8_url": s8_url,
         "s10_url": s10_url,
-        "s8_data_dir": str(data_dir),
         "ports": ports,
+        "persistence": "postgres-minio",
         "auth_callers": ["health", "write", "spine", "halt"],
     }
 
@@ -130,7 +129,9 @@ def main() -> int:
             image=args.image,
             budget=_budget_token_from_json(budget_json),
             scope=_scope_token_from_json(scope_json),
-            data_dir=data_dir,
+            s8_url=s8_url,
+            s8_broker_write_key=runtime_secrets["s8_broker_write_key"].encode("utf-8"),
+            read_token=auth_tokens["health"],
             signing_key=runtime_secrets["s10_signing_key"].encode("utf-8"),
         )
         model_record = _post_json(
@@ -175,12 +176,21 @@ def main() -> int:
             evidence,
             s10_url,
             args.image,
-            data_dir,
+            s8_url,
             token=auth_tokens["halt"],
+            read_token=auth_tokens["health"],
+            s8_broker_write_key=runtime_secrets["s8_broker_write_key"].encode("utf-8"),
             signing_key=runtime_secrets["s10_signing_key"].encode("utf-8"),
         )
         _battery_g_argusverify(evidence)
-        _battery_d_tamper_detected(evidence, data_dir)
+        _battery_real_persistence(evidence, ports)
+        _battery_d_tamper_detected(
+            evidence,
+            s8_url=s8_url,
+            token=auth_tokens["health"],
+            minio_port=ports["ARGUS_M0_MINIO_PORT"],
+            model_record=model_record,
+        )
 
         if args.evidence_file:
             Path(args.evidence_file).write_text(json.dumps(evidence, indent=2, sort_keys=True) + "\n")
@@ -189,7 +199,6 @@ def main() -> int:
     finally:
         if not args.skip_compose_up and not args.keep_stack:
             _run([docker, "compose", "-f", args.compose_file, "down", "--volumes"], env=env, timeout=120, check=False)
-        data_tmp.cleanup()
 
 
 def _battery_a_contracts(evidence: dict[str, Any]) -> None:
@@ -386,31 +395,165 @@ def _battery_c_write_once(
     )
 
 
-def _battery_d_tamper_detected(evidence: dict[str, Any], data_dir: Path) -> None:
-    store = FileSystemArtifactStore(data_dir)
-    if not store.verify_audit_chain().valid:
-        raise AssertionError("audit chain was invalid before tamper")
-    ledger_path = data_dir / "artifact_ledger.jsonl"
-    lines = ledger_path.read_text().splitlines()
-    event = json.loads(lines[0])
-    event["record"]["kind"] = "tampered"
-    lines[0] = json.dumps(event, separators=(",", ":"), sort_keys=True)
-    ledger_path.write_text("\n".join(lines) + "\n")
+class S8InternalArtifactStoreClient:
+    def __init__(
+        self,
+        *,
+        s8_url: str,
+        broker_write_key: bytes,
+        scope_job_id: str,
+        producer_subsystems: tuple[str, ...],
+    ) -> None:
+        self._s8_url = s8_url.rstrip("/")
+        self._broker_write_key = broker_write_key
+        self._scope_job_id = scope_job_id
+        self._producer_subsystems = producer_subsystems
+
+    def create_artifact(
+        self,
+        *,
+        kind: str,
+        payload: Any,
+        producer: Producer,
+        lineage: Lineage,
+        artifact_ref: str | None = None,
+        claim_tier: str = "ran-toy",
+        validation_report_ref: str | None = None,
+    ) -> ArtifactRecord:
+        sealed_producer = replace(producer, job_id=producer.job_id or self._scope_job_id)
+        sealed_lineage = replace(lineage, job_id=lineage.job_id or self._scope_job_id)
+        body = {
+            "authorization": {
+                "audience": "store",
+                "scope_job_id": self._scope_job_id,
+                "producer_subsystems": list(self._producer_subsystems),
+            },
+            "kind": kind,
+            "payload": payload,
+            "producer": asdict(sealed_producer),
+            "lineage": asdict(sealed_lineage),
+            "artifact_ref": artifact_ref,
+            "claim_tier": claim_tier,
+            "validation_report_ref": validation_report_ref,
+        }
+        response = _post_json(
+            f"{self._s8_url}/v1/internal/brokered-artifacts",
+            body,
+            expected_status=201,
+            headers=_broker_write_headers(body, self._broker_write_key),
+        )
+        return _artifact_record_from_json(response)
+
+
+def _battery_real_persistence(evidence: dict[str, Any], ports: dict[str, str]) -> None:
+    import psycopg
+    from minio import Minio
+
+    dsn = f"postgresql://argus:argus-dev-password@127.0.0.1:{ports['ARGUS_M0_POSTGRES_PORT']}/argus"
+    with psycopg.connect(dsn) as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT count(*) FROM s8.schema_migration;")
+            migration_count = int(cur.fetchone()[0])
+            cur.execute("SELECT count(*) FROM s8.artifact_record;")
+            record_count = int(cur.fetchone()[0])
+            cur.execute("SELECT count(*) FROM s8.ledger_leaf;")
+            leaf_count = int(cur.fetchone()[0])
+            update_denied = _postgres_append_only_update_denied(cur)
+    minio = Minio(
+        f"127.0.0.1:{ports['ARGUS_M0_MINIO_PORT']}",
+        access_key="argus",
+        secret_key="argus-dev-password",
+        secure=False,
+    )
+    object_count = sum(1 for _ in minio.list_objects("argus-s8-objects", recursive=True))
+    if migration_count < 1 or record_count < 2 or leaf_count < 2 or object_count < 2 or not update_denied:
+        raise AssertionError(
+            "Postgres/MinIO persistence did not record expected deployed S8 artifacts: "
+            f"migrations={migration_count} records={record_count} leaves={leaf_count} "
+            f"objects={object_count} update_denied={update_denied}"
+        )
+    _record(
+        evidence,
+        "persist",
+        "deployed S8 wrote C4 metadata to Postgres append-only ledger and payloads to MinIO",
+        {
+            "schema_migrations": migration_count,
+            "artifact_records": record_count,
+            "ledger_leaves": leaf_count,
+            "minio_objects": object_count,
+            "append_only_update_denied": update_denied,
+        },
+    )
+
+
+def _postgres_append_only_update_denied(cur: Any) -> bool:
     try:
-        FileSystemArtifactStore(data_dir)
-    except LedgerReplayError as exc:
-        _record(evidence, "d", "tampered committed ledger record detected during replay", {"error": str(exc)})
-        return
-    raise AssertionError("tampered ledger replay unexpectedly succeeded")
+        cur.execute(
+            """
+            UPDATE s8.artifact_record
+            SET kind = 'tampered'
+            WHERE artifact_id = (
+                SELECT artifact_id FROM s8.artifact_record ORDER BY merkle_seq LIMIT 1
+            );
+            """
+        )
+    except Exception as exc:
+        message = str(exc)
+        cur.connection.rollback()
+        return "append-only table artifact_record" in message
+    cur.connection.rollback()
+    return False
+
+
+def _battery_d_tamper_detected(
+    evidence: dict[str, Any],
+    *,
+    s8_url: str,
+    token: str,
+    minio_port: str,
+    model_record: dict[str, Any],
+) -> None:
+    from minio import Minio
+
+    payload_url = f"{s8_url}/v1/artifacts/{model_record['artifact_ref']}/payload"
+    _get_json(payload_url, token=token)
+    minio = Minio(
+        f"127.0.0.1:{minio_port}",
+        access_key="argus",
+        secret_key="argus-dev-password",
+        secure=False,
+    )
+    key = _minio_object_key(minio, "argus-s8-objects", model_record["content_hash"])
+    tampered = b'{"tampered":true}'
+    minio.put_object("argus-s8-objects", key, BytesIO(tampered), length=len(tampered), content_type="application/json")
+    response = _get_json(payload_url, token=token, expected_status=404)
+    if response["error"] != "HashMismatchError":
+        raise AssertionError(f"unexpected tamper detection payload: {response}")
+    _record(
+        evidence,
+        "d",
+        "tampered MinIO object bytes detected by S8 verify-on-read",
+        {"error": response["error"], "artifact_ref": model_record["artifact_ref"]},
+    )
+
+
+def _minio_object_key(minio: Any, bucket: str, content_hash: str) -> str:
+    object_name = content_hash.removeprefix("blake3:") if content_hash.startswith("blake3:") else content_hash.replace(":", "_")
+    for item in minio.list_objects(bucket, recursive=True):
+        if item.object_name and item.object_name.endswith("/" + object_name):
+            return item.object_name
+    raise KeyError(content_hash)
 
 
 def _battery_e_budget_halt(
     evidence: dict[str, Any],
     s10_url: str,
     image: str,
-    data_dir: Path,
+    s8_url: str,
     *,
     token: str,
+    read_token: str,
+    s8_broker_write_key: bytes,
     signing_key: bytes,
 ) -> None:
     budget_json = _post_json(
@@ -433,7 +576,12 @@ def _battery_e_budget_halt(
         quota_ledger=quota,
         audit_ledger=audit,
         policy_bundle=_policy_bundle(),
-        artifact_store=FileSystemArtifactStore(data_dir),
+        artifact_store=S8InternalArtifactStoreClient(
+            s8_url=s8_url,
+            broker_write_key=s8_broker_write_key,
+            scope_job_id="m0-budget-halt-job",
+            producer_subsystems=("S10",),
+        ),
     )
     request_obj = LaunchRequest(
         job_id="m0-budget-halt-job",
@@ -459,9 +607,15 @@ def _battery_e_budget_halt(
     try:
         orchestrator.launch_and_wait(request_obj)
     except BudgetExceededError:
+        if request_obj.job_id != "m0-budget-halt-job":
+            raise AssertionError("budget halt request job changed")
         events = [event.event_type for event in audit.events()]
         if "budget.halt" not in events:
             raise AssertionError("budget halt event missing")
+        handle = next(iter(orchestrator._handles.values()))
+        if handle.launch_provenance_ref is None:
+            raise AssertionError("budget halt launch provenance missing")
+        _get_json(f"{s8_url}/v1/artifacts/{handle.launch_provenance_ref}/record", token=read_token)
         _record(evidence, "e", "sandbox ran past budget and was halted with audit evidence", {"events": events})
         return
     raise AssertionError("budget halt launch unexpectedly completed without BudgetExceededError")
@@ -496,7 +650,9 @@ def _run_no_network_launch(
     image: str,
     budget: BudgetToken,
     scope: ScopeToken,
-    data_dir: Path,
+    s8_url: str,
+    s8_broker_write_key: bytes,
+    read_token: str,
     signing_key: bytes,
 ) -> dict[str, Any]:
     tokens = InMemoryTokenService(signing_key=signing_key)
@@ -507,7 +663,12 @@ def _run_no_network_launch(
         quota_ledger=quota,
         audit_ledger=audit,
         policy_bundle=_policy_bundle(),
-        artifact_store=FileSystemArtifactStore(data_dir),
+        artifact_store=S8InternalArtifactStoreClient(
+            s8_url=s8_url,
+            broker_write_key=s8_broker_write_key,
+            scope_job_id="m0-spine-job",
+            producer_subsystems=("S10",),
+        ),
     )
     launch = LaunchRequest(
         job_id="m0-spine-job",
@@ -543,8 +704,7 @@ def _run_no_network_launch(
         raise AssertionError(f"no-network sandbox launch failed: exit={result.exit_code} stdout={result.stdout!r}")
     if stored_handle.launch_provenance_ref is None:
         raise AssertionError("launch provenance ref missing")
-    record = FileSystemArtifactStore(data_dir).get_record(stored_handle.launch_provenance_ref)
-    payload = json.loads(FileSystemArtifactStore(data_dir).get_artifact(record.artifact_ref).decode("utf-8"))
+    payload = _get_json(f"{s8_url}/v1/artifacts/{stored_handle.launch_provenance_ref}/payload", token=read_token)
     return {
         "stdout": result.stdout,
         "launch_provenance_ref": stored_handle.launch_provenance_ref,
@@ -613,10 +773,17 @@ def _scope_token_from_json(value: dict[str, Any]) -> ScopeToken:
     )
 
 
-def _post_json(url: str, body: dict[str, Any], *, expected_status: int, token: str | None = None) -> dict[str, Any]:
+def _post_json(
+    url: str,
+    body: dict[str, Any],
+    *,
+    expected_status: int,
+    token: str | None = None,
+    headers: dict[str, str] | None = None,
+) -> dict[str, Any]:
     encoded = json.dumps(body, sort_keys=True).encode("utf-8")
-    headers = {"Content-Type": "application/json", **_auth_headers(token)}
-    req = request.Request(url, data=encoded, method="POST", headers=headers)
+    request_headers = {"Content-Type": "application/json", **_auth_headers(token), **(headers or {})}
+    req = request.Request(url, data=encoded, method="POST", headers=request_headers)
     return _open_json(req, expected_status=expected_status)
 
 
@@ -628,6 +795,30 @@ def _auth_headers(token: str | None) -> dict[str, str]:
     if token is None:
         return {}
     return {"Authorization": f"Bearer {token}"}
+
+
+def _broker_write_headers(body: dict[str, Any], broker_write_key: bytes) -> dict[str, str]:
+    digest = hmac.new(broker_write_key, canonical_json_bytes(body), sha256).hexdigest()
+    return {"X-Argus-Store-Write-Signature": f"hmac-sha256:{digest}"}
+
+
+def _artifact_record_from_json(value: dict[str, Any]) -> ArtifactRecord:
+    producer = Producer(**dict(value["producer"]))
+    lineage_body = dict(value["lineage"])
+    lineage_body["input_refs"] = tuple(lineage_body.get("input_refs") or ())
+    lineage_body["seeds"] = tuple(lineage_body.get("seeds") or ())
+    lineage = Lineage(**lineage_body)
+    return ArtifactRecord(
+        artifact_ref=value["artifact_ref"],
+        kind=value["kind"],
+        content_hash=value["content_hash"],
+        size_bytes=int(value["size_bytes"]),
+        producer=producer,
+        lineage=lineage,
+        claim_tier=value.get("claim_tier", "ran-toy"),
+        validation_report_ref=value.get("validation_report_ref"),
+        created_at=value.get("created_at", ""),
+    )
 
 
 def _open_json(req: request.Request, *, expected_status: int) -> dict[str, Any]:
@@ -660,20 +851,6 @@ def _ensure_image(docker: str, image: str) -> None:
     if inspected.returncode == 0:
         return
     _run([docker, "pull", image], timeout=120)
-
-
-def _prepare_shared_data_dir(data_dir: Path) -> None:
-    for path in (
-        data_dir,
-        data_dir / "objects",
-        data_dir / "objects" / WRITE_ONCE_BUCKET,
-        data_dir / "objects" / SCRATCH_BUCKET,
-    ):
-        path.mkdir(parents=True, exist_ok=True)
-        path.chmod(0o777)
-    ledger_path = data_dir / "artifact_ledger.jsonl"
-    ledger_path.touch(exist_ok=True)
-    ledger_path.chmod(0o666)
 
 
 def _run(

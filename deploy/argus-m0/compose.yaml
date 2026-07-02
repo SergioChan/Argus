@@ -40,9 +40,16 @@ services:
       dockerfile: deploy/argus-m0/python-service.Dockerfile
     command: ["python", "-m", "argus_runtime.s8_writer_service"]
     environment:
-      ARGUS_S8_DATA_DIR: /var/lib/argus/s8
       ARGUS_S8_HOST: "0.0.0.0"
       ARGUS_S8_PORT: "8080"
+      ARGUS_S8_POSTGRES_DSN: postgresql://argus:argus-dev-password@postgres:5432/argus
+      ARGUS_S8_APPLY_MIGRATIONS: "1"
+      ARGUS_S8_MIGRATIONS_DIR: /app/db/s8
+      ARGUS_S8_MINIO_ENDPOINT: minio:9000
+      ARGUS_S8_MINIO_ACCESS_KEY: argus
+      ARGUS_S8_MINIO_SECRET_KEY: argus-dev-password
+      ARGUS_S8_MINIO_BUCKET: argus-s8-objects
+      ARGUS_S8_MINIO_SECURE: "0"
       ARGUS_RUNTIME_BOOTSTRAP_TOKEN: ${ARGUS_RUNTIME_BOOTSTRAP_TOKEN:?ARGUS_RUNTIME_BOOTSTRAP_TOKEN is required}
       ARGUS_RUNTIME_IDENTITY_SIGNING_KEY: ${ARGUS_RUNTIME_IDENTITY_SIGNING_KEY:?ARGUS_RUNTIME_IDENTITY_SIGNING_KEY is required}
       ARGUS_S8_BROKER_WRITE_KEY: ${ARGUS_S8_BROKER_WRITE_KEY:?ARGUS_S8_BROKER_WRITE_KEY is required}
@@ -61,8 +68,6 @@ services:
       interval: 5s
       timeout: 3s
       retries: 20
-    volumes:
-      - ${ARGUS_M0_S8_DATA_DIR:-s8-data}:/var/lib/argus/s8
 
   s10-supervisor:
     build:
@@ -93,4 +98,3 @@ services:
 volumes:
   postgres-data:
   minio-data:
-  s8-data:

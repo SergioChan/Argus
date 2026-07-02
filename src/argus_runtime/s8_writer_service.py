@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import asdict
 from hashlib import sha256
 import hmac
+import json
 import os
 from pathlib import Path
 from typing import Any
@@ -18,7 +19,7 @@ from .http_json import JsonHttpApp, JsonRequest, serve_json_app
 class S8WriterApp:
     def __init__(
         self,
-        store: FileSystemArtifactStore,
+        store: Any,
         *,
         data_dir: str | os.PathLike[str] | None = None,
         auth: RuntimeAuth | None = None,
@@ -78,6 +79,10 @@ class S8WriterApp:
         self._refresh_store()
         return asdict(self.store.get_artifact_record(ref))
 
+    def get_artifact_payload(self, ref: str) -> Any:
+        self._refresh_store()
+        return json.loads(self.store.get_artifact(ref).decode("utf-8"))
+
     def get_lineage(self, ref: str, *, direction: str) -> dict[str, Any]:
         self._refresh_store()
         graph = self.store.get_lineage(ref, direction=direction)
@@ -89,6 +94,8 @@ class S8WriterApp:
     def _refresh_store(self) -> None:
         if self._data_dir is not None:
             self.store = FileSystemArtifactStore(self._data_dir)
+        elif hasattr(self.store, "refresh"):
+            self.store.refresh()
 
     def _authenticate(self, request: JsonRequest) -> tuple[bool, dict[str, Any] | None]:
         try:
@@ -151,13 +158,19 @@ class S8WriterApp:
             if not authenticated:
                 return 401, error_response
             suffix = request.path.removeprefix("/v1/artifacts/")
-            if not suffix.endswith("/record"):
-                return 404, {"error": "not_found"}
-            artifact_ref = suffix.removesuffix("/record")
-            try:
-                return 200, self.get_artifact_record(artifact_ref)
-            except Exception as exc:
-                return 404, {"error": type(exc).__name__, "message": str(exc)}
+            if suffix.endswith("/record"):
+                artifact_ref = suffix.removesuffix("/record")
+                try:
+                    return 200, self.get_artifact_record(artifact_ref)
+                except Exception as exc:
+                    return 404, {"error": type(exc).__name__, "message": str(exc)}
+            if suffix.endswith("/payload"):
+                artifact_ref = suffix.removesuffix("/payload")
+                try:
+                    return 200, self.get_artifact_payload(artifact_ref)
+                except Exception as exc:
+                    return 404, {"error": type(exc).__name__, "message": str(exc)}
+            return 404, {"error": "not_found"}
 
         @self.http.prefix("GET", "/v1/lineage/")
         def lineage(request: JsonRequest) -> tuple[int, Any]:
@@ -173,8 +186,16 @@ class S8WriterApp:
 
 
 def build_app_from_env() -> S8WriterApp:
-    data_dir = os.environ.get("ARGUS_S8_DATA_DIR", "/var/lib/argus/s8")
     broker_write_key = os.environ.get("ARGUS_S8_BROKER_WRITE_KEY")
+    if os.environ.get("ARGUS_S8_POSTGRES_DSN"):
+        from .s8_persistence import build_postgres_minio_store_from_env
+
+        return S8WriterApp(
+            build_postgres_minio_store_from_env(dict(os.environ)),
+            auth=runtime_auth_from_env(),
+            broker_write_key=broker_write_key.encode("utf-8") if broker_write_key else None,
+        )
+    data_dir = os.environ.get("ARGUS_S8_DATA_DIR", "/var/lib/argus/s8")
     return S8WriterApp(
         FileSystemArtifactStore(data_dir),
         data_dir=data_dir,
