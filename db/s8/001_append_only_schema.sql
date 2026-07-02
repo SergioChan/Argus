@@ -84,6 +84,76 @@ BEGIN
 END;
 $$;
 
+CREATE OR REPLACE FUNCTION s8.insert_lineage_edge(
+    p_src_artifact_id text,
+    p_dst_artifact_id text,
+    p_edge_type text,
+    p_role text DEFAULT NULL
+)
+RETURNS bigint
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = s8, pg_temp
+AS $$
+DECLARE
+    inserted_edge_id bigint;
+BEGIN
+    IF p_src_artifact_id = p_dst_artifact_id THEN
+        RAISE EXCEPTION 'lineage cycle detected through %', p_src_artifact_id
+            USING ERRCODE = '23P01';
+    END IF;
+
+    IF EXISTS (
+        SELECT 1
+        FROM s8.lineage_closure
+        WHERE ancestor_id = p_dst_artifact_id
+          AND descendant_id = p_src_artifact_id
+    ) THEN
+        RAISE EXCEPTION 'lineage cycle detected through % -> %', p_src_artifact_id, p_dst_artifact_id
+            USING ERRCODE = '23P01';
+    END IF;
+
+    INSERT INTO s8.lineage_edge (src_artifact_id, dst_artifact_id, edge_type, role)
+    SELECT p_src_artifact_id, p_dst_artifact_id, p_edge_type, p_role
+    WHERE NOT EXISTS (
+        SELECT 1
+        FROM s8.lineage_edge
+        WHERE src_artifact_id = p_src_artifact_id
+          AND dst_artifact_id = p_dst_artifact_id
+          AND edge_type = p_edge_type
+          AND COALESCE(role, '') = COALESCE(p_role, '')
+    )
+    RETURNING edge_id INTO inserted_edge_id;
+
+    INSERT INTO s8.lineage_closure (ancestor_id, descendant_id, depth)
+    SELECT ancestor_id, descendant_id, min(depth)
+    FROM (
+        SELECT
+            ancestors.ancestor_id,
+            descendants.descendant_id,
+            ancestors.depth + 1 + descendants.depth AS depth
+        FROM (
+            SELECT p_src_artifact_id AS ancestor_id, 0 AS depth
+            UNION ALL
+            SELECT ancestor_id, depth
+            FROM s8.lineage_closure
+            WHERE descendant_id = p_src_artifact_id
+        ) AS ancestors
+        CROSS JOIN (
+            SELECT p_dst_artifact_id AS descendant_id, 0 AS depth
+            UNION ALL
+            SELECT descendant_id, depth
+            FROM s8.lineage_closure
+            WHERE ancestor_id = p_dst_artifact_id
+        ) AS descendants
+    ) AS closure_paths
+    GROUP BY ancestor_id, descendant_id
+    ON CONFLICT (ancestor_id, descendant_id) DO NOTHING;
+
+    RETURN inserted_edge_id;
+END;
+$$;
+
 DROP TRIGGER IF EXISTS artifact_record_append_only ON s8.artifact_record;
 CREATE TRIGGER artifact_record_append_only
     BEFORE UPDATE OR DELETE ON s8.artifact_record
@@ -123,13 +193,13 @@ GRANT SELECT ON ALL TABLES IN SCHEMA s8 TO argus_s8_reader, argus_s8_ledger_writ
 
 GRANT INSERT ON
     s8.artifact_record,
-    s8.lineage_edge,
-    s8.lineage_closure,
     s8.external_source,
     s8.merkle_checkpoint,
     s8.reproducibility_check
 TO argus_s8_ledger_writer;
 
 GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA s8 TO argus_s8_ledger_writer;
+REVOKE ALL ON FUNCTION s8.insert_lineage_edge(text, text, text, text) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION s8.insert_lineage_edge(text, text, text, text) TO argus_s8_ledger_writer;
 
 COMMIT;
