@@ -60,7 +60,7 @@ CREATE TABLE IF NOT EXISTS s8.external_source (
 CREATE TABLE IF NOT EXISTS s8.merkle_checkpoint (
     seq bigint PRIMARY KEY,
     root text NOT NULL,
-    signature text NOT NULL,
+    signature text NOT NULL CHECK (signature LIKE 'hmac-sha256:%'),
     signer_key_id text NOT NULL,
     created_at timestamptz NOT NULL DEFAULT now()
 );
@@ -313,6 +313,65 @@ BEGIN
 END;
 $$;
 
+CREATE OR REPLACE FUNCTION s8.append_merkle_checkpoint(
+    p_seq bigint,
+    p_root text,
+    p_signature text,
+    p_signer_key_id text
+)
+RETURNS boolean
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = s8, pg_temp
+AS $$
+DECLARE
+    latest_leaf s8.ledger_leaf%ROWTYPE;
+    existing_checkpoint s8.merkle_checkpoint%ROWTYPE;
+BEGIN
+    SELECT *
+    INTO latest_leaf
+    FROM s8.ledger_leaf
+    ORDER BY sequence DESC
+    LIMIT 1;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'cannot checkpoint empty ledger'
+            USING ERRCODE = '23503';
+    END IF;
+
+    IF p_seq <> latest_leaf.sequence OR p_root <> latest_leaf.root THEN
+        RAISE EXCEPTION 'checkpoint does not match latest ledger leaf %', latest_leaf.sequence
+            USING ERRCODE = '23514';
+    END IF;
+
+    IF p_signature NOT LIKE 'hmac-sha256:%' THEN
+        RAISE EXCEPTION 'unsupported checkpoint signature algorithm'
+            USING ERRCODE = '23514';
+    END IF;
+
+    SELECT *
+    INTO existing_checkpoint
+    FROM s8.merkle_checkpoint
+    WHERE seq = p_seq;
+
+    IF FOUND THEN
+        IF existing_checkpoint.root = p_root
+           AND existing_checkpoint.signature = p_signature
+           AND existing_checkpoint.signer_key_id = p_signer_key_id THEN
+            RETURN FALSE;
+        END IF;
+
+        RAISE EXCEPTION 'merkle checkpoint % already exists with different payload', p_seq
+            USING ERRCODE = '23505';
+    END IF;
+
+    INSERT INTO s8.merkle_checkpoint (seq, root, signature, signer_key_id)
+    VALUES (p_seq, p_root, p_signature, p_signer_key_id);
+
+    RETURN TRUE;
+END;
+$$;
+
 DROP TRIGGER IF EXISTS artifact_record_append_only ON s8.artifact_record;
 CREATE TRIGGER artifact_record_append_only
     BEFORE UPDATE OR DELETE ON s8.artifact_record
@@ -359,12 +418,12 @@ REVOKE INSERT ON
     s8.artifact_record,
     s8.lineage_edge,
     s8.lineage_closure,
-    s8.ledger_leaf
+    s8.ledger_leaf,
+    s8.merkle_checkpoint
 FROM argus_s8_ledger_writer;
 
 GRANT INSERT ON
     s8.external_source,
-    s8.merkle_checkpoint,
     s8.reproducibility_check
 TO argus_s8_ledger_writer;
 
@@ -375,5 +434,7 @@ REVOKE ALL ON FUNCTION s8.commit_artifact_record(text, text, text, jsonb, jsonb,
 GRANT EXECUTE ON FUNCTION s8.commit_artifact_record(text, text, text, jsonb, jsonb, text, bigint, text, text, text[]) TO argus_s8_ledger_writer;
 REVOKE ALL ON FUNCTION s8.append_ledger_leaf(text, text, bigint, text, text) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION s8.append_ledger_leaf(text, text, bigint, text, text) TO argus_s8_ledger_writer;
+REVOKE ALL ON FUNCTION s8.append_merkle_checkpoint(bigint, text, text, text) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION s8.append_merkle_checkpoint(bigint, text, text, text) TO argus_s8_ledger_writer;
 
 COMMIT;

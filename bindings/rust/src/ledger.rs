@@ -1,7 +1,12 @@
 use crate::hash::{hash_bytes, BLAKE3_PREFIX};
+use hmac::{Hmac, KeyInit, Mac};
 use postgres::types::Json;
 use postgres::{Client, GenericClient, NoTls};
 use serde_json::Value;
+use sha2::Sha256;
+
+const CHECKPOINT_SIGNATURE_ALGORITHM: &str = "hmac-sha256";
+const CHECKPOINT_SIGNATURE_PREFIX: &str = "hmac-sha256:";
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ArtifactRecordDraft {
@@ -46,6 +51,54 @@ pub struct PostgresLedgerWriter {
     client: Client,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckpointSigner {
+    key_id: String,
+    secret: Vec<u8>,
+}
+
+impl CheckpointSigner {
+    pub fn new(key_id: impl Into<String>, secret: impl Into<Vec<u8>>) -> Self {
+        Self {
+            key_id: key_id.into(),
+            secret: secret.into(),
+        }
+    }
+
+    pub fn key_id(&self) -> &str {
+        &self.key_id
+    }
+
+    pub fn sign(&self, sequence: i64, root: &str) -> String {
+        let mut mac =
+            Hmac::<Sha256>::new_from_slice(&self.secret).expect("HMAC accepts any key size");
+        mac.update(checkpoint_signature_payload(sequence, root, &self.key_id).as_bytes());
+        format!(
+            "{CHECKPOINT_SIGNATURE_PREFIX}{}",
+            hex_lower(&mac.finalize().into_bytes())
+        )
+    }
+
+    pub fn verify(&self, checkpoint: &MerkleCheckpoint) -> bool {
+        checkpoint.signer_key_id == self.key_id
+            && checkpoint
+                .signature
+                .starts_with(CHECKPOINT_SIGNATURE_PREFIX)
+            && constant_time_eq(
+                checkpoint.signature.as_bytes(),
+                self.sign(checkpoint.sequence, &checkpoint.root).as_bytes(),
+            )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MerkleCheckpoint {
+    pub sequence: i64,
+    pub root: String,
+    pub signature: String,
+    pub signer_key_id: String,
+}
+
 impl PostgresLedgerWriter {
     pub fn connect(params: &str) -> Result<Self, postgres::Error> {
         Ok(Self {
@@ -81,6 +134,36 @@ impl PostgresLedgerWriter {
         }
         transaction.commit()?;
         Ok(())
+    }
+
+    pub fn append_latest_checkpoint(
+        &mut self,
+        signer: &CheckpointSigner,
+    ) -> Result<Option<MerkleCheckpoint>, postgres::Error> {
+        let mut transaction = self.client.transaction()?;
+        let Some((sequence, root)) = latest_ledger_leaf(&mut transaction)? else {
+            transaction.commit()?;
+            return Ok(None);
+        };
+        let checkpoint = MerkleCheckpoint {
+            sequence,
+            root: root.clone(),
+            signature: signer.sign(sequence, &root),
+            signer_key_id: signer.key_id().to_string(),
+        };
+        transaction.execute(
+            "
+            SELECT s8.append_merkle_checkpoint($1, $2, $3, $4);
+            ",
+            &[
+                &checkpoint.sequence,
+                &checkpoint.root,
+                &checkpoint.signature,
+                &checkpoint.signer_key_id,
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(Some(checkpoint))
     }
 
     pub fn into_client(self) -> Client {
@@ -119,6 +202,16 @@ fn commit_artifact_record<C: GenericClient>(
 fn next_ledger_position<C: GenericClient>(
     client: &mut C,
 ) -> Result<(i64, String), postgres::Error> {
+    if let Some((sequence, root)) = latest_ledger_leaf(client)? {
+        Ok((sequence + 1, root))
+    } else {
+        Ok((1, zero_ledger_root()))
+    }
+}
+
+fn latest_ledger_leaf<C: GenericClient>(
+    client: &mut C,
+) -> Result<Option<(i64, String)>, postgres::Error> {
     let latest = client.query_opt(
         "
         SELECT sequence, root
@@ -131,9 +224,9 @@ fn next_ledger_position<C: GenericClient>(
     if let Some(row) = latest {
         let sequence: i64 = row.get(0);
         let root: String = row.get(1);
-        Ok((sequence + 1, root))
+        Ok(Some((sequence, root)))
     } else {
-        Ok((1, zero_ledger_root()))
+        Ok(None)
     }
 }
 
@@ -143,6 +236,33 @@ fn next_ledger_root(previous_root: &str, record_hash: &str, sequence: i64) -> St
 
 fn zero_ledger_root() -> String {
     format!("{BLAKE3_PREFIX}{}", "0".repeat(64))
+}
+
+fn checkpoint_signature_payload(sequence: i64, root: &str, signer_key_id: &str) -> String {
+    format!(
+        "argus-s8-merkle-checkpoint-v1\nalgorithm:{CHECKPOINT_SIGNATURE_ALGORITHM}\nseq:{sequence}\nroot:{root}\nsigner_key_id:{signer_key_id}\n"
+    )
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (left, right) in left.iter().zip(right) {
+        diff |= left ^ right;
+    }
+    diff == 0
 }
 
 #[cfg(test)]
@@ -200,6 +320,19 @@ mod tests {
         let rollback_error = writer
             .commit_artifact_record(&rollback_model)
             .expect_err("missing input ref must fail");
+        let checkpoint_signer =
+            CheckpointSigner::new("s8-ledger-key", b"s8-ledger-secret".to_vec());
+        let checkpoint = writer
+            .append_latest_checkpoint(&checkpoint_signer)?
+            .expect("non-empty ledger has a checkpoint");
+        let repeated_checkpoint = writer
+            .append_latest_checkpoint(&checkpoint_signer)?
+            .expect("checkpoint append is idempotent");
+        let conflicting_signer =
+            CheckpointSigner::new("s8-ledger-key-rotated", b"rotated-secret".to_vec());
+        let checkpoint_conflict = writer
+            .append_latest_checkpoint(&conflicting_signer)
+            .expect_err("existing checkpoint cannot be overwritten by a different signer");
 
         let mut admin = postgres.admin_client()?;
         let record_count = scalar_i64(&mut admin, "SELECT count(*) FROM s8.artifact_record;")?;
@@ -243,6 +376,22 @@ mod tests {
         )?;
         let latest_sequence: i64 = latest_leaf.get(0);
         let latest_root: String = latest_leaf.get(1);
+        let checkpoint_count =
+            scalar_i64(&mut admin, "SELECT count(*) FROM s8.merkle_checkpoint;")?;
+        let persisted_checkpoint = admin.query_one(
+            "
+            SELECT seq, root, signature, signer_key_id
+            FROM s8.merkle_checkpoint
+            WHERE seq = $1;
+            ",
+            &[&latest_sequence],
+        )?;
+        let persisted_checkpoint = MerkleCheckpoint {
+            sequence: persisted_checkpoint.get(0),
+            root: persisted_checkpoint.get(1),
+            signature: persisted_checkpoint.get(2),
+            signer_key_id: persisted_checkpoint.get(3),
+        };
         let mut expected_root = zero_ledger_root();
         for (sequence, draft) in [&dataset, &report, &model, &idempotent_dataset]
             .into_iter()
@@ -288,6 +437,20 @@ mod tests {
                 &[],
             )
             .expect_err("writer role must not insert ledger leaves directly");
+        let direct_checkpoint_insert_error = ledger_client
+            .execute(
+                "
+                INSERT INTO s8.merkle_checkpoint (seq, root, signature, signer_key_id)
+                VALUES (
+                    4,
+                    'blake3:0000000000000000000000000000000000000000000000000000000000009999',
+                    'hmac-sha256:bad',
+                    'direct-writer'
+                );
+                ",
+                &[],
+            )
+            .expect_err("writer role must not insert checkpoints directly");
 
         assert_eq!(record_count, 4);
         assert_eq!(input_edge_count, 1);
@@ -296,6 +459,15 @@ mod tests {
         assert_eq!(leaf_count, 4);
         assert_eq!(latest_sequence, 4);
         assert_eq!(latest_root, expected_root);
+        assert_eq!(checkpoint_count, 1);
+        assert_eq!(checkpoint, repeated_checkpoint);
+        assert_eq!(checkpoint, persisted_checkpoint);
+        assert!(checkpoint_signer.verify(&persisted_checkpoint));
+        assert_eq!(
+            sqlstate(&checkpoint_conflict).as_deref(),
+            Some("23505"),
+            "{checkpoint_conflict:?}"
+        );
         assert_eq!(
             sqlstate(&rollback_error).as_deref(),
             Some("23503"),
@@ -311,6 +483,11 @@ mod tests {
             sqlstate(&direct_leaf_insert_error).as_deref(),
             Some("42501"),
             "{direct_leaf_insert_error:?}"
+        );
+        assert_eq!(
+            sqlstate(&direct_checkpoint_insert_error).as_deref(),
+            Some("42501"),
+            "{direct_checkpoint_insert_error:?}"
         );
         Ok(())
     }

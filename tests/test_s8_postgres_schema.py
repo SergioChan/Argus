@@ -294,6 +294,91 @@ class S8PostgresSchemaTests(unittest.TestCase):
         self.assertIn("permission denied", direct_leaf.stderr)
         self.assertEqual(leaf_count.stdout.strip(), "1")
 
+    def test_merkle_checkpoint_function_requires_latest_signed_leaf(self) -> None:
+        zero_root = "blake3:" + ("0" * 64)
+        first_root = "blake3:leaf-root-1"
+        second_root = "blake3:leaf-root-2"
+        self._commit_record("c4://artifact/a", sequence=1)
+        self._commit_record("c4://artifact/b", sequence=2)
+        self._psql(
+            f"""
+            SET ROLE argus_s8_ledger_writer;
+            SELECT s8.append_ledger_leaf(
+                'c4://artifact/a',
+                'blake3:record-1',
+                1,
+                '{zero_root}',
+                '{first_root}'
+            );
+            SELECT s8.append_ledger_leaf(
+                'c4://artifact/b',
+                'blake3:record-2',
+                2,
+                '{first_root}',
+                '{second_root}'
+            );
+            """
+        )
+        stale_checkpoint = self._psql(
+            f"""
+            SET ROLE argus_s8_ledger_writer;
+            SELECT s8.append_merkle_checkpoint(
+                1,
+                '{first_root}',
+                'hmac-sha256:stale',
+                's8-ledger-key'
+            );
+            """,
+            check=False,
+        )
+        bad_signature = self._psql(
+            f"""
+            SET ROLE argus_s8_ledger_writer;
+            SELECT s8.append_merkle_checkpoint(
+                2,
+                '{second_root}',
+                'placeholder:bad',
+                's8-ledger-key'
+            );
+            """,
+            check=False,
+        )
+        appended = self._psql(
+            f"""
+            SET ROLE argus_s8_ledger_writer;
+            SELECT s8.append_merkle_checkpoint(
+                2,
+                '{second_root}',
+                'hmac-sha256:valid-test-signature',
+                's8-ledger-key'
+            );
+            SELECT s8.append_merkle_checkpoint(
+                2,
+                '{second_root}',
+                'hmac-sha256:valid-test-signature',
+                's8-ledger-key'
+            );
+            """
+        )
+        direct_checkpoint = self._psql(
+            f"""
+            SET ROLE argus_s8_ledger_writer;
+            INSERT INTO s8.merkle_checkpoint (seq, root, signature, signer_key_id)
+            VALUES (2, '{second_root}', 'hmac-sha256:direct', 's8-ledger-key');
+            """,
+            check=False,
+        )
+        checkpoint_count = self._psql("SELECT count(*) FROM s8.merkle_checkpoint;")
+
+        self.assertNotEqual(stale_checkpoint.returncode, 0)
+        self.assertIn("checkpoint does not match latest ledger leaf", stale_checkpoint.stderr)
+        self.assertNotEqual(bad_signature.returncode, 0)
+        self.assertIn("unsupported checkpoint signature algorithm", bad_signature.stderr)
+        self.assertEqual(appended.returncode, 0)
+        self.assertNotEqual(direct_checkpoint.returncode, 0)
+        self.assertIn("permission denied", direct_checkpoint.stderr)
+        self.assertEqual(checkpoint_count.stdout.strip(), "1")
+
     def test_writer_role_cannot_bypass_lineage_function(self) -> None:
         self._commit_record("c4://artifact/a", sequence=1)
         self._commit_record("c4://artifact/b", sequence=2)

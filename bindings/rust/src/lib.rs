@@ -4,7 +4,7 @@ pub mod hash;
 pub mod ledger;
 
 pub use hash::{hash_blob, hash_blob_stream, hash_bytes, BlobHasher, HashBlob, HashBlobError, BLAKE3_PREFIX, CANON_VERSION};
-pub use ledger::{ArtifactRecordDraft, PostgresLedgerWriter};
+pub use ledger::{ArtifactRecordDraft, CheckpointSigner, MerkleCheckpoint, PostgresLedgerWriter};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Contract {
