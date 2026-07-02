@@ -553,12 +553,31 @@ class S10DockerSupervisorTests(unittest.TestCase):
             wallclock_s=1,
         )
         handle = self._handle()
+        container_name = f"argus-{handle.sandbox_id.replace('-', '')[:24]}"
+        self.addCleanup(
+            lambda: subprocess.run(
+                [self.docker_bin, "rm", "-f", container_name],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+        )
 
         result = self.supervisor.run(handle=handle, request=request, materialized_env={})
 
         self.assertTrue(result.timed_out)
         self.assertIsNone(result.exit_code)
         self.assertGreaterEqual(result.duration_s, 1)
+        self.assertFalse(self._container_exists(container_name))
+
+    def _container_exists(self, container_name: str) -> bool:
+        inspect = subprocess.run(
+            [self.docker_bin, "container", "inspect", container_name],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        return inspect.returncode == 0
 
     @classmethod
     def _resolve_digest_pinned_busybox(cls) -> str:
