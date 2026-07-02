@@ -13,6 +13,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 SCHEMA_SQL = ROOT / "db" / "s8" / "001_append_only_schema.sql"
+MIGRATION_SCRIPT = ROOT / "scripts" / "apply_s8_migrations.py"
 
 
 def _free_port() -> int:
@@ -143,7 +144,7 @@ class S8PostgresSchemaTests(unittest.TestCase):
 
     def setUp(self) -> None:
         self._psql("DROP SCHEMA IF EXISTS s8 CASCADE;")
-        self._psql_file(SCHEMA_SQL)
+        self._apply_s8_migrations()
 
     def test_ledger_writer_commits_records_and_lineage_through_function(self) -> None:
         self._commit_record("c4://artifact/a", sequence=1, kind="dataset")
@@ -464,6 +465,25 @@ class S8PostgresSchemaTests(unittest.TestCase):
         self.assertNotEqual(commit_denied.returncode, 0)
         self.assertIn("permission denied", commit_denied.stderr)
 
+    def test_migration_runner_records_checksum_and_rejects_drift(self) -> None:
+        first_count = self._psql("SELECT count(*) FROM s8.schema_migration;")
+        reapplied = self._apply_s8_migrations()
+        second_count = self._psql("SELECT count(*) FROM s8.schema_migration;")
+        self._psql(
+            """
+            UPDATE s8.schema_migration
+            SET checksum_sha256 = 'sha256-drift'
+            WHERE migration_id = '001_append_only_schema';
+            """
+        )
+        drift = self._apply_s8_migrations(check=False)
+
+        self.assertEqual(first_count.stdout.strip(), "1")
+        self.assertIn("already applied with matching checksum", reapplied.stdout)
+        self.assertEqual(second_count.stdout.strip(), "1")
+        self.assertNotEqual(drift.returncode, 0)
+        self.assertIn("checksum drift", drift.stderr)
+
     def _commit_record(
         self,
         artifact_ref: str,
@@ -503,6 +523,21 @@ class S8PostgresSchemaTests(unittest.TestCase):
             """,
             check=check,
         )
+
+    def _apply_s8_migrations(self, *, check: bool = True) -> subprocess.CompletedProcess[str]:
+        command = [
+            "python3",
+            str(MIGRATION_SCRIPT),
+            "--host",
+            str(self.pg_host),
+            "--database",
+            self.pg_database,
+            "--migration",
+            str(SCHEMA_SQL),
+        ]
+        if self.pg_port is not None:
+            command.extend(["--port", str(self.pg_port)])
+        return subprocess.run(command, check=check, text=True, capture_output=True)
 
     def _psql_file(self, path: Path) -> subprocess.CompletedProcess[str]:
         return subprocess.run(

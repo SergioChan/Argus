@@ -27,4 +27,4 @@ test:
 	python3 -m unittest discover -s tests
 
 lint:
-	python3 -m py_compile scripts/check.py scripts/generate_bindings.py scripts/roadmap_audit.py scripts/schema_compatibility.py scripts/validate_docs.py scripts/validate_schemas.py
+	python3 -m py_compile scripts/apply_s8_migrations.py scripts/check.py scripts/generate_bindings.py scripts/roadmap_audit.py scripts/schema_compatibility.py scripts/validate_docs.py scripts/validate_schemas.py

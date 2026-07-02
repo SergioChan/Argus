@@ -2,6 +2,13 @@ BEGIN;
 
 CREATE SCHEMA IF NOT EXISTS s8;
 
+CREATE TABLE IF NOT EXISTS s8.schema_migration (
+    migration_id text PRIMARY KEY,
+    checksum_sha256 text NOT NULL,
+    applied_at timestamptz NOT NULL DEFAULT now(),
+    applied_by text NOT NULL DEFAULT current_user
+);
+
 DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'argus_s8_reader') THEN

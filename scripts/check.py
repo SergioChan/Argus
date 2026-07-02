@@ -22,6 +22,7 @@ CHECKS = (
             "python3",
             "-m",
             "py_compile",
+            "scripts/apply_s8_migrations.py",
             "scripts/check.py",
             "scripts/generate_bindings.py",
             "scripts/roadmap_audit.py",
