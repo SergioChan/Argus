@@ -9,7 +9,9 @@ from scripts.roadmap_audit import (
     expand_ledger_cell,
     parse_backlog,
     parse_roadmap_stage_map,
+    parse_summary_counts,
     render_status,
+    stage_evidence_anchor_error,
     validate_status,
 )
 
@@ -128,6 +130,62 @@ class RoadmapAuditTests(unittest.TestCase):
 
         self.assertTrue(any("without deployment evidence" in error for error in deployed_errors))
         self.assertTrue(any("without e2e evidence" in error for error in e2e_errors))
+
+    def test_stage_gate_evidence_requires_verifiable_anchor(self) -> None:
+        self.assertIsNone(stage_evidence_anchor_error("passed on GitHub Actions CI run 28605979333 artifact m0-spine-evidence"))
+        self.assertIsNone(stage_evidence_anchor_error("evidence file docs/RoadmapStatus.md records the gate"))
+        self.assertIn(
+            "local-only path",
+            stage_evidence_anchor_error(
+                "local evidence /tmp/argus-m0-stage-gate.json commit 5ce93f4e1429a0de5924bcb5a551390ef42c928a"
+            )
+            or "",
+        )
+        self.assertIn("lacks a verifiable", stage_evidence_anchor_error("compose stack passed on my machine") or "")
+
+    def test_validate_status_derives_gate_counts_from_stage_table(self) -> None:
+        tasks = (
+            BacklogTask("S1-T01", "Author canonical C1 JSON Schema", "M", "C1", "C1", "schema validates"),
+        )
+        statuses = {
+            "S1-T01": TaskStatus(
+                task_id="S1-T01",
+                stage="M0",
+                status="complete",
+                evidence="acceptance=x; impl=x; unit=x; local=x; commit=x; push=x",
+            ),
+        }
+
+        errors = validate_status(
+            tasks=tasks,
+            stage_map={"S1-T01": "M0"},
+            stages={
+                "M0": StageStatus(
+                    "M0",
+                    "e2e_passed",
+                    "GitHub Actions CI run 28605979333 deployment artifact m0-spine-evidence",
+                    "GitHub Actions CI run 28605979333 E2E artifact m0-spine-evidence",
+                )
+            },
+            statuses=statuses,
+            summary_counts={
+                "Real deployment gates passed": 999,
+                "Real end-to-end gates passed": 1,
+            },
+        )
+
+        self.assertTrue(any("Real deployment gates passed" in error for error in errors))
+
+    def test_parse_summary_counts_reads_gate_headlines(self) -> None:
+        counts = parse_summary_counts(
+            """
+- Real deployment gates passed: 1
+- Real end-to-end gates passed: 2
+"""
+        )
+
+        self.assertEqual(counts["Real deployment gates passed"], 1)
+        self.assertEqual(counts["Real end-to-end gates passed"], 2)
 
     def test_render_status_defaults_every_task_to_not_started(self) -> None:
         tasks = (

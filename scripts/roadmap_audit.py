@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 import re
 import sys
+from typing import Mapping
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -29,6 +30,11 @@ VALID_TASK_STATES = {
 }
 VALID_STAGE_STATES = {"not_started", "in_progress", "deployed", "e2e_passed", "complete", "blocked"}
 COMPLETE_EVIDENCE_KEYS = ("acceptance", "impl", "unit", "local", "commit", "push")
+STAGE_DEPLOYED_STATES = {"deployed", "e2e_passed", "complete"}
+STAGE_E2E_STATES = {"e2e_passed", "complete"}
+LOCAL_ONLY_EVIDENCE_PATTERNS = ("/tmp/", "/Users/")
+CI_RUN_RE = re.compile(r"\b(?:github actions|ci)[^|`]*\brun\s+\d{8,}\b", re.I)
+REPO_EVIDENCE_FILE_RE = re.compile(r"(?:^|\s|`)((?:docs|artifacts|evidence|ci|reports)/[A-Za-z0-9._/+:-]+)")
 
 TASK_ROW = re.compile(
     r"^\|\s*(S\d+-(?:T\d+[a-z]?|TPR\d+|TDB\d+))\s*"
@@ -150,10 +156,24 @@ def parse_status(text: str) -> tuple[dict[str, StageStatus], dict[str, TaskStatu
     return stages, tasks
 
 
+def parse_summary_counts(text: str) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for line in text.splitlines():
+        match = re.fullmatch(r"- (Real deployment gates passed|Real end-to-end gates passed): (\d+)", line.strip())
+        if match:
+            counts[match.group(1)] = int(match.group(2))
+    return counts
+
+
 def render_status(tasks: tuple[BacklogTask, ...], stage_map: dict[str, str]) -> str:
     by_subsystem = Counter(task.subsystem for task in tasks)
     by_estimate = Counter(task.estimate for task in tasks)
     stages = tuple(f"M{index}" for index in range(7))
+    default_stages = {
+        stage: StageStatus(stage=stage, status="not_started", deployment_evidence="-", e2e_evidence="-")
+        for stage in stages
+    }
+    gate_counts = count_stage_gates(default_stages)
     lines = [
         "# Roadmap Status",
         "",
@@ -165,8 +185,8 @@ def render_status(tasks: tuple[BacklogTask, ...], stage_map: dict[str, str]) -> 
         f"- Backlog subtasks: {len(tasks)}",
         "- Strictly complete subtasks: 0",
         "- Strictly complete stages: 0",
-        "- Real deployment gates passed: 0",
-        "- Real end-to-end gates passed: 0",
+        f"- Real deployment gates passed: {gate_counts['Real deployment gates passed']}",
+        f"- Real end-to-end gates passed: {gate_counts['Real end-to-end gates passed']}",
         f"- Subsystems: {_counter_text(by_subsystem)}",
         f"- Estimates: {_counter_text(by_estimate)}",
         "",
@@ -199,6 +219,7 @@ def validate_status(
     stage_map: dict[str, str],
     stages: dict[str, StageStatus],
     statuses: dict[str, TaskStatus],
+    summary_counts: Mapping[str, int] | None = None,
 ) -> list[str]:
     errors: list[str] = []
     task_ids = {task.task_id for task in tasks}
@@ -220,22 +241,60 @@ def validate_status(
             if missing_keys:
                 errors.append(f"{status.task_id} complete without required evidence keys: {missing_keys}")
 
+    expected_gate_counts = count_stage_gates(stages)
+    if summary_counts is not None:
+        for key, expected in expected_gate_counts.items():
+            actual = summary_counts.get(key)
+            if actual != expected:
+                errors.append(f"summary {key!r} mismatch: summary={actual} stage_table={expected}")
+
     for stage, status in stages.items():
         if status.status not in VALID_STAGE_STATES:
             errors.append(f"{stage} has invalid stage status {status.status!r}")
         missing_stage_evidence: list[str] = []
-        if status.status in {"deployed", "e2e_passed", "complete"} and status.deployment_evidence == "-":
+        if status.status in STAGE_DEPLOYED_STATES and status.deployment_evidence == "-":
             missing_stage_evidence.append("deployment")
-        if status.status in {"e2e_passed", "complete"} and status.e2e_evidence == "-":
+        if status.status in STAGE_E2E_STATES and status.e2e_evidence == "-":
             missing_stage_evidence.append("e2e")
         if missing_stage_evidence:
             errors.append(f"{stage} {status.status} without {' and '.join(missing_stage_evidence)} evidence")
+        if status.status in STAGE_DEPLOYED_STATES and status.deployment_evidence != "-":
+            anchor_error = stage_evidence_anchor_error(status.deployment_evidence)
+            if anchor_error is not None:
+                errors.append(f"{stage} deployment evidence {anchor_error}")
+        if status.status in STAGE_E2E_STATES and status.e2e_evidence != "-":
+            anchor_error = stage_evidence_anchor_error(status.e2e_evidence)
+            if anchor_error is not None:
+                errors.append(f"{stage} e2e evidence {anchor_error}")
         if status.status == "complete":
             stage_tasks = [task_status for task_status in statuses.values() if task_status.stage == stage]
             incomplete = [task_status.task_id for task_status in stage_tasks if task_status.status != "complete"]
             if incomplete:
                 errors.append(f"{stage} complete with incomplete tasks: {incomplete}")
     return errors
+
+
+def count_stage_gates(stages: Mapping[str, StageStatus]) -> dict[str, int]:
+    return {
+        "Real deployment gates passed": sum(1 for status in stages.values() if status.status in STAGE_DEPLOYED_STATES),
+        "Real end-to-end gates passed": sum(1 for status in stages.values() if status.status in STAGE_E2E_STATES),
+    }
+
+
+def stage_evidence_anchor_error(evidence: str) -> str | None:
+    normalized = evidence.strip()
+    if not normalized or normalized == "-":
+        return "is missing"
+    for pattern in LOCAL_ONLY_EVIDENCE_PATTERNS:
+        if pattern in normalized:
+            return f"uses local-only path {pattern!r}"
+    if CI_RUN_RE.search(normalized):
+        return None
+    for match in REPO_EVIDENCE_FILE_RE.finditer(normalized):
+        path = match.group(1).rstrip(".,;)")
+        if (ROOT / path).is_file():
+            return None
+    return "lacks a verifiable CI run or committed evidence file anchor"
 
 
 def split_row(line: str) -> list[str]:
@@ -303,8 +362,16 @@ def main() -> int:
     if not STATUS.exists():
         print("ERROR: docs/RoadmapStatus.md is missing; run scripts/roadmap_audit.py --write", file=sys.stderr)
         return 1
-    stages, statuses = parse_status(STATUS.read_text(encoding="utf-8"))
-    errors = validate_status(tasks=tasks, stage_map=stage_map, stages=stages, statuses=statuses)
+    status_text = STATUS.read_text(encoding="utf-8")
+    stages, statuses = parse_status(status_text)
+    summary_counts = parse_summary_counts(status_text)
+    errors = validate_status(
+        tasks=tasks,
+        stage_map=stage_map,
+        stages=stages,
+        statuses=statuses,
+        summary_counts=summary_counts,
+    )
     if errors:
         for error in errors:
             print(f"ERROR: {error}", file=sys.stderr)
