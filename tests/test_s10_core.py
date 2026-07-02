@@ -102,6 +102,7 @@ class S10TokenServiceTests(unittest.TestCase):
                 allowed_adapters=("adapter:a",),
                 egress_allowlist=(EgressRule("store.local", 443, "https"),),
                 broker_audiences=("store", "adapter:a"),
+                capabilities=("s8.read",),
                 producer_subsystems=("S2", "S3"),
                 disallowed_actions=("direct_ledger_write",),
             ),
@@ -112,6 +113,7 @@ class S10TokenServiceTests(unittest.TestCase):
                 allowed_adapters=("adapter:a",),
                 egress_allowlist=(EgressRule("store.local", 443, "https"),),
                 broker_audiences=("store",),
+                capabilities=("s8.read",),
                 producer_subsystems=("S2",),
                 disallowed_actions=("direct_ledger_write", "direct_egress"),
             ),
@@ -125,6 +127,20 @@ class S10TokenServiceTests(unittest.TestCase):
                     allowed_adapters=("adapter:a", "adapter:b"),
                     egress_allowlist=(EgressRule("store.local", 443, "https"),),
                     broker_audiences=("store",),
+                    capabilities=("s8.read",),
+                    producer_subsystems=("S2",),
+                    disallowed_actions=("direct_ledger_write",),
+                ),
+            )
+
+        with self.assertRaises(ScopeWideningError):
+            self.tokens.attenuate_scope(
+                parent_scope,
+                ScopeGrant(
+                    allowed_adapters=("adapter:a",),
+                    egress_allowlist=(EgressRule("store.local", 443, "https"),),
+                    broker_audiences=("store",),
+                    capabilities=("s8.write",),
                     producer_subsystems=("S2",),
                     disallowed_actions=("direct_ledger_write",),
                 ),

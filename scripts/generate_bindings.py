@@ -849,6 +849,7 @@ class ScopeGrant(BaseModel):
     allowed_datasets: list[ArtifactRef]
     egress_allowlist: list[EgressRule]
     broker_audiences: list[str]
+    capabilities: list[str]
     producer_subsystems: list[Annotated[str, Field(pattern=r"^S\\d+$")]]
     sandbox_risk_class: RiskClass
     disallowed_actions: list[str]
@@ -858,6 +859,7 @@ class ScopeGrant(BaseModel):
         "allowed_datasets",
         "egress_allowlist",
         "broker_audiences",
+        "capabilities",
         "producer_subsystems",
         "disallowed_actions",
     )
@@ -1088,6 +1090,7 @@ export interface ScopeGrant {{
   allowed_datasets: readonly string[];
   egress_allowlist: readonly EgressRule[];
   broker_audiences: readonly string[];
+  capabilities: readonly string[];
   producer_subsystems: readonly string[];
   sandbox_risk_class: RiskClass;
   disallowed_actions: readonly string[];
@@ -1232,6 +1235,7 @@ const imagePattern = /^(?:[^\\s@]+@)?sha256:[0-9a-f]{{64}}$/;
 const envKeyPattern = /^[A-Z_][A-Z0-9_]*$/;
 const subsystemPattern = /^S\\d+$/;
 const brokerAudiencePattern = /^(store|model|adapter:[A-Za-z0-9._:-]+)$/;
+const capabilityPattern = /^[A-Za-z0-9._:-]+$/;
 const runtimeClasses = ["auto", "gvisor", "firecracker", "docker"] as const;
 const riskClasses = ["standard", "federated", "high"] as const;
 
@@ -1356,6 +1360,7 @@ function assertScopeGrant(value: unknown, path: string): void {{
     "allowed_datasets",
     "egress_allowlist",
     "broker_audiences",
+    "capabilities",
     "producer_subsystems",
     "sandbox_risk_class",
     "disallowed_actions",
@@ -1364,6 +1369,7 @@ function assertScopeGrant(value: unknown, path: string): void {{
   assertStringArray(record.allowed_datasets, path + ".allowed_datasets", artifactRefPattern);
   assertEgressRuleArray(record.egress_allowlist, path + ".egress_allowlist");
   assertStringArray(record.broker_audiences, path + ".broker_audiences", brokerAudiencePattern);
+  assertStringArray(record.capabilities, path + ".capabilities", capabilityPattern);
   assertStringArray(record.producer_subsystems, path + ".producer_subsystems", subsystemPattern);
   assertOneOf(record.sandbox_risk_class, riskClasses, path + ".sandbox_risk_class");
   assertStringArray(record.disallowed_actions, path + ".disallowed_actions");
@@ -2240,6 +2246,7 @@ pub struct ScopeGrant {{
     pub allowed_datasets: Vec<String>,
     pub egress_allowlist: Vec<EgressRule>,
     pub broker_audiences: Vec<String>,
+    pub capabilities: Vec<String>,
     pub producer_subsystems: Vec<String>,
     pub sandbox_risk_class: RiskClass,
     pub disallowed_actions: Vec<String>,

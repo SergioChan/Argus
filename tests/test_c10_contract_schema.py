@@ -28,10 +28,10 @@ class C10ContractSchemaTests(unittest.TestCase):
         Draft202012Validator.check_schema(cls.schema)
         cls.validator = Draft202012Validator(cls.schema)
 
-    def test_schema_is_canonical_c10_v2(self) -> None:
+    def test_schema_is_canonical_c10_v3(self) -> None:
         definitions = self.schema["$defs"]
 
-        self.assertEqual(self.schema["x-argus-contract"], {"id": "C10", "owner": "S10", "version": "2.0.0"})
+        self.assertEqual(self.schema["x-argus-contract"], {"id": "C10", "owner": "S10", "version": "3.0.0"})
         for name in (
             "BudgetToken",
             "ScopeToken",
@@ -65,10 +65,16 @@ class C10ContractSchemaTests(unittest.TestCase):
 
         self._assert_invalid(payload)
 
+    def test_scope_grant_rejects_duplicate_capabilities(self) -> None:
+        payload = json.loads((EXAMPLES / "c10.scope-token.example.json").read_text(encoding="utf-8"))
+        payload["scopes"]["capabilities"] = ["s8.read", "s8.read"]
+
+        self._assert_invalid(payload)
+
     def test_generated_python_binding_points_to_exact_c10_schema_digest(self) -> None:
         contract = CONTRACT_BY_ID["C10"]
 
-        self.assertEqual(contract.version, "2.0.0")
+        self.assertEqual(contract.version, "3.0.0")
         self.assertEqual(contract.schema, "c10.s10-runtime.schema.json")
         self.assertEqual(contract.schema_sha256, self._schema_sha256(self.schema))
 

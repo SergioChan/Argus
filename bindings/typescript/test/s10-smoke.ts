@@ -56,6 +56,9 @@ const launchRequest = {
         "store",
         "adapter:toy-solver"
       ],
+      "capabilities": [
+        "s8.read"
+      ],
       "producer_subsystems": [
         "S2"
       ],
@@ -123,7 +126,7 @@ const policyBundle = {
   "signature": "hmac-sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
 };
 
-assert.equal(C10_SCHEMA_SHA256, "sha256:6d3ec4964f831f9fd2e281248080f30630d2b3e75d1ffd8d1a0a7009d74c5506");
+assert.equal(C10_SCHEMA_SHA256, "sha256:827e33401405e7970d191a15e8604cd98eb9268891644df58b565a904d343a9e");
 assert.doesNotThrow(() => assertLaunchRequest(launchRequest));
 assert.doesNotThrow(() => assertBudgetToken(launchRequest.budget_token));
 assert.doesNotThrow(() => assertScopeToken(launchRequest.scope_token));

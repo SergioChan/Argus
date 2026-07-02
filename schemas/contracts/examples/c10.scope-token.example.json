@@ -12,6 +12,7 @@
       }
     ],
     "broker_audiences": ["store", "adapter:toy-solver"],
+    "capabilities": ["s8.read"],
     "producer_subsystems": ["S2"],
     "sandbox_risk_class": "standard",
     "disallowed_actions": ["direct_store_write"]

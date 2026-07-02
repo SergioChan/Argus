@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-pub const C10_SCHEMA_SHA256: &str = "sha256:6d3ec4964f831f9fd2e281248080f30630d2b3e75d1ffd8d1a0a7009d74c5506";
+pub const C10_SCHEMA_SHA256: &str = "sha256:827e33401405e7970d191a15e8604cd98eb9268891644df58b565a904d343a9e";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -66,6 +66,7 @@ pub struct ScopeGrant {
     pub allowed_datasets: Vec<String>,
     pub egress_allowlist: Vec<EgressRule>,
     pub broker_audiences: Vec<String>,
+    pub capabilities: Vec<String>,
     pub producer_subsystems: Vec<String>,
     pub sandbox_risk_class: RiskClass,
     pub disallowed_actions: Vec<String>,
@@ -346,6 +347,9 @@ mod tests {
                                     "broker_audiences": [
                                                 "store",
                                                 "adapter:toy-solver"
+                                    ],
+                                    "capabilities": [
+                                                "s8.read"
                                     ],
                                     "producer_subsystems": [
                                                 "S2"

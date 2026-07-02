@@ -7,7 +7,7 @@ from typing import Annotated, Any, Literal, Mapping
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
-C10_SCHEMA_SHA256 = "sha256:6d3ec4964f831f9fd2e281248080f30630d2b3e75d1ffd8d1a0a7009d74c5506"
+C10_SCHEMA_SHA256 = "sha256:827e33401405e7970d191a15e8604cd98eb9268891644df58b565a904d343a9e"
 
 ArtifactRef = Annotated[str, Field(pattern=r"^c4://[A-Za-z0-9._:/-]+$")]
 HashRef = Annotated[str, Field(pattern=r"^blake3:[a-f0-9]{64}$")]
@@ -62,6 +62,7 @@ class ScopeGrant(BaseModel):
     allowed_datasets: list[ArtifactRef]
     egress_allowlist: list[EgressRule]
     broker_audiences: list[str]
+    capabilities: list[str]
     producer_subsystems: list[Annotated[str, Field(pattern=r"^S\d+$")]]
     sandbox_risk_class: RiskClass
     disallowed_actions: list[str]
@@ -71,6 +72,7 @@ class ScopeGrant(BaseModel):
         "allowed_datasets",
         "egress_allowlist",
         "broker_audiences",
+        "capabilities",
         "producer_subsystems",
         "disallowed_actions",
     )

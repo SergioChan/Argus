@@ -38,6 +38,7 @@ from argus_runtime.s8_writer_service import S8WriterApp
 AUTH_TOKEN = "test-runtime-token"
 S8_READ_TOKEN = "test-s8-read-token"
 S8_REPRO_WRITE_TOKEN = "test-s8-repro-write-token"
+S8_BROKER_AUDIENCE_ONLY_READ_TOKEN = "test-s8-broker-audience-only-read-token"
 BOOTSTRAP_TOKEN = "test-bootstrap-token"
 IDENTITY_SIGNING_KEY = b"test-identity-signing-key"
 HEALTH_TOKEN = "test-health-token"
@@ -398,6 +399,15 @@ class ArgusM0RuntimeServiceTests(unittest.TestCase):
                     headers=_auth_headers(S8_REPRO_WRITE_TOKEN),
                 )
             )
+            broker_audience_only_query_status, broker_audience_only_query_payload = app.http.handle(
+                JsonRequest(
+                    method="GET",
+                    path="/v1/artifacts",
+                    query={"kind": ["model"]},
+                    body=None,
+                    headers=_auth_headers(S8_BROKER_AUDIENCE_ONLY_READ_TOKEN),
+                )
+            )
             bad_page_status, bad_page_payload = app.http.handle(
                 JsonRequest(
                     method="GET",
@@ -510,6 +520,8 @@ class ArgusM0RuntimeServiceTests(unittest.TestCase):
             self.assertEqual(unauth_query_payload["error"], "Unauthorized")
             self.assertEqual(write_only_query_status, 403)
             self.assertEqual(write_only_query_payload["error"], "CapabilityDenied")
+            self.assertEqual(broker_audience_only_query_status, 403)
+            self.assertEqual(broker_audience_only_query_payload["error"], "CapabilityDenied")
             self.assertEqual(bad_page_status, 400)
             self.assertEqual(bad_page_payload["error"], "ValueError")
             self.assertEqual(manifest_status, 200)
@@ -1001,6 +1013,7 @@ class ArgusM0RuntimeServiceTests(unittest.TestCase):
                     allowed_datasets=tuple(scope["scopes"]["allowed_datasets"]),
                     egress_allowlist=(),
                     broker_audiences=tuple(scope["scopes"]["broker_audiences"]),
+                    capabilities=tuple(scope["scopes"]["capabilities"]),
                     producer_subsystems=tuple(scope["scopes"]["producer_subsystems"]),
                     disallowed_actions=tuple(scope["scopes"]["disallowed_actions"]),
                     sandbox_risk_class=scope["scopes"]["sandbox_risk_class"],
@@ -1181,7 +1194,8 @@ def _s8_runtime_auth() -> RuntimeAuth:
                 job_id="job-auth",
                 root_request_id="root-auth",
                 scopes=ScopeGrant(
-                    broker_audiences=("store", "s8.read", "s8.reproducibility.write"),
+                    broker_audiences=("store",),
+                    capabilities=("s8.read", "s8.reproducibility.write"),
                     producer_subsystems=("S2",),
                 ),
                 budget_caps=BudgetCaps(max_compute_units=10, max_wallclock_s=30, max_cost_usd=5),
@@ -1191,7 +1205,7 @@ def _s8_runtime_auth() -> RuntimeAuth:
                 caller_id="test-s8-read",
                 job_id="job-read",
                 root_request_id="root-read",
-                scopes=ScopeGrant(broker_audiences=("s8.read",)),
+                scopes=ScopeGrant(capabilities=("s8.read",)),
                 budget_caps=BudgetCaps(max_compute_units=10, max_wallclock_s=30, max_cost_usd=5),
                 max_ttl_s=300,
             ),
@@ -1199,7 +1213,15 @@ def _s8_runtime_auth() -> RuntimeAuth:
                 caller_id="test-s8-repro-write",
                 job_id="job-repro-write",
                 root_request_id="root-repro-write",
-                scopes=ScopeGrant(broker_audiences=("s8.reproducibility.write",)),
+                scopes=ScopeGrant(capabilities=("s8.reproducibility.write",)),
+                budget_caps=BudgetCaps(max_compute_units=10, max_wallclock_s=30, max_cost_usd=5),
+                max_ttl_s=300,
+            ),
+            S8_BROKER_AUDIENCE_ONLY_READ_TOKEN: RuntimeIdentity(
+                caller_id="test-s8-broker-audience-only-read",
+                job_id="job-broker-only-read",
+                root_request_id="root-broker-only-read",
+                scopes=ScopeGrant(broker_audiences=("s8.read",)),
                 budget_caps=BudgetCaps(max_compute_units=10, max_wallclock_s=30, max_cost_usd=5),
                 max_ttl_s=300,
             ),

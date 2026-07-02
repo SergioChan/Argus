@@ -351,7 +351,7 @@ def _m0_identity_requests() -> dict[str, dict[str, Any]]:
             "job_id": "m0-read",
             "root_request_id": "m0-read-root",
             "scopes": {
-                "broker_audiences": ["s8.read"],
+                "capabilities": ["s8.read"],
             },
         },
         "write": {
@@ -359,7 +359,8 @@ def _m0_identity_requests() -> dict[str, dict[str, Any]]:
             "job_id": "m0-spine-write-tests",
             "root_request_id": "m0-spine-write-root",
             "scopes": {
-                "broker_audiences": ["store", "s8.reproducibility.write"],
+                "broker_audiences": ["store"],
+                "capabilities": ["s8.reproducibility.write"],
                 "producer_subsystems": ["S2"],
                 "sandbox_risk_class": "standard",
             },
@@ -371,6 +372,7 @@ def _m0_identity_requests() -> dict[str, dict[str, Any]]:
             "budget_caps": {"max_compute_units": 10, "max_wallclock_s": 10, "max_cost_usd": 5},
             "scopes": {
                 "broker_audiences": ["store"],
+                "capabilities": ["s8.read", "s8.reproducibility.write"],
                 "producer_subsystems": ["S2"],
                 "sandbox_risk_class": "standard",
             },
@@ -388,6 +390,7 @@ def _m0_identity_requests() -> dict[str, dict[str, Any]]:
             "root_request_id": "m0-verifier-root",
             "scopes": {
                 "broker_audiences": ["store"],
+                "capabilities": ["s8.read"],
                 "producer_subsystems": ["S3"],
                 "sandbox_risk_class": "standard",
             },
@@ -1499,6 +1502,7 @@ def _scope_token_from_json(value: dict[str, Any]) -> ScopeToken:
             allowed_datasets=tuple(scopes.get("allowed_datasets") or ()),
             egress_allowlist=tuple(EgressRule(**rule) for rule in scopes.get("egress_allowlist") or ()),
             broker_audiences=tuple(scopes.get("broker_audiences") or ()),
+            capabilities=tuple(scopes.get("capabilities") or ()),
             producer_subsystems=tuple(scopes.get("producer_subsystems") or ()),
             sandbox_risk_class=scopes.get("sandbox_risk_class", "standard"),
             disallowed_actions=tuple(scopes.get("disallowed_actions") or ()),

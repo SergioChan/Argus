@@ -588,6 +588,7 @@ def _scope_grant_from_dict(value: dict[str, Any]) -> ScopeGrant:
         allowed_datasets=tuple(value.get("allowed_datasets") or ()),
         egress_allowlist=tuple(EgressRule(**rule) for rule in value.get("egress_allowlist") or ()),
         broker_audiences=tuple(value.get("broker_audiences") or ()),
+        capabilities=tuple(value.get("capabilities") or ()),
         producer_subsystems=tuple(value.get("producer_subsystems") or ()),
         disallowed_actions=tuple(value.get("disallowed_actions") or ()),
         sandbox_risk_class=str(value.get("sandbox_risk_class", "standard")),
@@ -619,6 +620,8 @@ def _require_scope_subset(child: ScopeGrant, parent: ScopeGrant) -> None:
         raise PermissionError("scope token egress_allowlist exceeds authenticated identity")
     if not set(child.broker_audiences).issubset(parent.broker_audiences):
         raise PermissionError("scope token broker_audiences exceeds authenticated identity")
+    if not set(child.capabilities).issubset(parent.capabilities):
+        raise PermissionError("scope token capabilities exceeds authenticated identity")
     if not set(child.producer_subsystems).issubset(parent.producer_subsystems):
         raise PermissionError("scope token producer_subsystems exceeds authenticated identity")
     if not set(parent.disallowed_actions).issubset(child.disallowed_actions):

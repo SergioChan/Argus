@@ -160,7 +160,7 @@ class S8WriterApp:
             identity = self.auth.authenticate(request)
         except UnauthorizedError as exc:
             return False, 401, {"error": "Unauthorized", "message": str(exc)}
-        if capability is not None and capability not in identity.scopes.broker_audiences:
+        if capability is not None and capability not in identity.scopes.capabilities:
             return False, 403, {"error": "CapabilityDenied", "message": f"missing capability: {capability}"}
         return True, 200, None
 

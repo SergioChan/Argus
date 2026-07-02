@@ -110,6 +110,7 @@ class ScopeGrant:
     allowed_datasets: tuple[str, ...] = ()
     egress_allowlist: tuple[EgressRule, ...] = ()
     broker_audiences: tuple[str, ...] = ()
+    capabilities: tuple[str, ...] = ()
     producer_subsystems: tuple[str, ...] = ()
     sandbox_risk_class: RiskClass = "standard"
     disallowed_actions: tuple[str, ...] = ()
@@ -598,6 +599,8 @@ class InMemoryTokenService:
             raise ScopeWideningError("attenuated scope cannot add egress")
         if set(child.broker_audiences) - set(parent.broker_audiences):
             raise ScopeWideningError("attenuated scope cannot add broker audiences")
+        if set(child.capabilities) - set(parent.capabilities):
+            raise ScopeWideningError("attenuated scope cannot add capabilities")
         if set(child.producer_subsystems) - set(parent.producer_subsystems):
             raise ScopeWideningError("attenuated scope cannot add producer subsystems")
         if child.sandbox_risk_class != parent.sandbox_risk_class:
