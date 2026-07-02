@@ -97,6 +97,19 @@ class S10GeneratedBindingsTests(unittest.TestCase):
         with self.assertRaises(ValidationError):
             validate_policy_bundle(bad_policy_signature)
 
+    def test_c10_python_binding_accepts_ed25519_tokens_only(self) -> None:
+        ed25519_launch = copy.deepcopy(self.launch_request)
+        ed25519_launch["budget_token"]["signature"] = "ed25519:" + "a" * 128
+        ed25519_launch["scope_token"]["signature"] = "ed25519:" + "b" * 128
+        ed25519_policy = {**copy.deepcopy(self.policy_bundle), "signature": "ed25519:" + "c" * 128}
+
+        validated = validate_launch_request(ed25519_launch)
+
+        self.assertTrue(validated.budget_token.signature.startswith("ed25519:"))
+        self.assertTrue(validated.scope_token.signature.startswith("ed25519:"))
+        with self.assertRaises(ValidationError):
+            validate_policy_bundle(ed25519_policy)
+
     def test_c10_registry_entry_is_present_in_typescript_and_rust_bindings(self) -> None:
         c10 = CONTRACT_BY_ID["C10"]
         typescript_contracts = (ROOT / "bindings" / "typescript" / "src" / "contracts.ts").read_text(

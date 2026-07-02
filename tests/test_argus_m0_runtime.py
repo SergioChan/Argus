@@ -49,6 +49,8 @@ BROKER_WRITE_KEY = b"test-s8-broker-write-key"
 POLICY_SIGNING_KEY = "test-s10-policy-signing-key"
 CHECKPOINT_SIGNING_KEY = "test-s10-checkpoint-signing-key"
 CHECKPOINT_SIGNER_AUTH_TOKEN = "test-checkpoint-signer-token"
+TOKEN_ED25519_PRIVATE_KEY_HEX = "1111111111111111111111111111111111111111111111111111111111111111"
+TOKEN_ED25519_PUBLIC_KEY_HEX = "d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737"
 C3_VERIFIER_KEYS_JSON = json.dumps(
     {"argus-m0-c3-verifier": "test-c3-verifier-key"},
     separators=(",", ":"),
@@ -909,6 +911,68 @@ class ArgusM0RuntimeServiceTests(unittest.TestCase):
         self.assertEqual(payload["policy_bundle_version"], "argus-m0-dev")
         self.assertEqual(payload["policy_signer_key_id"], "argus-m0-policy")
         self.assertEqual(payload["checkpoint_signer"], "s10-kms")
+        self.assertEqual(payload["token_signer"], "local-hmac")
+        self.assertEqual(payload["token_signature_algorithm"], "hmac-sha256")
+
+    def test_s10_env_build_can_use_ed25519_token_signer_and_public_verifier(self) -> None:
+        base_env = {
+            "ARGUS_S10_TOKEN_SIGNING_MODE": "ed25519",
+            "ARGUS_S10_TOKEN_SIGNER_KEY_ID": "argus-m0-token-root",
+            "ARGUS_S10_TOKEN_ED25519_PRIVATE_KEY_HEX": TOKEN_ED25519_PRIVATE_KEY_HEX,
+            "ARGUS_S10_TOKEN_ED25519_PUBLIC_KEY_HEX": TOKEN_ED25519_PUBLIC_KEY_HEX,
+            "ARGUS_RUNTIME_BOOTSTRAP_TOKEN": BOOTSTRAP_TOKEN,
+            "ARGUS_RUNTIME_IDENTITY_SIGNING_KEY": IDENTITY_SIGNING_KEY.decode("utf-8"),
+            "ARGUS_RUNTIME_IDENTITY_MINT_POLICY_JSON": _runtime_identity_mint_policy_json(),
+            "ARGUS_M0_HEALTH_TOKEN": HEALTH_TOKEN,
+            "ARGUS_S10_POLICY_SIGNING_KEY": POLICY_SIGNING_KEY,
+            "ARGUS_S10_CHECKPOINT_SIGNING_KEY": CHECKPOINT_SIGNING_KEY,
+            "ARGUS_S10_CHECKPOINT_SIGNER_AUTH_TOKEN": CHECKPOINT_SIGNER_AUTH_TOKEN,
+        }
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(
+            os.environ,
+            {**base_env, "ARGUS_S10_TOKEN_REVOCATION_STORE_PATH": os.path.join(tmp, "revocations.jsonl")},
+            clear=True,
+        ):
+            app = build_s10_app_from_env()
+            health_status, health = app.http.handle(
+                JsonRequest(method="GET", path="/healthz", query={}, body=None, headers=_auth_headers(HEALTH_TOKEN))
+            )
+            runtime_status, runtime_token = app.http.handle(
+                JsonRequest(
+                    method="POST",
+                    path="/v1/runtime-identities",
+                    query={},
+                    body={"caller_id": "sandbox-1"},
+                    headers=_auth_headers(BOOTSTRAP_TOKEN),
+                )
+            )
+            budget_status, budget = app.http.handle(
+                JsonRequest(
+                    method="POST",
+                    path="/v1/budget-tokens",
+                    query={},
+                    body={},
+                    headers=_auth_headers(runtime_token["access_token"]),
+                )
+            )
+
+        self.assertEqual(health_status, 200)
+        self.assertEqual(health["token_signer"], "s10-kms-ed25519")
+        self.assertEqual(health["token_signature_algorithm"], "ed25519")
+        self.assertEqual(health["token_verifier"], "offline-ed25519-public")
+        self.assertEqual(health["token_revocation_store"], "file")
+        self.assertEqual(runtime_status, 201)
+        self.assertEqual(budget_status, 201)
+        self.assertEqual(budget["signer_key_id"], "argus-m0-token-root")
+        self.assertTrue(budget["signature"].startswith("ed25519:"))
+
+        with patch.dict(
+            os.environ,
+            {**base_env, "ARGUS_S10_TOKEN_ED25519_PUBLIC_KEY_HEX": "00" * 32},
+            clear=True,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "does not match private key"):
+                build_s10_app_from_env()
 
     def test_s10_env_build_requires_checkpoint_signer_material_and_auth_token(self) -> None:
         base_env = {
@@ -1048,6 +1112,54 @@ class ArgusM0RuntimeServiceTests(unittest.TestCase):
             self.assertEqual(payload["error"], "PermissionError")
             self.assertEqual(app.artifacts.record_count, 0)
 
+    def test_s10_revoke_scope_token_denies_brokered_write(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            app = S10SupervisorApp(
+                signing_key=b"test-key",
+                artifact_store=FileSystemArtifactStore(tmp),
+                artifact_store_path=tmp,
+                auth=_runtime_auth(),
+            )
+            scope_status, scope = app.http.handle(
+                JsonRequest(method="POST", path="/v1/scope-tokens", query={}, body={}, headers=_auth_headers())
+            )
+            revoke_status, revoke = app.http.handle(
+                JsonRequest(
+                    method="POST",
+                    path="/v1/tokens:revoke",
+                    query={},
+                    body={"token_type": "scope", "token": scope},
+                    headers=_auth_headers(),
+                )
+            )
+            write_status, write_payload = app.http.handle(
+                JsonRequest(
+                    method="POST",
+                    path="/v1/store/artifacts",
+                    query={},
+                    body={
+                        "scope_token": scope,
+                        "kind": "model",
+                        "payload": {"weights": [1]},
+                        "producer": {"subsystem": "S2", "version": "0.0.0"},
+                        "lineage": {
+                            "input_refs": [],
+                            "code_ref": "git:model",
+                            "environment_digest": "oci:model",
+                        },
+                    },
+                    headers=_auth_headers(),
+                )
+            )
+
+            self.assertEqual(scope_status, 201)
+            self.assertEqual(revoke_status, 200)
+            self.assertEqual(revoke["revoked_token_id"], scope["scope_id"])
+            self.assertEqual(write_status, 401)
+            self.assertEqual(write_payload["error"], "TokenInvalidError")
+            self.assertIn("revoked", write_payload["message"])
+            self.assertEqual(app.artifacts.record_count, 0)
+
     def test_s10_supervisor_service_mints_verifiable_tokens(self) -> None:
         app = S10SupervisorApp(signing_key=b"test-key")
 
@@ -1149,7 +1261,8 @@ class ArgusM0ComposeTests(unittest.TestCase):
                 "ARGUS_RUNTIME_IDENTITY_SIGNING_KEY": IDENTITY_SIGNING_KEY.decode("utf-8"),
                 "ARGUS_RUNTIME_IDENTITY_MINT_POLICY_JSON": _runtime_identity_mint_policy_json(),
                 "ARGUS_M0_HEALTH_TOKEN": HEALTH_TOKEN,
-                "ARGUS_S10_SIGNING_KEY": "test-s10-signing-key",
+                "ARGUS_S10_TOKEN_ED25519_PRIVATE_KEY_HEX": TOKEN_ED25519_PRIVATE_KEY_HEX,
+                "ARGUS_S10_TOKEN_ED25519_PUBLIC_KEY_HEX": TOKEN_ED25519_PUBLIC_KEY_HEX,
                 "ARGUS_S10_POLICY_SIGNING_KEY": POLICY_SIGNING_KEY,
                 "ARGUS_S8_BROKER_WRITE_KEY": BROKER_WRITE_KEY.decode("utf-8"),
                 "ARGUS_S10_CHECKPOINT_SIGNING_KEY": CHECKPOINT_SIGNING_KEY,
@@ -1216,7 +1329,24 @@ class ArgusM0ComposeTests(unittest.TestCase):
             "http://s8-writer:8080/v1/internal/brokered-artifacts",
         )
         self.assertIn("ARGUS_S8_BROKER_WRITE_KEY", services["s10-supervisor"]["environment"])
-        self.assertEqual(services["s10-supervisor"]["environment"]["ARGUS_S10_SIGNING_KEY"], "test-s10-signing-key")
+        self.assertNotIn("ARGUS_S10_SIGNING_KEY", services["s10-supervisor"]["environment"])
+        self.assertEqual(services["s10-supervisor"]["environment"]["ARGUS_S10_TOKEN_SIGNING_MODE"], "ed25519")
+        self.assertEqual(
+            services["s10-supervisor"]["environment"]["ARGUS_S10_TOKEN_SIGNER_KEY_ID"],
+            "argus-m0-token-root",
+        )
+        self.assertEqual(
+            services["s10-supervisor"]["environment"]["ARGUS_S10_TOKEN_ED25519_PRIVATE_KEY_HEX"],
+            TOKEN_ED25519_PRIVATE_KEY_HEX,
+        )
+        self.assertEqual(
+            services["s10-supervisor"]["environment"]["ARGUS_S10_TOKEN_ED25519_PUBLIC_KEY_HEX"],
+            TOKEN_ED25519_PUBLIC_KEY_HEX,
+        )
+        self.assertEqual(
+            services["s10-supervisor"]["environment"]["ARGUS_S10_TOKEN_REVOCATION_STORE_PATH"],
+            "/var/lib/argus/s10/token-revocations.jsonl",
+        )
         self.assertEqual(services["s10-supervisor"]["environment"]["ARGUS_S10_POLICY_SIGNING_KEY"], POLICY_SIGNING_KEY)
         self.assertEqual(
             services["s10-supervisor"]["environment"]["ARGUS_S10_CHECKPOINT_SIGNER_KEY_ID"],
@@ -1231,8 +1361,10 @@ class ArgusM0ComposeTests(unittest.TestCase):
             CHECKPOINT_SIGNER_AUTH_TOKEN,
         )
         s10_volumes = services["s10-supervisor"].get("volumes", [])
-        self.assertEqual(len(s10_volumes), 1)
-        self.assertEqual(s10_volumes[0]["target"], "/var/run/docker.sock")
+        self.assertEqual(
+            sorted(volume["target"] for volume in s10_volumes),
+            ["/var/lib/argus/s10", "/var/run/docker.sock"],
+        )
         self.assertEqual(s10_volumes[0]["source"], "/var/run/docker.sock")
         self.assertNotIn("s8-data", rendered["volumes"])
         self.assertIn("postgres-data", rendered["volumes"])

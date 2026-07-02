@@ -7,11 +7,12 @@ from typing import Annotated, Any, Literal, Mapping
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
-C10_SCHEMA_SHA256 = "sha256:827e33401405e7970d191a15e8604cd98eb9268891644df58b565a904d343a9e"
+C10_SCHEMA_SHA256 = "sha256:80d5dcfbd1305026be71eb306f465e3119d725528008f61aa7e086503a6eb4b1"
 
 ArtifactRef = Annotated[str, Field(pattern=r"^c4://[A-Za-z0-9._:/-]+$")]
 HashRef = Annotated[str, Field(pattern=r"^blake3:[a-f0-9]{64}$")]
 Signature = Annotated[str, Field(pattern=r"^hmac-sha256:[a-f0-9]{64}$")]
+TokenSignature = Annotated[str, Field(pattern=r"^(?:hmac-sha256:[a-f0-9]{64}|ed25519:[a-f0-9]{128})$")]
 DigestPinnedImage = Annotated[str, Field(pattern=r"^(?:[^\s@]+@)?sha256:[0-9a-f]{64}$")]
 RuntimeClass = Literal["auto", "gvisor", "firecracker", "docker"]
 RiskClass = Literal["standard", "federated", "high"]
@@ -98,7 +99,7 @@ class BudgetToken(BaseModel):
     ttl_s: int = Field(ge=1)
     parent_budget_id: str | None
     signer_key_id: str = Field(min_length=1)
-    signature: Signature
+    signature: TokenSignature
 
 
 class ScopeToken(BaseModel):
@@ -112,7 +113,7 @@ class ScopeToken(BaseModel):
     ttl_s: int = Field(ge=1)
     parent_scope_id: str | None
     signer_key_id: str = Field(min_length=1)
-    signature: Signature
+    signature: TokenSignature
 
 
 class ResourceCeilings(BaseModel):

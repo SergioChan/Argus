@@ -84,7 +84,11 @@ services:
     environment:
       ARGUS_S10_HOST: "0.0.0.0"
       ARGUS_S10_PORT: "8080"
-      ARGUS_S10_SIGNING_KEY: ${ARGUS_S10_SIGNING_KEY:?ARGUS_S10_SIGNING_KEY is required}
+      ARGUS_S10_TOKEN_SIGNING_MODE: ed25519
+      ARGUS_S10_TOKEN_SIGNER_KEY_ID: argus-m0-token-root
+      ARGUS_S10_TOKEN_ED25519_PRIVATE_KEY_HEX: ${ARGUS_S10_TOKEN_ED25519_PRIVATE_KEY_HEX:?ARGUS_S10_TOKEN_ED25519_PRIVATE_KEY_HEX is required}
+      ARGUS_S10_TOKEN_ED25519_PUBLIC_KEY_HEX: ${ARGUS_S10_TOKEN_ED25519_PUBLIC_KEY_HEX:?ARGUS_S10_TOKEN_ED25519_PUBLIC_KEY_HEX is required}
+      ARGUS_S10_TOKEN_REVOCATION_STORE_PATH: /var/lib/argus/s10/token-revocations.jsonl
       ARGUS_S10_POLICY_SIGNING_KEY: ${ARGUS_S10_POLICY_SIGNING_KEY:?ARGUS_S10_POLICY_SIGNING_KEY is required}
       ARGUS_S10_CHECKPOINT_SIGNER_KEY_ID: argus-m0-s8-checkpoint
       ARGUS_S10_CHECKPOINT_SIGNING_KEY: ${ARGUS_S10_CHECKPOINT_SIGNING_KEY:?ARGUS_S10_CHECKPOINT_SIGNING_KEY is required}
@@ -99,6 +103,7 @@ services:
       - "127.0.0.1:${ARGUS_M0_S10_PORT:-58081}:8080"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
+      - s10-token-state:/var/lib/argus/s10
     depends_on:
       s8-writer:
         condition: service_healthy
@@ -112,3 +117,4 @@ services:
 volumes:
   postgres-data:
   minio-data:
+  s10-token-state:

@@ -799,6 +799,7 @@ C10_SCHEMA_SHA256 = "{c10_schema_sha256}"
 ArtifactRef = Annotated[str, Field(pattern=r"^c4://[A-Za-z0-9._:/-]+$")]
 HashRef = Annotated[str, Field(pattern=r"^blake3:[a-f0-9]{{64}}$")]
 Signature = Annotated[str, Field(pattern=r"^hmac-sha256:[a-f0-9]{{64}}$")]
+TokenSignature = Annotated[str, Field(pattern=r"^(?:hmac-sha256:[a-f0-9]{{64}}|ed25519:[a-f0-9]{{128}})$")]
 DigestPinnedImage = Annotated[str, Field(pattern=r"^(?:[^\\s@]+@)?sha256:[0-9a-f]{{64}}$")]
 RuntimeClass = Literal["auto", "gvisor", "firecracker", "docker"]
 RiskClass = Literal["standard", "federated", "high"]
@@ -885,7 +886,7 @@ class BudgetToken(BaseModel):
     ttl_s: int = Field(ge=1)
     parent_budget_id: str | None
     signer_key_id: str = Field(min_length=1)
-    signature: Signature
+    signature: TokenSignature
 
 
 class ScopeToken(BaseModel):
@@ -899,7 +900,7 @@ class ScopeToken(BaseModel):
     ttl_s: int = Field(ge=1)
     parent_scope_id: str | None
     signer_key_id: str = Field(min_length=1)
-    signature: Signature
+    signature: TokenSignature
 
 
 class ResourceCeilings(BaseModel):
@@ -1229,6 +1230,7 @@ export interface S8CheckpointSignature {{
 
 const hashRefPattern = /^blake3:[a-f0-9]{{64}}$/;
 const signaturePattern = /^hmac-sha256:[a-f0-9]{{64}}$/;
+const tokenSignaturePattern = /^(?:hmac-sha256:[a-f0-9]{{64}}|ed25519:[a-f0-9]{{128}})$/;
 const artifactRefPattern = /^c4:\\/\\/[A-Za-z0-9._:/-]+$/;
 const semverPattern = /^\\d+\\.\\d+\\.\\d+$/;
 const imagePattern = /^(?:[^\\s@]+@)?sha256:[0-9a-f]{{64}}$/;
@@ -1266,7 +1268,7 @@ export function assertBudgetToken(payload: unknown): asserts payload is BudgetTo
   assertPositiveInteger(record.ttl_s, "budget_token.ttl_s");
   assertStringOrNull(record.parent_budget_id, "budget_token.parent_budget_id");
   assertMinString(record.signer_key_id, 1, "budget_token.signer_key_id");
-  assertPattern(record.signature, signaturePattern, "budget_token.signature");
+  assertPattern(record.signature, tokenSignaturePattern, "budget_token.signature");
 }}
 
 export function assertScopeToken(payload: unknown): asserts payload is ScopeToken {{
@@ -1290,7 +1292,7 @@ export function assertScopeToken(payload: unknown): asserts payload is ScopeToke
   assertPositiveInteger(record.ttl_s, "scope_token.ttl_s");
   assertStringOrNull(record.parent_scope_id, "scope_token.parent_scope_id");
   assertMinString(record.signer_key_id, 1, "scope_token.signer_key_id");
-  assertPattern(record.signature, signaturePattern, "scope_token.signature");
+  assertPattern(record.signature, tokenSignaturePattern, "scope_token.signature");
 }}
 
 export function assertPolicyBundle(payload: unknown): asserts payload is PolicyBundle {{
@@ -2273,8 +2275,8 @@ impl BudgetToken {{
         if self.budget_epoch == 0 {{
             return Err("budget_epoch must be positive");
         }}
-        if !is_hmac_sha256_signature(&self.signature) {{
-            return Err("budget signature must be hmac-sha256");
+        if !is_token_signature(&self.signature) {{
+            return Err("budget signature must be hmac-sha256 or ed25519");
         }}
         Ok(())
     }}
@@ -2295,8 +2297,8 @@ pub struct ScopeToken {{
 
 impl ScopeToken {{
     pub fn validate(&self) -> Result<(), &'static str> {{
-        if !is_hmac_sha256_signature(&self.signature) {{
-            return Err("scope signature must be hmac-sha256");
+        if !is_token_signature(&self.signature) {{
+            return Err("scope signature must be hmac-sha256 or ed25519");
         }}
         Ok(())
     }}
@@ -2462,6 +2464,13 @@ pub fn is_hmac_sha256_signature(signature: &str) -> bool {{
     signature
         .strip_prefix("hmac-sha256:")
         .is_some_and(|digest| is_lower_hex_digest(digest, 64))
+}}
+
+pub fn is_token_signature(signature: &str) -> bool {{
+    is_hmac_sha256_signature(signature)
+        || signature
+            .strip_prefix("ed25519:")
+            .is_some_and(|digest| is_lower_hex_digest(digest, 128))
 }}
 
 pub fn is_blake3_hash(value: &str) -> bool {{

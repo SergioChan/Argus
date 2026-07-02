@@ -6,7 +6,7 @@
   "x-argus-contract": {
     "id": "C10",
     "owner": "S10",
-    "version": "3.0.0"
+    "version": "4.0.0"
   },
   "oneOf": [
     { "$ref": "#/$defs/BudgetToken" },
@@ -34,6 +34,10 @@
     "Signature": {
       "type": "string",
       "pattern": "^hmac-sha256:[a-f0-9]{64}$"
+    },
+    "TokenSignature": {
+      "type": "string",
+      "pattern": "^(?:hmac-sha256:[a-f0-9]{64}|ed25519:[a-f0-9]{128})$"
     },
     "SemVer": {
       "type": "string",
@@ -162,7 +166,7 @@
         "ttl_s": { "type": "integer", "minimum": 1 },
         "parent_budget_id": { "type": ["string", "null"], "minLength": 1 },
         "signer_key_id": { "type": "string", "minLength": 1 },
-        "signature": { "$ref": "#/$defs/Signature" }
+        "signature": { "$ref": "#/$defs/TokenSignature" }
       }
     },
     "ScopeToken": {
@@ -188,7 +192,7 @@
         "ttl_s": { "type": "integer", "minimum": 1 },
         "parent_scope_id": { "type": ["string", "null"], "minLength": 1 },
         "signer_key_id": { "type": "string", "minLength": 1 },
-        "signature": { "$ref": "#/$defs/Signature" }
+        "signature": { "$ref": "#/$defs/TokenSignature" }
       }
     },
     "ResourceCeilings": {

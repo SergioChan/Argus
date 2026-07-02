@@ -17,6 +17,10 @@ from typing import Any, Callable, Literal, NoReturn
 from uuid import uuid4
 from weakref import ref
 
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
+
 from .canonical import canonical_json_bytes
 from .c3 import C3_SIGNATURE_PREFIX, SIGNATURE_VERIFICATION_ACCEPTED, VerifierKey
 from .hashing import BLAKE3_PREFIX, hash_json
@@ -24,6 +28,7 @@ from .s8 import ArtifactRecord, InMemoryArtifactStore, Lineage, Producer
 
 
 SIGNATURE_PREFIX = "hmac-sha256:"
+TOKEN_ED25519_SIGNATURE_PREFIX = "ed25519:"
 DOCKER_SANDBOX_USER = "65532:65532"
 SECRET_VALUE_PATTERNS = (
     re.compile(r"-----BEGIN [A-Z ]+PRIVATE KEY-----"),
@@ -456,21 +461,302 @@ def s8_checkpoint_signature_payload(*, sequence: int, root: str, signer_key_id: 
     )
 
 
+def token_signature_payload(token: BudgetToken | ScopeToken) -> bytes:
+    payload = asdict(token)
+    payload["signature"] = ""
+    return canonical_json_bytes(payload)
+
+
+class InMemoryTokenRevocationStore:
+    """Process-local token revocation store."""
+
+    kind = "memory"
+
+    def __init__(self, revoked_ids: tuple[str, ...] = ()) -> None:
+        self._revoked_ids = set(revoked_ids)
+
+    def revoke(self, token_id: str) -> None:
+        self._revoked_ids.add(_validate_token_id(token_id))
+
+    def is_revoked(self, token_id: str) -> bool:
+        return _validate_token_id(token_id) in self._revoked_ids
+
+    def snapshot(self) -> tuple[str, ...]:
+        return tuple(sorted(self._revoked_ids))
+
+
+class FileTokenRevocationStore:
+    """Append-only JSONL token revocation store shared by token-service instances."""
+
+    kind = "file"
+
+    def __init__(self, path: str | os.PathLike[str], *, now_fn: Callable[[], int] | None = None) -> None:
+        self._path = os.fspath(path)
+        self._now_fn = now_fn or (lambda: int(time.time()))
+        os.makedirs(os.path.dirname(os.path.abspath(self._path)), exist_ok=True)
+
+    @property
+    def path(self) -> str:
+        return self._path
+
+    def revoke(self, token_id: str) -> None:
+        token_id = _validate_token_id(token_id)
+        if self.is_revoked(token_id):
+            return
+        entry = {"token_id": token_id, "revoked_at": self._now_fn()}
+        with open(self._path, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(entry, sort_keys=True, separators=(",", ":")) + "\n")
+
+    def is_revoked(self, token_id: str) -> bool:
+        return _validate_token_id(token_id) in self._load_revoked_ids()
+
+    def snapshot(self) -> tuple[str, ...]:
+        return tuple(sorted(self._load_revoked_ids()))
+
+    def _load_revoked_ids(self) -> set[str]:
+        if not os.path.exists(self._path):
+            return set()
+        revoked: set[str] = set()
+        with open(self._path, encoding="utf-8") as handle:
+            for line_number, line in enumerate(handle, start=1):
+                if not line.strip():
+                    continue
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError as exc:
+                    raise ValueError(f"invalid token revocation entry at line {line_number}") from exc
+                token_id = entry.get("token_id") if isinstance(entry, dict) else None
+                if not isinstance(token_id, str) or not token_id:
+                    raise ValueError(f"invalid token revocation token_id at line {line_number}")
+                revoked.add(token_id)
+        return revoked
+
+
+class HmacTokenSigner:
+    """Local HMAC token signer kept for compatibility with existing tests and baselines."""
+
+    algorithm = "hmac-sha256"
+    kind = "local-hmac"
+
+    def __init__(self, *, signer_key_id: str, signing_key: bytes) -> None:
+        if not signer_key_id:
+            raise ValueError("signer_key_id is required")
+        if not signing_key:
+            raise ValueError("token signing key is required")
+        self.signer_key_id = signer_key_id
+        self._signing_key = bytes(signing_key)
+
+    def sign(self, token: BudgetToken | ScopeToken) -> str:
+        digest = hmac.new(self._signing_key, token_signature_payload(token), sha256).hexdigest()
+        return f"{SIGNATURE_PREFIX}{digest}"
+
+    def trust_store(self) -> "TokenSignatureTrustStore":
+        return TokenSignatureTrustStore(hmac_keys={self.signer_key_id: self._signing_key})
+
+
+class Ed25519KmsTokenSigner:
+    """KMS-style Ed25519 token signer that exposes only public verification material."""
+
+    algorithm = "ed25519"
+    kind = "s10-kms-ed25519"
+
+    def __init__(self, *, signer_key_id: str, private_key_bytes: bytes) -> None:
+        if not signer_key_id:
+            raise ValueError("signer_key_id is required")
+        if len(private_key_bytes) != 32:
+            raise ValueError("Ed25519 private key must be 32 raw bytes")
+        self.signer_key_id = signer_key_id
+        self._private_key = Ed25519PrivateKey.from_private_bytes(private_key_bytes)
+        self.public_key_bytes = self._private_key.public_key().public_bytes(
+            encoding=serialization.Encoding.Raw,
+            format=serialization.PublicFormat.Raw,
+        )
+
+    def sign(self, token: BudgetToken | ScopeToken) -> str:
+        signature = self._private_key.sign(token_signature_payload(token))
+        return f"{TOKEN_ED25519_SIGNATURE_PREFIX}{signature.hex()}"
+
+    def trust_store(self) -> "TokenSignatureTrustStore":
+        return TokenSignatureTrustStore(ed25519_public_keys={self.signer_key_id: self.public_key_bytes})
+
+
+class TokenSignatureTrustStore:
+    """Offline verifier for S10 token signatures."""
+
+    def __init__(
+        self,
+        *,
+        hmac_keys: dict[str, bytes] | None = None,
+        ed25519_public_keys: dict[str, bytes] | None = None,
+    ) -> None:
+        self._hmac_keys = {key_id: bytes(value) for key_id, value in (hmac_keys or {}).items()}
+        self._ed25519_public_keys = {
+            key_id: Ed25519PublicKey.from_public_bytes(bytes(value))
+            for key_id, value in (ed25519_public_keys or {}).items()
+        }
+        if self._ed25519_public_keys and not self._hmac_keys:
+            self.kind = "offline-ed25519-public"
+        elif self._ed25519_public_keys and self._hmac_keys:
+            self.kind = "offline-mixed"
+        else:
+            self.kind = "shared-secret-hmac"
+
+    def verify(self, token: BudgetToken | ScopeToken) -> TokenVerification:
+        if token.signature.startswith(SIGNATURE_PREFIX):
+            return self._verify_hmac(token)
+        if token.signature.startswith(TOKEN_ED25519_SIGNATURE_PREFIX):
+            return self._verify_ed25519(token)
+        return TokenVerification(valid=False, reason="signature_invalid")
+
+    def _verify_hmac(self, token: BudgetToken | ScopeToken) -> TokenVerification:
+        signing_key = self._hmac_keys.get(token.signer_key_id)
+        if signing_key is None:
+            return TokenVerification(valid=False, reason="unknown_signer")
+        signature_hex = token.signature.removeprefix(SIGNATURE_PREFIX)
+        if _lower_hex_to_bytes(signature_hex, expected_bytes=32) is None:
+            return TokenVerification(valid=False, reason="signature_invalid")
+        digest = hmac.new(signing_key, token_signature_payload(token), sha256).hexdigest()
+        expected = f"{SIGNATURE_PREFIX}{digest}"
+        if not hmac.compare_digest(token.signature, expected):
+            return TokenVerification(valid=False, reason="signature_invalid")
+        return TokenVerification(valid=True)
+
+    def _verify_ed25519(self, token: BudgetToken | ScopeToken) -> TokenVerification:
+        public_key = self._ed25519_public_keys.get(token.signer_key_id)
+        if public_key is None:
+            return TokenVerification(valid=False, reason="unknown_signer")
+        signature = _lower_hex_to_bytes(
+            token.signature.removeprefix(TOKEN_ED25519_SIGNATURE_PREFIX),
+            expected_bytes=64,
+        )
+        if signature is None:
+            return TokenVerification(valid=False, reason="signature_invalid")
+        try:
+            public_key.verify(signature, token_signature_payload(token))
+        except InvalidSignature:
+            return TokenVerification(valid=False, reason="signature_invalid")
+        return TokenVerification(valid=True)
+
+
+class OfflineTokenVerifier:
+    """Full S10 token verifier that does not hold minting or private signing material."""
+
+    def __init__(
+        self,
+        *,
+        verifier: TokenSignatureTrustStore,
+        revocation_store: InMemoryTokenRevocationStore | FileTokenRevocationStore | None = None,
+        now_fn: Callable[[], int] | None = None,
+    ) -> None:
+        self._verifier = verifier
+        self._revocation_store = revocation_store or InMemoryTokenRevocationStore()
+        self._now_fn = now_fn or (lambda: int(time.time()))
+
+    @property
+    def verifier_kind(self) -> str:
+        return self._verifier.kind
+
+    @property
+    def revocation_store_kind(self) -> str:
+        return self._revocation_store.kind
+
+    def verify_budget(self, token: BudgetToken) -> TokenVerification:
+        return _verify_token_common(
+            token=token,
+            token_id=token.budget_id,
+            verifier=self._verifier,
+            revocation_store=self._revocation_store,
+            now_fn=self._now_fn,
+        )
+
+    def verify_scope(self, token: ScopeToken) -> TokenVerification:
+        return _verify_token_common(
+            token=token,
+            token_id=token.scope_id,
+            verifier=self._verifier,
+            revocation_store=self._revocation_store,
+            now_fn=self._now_fn,
+        )
+
+
+def _validate_token_id(token_id: str) -> str:
+    if not isinstance(token_id, str) or not token_id or "\n" in token_id:
+        raise ValueError("token_id must be a non-empty single-line string")
+    return token_id
+
+
+def _lower_hex_to_bytes(value: str, *, expected_bytes: int) -> bytes | None:
+    expected_len = expected_bytes * 2
+    if len(value) != expected_len:
+        return None
+    if any(char not in "0123456789abcdef" for char in value):
+        return None
+    return bytes.fromhex(value)
+
+
+def _verify_token_common(
+    *,
+    token: BudgetToken | ScopeToken,
+    token_id: str,
+    verifier: TokenSignatureTrustStore,
+    revocation_store: InMemoryTokenRevocationStore | FileTokenRevocationStore,
+    now_fn: Callable[[], int],
+) -> TokenVerification:
+    try:
+        revoked = revocation_store.is_revoked(token_id)
+    except (OSError, ValueError):
+        return TokenVerification(valid=False, reason="revocation_store_unavailable")
+    if revoked:
+        return TokenVerification(valid=False, reason="revoked")
+    if token.expires_at <= now_fn():
+        return TokenVerification(valid=False, reason="expired")
+    return verifier.verify(token)
+
+
 class InMemoryTokenService:
     """Signed token service with attenuation and revocation semantics."""
 
     def __init__(
         self,
         *,
-        signing_key: bytes,
+        signing_key: bytes | None = None,
         signer_key_id: str = "s10-test-key",
+        signer: HmacTokenSigner | Ed25519KmsTokenSigner | None = None,
+        verifier: TokenSignatureTrustStore | None = None,
+        revocation_store: InMemoryTokenRevocationStore | FileTokenRevocationStore | None = None,
         now_fn: Callable[[], int] | None = None,
     ) -> None:
-        self._signing_key = signing_key
-        self._signer_key_id = signer_key_id
+        if signer is not None and signing_key is not None:
+            raise ValueError("configure either signing_key or signer, not both")
+        if signer is None:
+            if signing_key is None:
+                raise ValueError("signing_key or signer is required")
+            signer = HmacTokenSigner(signer_key_id=signer_key_id, signing_key=signing_key)
+        self._signer = signer
+        self._verifier = verifier or signer.trust_store()
+        self._revocation_store = revocation_store or InMemoryTokenRevocationStore()
         self._now_fn = now_fn or (lambda: int(time.time()))
-        self._revoked_ids: set[str] = set()
         self.minting_enabled = True
+
+    @property
+    def signer_key_id(self) -> str:
+        return self._signer.signer_key_id
+
+    @property
+    def signer_kind(self) -> str:
+        return self._signer.kind
+
+    @property
+    def signature_algorithm(self) -> str:
+        return self._signer.algorithm
+
+    @property
+    def verifier_kind(self) -> str:
+        return self._verifier.kind
+
+    @property
+    def revocation_store_kind(self) -> str:
+        return self._revocation_store.kind
 
     def mint_budget(
         self,
@@ -498,7 +784,7 @@ class InMemoryTokenService:
             expires_at=issued_at + ttl_s,
             ttl_s=ttl_s,
             parent_budget_id=parent.budget_id if parent else None,
-            signer_key_id=self._signer_key_id,
+            signer_key_id=self.signer_key_id,
             signature="",
         )
         return replace(unsigned, signature=self._sign_token(unsigned))
@@ -524,7 +810,7 @@ class InMemoryTokenService:
             expires_at=issued_at + ttl_s,
             ttl_s=ttl_s,
             parent_scope_id=parent.scope_id if parent else None,
-            signer_key_id=self._signer_key_id,
+            signer_key_id=self.signer_key_id,
             signature="",
         )
         return replace(unsigned, signature=self._sign_token(unsigned))
@@ -554,7 +840,7 @@ class InMemoryTokenService:
         return self._verify_token(token, token.scope_id)
 
     def revoke(self, token_id: str) -> None:
-        self._revoked_ids.add(token_id)
+        self._revocation_store.revoke(token_id)
 
     def _require_valid_budget(self, token: BudgetToken) -> None:
         verification = self.verify_budget(token)
@@ -567,21 +853,16 @@ class InMemoryTokenService:
             raise TokenInvalidError(verification.reason or "invalid scope token")
 
     def _verify_token(self, token: BudgetToken | ScopeToken, token_id: str) -> TokenVerification:
-        if token.signer_key_id != self._signer_key_id:
-            return TokenVerification(valid=False, reason="unknown_signer")
-        if token_id in self._revoked_ids:
-            return TokenVerification(valid=False, reason="revoked")
-        if token.expires_at <= self._now():
-            return TokenVerification(valid=False, reason="expired")
-        if not hmac.compare_digest(token.signature, self._sign_token(token)):
-            return TokenVerification(valid=False, reason="signature_invalid")
-        return TokenVerification(valid=True)
+        return _verify_token_common(
+            token=token,
+            token_id=token_id,
+            verifier=self._verifier,
+            revocation_store=self._revocation_store,
+            now_fn=self._now,
+        )
 
     def _sign_token(self, token: BudgetToken | ScopeToken) -> str:
-        payload = asdict(token)
-        payload["signature"] = ""
-        digest = hmac.new(self._signing_key, canonical_json_bytes(payload), sha256).hexdigest()
-        return f"{SIGNATURE_PREFIX}{digest}"
+        return self._signer.sign(token)
 
     def _assert_minting_enabled(self) -> None:
         if not self.minting_enabled:

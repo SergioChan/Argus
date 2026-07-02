@@ -83,7 +83,8 @@ def main() -> int:
         "ARGUS_RUNTIME_IDENTITY_SIGNING_KEY": runtime_secrets["identity_signing_key"],
         "ARGUS_RUNTIME_IDENTITY_MINT_POLICY_JSON": _m0_identity_mint_policy_json(),
         "ARGUS_M0_HEALTH_TOKEN": runtime_secrets["health_token"],
-        "ARGUS_S10_SIGNING_KEY": runtime_secrets["s10_signing_key"],
+        "ARGUS_S10_TOKEN_ED25519_PRIVATE_KEY_HEX": runtime_secrets["s10_token_ed25519_private_key_hex"],
+        "ARGUS_S10_TOKEN_ED25519_PUBLIC_KEY_HEX": runtime_secrets["s10_token_ed25519_public_key_hex"],
         "ARGUS_S10_POLICY_SIGNING_KEY": runtime_secrets["s10_policy_signing_key"],
         "ARGUS_S10_CHECKPOINT_SIGNING_KEY": runtime_secrets["s10_checkpoint_signing_key"],
         "ARGUS_S10_CHECKPOINT_SIGNER_AUTH_TOKEN": runtime_secrets["s10_checkpoint_signer_auth_token"],
@@ -132,6 +133,7 @@ def main() -> int:
         write_scope_json = _mint_store_scope(s10_url=s10_url, token=auth_tokens["write"])
         _battery_direct_s8_write_denied(evidence, s8_url, token=auth_tokens["read"])
         _battery_forged_scope_token_denied(evidence, s10_url, write_scope_json, token=auth_tokens["write"])
+        _battery_revoked_scope_token_denied(evidence, s10_url, token=auth_tokens["write"])
         _battery_b_incomplete_lineage(evidence, s10_url, write_scope_json, token=auth_tokens["write"])
         _battery_c_write_once(evidence, s10_url, write_scope_json, token=auth_tokens["write"])
         verifier_scope_json = _mint_store_scope(s10_url=s10_url, token=auth_tokens["verify"])
@@ -166,6 +168,10 @@ def main() -> int:
             expected_status=201,
             token=auth_tokens["spine"],
         )
+        if not str(budget_json.get("signature", "")).startswith("ed25519:"):
+            raise AssertionError(f"S10 budget token was not Ed25519-signed: {budget_json}")
+        if not str(scope_json.get("signature", "")).startswith("ed25519:"):
+            raise AssertionError(f"S10 scope token was not Ed25519-signed: {scope_json}")
         launch_result = _run_no_network_launch(
             image=args.image,
             budget=budget_json,
@@ -324,6 +330,8 @@ def _m0_runtime_secrets() -> dict[str, str]:
         "health_token": f"argus-health-{uuid4().hex}",
         "identity_signing_key": f"argus-identity-key-{uuid4().hex}",
         "s10_signing_key": f"argus-s10-key-{uuid4().hex}",
+        "s10_token_ed25519_private_key_hex": "1111111111111111111111111111111111111111111111111111111111111111",
+        "s10_token_ed25519_public_key_hex": "d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737",
         "s10_policy_signing_key": f"argus-s10-policy-key-{uuid4().hex}",
         "s10_checkpoint_signing_key": f"argus-s10-checkpoint-key-{uuid4().hex}",
         "s10_checkpoint_signer_auth_token": f"argus-s10-checkpoint-signer-{uuid4().hex}",
@@ -494,6 +502,14 @@ def _battery_runtime_auth_required(
         raise AssertionError(f"S8 did not activate the C3 report verifier: {s8_health}")
     if s10_health.get("checkpoint_signer") != "s10-kms":
         raise AssertionError(f"S10 did not activate the KMS checkpoint signer: {s10_health}")
+    if s10_health.get("token_signer") != "s10-kms-ed25519":
+        raise AssertionError(f"S10 did not activate the Ed25519 KMS token signer: {s10_health}")
+    if s10_health.get("token_signature_algorithm") != "ed25519":
+        raise AssertionError(f"S10 did not activate Ed25519 token signatures: {s10_health}")
+    if s10_health.get("token_verifier") != "offline-ed25519-public":
+        raise AssertionError(f"S10 did not activate public-key offline token verification: {s10_health}")
+    if s10_health.get("token_revocation_store") != "file":
+        raise AssertionError(f"S10 did not activate file-backed token revocation state: {s10_health}")
     _record(
         evidence,
         "auth",
@@ -507,6 +523,10 @@ def _battery_runtime_auth_required(
             "s8_report_verifier": s8_health["report_verifier"],
             "s10_health": s10_health["status"],
             "s10_checkpoint_signer": s10_health["checkpoint_signer"],
+            "s10_token_signer": s10_health["token_signer"],
+            "s10_token_signature_algorithm": s10_health["token_signature_algorithm"],
+            "s10_token_verifier": s10_health["token_verifier"],
+            "s10_token_revocation_store": s10_health["token_revocation_store"],
         },
     )
     return str(s10_health["checkpoint_signer"])
@@ -519,7 +539,7 @@ def _battery_forged_scope_token_denied(
     *,
     token: str,
 ) -> None:
-    forged_scope = {**scope_json, "signature": "hmac-sha256:" + "0" * 64}
+    forged_scope = {**scope_json, "signature": "ed25519:" + "0" * 128}
     response = _post_json(
         f"{s10_url}/v1/store/artifacts",
         {
@@ -535,6 +555,46 @@ def _battery_forged_scope_token_denied(
     if response["error"] != "TokenInvalidError":
         raise AssertionError(f"unexpected forged-token denial error: {response}")
     _record(evidence, "scope-forged", "brokered write with forged scope token rejected fail-closed", response)
+
+
+def _battery_revoked_scope_token_denied(
+    evidence: dict[str, Any],
+    s10_url: str,
+    *,
+    token: str,
+) -> None:
+    scope_json = _mint_store_scope(s10_url=s10_url, token=token)
+    revoke_response = _post_json(
+        f"{s10_url}/v1/tokens:revoke",
+        {"token_type": "scope", "token": scope_json},
+        expected_status=200,
+        token=token,
+    )
+    denied_response = _post_json(
+        f"{s10_url}/v1/store/artifacts",
+        {
+            "scope_token": scope_json,
+            "kind": "model",
+            "payload": {"weights": [9]},
+            "producer": {"subsystem": "S2", "version": "0.0.0"},
+            "lineage": {"input_refs": [], "code_ref": "git:revoked", "environment_digest": "oci:revoked"},
+        },
+        expected_status=401,
+        token=token,
+    )
+    if denied_response.get("error") != "TokenInvalidError":
+        raise AssertionError(f"unexpected revoked-token denial error: {denied_response}")
+    _record(
+        evidence,
+        "scope-revoked",
+        "file-backed S10 revocation state denies a revoked scope token fail-closed",
+        {
+            "revocation_store": revoke_response["revocation_store"],
+            "revoked_token_id": revoke_response["revoked_token_id"],
+            "denial_error": denied_response["error"],
+            "denial_message": denied_response.get("message"),
+        },
+    )
 
 
 def _battery_s8_capability_scopes(

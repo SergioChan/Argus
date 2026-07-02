@@ -31,7 +31,7 @@ EXPECTED_CONTRACT_VERSIONS = {
     "C4": "1.0.0",
     "C5": "1.0.0",
     "C6": "1.0.0",
-    "C10": "3.0.0",
+    "C10": "4.0.0",
 }
 
 C3_V11_FIELDS = {
@@ -92,6 +92,7 @@ C10_REQUIRED_DEFS = {
     "ScopeGrant",
     "ScopeToken",
     "StoreBrokerHandle",
+    "TokenSignature",
 }
 
 
@@ -247,6 +248,10 @@ def validate_contract_schema(entry: dict) -> None:
         policy_bundle = definitions.get("PolicyBundle", {})
         if policy_bundle.get("properties", {}).get("signature", {}).get("$ref") != "#/$defs/Signature":
             fail("C10 PolicyBundle.signature must reference Signature")
+        for token_def in ("BudgetToken", "ScopeToken"):
+            token_signature = definitions.get(token_def, {}).get("properties", {}).get("signature", {})
+            if token_signature.get("$ref") != "#/$defs/TokenSignature":
+                fail(f"C10 {token_def}.signature must reference TokenSignature")
 
     example_path = EXAMPLES / f"{contract_id.lower()}.example.json"
     if not example_path.is_file():

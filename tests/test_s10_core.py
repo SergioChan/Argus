@@ -6,6 +6,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import unittest
 
 import argus_core.s10 as s10_module
@@ -15,8 +16,10 @@ from argus_core import (
     BudgetUsage,
     DockerSandboxOrchestrator,
     DockerSandboxSupervisor,
+    Ed25519KmsTokenSigner,
     EgressProxy,
     EgressRule,
+    FileTokenRevocationStore,
     InMemoryArtifactStore,
     InMemoryAuditLedger,
     InMemoryPolicyBundleTrustStore,
@@ -27,6 +30,7 @@ from argus_core import (
     LaunchEnvelope,
     LaunchRequest,
     Lineage,
+    OfflineTokenVerifier,
     PolicyBundle,
     PolicyBundleSignatureError,
     PolicyBundleSigner,
@@ -40,6 +44,7 @@ from argus_core import (
     ScopeGrant,
     ScopeWideningError,
     StoreWriterBroker,
+    TokenSignatureTrustStore,
     TokenInvalidError,
     WriteOnceViolationError,
     canonical_json_bytes,
@@ -157,6 +162,79 @@ class S10TokenServiceTests(unittest.TestCase):
                     disallowed_actions=("direct_ledger_write",),
                 ),
             )
+
+    def test_ed25519_tokens_verify_offline_with_public_trust_root(self) -> None:
+        now = 2_000
+        signer = Ed25519KmsTokenSigner(
+            signer_key_id="s10-token-root",
+            private_key_bytes=bytes.fromhex("11" * 32),
+        )
+        public_trust = TokenSignatureTrustStore(
+            ed25519_public_keys={"s10-token-root": signer.public_key_bytes}
+        )
+        tokens = InMemoryTokenService(
+            signer=signer,
+            verifier=public_trust,
+            now_fn=lambda: now,
+        )
+        budget = tokens.mint_budget(
+            caps=BudgetCaps(max_wallclock_s=30, max_cost_usd=1),
+            job_id="job-ed",
+            root_request_id="root-ed",
+            ttl_s=30,
+        )
+        scope = tokens.mint_scope(
+            job_id="job-ed",
+            scopes=ScopeGrant(broker_audiences=("store",), producer_subsystems=("S2",)),
+            ttl_s=30,
+        )
+        offline = OfflineTokenVerifier(verifier=public_trust, now_fn=lambda: now)
+
+        self.assertTrue(budget.signature.startswith("ed25519:"))
+        self.assertEqual(len(budget.signature.removeprefix("ed25519:")), 128)
+        self.assertTrue(offline.verify_budget(budget).valid)
+        self.assertTrue(offline.verify_scope(scope).valid)
+        self.assertEqual(
+            offline.verify_budget(replace(budget, caps=replace(budget.caps, max_cost_usd=2))).reason,
+            "signature_invalid",
+        )
+        self.assertEqual(offline.verify_scope(replace(scope, signer_key_id="unknown")).reason, "unknown_signer")
+
+        now = 2_031
+        self.assertEqual(offline.verify_budget(budget).reason, "expired")
+
+    def test_file_revocation_store_is_shared_by_offline_verifiers(self) -> None:
+        now = 3_000
+        signer = Ed25519KmsTokenSigner(
+            signer_key_id="s10-token-root",
+            private_key_bytes=bytes.fromhex("22" * 32),
+        )
+        trust = TokenSignatureTrustStore(ed25519_public_keys={"s10-token-root": signer.public_key_bytes})
+        with tempfile.TemporaryDirectory() as tmp:
+            revocation_path = os.path.join(tmp, "token-revocations.jsonl")
+            writer_store = FileTokenRevocationStore(revocation_path, now_fn=lambda: now)
+            reader_store = FileTokenRevocationStore(revocation_path, now_fn=lambda: now)
+            tokens = InMemoryTokenService(
+                signer=signer,
+                verifier=trust,
+                revocation_store=writer_store,
+                now_fn=lambda: now,
+            )
+            offline = OfflineTokenVerifier(
+                verifier=trust,
+                revocation_store=reader_store,
+                now_fn=lambda: now,
+            )
+            scope = tokens.mint_scope(
+                job_id="job-revoke",
+                scopes=ScopeGrant(broker_audiences=("store",), producer_subsystems=("S2",)),
+            )
+
+            self.assertTrue(offline.verify_scope(scope).valid)
+            tokens.revoke(scope.scope_id)
+
+            self.assertEqual(offline.verify_scope(scope).reason, "revoked")
+            self.assertEqual(reader_store.snapshot(), (scope.scope_id,))
 
 
 class S10QuotaLedgerTests(unittest.TestCase):

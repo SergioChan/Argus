@@ -19,6 +19,8 @@ from argus_core import (
     EgressRule,
     DockerSandboxOrchestrator,
     DockerSandboxSupervisor,
+    Ed25519KmsTokenSigner,
+    FileTokenRevocationStore,
     FileSystemArtifactStore,
     InMemoryArtifactStore,
     InMemoryAuditLedger,
@@ -41,6 +43,7 @@ from argus_core import (
     ScopeToken,
     StoreWriterBroker,
     TokenInvalidError,
+    TokenSignatureTrustStore,
     WriteOnceViolationError,
     IncompleteLineageError,
     canonical_json_bytes,
@@ -103,7 +106,8 @@ class S10SupervisorApp:
     def __init__(
         self,
         *,
-        signing_key: bytes,
+        signing_key: bytes | None = None,
+        token_service: InMemoryTokenService | None = None,
         artifact_store: InMemoryArtifactStore | None = None,
         artifact_store_path: str | os.PathLike[str] | None = None,
         auth: RuntimeAuth | None = None,
@@ -114,7 +118,7 @@ class S10SupervisorApp:
         checkpoint_signer_auth_token: str | None = None,
         docker_supervisor: DockerSandboxSupervisor | None = None,
     ) -> None:
-        self.tokens = InMemoryTokenService(signing_key=signing_key)
+        self.tokens = token_service or InMemoryTokenService(signing_key=signing_key)
         self.quota = InMemoryQuotaLedger()
         self.audit = InMemoryAuditLedger()
         self.artifacts = artifact_store or InMemoryArtifactStore()
@@ -234,6 +238,36 @@ class S10SupervisorApp:
         result = self._docker_orchestrator.launch_and_wait(launch)
         return asdict(result)
 
+    def revoke_token_for_identity(self, identity: RuntimeIdentity, body: dict[str, Any]) -> dict[str, Any]:
+        _require_runtime_identity(identity)
+        token_type = _required_str(body, "token_type")
+        token_body = _required_dict(body, "token")
+        if token_type == "budget":
+            token = _budget_token_from_dict(token_body)
+            verification = self.tokens.verify_budget(token)
+            if not verification.valid and verification.reason != "revoked":
+                raise TokenInvalidError(verification.reason or "invalid budget token")
+            if token.job_id != identity.job_id or token.root_request_id != identity.root_request_id:
+                raise PermissionError("budget token is not bound to the authenticated runtime identity")
+            token_id = token.budget_id
+        elif token_type == "scope":
+            token = _scope_token_from_dict(token_body)
+            verification = self.tokens.verify_scope(token)
+            if not verification.valid and verification.reason != "revoked":
+                raise TokenInvalidError(verification.reason or "invalid scope token")
+            if token.job_id != identity.job_id:
+                raise PermissionError("scope token is not bound to the authenticated runtime identity")
+            _require_scope_subset(token.scopes, identity.scopes)
+            token_id = token.scope_id
+        else:
+            raise ValueError("token_type must be budget or scope")
+        self.tokens.revoke(token_id)
+        return {
+            "revoked_token_id": token_id,
+            "token_type": token_type,
+            "revocation_store": self.tokens.revocation_store_kind,
+        }
+
     def _build_docker_orchestrator(self) -> DockerSandboxOrchestrator:
         return DockerSandboxOrchestrator(
             token_service=self.tokens,
@@ -275,6 +309,10 @@ class S10SupervisorApp:
                 "policy_bundle_version": self.policy.bundle_version,
                 "policy_signer_key_id": self.policy.signer_key_id,
                 "checkpoint_signer": self.checkpoint_signer.kind if self.checkpoint_signer is not None else "unconfigured",
+                "token_signer": self.tokens.signer_kind,
+                "token_signature_algorithm": self.tokens.signature_algorithm,
+                "token_verifier": self.tokens.verifier_kind,
+                "token_revocation_store": self.tokens.revocation_store_kind,
                 "audit_events": len(self.audit.events()),
             }
 
@@ -364,6 +402,22 @@ class S10SupervisorApp:
             except Exception as exc:
                 return 400, {"error": type(exc).__name__, "message": str(exc)}
 
+        @self.http.route("POST", "/v1/tokens:revoke")
+        def revoke_token(request: JsonRequest) -> tuple[int, Any]:
+            try:
+                identity = self._authenticate(request)
+                if not isinstance(request.body, dict):
+                    return 400, {"error": "json_object_required"}
+                return 200, self.revoke_token_for_identity(identity, request.body)
+            except UnauthorizedError as exc:
+                return 401, {"error": "Unauthorized", "message": str(exc)}
+            except TokenInvalidError as exc:
+                return 401, {"error": type(exc).__name__, "message": str(exc)}
+            except PermissionError as exc:
+                return 403, {"error": type(exc).__name__, "message": str(exc)}
+            except Exception as exc:
+                return 400, {"error": type(exc).__name__, "message": str(exc)}
+
         @self.http.route("POST", "/v1/sandboxes:launch")
         def launch_sandbox(request: JsonRequest) -> tuple[int, Any]:
             launch: LaunchRequest | None = None
@@ -410,14 +464,7 @@ class S10SupervisorApp:
 
 
 def build_app_from_env() -> S10SupervisorApp:
-    key_file = os.environ.get("ARGUS_S10_SIGNING_KEY_FILE")
-    if key_file:
-        signing_key = Path(key_file).read_bytes()
-    else:
-        signing_key_value = os.environ.get("ARGUS_S10_SIGNING_KEY")
-        if not signing_key_value:
-            raise RuntimeError("ARGUS_S10_SIGNING_KEY or ARGUS_S10_SIGNING_KEY_FILE is required")
-        signing_key = signing_key_value.encode("utf-8")
+    token_service = _token_service_from_env()
     s8_broker_url = os.environ.get("ARGUS_S8_BROKER_URL")
     s8_broker_key = os.environ.get("ARGUS_S8_BROKER_WRITE_KEY")
     mint_policy = _runtime_identity_mint_policy_from_env()
@@ -429,7 +476,7 @@ def build_app_from_env() -> S10SupervisorApp:
         if not s8_broker_key:
             raise RuntimeError("ARGUS_S8_BROKER_WRITE_KEY is required when ARGUS_S8_BROKER_URL is configured")
         return S10SupervisorApp(
-            signing_key=signing_key,
+            token_service=token_service,
             artifact_store=S8BrokeredArtifactStoreClient(
                 endpoint_url=s8_broker_url,
                 broker_write_key=s8_broker_key.encode("utf-8"),
@@ -444,7 +491,7 @@ def build_app_from_env() -> S10SupervisorApp:
     data_dir = os.environ.get("ARGUS_S8_DATA_DIR")
     if data_dir:
         return S10SupervisorApp(
-            signing_key=signing_key,
+            token_service=token_service,
             artifact_store=FileSystemArtifactStore(data_dir),
             artifact_store_path=data_dir,
             auth=runtime_auth_from_env(),
@@ -455,7 +502,7 @@ def build_app_from_env() -> S10SupervisorApp:
             checkpoint_signer_auth_token=checkpoint_signer_auth_token,
         )
     return S10SupervisorApp(
-        signing_key=signing_key,
+        token_service=token_service,
         auth=runtime_auth_from_env(),
         runtime_identity_mint_policy=mint_policy,
         health_token=health_token,
@@ -469,6 +516,70 @@ def main() -> None:
     host = os.environ.get("ARGUS_S10_HOST", "127.0.0.1")
     port = int(os.environ.get("ARGUS_S10_PORT", "8080"))
     serve_json_app(build_app_from_env().http, host=host, port=port)
+
+
+def _token_service_from_env() -> InMemoryTokenService:
+    revocation_store = _token_revocation_store_from_env()
+    mode = os.environ.get("ARGUS_S10_TOKEN_SIGNING_MODE", "hmac-sha256").strip().lower()
+    signer_key_id = os.environ.get("ARGUS_S10_TOKEN_SIGNER_KEY_ID", "s10-test-key")
+    if mode in {"hmac", "hmac-sha256"}:
+        key_file = os.environ.get("ARGUS_S10_SIGNING_KEY_FILE")
+        if key_file:
+            signing_key = Path(key_file).read_bytes()
+        else:
+            signing_key_value = os.environ.get("ARGUS_S10_SIGNING_KEY")
+            if not signing_key_value:
+                raise RuntimeError("ARGUS_S10_SIGNING_KEY or ARGUS_S10_SIGNING_KEY_FILE is required")
+            signing_key = signing_key_value.encode("utf-8")
+        return InMemoryTokenService(
+            signing_key=signing_key,
+            signer_key_id=signer_key_id,
+            revocation_store=revocation_store,
+        )
+    if mode == "ed25519":
+        private_key = _read_hex_secret(
+            value_name="ARGUS_S10_TOKEN_ED25519_PRIVATE_KEY_HEX",
+            file_name="ARGUS_S10_TOKEN_ED25519_PRIVATE_KEY_HEX_FILE",
+            expected_bytes=32,
+        )
+        public_key = _read_hex_secret(
+            value_name="ARGUS_S10_TOKEN_ED25519_PUBLIC_KEY_HEX",
+            file_name="ARGUS_S10_TOKEN_ED25519_PUBLIC_KEY_HEX_FILE",
+            expected_bytes=32,
+        )
+        signer = Ed25519KmsTokenSigner(signer_key_id=signer_key_id, private_key_bytes=private_key)
+        if signer.public_key_bytes != public_key:
+            raise RuntimeError("ARGUS_S10_TOKEN_ED25519_PUBLIC_KEY_HEX does not match private key")
+        return InMemoryTokenService(
+            signer=signer,
+            verifier=TokenSignatureTrustStore(ed25519_public_keys={signer_key_id: public_key}),
+            revocation_store=revocation_store,
+        )
+    raise RuntimeError("ARGUS_S10_TOKEN_SIGNING_MODE must be hmac-sha256 or ed25519")
+
+
+def _token_revocation_store_from_env() -> FileTokenRevocationStore | None:
+    path = os.environ.get("ARGUS_S10_TOKEN_REVOCATION_STORE_PATH")
+    if not path:
+        return None
+    return FileTokenRevocationStore(path)
+
+
+def _read_hex_secret(*, value_name: str, file_name: str, expected_bytes: int) -> bytes:
+    file_path = os.environ.get(file_name)
+    if file_path:
+        raw = Path(file_path).read_text(encoding="utf-8").strip()
+    else:
+        raw = os.environ.get(value_name, "").strip()
+    if not raw:
+        raise RuntimeError(f"{value_name} or {file_name} is required")
+    try:
+        value = bytes.fromhex(raw)
+    except ValueError as exc:
+        raise RuntimeError(f"{value_name} must be lowercase hex") from exc
+    if raw != value.hex() or len(value) != expected_bytes:
+        raise RuntimeError(f"{value_name} must be {expected_bytes} raw bytes encoded as lowercase hex")
+    return value
 
 
 def _default_policy_bundle() -> PolicyBundle:

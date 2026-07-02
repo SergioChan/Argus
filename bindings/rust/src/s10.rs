@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-pub const C10_SCHEMA_SHA256: &str = "sha256:827e33401405e7970d191a15e8604cd98eb9268891644df58b565a904d343a9e";
+pub const C10_SCHEMA_SHA256: &str = "sha256:80d5dcfbd1305026be71eb306f465e3119d725528008f61aa7e086503a6eb4b1";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -93,8 +93,8 @@ impl BudgetToken {
         if self.budget_epoch == 0 {
             return Err("budget_epoch must be positive");
         }
-        if !is_hmac_sha256_signature(&self.signature) {
-            return Err("budget signature must be hmac-sha256");
+        if !is_token_signature(&self.signature) {
+            return Err("budget signature must be hmac-sha256 or ed25519");
         }
         Ok(())
     }
@@ -115,8 +115,8 @@ pub struct ScopeToken {
 
 impl ScopeToken {
     pub fn validate(&self) -> Result<(), &'static str> {
-        if !is_hmac_sha256_signature(&self.signature) {
-            return Err("scope signature must be hmac-sha256");
+        if !is_token_signature(&self.signature) {
+            return Err("scope signature must be hmac-sha256 or ed25519");
         }
         Ok(())
     }
@@ -282,6 +282,13 @@ pub fn is_hmac_sha256_signature(signature: &str) -> bool {
     signature
         .strip_prefix("hmac-sha256:")
         .is_some_and(|digest| is_lower_hex_digest(digest, 64))
+}
+
+pub fn is_token_signature(signature: &str) -> bool {
+    is_hmac_sha256_signature(signature)
+        || signature
+            .strip_prefix("ed25519:")
+            .is_some_and(|digest| is_lower_hex_digest(digest, 128))
 }
 
 pub fn is_blake3_hash(value: &str) -> bool {
