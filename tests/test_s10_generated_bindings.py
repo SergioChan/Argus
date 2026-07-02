@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+from dataclasses import fields as dataclass_fields
 import json
 from pathlib import Path
 import subprocess
@@ -16,15 +17,56 @@ if str(BINDINGS_PYTHON) not in sys.path:
     sys.path.insert(0, str(BINDINGS_PYTHON))
 
 from argus_contracts import (  # noqa: E402
+    AuditEvent,
+    BudgetCaps,
+    BudgetToken,
+    BudgetUsage,
     C10_SCHEMA_SHA256,
     CONTRACT_BY_ID,
+    EgressDecision,
+    EgressRule,
+    LaunchEnvelope,
+    LaunchRequest,
+    PolicyBundle,
+    PolicyVerdict,
+    QuotaState,
+    ResourceCeilings,
+    S8CheckpointSignature,
+    SandboxExecutionResult,
+    SandboxHandle,
+    ScopeGrant,
+    ScopeToken,
+    StoreBrokerHandle,
     validate_launch_request,
     validate_policy_bundle,
 )
+from argus_core import s10 as runtime_s10  # noqa: E402
 
 
 C10_EXAMPLE = ROOT / "schemas" / "contracts" / "examples" / "c10.example.json"
 C10_POLICY_EXAMPLE = ROOT / "schemas" / "contracts" / "examples" / "c10.policy-bundle.example.json"
+C10_SCHEMA = ROOT / "schemas" / "contracts" / "c10.s10-runtime.schema.json"
+
+C10_RUNTIME_FIELD_GUARDS = (
+    ("AuditEvent", runtime_s10.AuditEvent, AuditEvent),
+    ("BudgetCaps", runtime_s10.BudgetCaps, BudgetCaps),
+    ("BudgetToken", runtime_s10.BudgetToken, BudgetToken),
+    ("BudgetUsage", runtime_s10.BudgetUsage, BudgetUsage),
+    ("EgressDecision", runtime_s10.EgressDecision, EgressDecision),
+    ("EgressRule", runtime_s10.EgressRule, EgressRule),
+    ("LaunchEnvelope", runtime_s10.LaunchEnvelope, LaunchEnvelope),
+    ("LaunchRequest", runtime_s10.LaunchRequest, LaunchRequest),
+    ("PolicyBundle", runtime_s10.PolicyBundle, PolicyBundle),
+    ("PolicyVerdict", runtime_s10.PolicyVerdict, PolicyVerdict),
+    ("QuotaState", runtime_s10.QuotaState, QuotaState),
+    ("ResourceCeilings", runtime_s10.ResourceCeilings, ResourceCeilings),
+    ("S8CheckpointSignature", runtime_s10.S8CheckpointSignature, S8CheckpointSignature),
+    ("SandboxExecutionResult", runtime_s10.SandboxExecutionResult, SandboxExecutionResult),
+    ("SandboxHandle", runtime_s10.SandboxHandle, SandboxHandle),
+    ("ScopeGrant", runtime_s10.ScopeGrant, ScopeGrant),
+    ("ScopeToken", runtime_s10.ScopeToken, ScopeToken),
+    ("StoreBrokerHandle", runtime_s10.StoreBrokerHandle, StoreBrokerHandle),
+)
 
 
 class S10GeneratedBindingsTests(unittest.TestCase):
@@ -68,6 +110,21 @@ class S10GeneratedBindingsTests(unittest.TestCase):
         self.assertIn(f'export const C10_SCHEMA_SHA256 = "{c10.schema_sha256}"', typescript_s10)
         self.assertIn('id: "C10"', rust_lib)
         self.assertIn(f'pub const C10_SCHEMA_SHA256: &str = "{c10.schema_sha256}"', rust_s10)
+
+    def test_c10_runtime_dataclasses_match_generated_wire_fields(self) -> None:
+        schema = json.loads(C10_SCHEMA.read_text(encoding="utf-8"))
+        definitions = schema["$defs"]
+
+        for definition_name, runtime_cls, generated_cls in C10_RUNTIME_FIELD_GUARDS:
+            with self.subTest(definition=definition_name):
+                schema_fields = set(definitions[definition_name]["properties"])
+                required_fields = set(definitions[definition_name]["required"])
+                runtime_fields = {field.name for field in dataclass_fields(runtime_cls)}
+                generated_fields = set(generated_cls.model_fields)
+
+                self.assertEqual(schema_fields, required_fields)
+                self.assertEqual(schema_fields, generated_fields)
+                self.assertEqual(schema_fields, runtime_fields)
 
     def test_binding_generator_is_byte_stable_after_c10_generation(self) -> None:
         result = subprocess.run(
