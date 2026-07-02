@@ -880,9 +880,14 @@ class S8PostgresSchemaTests(unittest.TestCase):
             rerun_payload={**payload, "metric": 1.05},
             tolerance_id="metric-abs-0.1",
         )
+        third = store.record_reproducibility_check(
+            record.artifact_ref,
+            rerun_payload={**payload, "metric": 1.08},
+            tolerance_id="metric-abs-0.1",
+        )
         persisted = self._psql(
             f"""
-            SELECT count(*) || '|' || max(verdict) || '|' || max(tolerance_id)
+            SELECT count(*) || '|' || count(DISTINCT check_id) || '|' || max(verdict) || '|' || max(tolerance_id)
             FROM s8.reproducibility_check
             WHERE artifact_id = {_sql_literal(record.artifact_ref)};
             """
@@ -894,7 +899,8 @@ class S8PostgresSchemaTests(unittest.TestCase):
         self.assertEqual(first.verdict, "PASS")
         self.assertEqual(first.comparator_id, "numeric_abs_tolerance")
         self.assertEqual(first.check_id, second.check_id)
-        self.assertEqual(persisted.stdout.strip(), "1|PASS|metric-abs-0.1")
+        self.assertNotEqual(first.check_id, third.check_id)
+        self.assertEqual(persisted.stdout.strip(), "2|2|PASS|metric-abs-0.1")
 
     def test_postgres_store_exports_and_verifies_audit_slice(self) -> None:
         store = self._postgres_store()

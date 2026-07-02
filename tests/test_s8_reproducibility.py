@@ -83,6 +83,34 @@ class S8ReproducibilityTests(unittest.TestCase):
         self.assertTrue(self.store.is_non_reproducible(record.artifact_ref))
         self.assertEqual(len(self.store.reproducibility_checks(record.artifact_ref)), 1)
 
+    def test_check_id_is_content_addressed_not_sequence_addressed(self) -> None:
+        record = self.store.create_artifact(
+            kind="model",
+            payload=self._payload(metric=1.0),
+            producer=self.producer,
+            lineage=self.lineage,
+        )
+
+        first = self.store.record_reproducibility_check(
+            record.artifact_ref,
+            rerun_payload=self._payload(metric=1.05),
+            tolerance_id="model-metric-abs-0.1",
+        )
+        different = self.store.record_reproducibility_check(
+            record.artifact_ref,
+            rerun_payload=self._payload(metric=1.08),
+            tolerance_id="model-metric-abs-0.1",
+        )
+        repeat = self.store.record_reproducibility_check(
+            record.artifact_ref,
+            rerun_payload=self._payload(metric=1.05),
+            tolerance_id="model-metric-abs-0.1",
+        )
+
+        self.assertEqual(first.check_id, repeat.check_id)
+        self.assertNotEqual(first.check_id, different.check_id)
+        self.assertEqual(len(self.store.reproducibility_checks(record.artifact_ref)), 2)
+
     def test_hash_equal_default_and_pluggable_comparator(self) -> None:
         deterministic = self.store.create_artifact(
             kind="dataset",

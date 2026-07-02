@@ -909,7 +909,6 @@ class InMemoryArtifactStore:
                 "rerun_content_hash": rerun_content_hash,
                 "comparator_id": selected_comparator,
                 "tolerance_id": tolerance_id,
-                "sequence": len(self._reproducibility_checks) + 1,
             }
         )[:16]
         check = ReproducibilityCheck(
@@ -922,6 +921,12 @@ class InMemoryArtifactStore:
             divergence=divergence,
             reason=reason,
         )
+        for existing in self._reproducibility_checks:
+            if existing.check_id != check_id:
+                continue
+            if existing == check:
+                return existing
+            raise WriteOnceViolationError(f"reproducibility check already exists: {check_id}")
         self._reproducibility_checks.append(check)
         if verdict == "FAIL":
             self._non_reproducible_artifacts.add(artifact_ref)
