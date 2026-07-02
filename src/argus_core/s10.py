@@ -802,6 +802,7 @@ class StoreWriterBroker:
         payload: Any,
         producer: Producer,
         lineage: Lineage,
+        artifact_ref: str | None = None,
         claim_tier: str = "ran-toy",
         validation_report_ref: str | None = None,
     ) -> ArtifactRecord:
@@ -824,6 +825,7 @@ class StoreWriterBroker:
             payload=payload,
             producer=producer,
             lineage=lineage,
+            artifact_ref=artifact_ref,
             claim_tier=claim_tier,
             validation_report_ref=validation_report_ref,
         )
@@ -855,6 +857,7 @@ class StoreWriterBroker:
         payload: Any,
         producer: Producer,
         lineage: Lineage,
+        artifact_ref: str | None = None,
         claim_tier: str = "ran-toy",
         validation_report_ref: str | None = None,
     ) -> ArtifactRecord:
@@ -864,6 +867,7 @@ class StoreWriterBroker:
             payload=payload,
             producer=producer,
             lineage=lineage,
+            artifact_ref=artifact_ref,
             claim_tier=claim_tier,
             validation_report_ref=validation_report_ref,
         )
@@ -932,6 +936,7 @@ class BrokeredStoreClient:
         payload: Any,
         producer: Producer,
         lineage: Lineage,
+        artifact_ref: str | None = None,
         claim_tier: str = "ran-toy",
         validation_report_ref: str | None = None,
     ) -> ArtifactRecord:
@@ -941,6 +946,7 @@ class BrokeredStoreClient:
             payload=payload,
             producer=producer,
             lineage=lineage,
+            artifact_ref=artifact_ref,
             claim_tier=claim_tier,
             validation_report_ref=validation_report_ref,
         )
@@ -964,6 +970,7 @@ def _dispatch_store_put(
     payload: Any,
     producer: Producer,
     lineage: Lineage,
+    artifact_ref: str | None = None,
     claim_tier: str = "ran-toy",
     validation_report_ref: str | None = None,
 ) -> ArtifactRecord:
@@ -973,6 +980,7 @@ def _dispatch_store_put(
         payload=payload,
         producer=producer,
         lineage=lineage,
+        artifact_ref=artifact_ref,
         claim_tier=claim_tier,
         validation_report_ref=validation_report_ref,
     )

@@ -10,6 +10,7 @@ import unittest
 from pathlib import Path
 
 from argus_core import BudgetCaps, BudgetToken, FileSystemArtifactStore, Lineage, Producer, ScopeGrant, ScopeToken
+from argus_runtime.http_json import JsonRequest
 from argus_runtime.s10_supervisor_service import S10SupervisorApp
 from argus_runtime.s8_writer_service import S8WriterApp
 
@@ -54,6 +55,32 @@ class ArgusM0RuntimeServiceTests(unittest.TestCase):
 
             self.assertEqual(fetched["artifact_ref"], external.artifact_ref)
             self.assertEqual(app.store.record_count, 1)
+
+    def test_s8_writer_http_denies_direct_artifact_writes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            app = S8WriterApp(FileSystemArtifactStore(tmp), data_dir=tmp)
+
+            status, payload = app.http.handle(
+                JsonRequest(
+                    method="POST",
+                    path="/v1/artifacts",
+                    query={},
+                    body={
+                        "kind": "model",
+                        "payload": {"weights": [1]},
+                        "producer": {"subsystem": "S2", "version": "0.0.0"},
+                        "lineage": {
+                            "input_refs": [],
+                            "code_ref": "git:model",
+                            "environment_digest": "oci:model",
+                        },
+                    },
+                )
+            )
+
+            self.assertEqual(status, 403)
+            self.assertEqual(payload["error"], "DirectWriteDenied")
+            self.assertEqual(app.store.record_count, 0)
 
     def test_s10_supervisor_service_mints_verifiable_tokens(self) -> None:
         app = S10SupervisorApp(signing_key=b"test-key")

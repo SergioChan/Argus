@@ -35,6 +35,7 @@ from argus_core import (
     ScopeWideningError,
     StoreWriterBroker,
     TokenInvalidError,
+    WriteOnceViolationError,
     canonical_json_bytes,
     decide_policy,
     hash_bytes,
@@ -310,6 +311,34 @@ class S10StoreWriterBrokerTests(unittest.TestCase):
         self.assertEqual(self.artifacts.get_artifact(record.artifact_ref), payload_bytes)
         self.assertEqual(self.artifacts.record_count, 1)
         self.assertEqual(self.audit.events()[-1].event_type, "store.put")
+
+    def test_sandbox_client_write_once_conflict_still_goes_through_broker_scope(self) -> None:
+        scope = self.tokens.mint_scope(
+            job_id="job-1",
+            scopes=ScopeGrant(broker_audiences=("store",), producer_subsystems=("S2",)),
+        )
+        client = self.broker.client_for(scope)
+        artifact_ref = "c4://m0-spine/overwrite-guard"
+        lineage = Lineage(input_refs=(), code_ref="git:model", environment_digest="oci:model")
+
+        first = client.put_artifact(
+            artifact_ref=artifact_ref,
+            kind="model",
+            payload={"weights": [1]},
+            producer=Producer(subsystem="S2", version="0.0.0"),
+            lineage=lineage,
+        )
+        with self.assertRaises(WriteOnceViolationError):
+            client.put_artifact(
+                artifact_ref=artifact_ref,
+                kind="model",
+                payload={"weights": [2]},
+                producer=Producer(subsystem="S2", version="0.0.0"),
+                lineage=lineage,
+            )
+
+        self.assertEqual(first.producer.job_id, "job-1")
+        self.assertEqual(self.artifacts.record_count, 1)
 
     def test_sandbox_client_holds_opaque_handle_without_broker_reference(self) -> None:
         scope = self.tokens.mint_scope(

@@ -76,6 +76,7 @@ class S10SupervisorApp:
             payload=body.get("payload"),
             producer=Producer(**_required_dict(body, "producer")),
             lineage=Lineage(**_normalize_lineage(_required_dict(body, "lineage"))),
+            artifact_ref=body.get("artifact_ref") if isinstance(body.get("artifact_ref"), str) else None,
             claim_tier=body.get("claim_tier") if isinstance(body.get("claim_tier"), str) else "ran-toy",
             validation_report_ref=body.get("validation_report_ref")
             if isinstance(body.get("validation_report_ref"), str)

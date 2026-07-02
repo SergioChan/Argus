@@ -57,12 +57,10 @@ class S8WriterApp:
 
         @self.http.route("POST", "/v1/artifacts")
         def create(request: JsonRequest) -> tuple[int, Any]:
-            try:
-                if not isinstance(request.body, dict):
-                    return 400, {"error": "json_object_required"}
-                return 201, self.create_artifact(request.body)
-            except Exception as exc:
-                return 400, {"error": type(exc).__name__, "message": str(exc)}
+            return 403, {
+                "error": "DirectWriteDenied",
+                "message": "artifact writes must use the S10 store broker",
+            }
 
         @self.http.prefix("GET", "/v1/artifacts/")
         def get_record(request: JsonRequest) -> tuple[int, Any]:

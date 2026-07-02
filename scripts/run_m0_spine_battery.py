@@ -101,8 +101,10 @@ def main() -> int:
         _ensure_image(docker, args.image)
 
         _battery_a_contracts(evidence)
-        _battery_b_incomplete_lineage(evidence, s8_url)
-        _battery_c_write_once(evidence, s8_url)
+        write_scope_json = _mint_store_scope(s10_url=s10_url, job_id="m0-spine-write-tests")
+        _battery_direct_s8_write_denied(evidence, s8_url)
+        _battery_b_incomplete_lineage(evidence, s10_url, write_scope_json)
+        _battery_c_write_once(evidence, s10_url, write_scope_json)
 
         budget_json = _post_json(
             f"{s10_url}/v1/budget-tokens",
@@ -193,10 +195,42 @@ def _battery_a_contracts(evidence: dict[str, Any]) -> None:
     _record(evidence, "a", "schemas meta-validated and Python/TypeScript/Rust binding gates passed")
 
 
-def _battery_b_incomplete_lineage(evidence: dict[str, Any], s8_url: str) -> None:
+def _mint_store_scope(*, s10_url: str, job_id: str) -> dict[str, Any]:
+    return _post_json(
+        f"{s10_url}/v1/scope-tokens",
+        {
+            "job_id": job_id,
+            "scopes": {
+                "broker_audiences": ["store"],
+                "producer_subsystems": ["S2"],
+                "sandbox_risk_class": "standard",
+            },
+        },
+        expected_status=201,
+    )
+
+
+def _battery_direct_s8_write_denied(evidence: dict[str, Any], s8_url: str) -> None:
     response = _post_json(
         f"{s8_url}/v1/artifacts",
         {
+            "kind": "model",
+            "payload": {"weights": [9]},
+            "producer": {"subsystem": "S2", "version": "0.0.0"},
+            "lineage": {"input_refs": [], "code_ref": "git:model", "environment_digest": "oci:model"},
+        },
+        expected_status=403,
+    )
+    if response["error"] != "DirectWriteDenied":
+        raise AssertionError(f"unexpected direct-write denial error: {response}")
+    _record(evidence, "f-direct", "direct S8 HTTP artifact write denied", response)
+
+
+def _battery_b_incomplete_lineage(evidence: dict[str, Any], s10_url: str, scope_json: dict[str, Any]) -> None:
+    response = _post_json(
+        f"{s10_url}/v1/store/artifacts",
+        {
+            "scope_token": scope_json,
             "kind": "model",
             "payload": {"weights": [0]},
             "producer": {"subsystem": "S2", "version": "0.0.0"},
@@ -206,26 +240,32 @@ def _battery_b_incomplete_lineage(evidence: dict[str, Any], s8_url: str) -> None
     )
     if response["error"] != "IncompleteLineageError":
         raise AssertionError(f"unexpected incomplete-lineage error: {response}")
-    _record(evidence, "b", "incomplete lineage write rejected fail-closed", response)
+    _record(evidence, "b", "brokered incomplete lineage write rejected fail-closed", response)
 
 
-def _battery_c_write_once(evidence: dict[str, Any], s8_url: str) -> None:
+def _battery_c_write_once(evidence: dict[str, Any], s10_url: str, scope_json: dict[str, Any]) -> None:
     body = {
+        "scope_token": scope_json,
         "artifact_ref": "c4://m0-spine/overwrite-guard",
         "kind": "model",
         "payload": {"weights": [1]},
         "producer": {"subsystem": "S2", "version": "0.0.0"},
         "lineage": {"input_refs": [], "code_ref": "git:model", "environment_digest": "oci:model"},
     }
-    first = _post_json(f"{s8_url}/v1/artifacts", body, expected_status=201)
+    first = _post_json(f"{s10_url}/v1/store/artifacts", body, expected_status=201)
     second = _post_json(
-        f"{s8_url}/v1/artifacts",
+        f"{s10_url}/v1/store/artifacts",
         {**body, "payload": {"weights": [2]}},
         expected_status=400,
     )
     if second["error"] != "WriteOnceViolationError":
         raise AssertionError(f"unexpected overwrite error: {second}")
-    _record(evidence, "c", "write-once overwrite blocked", {"artifact_ref": first["artifact_ref"], "error": second})
+    _record(
+        evidence,
+        "c",
+        "brokered write-once overwrite blocked",
+        {"artifact_ref": first["artifact_ref"], "error": second},
+    )
 
 
 def _battery_d_tamper_detected(evidence: dict[str, Any], data_dir: Path) -> None:
