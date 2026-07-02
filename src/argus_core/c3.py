@@ -5,7 +5,7 @@ from __future__ import annotations
 from copy import deepcopy
 from dataclasses import dataclass
 from hashlib import sha256
-from typing import Any
+from typing import Any, Protocol
 import hmac
 
 from .canonical import canonical_json_bytes
@@ -29,6 +29,11 @@ class C3SignatureVerification:
     key_id: str | None = None
     claim_tier: str | None = None
     aggregate_passed: bool | None = None
+
+
+class VerifierTrustStore(Protocol):
+    def get_key(self, key_id: str) -> VerifierKey | None:
+        ...
 
 
 class InMemoryVerifierTrustStore:
@@ -74,7 +79,7 @@ class C3ReportSigner:
 class C3ReportVerifier:
     """Verifies C3 ValidationReport signatures against a trust store."""
 
-    def __init__(self, trust_store: InMemoryVerifierTrustStore) -> None:
+    def __init__(self, trust_store: VerifierTrustStore) -> None:
         self._trust_store = trust_store
 
     def verify(self, report: dict[str, Any]) -> C3SignatureVerification:
@@ -102,9 +107,19 @@ class C3ReportVerifier:
             "key_id": key_id,
             "value": "",
         }
-        expected = C3ReportSigner._signature_value(unsigned, key.secret)
-        if not hmac.compare_digest(value, expected):
-            return C3SignatureVerification(valid=False, reason="signature_invalid", key_id=key_id)
+        verify_signature_value = getattr(self._trust_store, "verify_signature_value", None)
+        if callable(verify_signature_value):
+            reason = verify_signature_value(
+                key_id=key_id,
+                report_with_empty_signature=unsigned,
+                signature_value=value,
+            )
+            if reason is not None:
+                return C3SignatureVerification(valid=False, reason=reason, key_id=key_id)
+        else:
+            expected = C3ReportSigner._signature_value(unsigned, key.secret)
+            if not hmac.compare_digest(value, expected):
+                return C3SignatureVerification(valid=False, reason="signature_invalid", key_id=key_id)
 
         return C3SignatureVerification(
             valid=True,

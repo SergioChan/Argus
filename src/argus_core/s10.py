@@ -11,6 +11,7 @@ from typing import Any, Callable
 from uuid import uuid4
 
 from .canonical import canonical_json_bytes
+from .c3 import C3_SIGNATURE_PREFIX, VerifierKey
 from .hashing import BLAKE3_PREFIX, hash_json
 from .s8 import ArtifactRecord, InMemoryArtifactStore, Lineage, Producer
 
@@ -225,6 +226,121 @@ class AuditEvent:
 class AuditVerification:
     valid: bool
     break_sequence: int | None = None
+
+
+@dataclass(frozen=True)
+class S10VerifierKeyMetadata:
+    key_id: str
+    revoked: bool
+    epoch: int
+
+
+@dataclass(frozen=True)
+class _S10VerifierKeyMaterial:
+    key_id: str
+    secret: bytes
+    revoked: bool
+    epoch: int
+
+
+class InMemoryS10KmsVerifierKeyProvider:
+    """S10-owned verifier-key provider that exposes metadata snapshots and KMS-style verification."""
+
+    def __init__(self) -> None:
+        self._keys: dict[str, _S10VerifierKeyMaterial] = {}
+        self._epoch = 0
+
+    @property
+    def epoch(self) -> int:
+        return self._epoch
+
+    def register_verifier_key(self, key_id: str, secret: bytes) -> None:
+        self._epoch += 1
+        self._keys[key_id] = _S10VerifierKeyMaterial(
+            key_id=key_id,
+            secret=bytes(secret),
+            revoked=False,
+            epoch=self._epoch,
+        )
+
+    def rotate_verifier_key(self, key_id: str, secret: bytes) -> None:
+        self.register_verifier_key(key_id, secret)
+
+    def revoke_verifier_key(self, key_id: str) -> None:
+        key = self._keys[key_id]
+        self._epoch += 1
+        self._keys[key_id] = _S10VerifierKeyMaterial(
+            key_id=key.key_id,
+            secret=key.secret,
+            revoked=True,
+            epoch=self._epoch,
+        )
+
+    def snapshot(self) -> tuple[int, tuple[S10VerifierKeyMetadata, ...]]:
+        metadata = tuple(
+            S10VerifierKeyMetadata(key_id=key.key_id, revoked=key.revoked, epoch=key.epoch)
+            for key in sorted(self._keys.values(), key=lambda item: item.key_id)
+        )
+        return self._epoch, metadata
+
+    def verify_signature_value(
+        self,
+        *,
+        key_id: str,
+        report_with_empty_signature: dict[str, Any],
+        signature_value: str,
+    ) -> str | None:
+        key = self._keys.get(key_id)
+        if key is None:
+            return "unknown_key"
+        if key.revoked:
+            return "revoked_key"
+        digest = hmac.new(key.secret, canonical_json_bytes(report_with_empty_signature), sha256).hexdigest()
+        expected = f"{C3_SIGNATURE_PREFIX}{digest}"
+        if not hmac.compare_digest(signature_value, expected):
+            return "signature_invalid"
+        return None
+
+
+class S10VerifierTrustStoreClient:
+    """Read-only S8/S3 trust-store client backed by an S10 KMS verifier-key provider."""
+
+    def __init__(self, provider: InMemoryS10KmsVerifierKeyProvider) -> None:
+        self._provider = provider
+        self._epoch = -1
+        self._keys: dict[str, VerifierKey] = {}
+
+    @property
+    def epoch(self) -> int:
+        return self._epoch
+
+    def refresh(self) -> int:
+        epoch, metadata = self._provider.snapshot()
+        if epoch != self._epoch:
+            self._keys = {
+                item.key_id: VerifierKey(key_id=item.key_id, secret=b"", revoked=item.revoked)
+                for item in metadata
+            }
+            self._epoch = epoch
+        return self._epoch
+
+    def get_key(self, key_id: str) -> VerifierKey | None:
+        self.refresh()
+        return self._keys.get(key_id)
+
+    def verify_signature_value(
+        self,
+        *,
+        key_id: str,
+        report_with_empty_signature: dict[str, Any],
+        signature_value: str,
+    ) -> str | None:
+        self.refresh()
+        return self._provider.verify_signature_value(
+            key_id=key_id,
+            report_with_empty_signature=report_with_empty_signature,
+            signature_value=signature_value,
+        )
 
 
 class InMemoryTokenService:
