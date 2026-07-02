@@ -223,13 +223,18 @@ def validate_status(
     for stage, status in stages.items():
         if status.status not in VALID_STAGE_STATES:
             errors.append(f"{stage} has invalid stage status {status.status!r}")
+        missing_stage_evidence: list[str] = []
+        if status.status in {"deployed", "e2e_passed", "complete"} and status.deployment_evidence == "-":
+            missing_stage_evidence.append("deployment")
+        if status.status in {"e2e_passed", "complete"} and status.e2e_evidence == "-":
+            missing_stage_evidence.append("e2e")
+        if missing_stage_evidence:
+            errors.append(f"{stage} {status.status} without {' and '.join(missing_stage_evidence)} evidence")
         if status.status == "complete":
             stage_tasks = [task_status for task_status in statuses.values() if task_status.stage == stage]
             incomplete = [task_status.task_id for task_status in stage_tasks if task_status.status != "complete"]
             if incomplete:
                 errors.append(f"{stage} complete with incomplete tasks: {incomplete}")
-            if status.deployment_evidence == "-" or status.e2e_evidence == "-":
-                errors.append(f"{stage} complete without deployment and e2e evidence")
     return errors
 
 

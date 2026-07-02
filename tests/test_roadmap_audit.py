@@ -100,6 +100,35 @@ class RoadmapAuditTests(unittest.TestCase):
         self.assertTrue(any("incomplete tasks" in error for error in errors))
         self.assertTrue(any("deployment and e2e evidence" in error for error in errors))
 
+    def test_non_complete_stage_gate_states_require_matching_real_evidence(self) -> None:
+        tasks = (
+            BacklogTask("S1-T01", "Author canonical C1 JSON Schema", "M", "C1", "C1", "schema validates"),
+        )
+        statuses = {
+            "S1-T01": TaskStatus(
+                task_id="S1-T01",
+                stage="M0",
+                status="complete",
+                evidence="acceptance=x; impl=x; unit=x; local=x; commit=x; push=x",
+            ),
+        }
+
+        deployed_errors = validate_status(
+            tasks=tasks,
+            stage_map={"S1-T01": "M0"},
+            stages={"M0": StageStatus("M0", "deployed", "-", "-")},
+            statuses=statuses,
+        )
+        e2e_errors = validate_status(
+            tasks=tasks,
+            stage_map={"S1-T01": "M0"},
+            stages={"M0": StageStatus("M0", "e2e_passed", "compose stack", "-")},
+            statuses=statuses,
+        )
+
+        self.assertTrue(any("without deployment evidence" in error for error in deployed_errors))
+        self.assertTrue(any("without e2e evidence" in error for error in e2e_errors))
+
     def test_render_status_defaults_every_task_to_not_started(self) -> None:
         tasks = (
             BacklogTask("S1-T01", "Author canonical C1 JSON Schema", "M", "C1", "C1", "schema validates"),
