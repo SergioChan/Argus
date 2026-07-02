@@ -54,6 +54,11 @@ class SignatureInvalidError(S8Error):
 class CycleDetectedError(S8Error):
     """Raised when a lineage edge would create a cycle."""
 
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.category = "CYCLE_DETECTED"
+        self.reason = reason
+
 
 @dataclass(frozen=True)
 class Producer:
@@ -354,6 +359,10 @@ class InMemoryArtifactStore:
     @property
     def record_count(self) -> int:
         return len(self._records)
+
+    @property
+    def edge_count(self) -> int:
+        return sum(len(edge_types) for edge_types in self._edge_types.values())
 
     def __len__(self) -> int:
         return len(self._records)

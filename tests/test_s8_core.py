@@ -170,7 +170,7 @@ class InMemoryArtifactStoreTests(unittest.TestCase):
     def test_self_cycle_is_rejected(self) -> None:
         artifact_ref = "c4://artifact/self-cycle"
 
-        with self.assertRaises(CycleDetectedError):
+        with self.assertRaises(CycleDetectedError) as raised:
             self.store.create_artifact(
                 artifact_ref=artifact_ref,
                 kind="model",
@@ -182,6 +182,41 @@ class InMemoryArtifactStoreTests(unittest.TestCase):
                     environment_digest="oci:cycle",
                 ),
             )
+
+        self.assertEqual(raised.exception.category, "CYCLE_DETECTED")
+
+    def test_two_node_cycle_is_rejected_without_edge_mutation(self) -> None:
+        a_ref = "c4://artifact/a"
+        b_ref = "c4://artifact/b"
+        self.store.create_artifact(
+            artifact_ref=a_ref,
+            kind="dataset",
+            payload={"rows": [1]},
+            producer=self.producer,
+            lineage=Lineage(input_refs=(), code_ref="git:a", environment_digest="oci:a"),
+        )
+        self.store.create_artifact(
+            artifact_ref=b_ref,
+            kind="model",
+            payload={"weights": [1]},
+            producer=self.producer,
+            lineage=Lineage(input_refs=(a_ref,), code_ref="git:b", environment_digest="oci:b"),
+        )
+        edge_count = self.store.edge_count
+        record_count = self.store.record_count
+
+        with self.assertRaises(CycleDetectedError) as raised:
+            self.store.create_artifact(
+                artifact_ref=a_ref,
+                kind="dataset",
+                payload={"rows": [2]},
+                producer=self.producer,
+                lineage=Lineage(input_refs=(b_ref,), code_ref="git:a2", environment_digest="oci:a2"),
+            )
+
+        self.assertEqual(raised.exception.category, "CYCLE_DETECTED")
+        self.assertEqual(self.store.edge_count, edge_count)
+        self.assertEqual(self.store.record_count, record_count)
 
     def test_lineage_query_and_impact_set_follow_transitive_edges(self) -> None:
         source = self.store.create_artifact(
