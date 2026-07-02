@@ -8,15 +8,18 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from argus_core import BudgetCaps, BudgetToken, FileSystemArtifactStore, Lineage, Producer, ScopeGrant, ScopeToken
 from argus_runtime.auth import RuntimeAuth, RuntimeIdentity
 from argus_runtime.http_json import JsonRequest
-from argus_runtime.s10_supervisor_service import S10SupervisorApp
+from argus_runtime.s10_supervisor_service import S10SupervisorApp, build_app_from_env as build_s10_app_from_env
 from argus_runtime.s8_writer_service import S8WriterApp
 
 
 AUTH_TOKEN = "test-runtime-token"
+BOOTSTRAP_TOKEN = "test-bootstrap-token"
+IDENTITY_SIGNING_KEY = b"test-identity-signing-key"
 
 
 class ArgusM0RuntimeServiceTests(unittest.TestCase):
@@ -148,6 +151,66 @@ class ArgusM0RuntimeServiceTests(unittest.TestCase):
         self.assertEqual(scope["scopes"]["producer_subsystems"], ("S2",))
         self.assertEqual(override_status, 403)
         self.assertEqual(override_payload["error"], "IdentityOverrideError")
+
+    def test_s10_http_mints_runtime_identity_before_budget_scope_tokens(self) -> None:
+        app = S10SupervisorApp(signing_key=b"test-key", auth=_signed_runtime_auth())
+
+        identity_status, identity_payload = app.http.handle(
+            JsonRequest(
+                method="POST",
+                path="/v1/runtime-identities",
+                query={},
+                body={
+                    "caller_id": "sandbox-1",
+                    "job_id": "job-launch",
+                    "root_request_id": "root-launch",
+                    "budget_caps": {"max_compute_units": 10, "max_wallclock_s": 30, "max_cost_usd": 5},
+                    "scopes": {"broker_audiences": ["store"], "producer_subsystems": ["S2"]},
+                    "ttl_s": 120,
+                },
+                headers=_auth_headers(BOOTSTRAP_TOKEN),
+            )
+        )
+        bootstrap_budget_status, bootstrap_budget_payload = app.http.handle(
+            JsonRequest(
+                method="POST",
+                path="/v1/budget-tokens",
+                query={},
+                body={},
+                headers=_auth_headers(BOOTSTRAP_TOKEN),
+            )
+        )
+        runtime_headers = _auth_headers(identity_payload["access_token"])
+        budget_status, budget = app.http.handle(
+            JsonRequest(method="POST", path="/v1/budget-tokens", query={}, body={}, headers=runtime_headers)
+        )
+        scope_status, scope = app.http.handle(
+            JsonRequest(method="POST", path="/v1/scope-tokens", query={}, body={}, headers=runtime_headers)
+        )
+
+        self.assertEqual(identity_status, 201)
+        self.assertEqual(identity_payload["identity"]["job_id"], "job-launch")
+        self.assertTrue(identity_payload["access_token"].startswith("argus-runtime-v1."))
+        self.assertEqual(bootstrap_budget_status, 403)
+        self.assertEqual(bootstrap_budget_payload["error"], "PermissionError")
+        self.assertEqual(budget_status, 201)
+        self.assertEqual(budget["job_id"], "job-launch")
+        self.assertEqual(budget["root_request_id"], "root-launch")
+        self.assertEqual(scope_status, 201)
+        self.assertEqual(scope["job_id"], "job-launch")
+        self.assertEqual(scope["scopes"]["producer_subsystems"], ("S2",))
+
+    def test_s10_env_build_fails_closed_without_signing_key(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "ARGUS_RUNTIME_BOOTSTRAP_TOKEN": BOOTSTRAP_TOKEN,
+                "ARGUS_RUNTIME_IDENTITY_SIGNING_KEY": IDENTITY_SIGNING_KEY.decode("utf-8"),
+            },
+            clear=True,
+        ):
+            with self.assertRaises(RuntimeError):
+                build_s10_app_from_env()
 
     def test_s10_store_artifact_rejects_scope_token_from_other_identity(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -284,8 +347,9 @@ class ArgusM0ComposeTests(unittest.TestCase):
             text=True,
             env={
                 **os.environ,
-                "ARGUS_RUNTIME_AUTH_TOKENS_JSON": json.dumps(_runtime_auth_config()),
-                "ARGUS_M0_HEALTH_TOKEN": AUTH_TOKEN,
+                "ARGUS_RUNTIME_BOOTSTRAP_TOKEN": BOOTSTRAP_TOKEN,
+                "ARGUS_RUNTIME_IDENTITY_SIGNING_KEY": IDENTITY_SIGNING_KEY.decode("utf-8"),
+                "ARGUS_S10_SIGNING_KEY": "test-s10-signing-key",
             },
         )
         if config.returncode != 0:
@@ -302,8 +366,11 @@ class ArgusM0ComposeTests(unittest.TestCase):
         self.assertEqual(services["s10-supervisor"]["environment"]["ARGUS_S10_HOST"], "0.0.0.0")
         self.assertEqual(services["s8-writer"]["ports"][0]["host_ip"], "127.0.0.1")
         self.assertEqual(services["s10-supervisor"]["ports"][0]["host_ip"], "127.0.0.1")
-        self.assertIn("ARGUS_RUNTIME_AUTH_TOKENS_JSON", services["s8-writer"]["environment"])
-        self.assertIn("ARGUS_RUNTIME_AUTH_TOKENS_JSON", services["s10-supervisor"]["environment"])
+        self.assertIn("ARGUS_RUNTIME_BOOTSTRAP_TOKEN", services["s8-writer"]["environment"])
+        self.assertIn("ARGUS_RUNTIME_IDENTITY_SIGNING_KEY", services["s8-writer"]["environment"])
+        self.assertIn("ARGUS_RUNTIME_BOOTSTRAP_TOKEN", services["s10-supervisor"]["environment"])
+        self.assertIn("ARGUS_RUNTIME_IDENTITY_SIGNING_KEY", services["s10-supervisor"]["environment"])
+        self.assertEqual(services["s10-supervisor"]["environment"]["ARGUS_S10_SIGNING_KEY"], "test-s10-signing-key")
         self.assertIn("/var/lib/argus/s8", services["s10-supervisor"]["volumes"][0]["target"])
         self.assertIn("s8-data", rendered["volumes"])
 
@@ -328,17 +395,11 @@ def _runtime_auth() -> RuntimeAuth:
     )
 
 
-def _runtime_auth_config() -> dict[str, object]:
-    return {
-        AUTH_TOKEN: {
-            "caller_id": "test-caller",
-            "job_id": "job-auth",
-            "root_request_id": "root-auth",
-            "scopes": {"broker_audiences": ["store"], "producer_subsystems": ["S2"]},
-            "budget_caps": {"max_compute_units": 10, "max_wallclock_s": 30, "max_cost_usd": 5},
-            "max_ttl_s": 300,
-        }
-    }
+def _signed_runtime_auth() -> RuntimeAuth:
+    return RuntimeAuth.with_signed_identities(
+        bootstrap_token=BOOTSTRAP_TOKEN,
+        identity_signing_key=IDENTITY_SIGNING_KEY,
+    )
 
 
 def _auth_headers(token: str = AUTH_TOKEN) -> dict[str, str]:

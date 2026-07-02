@@ -19,9 +19,11 @@ from argus_core import (
     PolicyBundle,
     Producer,
     ResourceCeilings,
+    ScopeDeniedError,
     ScopeGrant,
     ScopeToken,
     StoreWriterBroker,
+    TokenInvalidError,
 )
 
 from .auth import (
@@ -30,6 +32,7 @@ from .auth import (
     RuntimeIdentity,
     UnauthorizedError,
     reject_identity_overrides,
+    runtime_identity_from_dict,
     runtime_auth_from_env,
 )
 from .http_json import JsonHttpApp, JsonRequest, serve_json_app
@@ -70,6 +73,7 @@ class S10SupervisorApp:
         return asdict(token)
 
     def mint_budget_for_identity(self, identity: RuntimeIdentity, body: dict[str, Any]) -> dict[str, Any]:
+        _require_runtime_identity(identity)
         reject_identity_overrides(body, ("job_id", "root_request_id", "caps", "risk_class"))
         ttl_s = _bounded_ttl(body, identity.max_ttl_s)
         token = self.tokens.mint_budget(
@@ -92,6 +96,7 @@ class S10SupervisorApp:
         return asdict(token)
 
     def mint_scope_for_identity(self, identity: RuntimeIdentity, body: dict[str, Any]) -> dict[str, Any]:
+        _require_runtime_identity(identity)
         reject_identity_overrides(body, ("job_id", "scopes"))
         ttl_s = _bounded_ttl(body, identity.max_ttl_s)
         token = self.tokens.mint_scope(
@@ -117,6 +122,7 @@ class S10SupervisorApp:
         return asdict(record)
 
     def broker_put_artifact_for_identity(self, identity: RuntimeIdentity, body: dict[str, Any]) -> dict[str, Any]:
+        _require_runtime_identity(identity)
         scope_token = _scope_token_from_dict(_required_dict(body, "scope_token"))
         if scope_token.job_id != identity.job_id:
             raise PermissionError("scope token is not bound to the authenticated runtime identity")
@@ -134,6 +140,14 @@ class S10SupervisorApp:
             else None,
         )
         return asdict(record)
+
+    def mint_runtime_identity_for_launcher(self, launcher: RuntimeIdentity, body: dict[str, Any]) -> dict[str, Any]:
+        if not launcher.can_mint_runtime_identity:
+            raise PermissionError("runtime identity minting requires bootstrap authentication")
+        if self.auth is None:
+            raise RuntimeError("runtime auth is not configured")
+        identity = runtime_identity_from_dict(body)
+        return self.auth.mint_identity_token(identity, ttl_s=int(body.get("ttl_s", identity.max_ttl_s)))
 
     def _refresh_artifacts(self) -> None:
         if self._artifact_store_path is not None:
@@ -163,6 +177,20 @@ class S10SupervisorApp:
                 "audit_events": len(self.audit.events()),
             }
 
+        @self.http.route("POST", "/v1/runtime-identities")
+        def runtime_identity(request: JsonRequest) -> tuple[int, Any]:
+            try:
+                launcher = self._authenticate(request)
+                if not isinstance(request.body, dict):
+                    return 400, {"error": "json_object_required"}
+                return 201, self.mint_runtime_identity_for_launcher(launcher, request.body)
+            except UnauthorizedError as exc:
+                return 401, {"error": "Unauthorized", "message": str(exc)}
+            except PermissionError as exc:
+                return 403, {"error": type(exc).__name__, "message": str(exc)}
+            except Exception as exc:
+                return 400, {"error": type(exc).__name__, "message": str(exc)}
+
         @self.http.route("POST", "/v1/budget-tokens")
         def budget(request: JsonRequest) -> tuple[int, Any]:
             try:
@@ -173,6 +201,8 @@ class S10SupervisorApp:
             except UnauthorizedError as exc:
                 return 401, {"error": "Unauthorized", "message": str(exc)}
             except IdentityOverrideError as exc:
+                return 403, {"error": type(exc).__name__, "message": str(exc)}
+            except PermissionError as exc:
                 return 403, {"error": type(exc).__name__, "message": str(exc)}
             except Exception as exc:
                 return 400, {"error": type(exc).__name__, "message": str(exc)}
@@ -188,6 +218,8 @@ class S10SupervisorApp:
                 return 401, {"error": "Unauthorized", "message": str(exc)}
             except IdentityOverrideError as exc:
                 return 403, {"error": type(exc).__name__, "message": str(exc)}
+            except PermissionError as exc:
+                return 403, {"error": type(exc).__name__, "message": str(exc)}
             except Exception as exc:
                 return 400, {"error": type(exc).__name__, "message": str(exc)}
 
@@ -200,6 +232,10 @@ class S10SupervisorApp:
                 return 201, self.broker_put_artifact_for_identity(identity, request.body)
             except UnauthorizedError as exc:
                 return 401, {"error": "Unauthorized", "message": str(exc)}
+            except TokenInvalidError as exc:
+                return 401, {"error": type(exc).__name__, "message": str(exc)}
+            except ScopeDeniedError as exc:
+                return 403, {"error": type(exc).__name__, "message": str(exc)}
             except PermissionError as exc:
                 return 403, {"error": type(exc).__name__, "message": str(exc)}
             except Exception as exc:
@@ -211,7 +247,10 @@ def build_app_from_env() -> S10SupervisorApp:
     if key_file:
         signing_key = Path(key_file).read_bytes()
     else:
-        signing_key = os.environ.get("ARGUS_S10_SIGNING_KEY", "argus-m0-dev-signing-key").encode("utf-8")
+        signing_key_value = os.environ.get("ARGUS_S10_SIGNING_KEY")
+        if not signing_key_value:
+            raise RuntimeError("ARGUS_S10_SIGNING_KEY or ARGUS_S10_SIGNING_KEY_FILE is required")
+        signing_key = signing_key_value.encode("utf-8")
     data_dir = os.environ.get("ARGUS_S8_DATA_DIR")
     if data_dir:
         return S10SupervisorApp(
@@ -266,6 +305,11 @@ def _bounded_ttl(body: dict[str, Any], max_ttl_s: int) -> int:
     if requested <= 0:
         raise ValueError("ttl_s must be positive")
     return min(requested, max_ttl_s)
+
+
+def _require_runtime_identity(identity: RuntimeIdentity) -> None:
+    if identity.can_mint_runtime_identity:
+        raise PermissionError("runtime identity token required")
 
 
 def _scope_grant_from_dict(value: dict[str, Any]) -> ScopeGrant:
