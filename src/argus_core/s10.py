@@ -9,7 +9,7 @@ import subprocess
 import time
 from dataclasses import asdict, dataclass, replace
 from hashlib import sha256
-from typing import Any, Callable, NoReturn
+from typing import Any, Callable, Literal, NoReturn
 from uuid import uuid4
 from weakref import ref
 
@@ -28,6 +28,19 @@ SECRET_VALUE_PATTERNS = (
     re.compile(r"(?i)(password|secret|api[_-]?key|token)=?[A-Za-z0-9_./+=:-]{8,}"),
 )
 DIGEST_PINNED_IMAGE = re.compile(r"^(?:[^\s@]+@)?sha256:[0-9a-f]{64}$")
+RuntimeClass = Literal["auto", "gvisor", "firecracker", "docker"]
+RiskClass = Literal["standard", "federated", "high"]
+EgressProto = Literal["https", "grpc", "tcp"]
+SandboxState = Literal[
+    "ADMITTED",
+    "RUNNING",
+    "SUCCEEDED",
+    "FAILED",
+    "TIMED_OUT",
+    "FROZEN",
+    "TERMINATED",
+    "QUARANTINED",
+]
 
 
 class S10Error(Exception):
@@ -88,7 +101,7 @@ class BudgetUsage:
 class EgressRule:
     host: str
     port: int
-    proto: str
+    proto: EgressProto
 
 
 @dataclass(frozen=True)
@@ -98,7 +111,7 @@ class ScopeGrant:
     egress_allowlist: tuple[EgressRule, ...] = ()
     broker_audiences: tuple[str, ...] = ()
     producer_subsystems: tuple[str, ...] = ()
-    sandbox_risk_class: str = "standard"
+    sandbox_risk_class: RiskClass = "standard"
     disallowed_actions: tuple[str, ...] = ()
 
 
@@ -109,7 +122,7 @@ class BudgetToken:
     root_request_id: str
     budget_epoch: int
     caps: BudgetCaps
-    risk_class: str
+    risk_class: RiskClass
     issued_at: int
     expires_at: int
     ttl_s: int
@@ -165,7 +178,7 @@ class PolicyBundle:
     bundle_version: str
     egress_allowlist: tuple[EgressRule, ...]
     resource_ceilings: ResourceCeilings
-    risk_to_runtime: dict[str, str]
+    risk_to_runtime: dict[RiskClass, RuntimeClass]
     seccomp_profile_hash: str
     signer_key_id: str
     signature: str
@@ -203,14 +216,14 @@ class LaunchRequest:
     env: dict[str, str]
     env_allowlist: tuple[str, ...]
     requested_envelope: LaunchEnvelope
-    runtime_class_hint: str = "auto"
+    runtime_class_hint: RuntimeClass = "auto"
     policy_pin: str | None = None
 
 
 @dataclass(frozen=True)
 class PolicyVerdict:
     allowed: bool
-    runtime_class: str | None
+    runtime_class: RuntimeClass | None
     egress_acl: tuple[EgressRule, ...]
     deny_reason: str | None = None
 
@@ -219,10 +232,10 @@ class PolicyVerdict:
 class SandboxHandle:
     sandbox_id: str
     job_id: str
-    runtime_class: str
+    runtime_class: RuntimeClass
     budget_epoch: int
     policy_bundle_version: str
-    state: str
+    state: SandboxState
     launch_provenance_ref: str | None = None
 
 

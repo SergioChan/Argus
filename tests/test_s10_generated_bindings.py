@@ -151,6 +151,22 @@ class S10GeneratedBindingsTests(unittest.TestCase):
         self.assertEqual(_annotation_wire_type(int, definitions), "integer")
         self.assertEqual(_annotation_wire_type(str, definitions), "string")
 
+    def test_c10_enum_guard_distinguishes_member_set_drift(self) -> None:
+        schema = json.loads(C10_SCHEMA.read_text(encoding="utf-8"))
+        definitions = schema["$defs"]
+        proto_schema = definitions["EgressRule"]["properties"]["proto"]
+        proto_annotation = EgressRule.model_fields["proto"].annotation
+
+        self.assertEqual(
+            _schema_wire_type(proto_schema, definitions),
+            'enum[string:"grpc","https","tcp"]',
+        )
+        self.assertEqual(_annotation_wire_type(proto_annotation, definitions), _schema_wire_type(proto_schema, definitions))
+        self.assertNotEqual(
+            _annotation_wire_type(proto_annotation, definitions),
+            _schema_wire_type({**proto_schema, "enum": ["https", "grpc"]}, definitions),
+        )
+
     def test_binding_generator_is_byte_stable_after_c10_generation(self) -> None:
         result = subprocess.run(
             ["python3", "scripts/generate_bindings.py", "--check"],
@@ -174,6 +190,10 @@ def _schema_wire_type(schema_fragment: dict[str, Any], definitions: dict[str, An
     raw_type = schema_fragment.get("type")
     if isinstance(raw_type, list):
         return "|".join(sorted(_schema_wire_type({**schema_fragment, "type": item}, definitions) for item in raw_type))
+    enum_values = schema_fragment.get("enum")
+    if isinstance(enum_values, list) and raw_type in {"string", "integer", "number", "boolean"}:
+        values = tuple(value for value in enum_values if _literal_wire_type(value) == raw_type)
+        return _enum_wire_type(raw_type, values)
     if raw_type == "array":
         return f"array[{_schema_wire_type(schema_fragment.get('items', {}), definitions)}]"
     if raw_type == "object":
@@ -194,8 +214,16 @@ def _annotation_wire_type(annotation: Any, definitions: dict[str, Any]) -> str:
     if origin is Annotated:
         return _annotation_wire_type(args[0], definitions)
     if origin is Literal:
-        literal_types = {_literal_wire_type(value) for value in args}
-        return "|".join(sorted(literal_types))
+        literals_by_type: dict[str, list[Any]] = {}
+        for value in args:
+            literals_by_type.setdefault(_literal_wire_type(value), []).append(value)
+        wire_types = []
+        for literal_type, values in literals_by_type.items():
+            if literal_type == "null":
+                wire_types.append("null")
+            else:
+                wire_types.append(_enum_wire_type(literal_type, tuple(values)))
+        return "|".join(sorted(wire_types))
     if origin in {Union, types.UnionType}:
         return "|".join(sorted(_annotation_wire_type(arg, definitions) for arg in args))
     if origin in {list, tuple}:
@@ -234,6 +262,13 @@ def _literal_wire_type(value: Any) -> str:
     if value is None:
         return "null"
     raise AssertionError(f"unsupported C10 literal value: {value!r}")
+
+
+def _enum_wire_type(literal_type: str, values: tuple[Any, ...]) -> str:
+    encoded_values = ",".join(
+        sorted(json.dumps(value, separators=(",", ":"), sort_keys=True) for value in values)
+    )
+    return f"enum[{literal_type}:{encoded_values}]"
 
 
 if __name__ == "__main__":
