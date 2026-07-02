@@ -3,11 +3,16 @@
 from __future__ import annotations
 
 from dataclasses import asdict
+from hashlib import sha256
+import hmac
+import json
 import os
 from pathlib import Path
 from typing import Any
+from urllib import error, request
 
 from argus_core import (
+    ArtifactRecord,
     BudgetCaps,
     EgressRule,
     FileSystemArtifactStore,
@@ -24,6 +29,9 @@ from argus_core import (
     ScopeToken,
     StoreWriterBroker,
     TokenInvalidError,
+    WriteOnceViolationError,
+    IncompleteLineageError,
+    canonical_json_bytes,
 )
 
 from .auth import (
@@ -251,6 +259,19 @@ def build_app_from_env() -> S10SupervisorApp:
         if not signing_key_value:
             raise RuntimeError("ARGUS_S10_SIGNING_KEY or ARGUS_S10_SIGNING_KEY_FILE is required")
         signing_key = signing_key_value.encode("utf-8")
+    s8_broker_url = os.environ.get("ARGUS_S8_BROKER_URL")
+    s8_broker_key = os.environ.get("ARGUS_S8_BROKER_WRITE_KEY")
+    if s8_broker_url:
+        if not s8_broker_key:
+            raise RuntimeError("ARGUS_S8_BROKER_WRITE_KEY is required when ARGUS_S8_BROKER_URL is configured")
+        return S10SupervisorApp(
+            signing_key=signing_key,
+            artifact_store=S8BrokeredArtifactStoreClient(
+                endpoint_url=s8_broker_url,
+                broker_write_key=s8_broker_key.encode("utf-8"),
+            ),
+            auth=runtime_auth_from_env(),
+        )
     data_dir = os.environ.get("ARGUS_S8_DATA_DIR")
     if data_dir:
         return S10SupervisorApp(
@@ -286,6 +307,58 @@ def _default_policy_bundle() -> PolicyBundle:
     )
 
 
+class S8BrokeredArtifactStoreClient:
+    def __init__(self, *, endpoint_url: str, broker_write_key: bytes) -> None:
+        self._endpoint_url = endpoint_url
+        self._broker_write_key = broker_write_key
+
+    def create_brokered_artifact(
+        self,
+        *,
+        scope_token: ScopeToken,
+        kind: str,
+        payload: Any,
+        producer: Producer,
+        lineage: Lineage,
+        artifact_ref: str | None = None,
+        claim_tier: str = "ran-toy",
+        validation_report_ref: str | None = None,
+    ) -> ArtifactRecord:
+        body = {
+            "authorization": {
+                "audience": "store",
+                "scope_id": scope_token.scope_id,
+                "scope_job_id": scope_token.job_id,
+                "producer_subsystems": list(scope_token.scopes.producer_subsystems),
+            },
+            "kind": kind,
+            "payload": payload,
+            "producer": asdict(producer),
+            "lineage": asdict(lineage),
+            "artifact_ref": artifact_ref,
+            "claim_tier": claim_tier,
+            "validation_report_ref": validation_report_ref,
+        }
+        encoded = canonical_json_bytes(body)
+        signature = "hmac-sha256:" + hmac.new(self._broker_write_key, canonical_json_bytes(body), sha256).hexdigest()
+        http_request = request.Request(
+            self._endpoint_url,
+            data=encoded,
+            method="POST",
+            headers={
+                "Content-Type": "application/json",
+                "X-Argus-Store-Write-Signature": signature,
+            },
+        )
+        try:
+            with request.urlopen(http_request, timeout=10) as response:
+                response_body = json.loads(response.read().decode("utf-8"))
+        except error.HTTPError as exc:
+            response_body = json.loads(exc.read().decode("utf-8"))
+            _raise_s8_http_error(response_body)
+        return _artifact_record_from_dict(response_body)
+
+
 def _required_str(body: dict[str, Any], field: str) -> str:
     value = body.get(field)
     if not isinstance(value, str) or not value:
@@ -298,6 +371,20 @@ def _required_dict(body: dict[str, Any], field: str) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ValueError(f"{field} is required")
     return dict(value)
+
+
+def _raise_s8_http_error(payload: dict[str, Any]) -> None:
+    error_name = payload.get("error")
+    message = str(payload.get("message", error_name or "s8 brokered write failed"))
+    if error_name == "IncompleteLineageError":
+        prefix = "incomplete lineage: "
+        missing = tuple(part.strip() for part in message.removeprefix(prefix).split(",") if part.strip())
+        raise IncompleteLineageError(missing)
+    if error_name == "WriteOnceViolationError":
+        raise WriteOnceViolationError(message)
+    if error_name == "PermissionError":
+        raise ScopeDeniedError(message)
+    raise RuntimeError(message)
 
 
 def _bounded_ttl(body: dict[str, Any], max_ttl_s: int) -> int:
@@ -321,6 +408,22 @@ def _scope_grant_from_dict(value: dict[str, Any]) -> ScopeGrant:
         producer_subsystems=tuple(value.get("producer_subsystems") or ()),
         disallowed_actions=tuple(value.get("disallowed_actions") or ()),
         sandbox_risk_class=str(value.get("sandbox_risk_class", "standard")),
+    )
+
+
+def _artifact_record_from_dict(value: dict[str, Any]) -> ArtifactRecord:
+    return ArtifactRecord(
+        artifact_ref=_required_str(value, "artifact_ref"),
+        kind=_required_str(value, "kind"),
+        content_hash=_required_str(value, "content_hash"),
+        size_bytes=int(value["size_bytes"]),
+        created_at=_required_str(value, "created_at"),
+        producer=Producer(**_required_dict(value, "producer")),
+        lineage=Lineage(**_normalize_lineage(_required_dict(value, "lineage"))),
+        claim_tier=_required_str(value, "claim_tier"),
+        validation_report_ref=value.get("validation_report_ref")
+        if isinstance(value.get("validation_report_ref"), str)
+        else None,
     )
 
 

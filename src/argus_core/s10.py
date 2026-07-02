@@ -817,15 +817,28 @@ class StoreWriterBroker:
             producer=producer,
             lineage=lineage,
         )
-        record = self._artifact_store.create_artifact(
-            kind=kind,
-            payload=payload,
-            producer=producer,
-            lineage=lineage,
-            artifact_ref=artifact_ref,
-            claim_tier=claim_tier,
-            validation_report_ref=validation_report_ref,
-        )
+        brokered_create = getattr(self._artifact_store, "create_brokered_artifact", None)
+        if callable(brokered_create):
+            record = brokered_create(
+                scope_token=scope_token,
+                kind=kind,
+                payload=payload,
+                producer=producer,
+                lineage=lineage,
+                artifact_ref=artifact_ref,
+                claim_tier=claim_tier,
+                validation_report_ref=validation_report_ref,
+            )
+        else:
+            record = self._artifact_store.create_artifact(
+                kind=kind,
+                payload=payload,
+                producer=producer,
+                lineage=lineage,
+                artifact_ref=artifact_ref,
+                claim_tier=claim_tier,
+                validation_report_ref=validation_report_ref,
+            )
         self._audit_ledger.append(
             "store.put",
             {

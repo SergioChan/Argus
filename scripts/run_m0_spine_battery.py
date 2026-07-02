@@ -84,6 +84,7 @@ def main() -> int:
         "ARGUS_RUNTIME_BOOTSTRAP_TOKEN": runtime_secrets["bootstrap_token"],
         "ARGUS_RUNTIME_IDENTITY_SIGNING_KEY": runtime_secrets["identity_signing_key"],
         "ARGUS_S10_SIGNING_KEY": runtime_secrets["s10_signing_key"],
+        "ARGUS_S8_BROKER_WRITE_KEY": runtime_secrets["s8_broker_write_key"],
     }
     s8_url = f"http://127.0.0.1:{ports['ARGUS_M0_S8_PORT']}"
     s10_url = f"http://127.0.0.1:{ports['ARGUS_M0_S10_PORT']}"
@@ -210,6 +211,7 @@ def _m0_runtime_secrets() -> dict[str, str]:
         "bootstrap_token": f"argus-bootstrap-{uuid4().hex}",
         "identity_signing_key": f"argus-identity-key-{uuid4().hex}",
         "s10_signing_key": f"argus-s10-key-{uuid4().hex}",
+        "s8_broker_write_key": f"argus-s8-broker-key-{uuid4().hex}",
     }
 
 

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import asdict
+from hashlib import sha256
+import hmac
 import json
 import os
 import shutil
@@ -11,6 +13,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from argus_core import BudgetCaps, BudgetToken, FileSystemArtifactStore, Lineage, Producer, ScopeGrant, ScopeToken
+from argus_core import canonical_json_bytes
 from argus_runtime.auth import RuntimeAuth, RuntimeIdentity
 from argus_runtime.http_json import JsonRequest
 from argus_runtime.s10_supervisor_service import S10SupervisorApp, build_app_from_env as build_s10_app_from_env
@@ -20,6 +23,7 @@ from argus_runtime.s8_writer_service import S8WriterApp
 AUTH_TOKEN = "test-runtime-token"
 BOOTSTRAP_TOKEN = "test-bootstrap-token"
 IDENTITY_SIGNING_KEY = b"test-identity-signing-key"
+BROKER_WRITE_KEY = b"test-s8-broker-write-key"
 
 
 class ArgusM0RuntimeServiceTests(unittest.TestCase):
@@ -89,6 +93,99 @@ class ArgusM0RuntimeServiceTests(unittest.TestCase):
             self.assertEqual(status, 403)
             self.assertEqual(payload["error"], "DirectWriteDenied")
             self.assertEqual(app.store.record_count, 0)
+
+    def test_s8_internal_broker_write_requires_signature_and_revalidates_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            app = S8WriterApp(
+                FileSystemArtifactStore(tmp),
+                data_dir=tmp,
+                auth=_runtime_auth(),
+                broker_write_key=BROKER_WRITE_KEY,
+            )
+            body = {
+                "authorization": {
+                    "audience": "store",
+                    "scope_job_id": "job-1",
+                    "producer_subsystems": ["S2"],
+                },
+                "kind": "model",
+                "payload": {"weights": [1]},
+                "producer": asdict(Producer(subsystem="S2", version="0.0.0", job_id="job-1")),
+                "lineage": asdict(Lineage(input_refs=(), code_ref="git:model", environment_digest="oci:model", job_id="job-1")),
+            }
+            bad_body = {
+                **body,
+                "producer": asdict(Producer(subsystem="S9", version="0.0.0", job_id="job-1")),
+            }
+
+            unauthorized_status, unauthorized_payload = app.http.handle(
+                JsonRequest(method="POST", path="/v1/internal/brokered-artifacts", query={}, body=body)
+            )
+            accepted_status, accepted_payload = app.http.handle(
+                JsonRequest(
+                    method="POST",
+                    path="/v1/internal/brokered-artifacts",
+                    query={},
+                    body=body,
+                    headers=_broker_write_headers(body),
+                )
+            )
+            rejected_status, rejected_payload = app.http.handle(
+                JsonRequest(
+                    method="POST",
+                    path="/v1/internal/brokered-artifacts",
+                    query={},
+                    body=bad_body,
+                    headers=_broker_write_headers(bad_body),
+                )
+            )
+
+            self.assertEqual(unauthorized_status, 401)
+            self.assertEqual(unauthorized_payload["error"], "Unauthorized")
+            self.assertEqual(accepted_status, 201)
+            self.assertEqual(accepted_payload["producer"]["job_id"], "job-1")
+            self.assertEqual(rejected_status, 403)
+            self.assertEqual(rejected_payload["error"], "PermissionError")
+            self.assertEqual(app.store.record_count, 1)
+
+            external = FileSystemArtifactStore(tmp).create_artifact(
+                kind="container",
+                payload={"exec_environment_digest": "oci:runtime", "exec_environment": {}, "launch": {}},
+                producer=Producer(subsystem="S10", version="0.0.0"),
+                lineage=Lineage(
+                    input_refs=(),
+                    code_ref="busybox@sha256:test",
+                    environment_digest="oci:runtime",
+                    seeds=("trace-1",),
+                ),
+            )
+            chained_body = {
+                **body,
+                "payload": {"weights": [2]},
+                "lineage": asdict(
+                    Lineage(
+                        input_refs=(external.artifact_ref,),
+                        code_ref="git:model",
+                        environment_digest="oci:runtime",
+                        seeds=("seed-1",),
+                        job_id="job-1",
+                    )
+                ),
+            }
+            chained_status, chained_payload = app.http.handle(
+                JsonRequest(
+                    method="POST",
+                    path="/v1/internal/brokered-artifacts",
+                    query={},
+                    body=chained_body,
+                    headers=_broker_write_headers(chained_body),
+                )
+            )
+            reloaded = FileSystemArtifactStore(tmp)
+
+            self.assertEqual(chained_status, 201)
+            self.assertEqual(reloaded.get_artifact_record(chained_payload["artifact_ref"]).artifact_ref, chained_payload["artifact_ref"])
+            self.assertEqual(reloaded.record_count, 3)
 
     def test_runtime_http_routes_require_bearer_authentication(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -350,6 +447,7 @@ class ArgusM0ComposeTests(unittest.TestCase):
                 "ARGUS_RUNTIME_BOOTSTRAP_TOKEN": BOOTSTRAP_TOKEN,
                 "ARGUS_RUNTIME_IDENTITY_SIGNING_KEY": IDENTITY_SIGNING_KEY.decode("utf-8"),
                 "ARGUS_S10_SIGNING_KEY": "test-s10-signing-key",
+                "ARGUS_S8_BROKER_WRITE_KEY": BROKER_WRITE_KEY.decode("utf-8"),
             },
         )
         if config.returncode != 0:
@@ -370,8 +468,14 @@ class ArgusM0ComposeTests(unittest.TestCase):
         self.assertIn("ARGUS_RUNTIME_IDENTITY_SIGNING_KEY", services["s8-writer"]["environment"])
         self.assertIn("ARGUS_RUNTIME_BOOTSTRAP_TOKEN", services["s10-supervisor"]["environment"])
         self.assertIn("ARGUS_RUNTIME_IDENTITY_SIGNING_KEY", services["s10-supervisor"]["environment"])
+        self.assertIn("ARGUS_S8_BROKER_WRITE_KEY", services["s8-writer"]["environment"])
+        self.assertEqual(
+            services["s10-supervisor"]["environment"]["ARGUS_S8_BROKER_URL"],
+            "http://s8-writer:8080/v1/internal/brokered-artifacts",
+        )
+        self.assertIn("ARGUS_S8_BROKER_WRITE_KEY", services["s10-supervisor"]["environment"])
         self.assertEqual(services["s10-supervisor"]["environment"]["ARGUS_S10_SIGNING_KEY"], "test-s10-signing-key")
-        self.assertIn("/var/lib/argus/s8", services["s10-supervisor"]["volumes"][0]["target"])
+        self.assertNotIn("volumes", services["s10-supervisor"])
         self.assertIn("s8-data", rendered["volumes"])
 
     def _skip_or_fail(self, reason: str) -> None:
@@ -404,6 +508,11 @@ def _signed_runtime_auth() -> RuntimeAuth:
 
 def _auth_headers(token: str = AUTH_TOKEN) -> dict[str, str]:
     return {"Authorization": f"Bearer {token}"}
+
+
+def _broker_write_headers(body: dict[str, object]) -> dict[str, str]:
+    signature = hmac.new(BROKER_WRITE_KEY, canonical_json_bytes(body), sha256).hexdigest()
+    return {"X-Argus-Store-Write-Signature": f"hmac-sha256:{signature}"}
 
 
 if __name__ == "__main__":
