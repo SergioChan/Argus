@@ -12,7 +12,7 @@ from typing import Any
 
 from argus_core import FileSystemArtifactStore, Lineage, Producer, canonical_json_bytes
 
-from .auth import RuntimeAuth, UnauthorizedError, runtime_auth_from_env
+from .auth import RuntimeAuth, UnauthorizedError, health_token_from_env, require_static_bearer_token, runtime_auth_from_env
 from .http_json import JsonHttpApp, JsonRequest, serve_json_app
 
 
@@ -24,11 +24,13 @@ class S8WriterApp:
         data_dir: str | os.PathLike[str] | None = None,
         auth: RuntimeAuth | None = None,
         broker_write_key: bytes | None = None,
+        health_token: str | None = None,
     ) -> None:
         self.store = store
         self._data_dir = Path(data_dir) if data_dir is not None else None
         self.auth = auth
         self._broker_write_key = broker_write_key
+        self._health_token = health_token
         self.http = JsonHttpApp()
         self._register_routes()
 
@@ -106,6 +108,13 @@ class S8WriterApp:
         except UnauthorizedError as exc:
             return False, {"error": "Unauthorized", "message": str(exc)}
 
+    def _authenticate_health(self, request: JsonRequest) -> tuple[bool, dict[str, Any] | None]:
+        try:
+            require_static_bearer_token(request, expected_token=self._health_token, purpose="health")
+            return True, None
+        except UnauthorizedError as exc:
+            return False, {"error": "Unauthorized", "message": str(exc)}
+
     def _authenticate_broker_write(self, request: JsonRequest) -> tuple[bool, dict[str, Any] | None]:
         if self._broker_write_key is None:
             return False, {"error": "Unauthorized", "message": "broker write key is not configured"}
@@ -122,7 +131,7 @@ class S8WriterApp:
     def _register_routes(self) -> None:
         @self.http.route("GET", "/healthz")
         def health(request: JsonRequest) -> tuple[int, Any]:
-            authenticated, error_response = self._authenticate(request)
+            authenticated, error_response = self._authenticate_health(request)
             if not authenticated:
                 return 401, error_response
             self._refresh_store()
@@ -194,6 +203,7 @@ def build_app_from_env() -> S8WriterApp:
             build_postgres_minio_store_from_env(dict(os.environ)),
             auth=runtime_auth_from_env(),
             broker_write_key=broker_write_key.encode("utf-8") if broker_write_key else None,
+            health_token=health_token_from_env(),
         )
     data_dir = os.environ.get("ARGUS_S8_DATA_DIR", "/var/lib/argus/s8")
     return S8WriterApp(
@@ -201,6 +211,7 @@ def build_app_from_env() -> S8WriterApp:
         data_dir=data_dir,
         auth=runtime_auth_from_env(),
         broker_write_key=broker_write_key.encode("utf-8") if broker_write_key else None,
+        health_token=health_token_from_env(),
     )
 
 

@@ -83,6 +83,7 @@ def main() -> int:
         "ARGUS_RUNTIME_BOOTSTRAP_TOKEN": runtime_secrets["bootstrap_token"],
         "ARGUS_RUNTIME_IDENTITY_SIGNING_KEY": runtime_secrets["identity_signing_key"],
         "ARGUS_RUNTIME_IDENTITY_MINT_POLICY_JSON": _m0_identity_mint_policy_json(),
+        "ARGUS_M0_HEALTH_TOKEN": runtime_secrets["health_token"],
         "ARGUS_S10_SIGNING_KEY": runtime_secrets["s10_signing_key"],
         "ARGUS_S8_BROKER_WRITE_KEY": runtime_secrets["s8_broker_write_key"],
     }
@@ -94,23 +95,29 @@ def main() -> int:
         "s10_url": s10_url,
         "ports": ports,
         "persistence": "postgres-minio",
-        "auth_callers": ["health", "write", "spine", "halt"],
+        "auth_callers": ["read", "write", "spine", "halt"],
     }
 
     try:
         if not args.skip_compose_up:
             _record(evidence, "deploy", "argus-m0 compose up --build --wait")
             _run([docker, "compose", "-f", args.compose_file, "up", "-d", "--build", "--wait"], env=env, timeout=240)
-        _wait_health(f"{s8_url}/healthz", token=runtime_secrets["bootstrap_token"])
-        _wait_health(f"{s10_url}/healthz", token=runtime_secrets["bootstrap_token"])
+        _wait_health(f"{s8_url}/healthz", token=runtime_secrets["health_token"])
+        _wait_health(f"{s10_url}/healthz", token=runtime_secrets["health_token"])
         _battery_runtime_identity_mint_policy(evidence, s10_url, bootstrap_token=runtime_secrets["bootstrap_token"])
         auth_tokens = _mint_m0_runtime_identities(s10_url=s10_url, bootstrap_token=runtime_secrets["bootstrap_token"])
         _ensure_image(docker, args.image)
 
         _battery_a_contracts(evidence)
-        _battery_runtime_auth_required(evidence, s8_url, s10_url)
+        _battery_runtime_auth_required(
+            evidence,
+            s8_url,
+            s10_url,
+            bootstrap_token=runtime_secrets["bootstrap_token"],
+            health_token=runtime_secrets["health_token"],
+        )
         write_scope_json = _mint_store_scope(s10_url=s10_url, token=auth_tokens["write"])
-        _battery_direct_s8_write_denied(evidence, s8_url, token=auth_tokens["health"])
+        _battery_direct_s8_write_denied(evidence, s8_url, token=auth_tokens["read"])
         _battery_forged_scope_token_denied(evidence, s10_url, write_scope_json, token=auth_tokens["write"])
         _battery_b_incomplete_lineage(evidence, s10_url, write_scope_json, token=auth_tokens["write"])
         _battery_c_write_once(evidence, s10_url, write_scope_json, token=auth_tokens["write"])
@@ -133,7 +140,7 @@ def main() -> int:
             scope=_scope_token_from_json(scope_json),
             s8_url=s8_url,
             s8_broker_write_key=runtime_secrets["s8_broker_write_key"].encode("utf-8"),
-            read_token=auth_tokens["health"],
+            read_token=auth_tokens["read"],
             signing_key=runtime_secrets["s10_signing_key"].encode("utf-8"),
         )
         model_record = _post_json(
@@ -153,10 +160,10 @@ def main() -> int:
             expected_status=201,
             token=auth_tokens["spine"],
         )
-        fetched = _get_json(f"{s8_url}/v1/artifacts/{model_record['artifact_ref']}/record", token=auth_tokens["health"])
+        fetched = _get_json(f"{s8_url}/v1/artifacts/{model_record['artifact_ref']}/record", token=auth_tokens["read"])
         lineage = _get_json(
             f"{s8_url}/v1/lineage/{model_record['artifact_ref']}?direction=ancestors",
-            token=auth_tokens["health"],
+            token=auth_tokens["read"],
         )
         ancestor_refs = {node["artifact_ref"] for node in lineage["nodes"]}
         if fetched["producer"]["job_id"] != "m0-spine-job":
@@ -180,7 +187,7 @@ def main() -> int:
             args.image,
             s8_url,
             token=auth_tokens["halt"],
-            read_token=auth_tokens["health"],
+            read_token=auth_tokens["read"],
             s8_broker_write_key=runtime_secrets["s8_broker_write_key"].encode("utf-8"),
             signing_key=runtime_secrets["s10_signing_key"].encode("utf-8"),
         )
@@ -189,7 +196,7 @@ def main() -> int:
         _battery_d_tamper_detected(
             evidence,
             s8_url=s8_url,
-            token=auth_tokens["health"],
+            token=auth_tokens["read"],
             minio_port=ports["ARGUS_M0_MINIO_PORT"],
             model_record=model_record,
         )
@@ -220,6 +227,7 @@ def _battery_a_contracts(evidence: dict[str, Any]) -> None:
 def _m0_runtime_secrets() -> dict[str, str]:
     return {
         "bootstrap_token": f"argus-bootstrap-{uuid4().hex}",
+        "health_token": f"argus-health-{uuid4().hex}",
         "identity_signing_key": f"argus-identity-key-{uuid4().hex}",
         "s10_signing_key": f"argus-s10-key-{uuid4().hex}",
         "s8_broker_write_key": f"argus-s8-broker-key-{uuid4().hex}",
@@ -228,10 +236,10 @@ def _m0_runtime_secrets() -> dict[str, str]:
 
 def _m0_identity_requests() -> dict[str, dict[str, Any]]:
     return {
-        "health": {
-            "caller_id": "m0-health",
-            "job_id": "m0-health",
-            "root_request_id": "m0-health-root",
+        "read": {
+            "caller_id": "m0-read",
+            "job_id": "m0-read",
+            "root_request_id": "m0-read-root",
         },
         "write": {
             "caller_id": "m0-spine-write",
@@ -326,16 +334,53 @@ def _mint_m0_runtime_identities(*, s10_url: str, bootstrap_token: str) -> dict[s
     return minted
 
 
-def _battery_runtime_auth_required(evidence: dict[str, Any], s8_url: str, s10_url: str) -> None:
-    s8_health = _get_json(f"{s8_url}/healthz", expected_status=401)
-    s10_scope = _post_json(f"{s10_url}/v1/scope-tokens", {}, expected_status=401)
-    if s8_health["error"] != "Unauthorized" or s10_scope["error"] != "Unauthorized":
-        raise AssertionError(f"unexpected auth denial payloads: {s8_health}, {s10_scope}")
+def _battery_runtime_auth_required(
+    evidence: dict[str, Any],
+    s8_url: str,
+    s10_url: str,
+    *,
+    bootstrap_token: str,
+    health_token: str,
+) -> None:
+    s8_health_no_auth = _get_json(f"{s8_url}/healthz", expected_status=401)
+    s10_scope_no_auth = _post_json(f"{s10_url}/v1/scope-tokens", {}, expected_status=401)
+    s8_health_bootstrap = _get_json(f"{s8_url}/healthz", expected_status=401, token=bootstrap_token)
+    s10_health_bootstrap = _get_json(f"{s10_url}/healthz", expected_status=401, token=bootstrap_token)
+    s8_health = _get_json(f"{s8_url}/healthz", expected_status=200, token=health_token)
+    s10_health = _get_json(f"{s10_url}/healthz", expected_status=200, token=health_token)
+    s10_mint_with_health = _post_json(
+        f"{s10_url}/v1/runtime-identities",
+        {"caller_id": "m0-spine-launch"},
+        expected_status=401,
+        token=health_token,
+    )
+    s8_write_with_health = _post_json(
+        f"{s8_url}/v1/artifacts",
+        {},
+        expected_status=401,
+        token=health_token,
+    )
+    errors = {
+        "s8_health_no_auth": s8_health_no_auth["error"],
+        "s10_scope_no_auth": s10_scope_no_auth["error"],
+        "s8_health_bootstrap": s8_health_bootstrap["error"],
+        "s10_health_bootstrap": s10_health_bootstrap["error"],
+        "s10_mint_with_health": s10_mint_with_health["error"],
+        "s8_write_with_health": s8_write_with_health["error"],
+    }
+    if any(error != "Unauthorized" for error in errors.values()):
+        raise AssertionError(f"unexpected auth denial payloads: {errors}")
+    if s8_health["status"] != "ok" or s10_health["status"] != "ok":
+        raise AssertionError(f"unexpected health payloads: s8={s8_health}, s10={s10_health}")
     _record(
         evidence,
         "auth",
-        "runtime HTTP routes require bearer authentication before health or token mint",
-        {"s8_health": s8_health["error"], "s10_scope": s10_scope["error"]},
+        "health checks use a separate bearer token from runtime bootstrap and runtime routes",
+        {
+            **errors,
+            "s8_health": s8_health["status"],
+            "s10_health": s10_health["status"],
+        },
     )
 
 

@@ -39,7 +39,9 @@ from .auth import (
     RuntimeAuth,
     RuntimeIdentity,
     UnauthorizedError,
+    health_token_from_env,
     reject_identity_overrides,
+    require_static_bearer_token,
     runtime_identity_from_dict,
     runtime_auth_from_env,
 )
@@ -94,6 +96,7 @@ class S10SupervisorApp:
         artifact_store_path: str | os.PathLike[str] | None = None,
         auth: RuntimeAuth | None = None,
         runtime_identity_mint_policy: RuntimeIdentityMintPolicy | None = None,
+        health_token: str | None = None,
     ) -> None:
         self.tokens = InMemoryTokenService(signing_key=signing_key)
         self.quota = InMemoryQuotaLedger()
@@ -102,6 +105,7 @@ class S10SupervisorApp:
         self._artifact_store_path = Path(artifact_store_path) if artifact_store_path is not None else None
         self.auth = auth
         self.runtime_identity_mint_policy = runtime_identity_mint_policy
+        self._health_token = health_token
         self.policy = _default_policy_bundle()
         self.broker = StoreWriterBroker(
             token_service=self.tokens,
@@ -215,11 +219,14 @@ class S10SupervisorApp:
             raise UnauthorizedError("runtime auth is not configured")
         return self.auth.authenticate(request)
 
+    def _authenticate_health(self, request: JsonRequest) -> None:
+        require_static_bearer_token(request, expected_token=self._health_token, purpose="health")
+
     def _register_routes(self) -> None:
         @self.http.route("GET", "/healthz")
         def health(request: JsonRequest) -> tuple[int, Any]:
             try:
-                self._authenticate(request)
+                self._authenticate_health(request)
             except UnauthorizedError as exc:
                 return 401, {"error": "Unauthorized", "message": str(exc)}
             return 200, {
@@ -308,6 +315,7 @@ def build_app_from_env() -> S10SupervisorApp:
     s8_broker_url = os.environ.get("ARGUS_S8_BROKER_URL")
     s8_broker_key = os.environ.get("ARGUS_S8_BROKER_WRITE_KEY")
     mint_policy = _runtime_identity_mint_policy_from_env()
+    health_token = health_token_from_env()
     if s8_broker_url:
         if not s8_broker_key:
             raise RuntimeError("ARGUS_S8_BROKER_WRITE_KEY is required when ARGUS_S8_BROKER_URL is configured")
@@ -319,6 +327,7 @@ def build_app_from_env() -> S10SupervisorApp:
             ),
             auth=runtime_auth_from_env(),
             runtime_identity_mint_policy=mint_policy,
+            health_token=health_token,
         )
     data_dir = os.environ.get("ARGUS_S8_DATA_DIR")
     if data_dir:
@@ -328,11 +337,13 @@ def build_app_from_env() -> S10SupervisorApp:
             artifact_store_path=data_dir,
             auth=runtime_auth_from_env(),
             runtime_identity_mint_policy=mint_policy,
+            health_token=health_token,
         )
     return S10SupervisorApp(
         signing_key=signing_key,
         auth=runtime_auth_from_env(),
         runtime_identity_mint_policy=mint_policy,
+        health_token=health_token,
     )
 
 

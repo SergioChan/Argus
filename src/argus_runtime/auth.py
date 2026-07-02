@@ -163,6 +163,24 @@ def runtime_auth_from_env() -> RuntimeAuth:
     raise RuntimeError("ARGUS_RUNTIME_BOOTSTRAP_TOKEN plus ARGUS_RUNTIME_IDENTITY_SIGNING_KEY is required")
 
 
+def health_token_from_env() -> str:
+    token = os.environ.get("ARGUS_M0_HEALTH_TOKEN")
+    if not token:
+        raise RuntimeError("ARGUS_M0_HEALTH_TOKEN is required")
+    return token
+
+
+def require_static_bearer_token(request: JsonRequest, *, expected_token: str | None, purpose: str) -> None:
+    if not expected_token:
+        raise UnauthorizedError(f"{purpose} token is not configured")
+    value = request.headers.get("authorization", "")
+    scheme, separator, token = value.partition(" ")
+    if scheme.lower() != "bearer" or not separator or not token:
+        raise UnauthorizedError(f"{purpose} bearer token required")
+    if not hmac.compare_digest(expected_token, token):
+        raise UnauthorizedError(f"{purpose} token invalid")
+
+
 def reject_identity_overrides(body: dict[str, Any], fields: tuple[str, ...]) -> None:
     for field in fields:
         if field in body:

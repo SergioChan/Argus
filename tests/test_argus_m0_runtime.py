@@ -27,6 +27,7 @@ from argus_runtime.s8_writer_service import S8WriterApp
 AUTH_TOKEN = "test-runtime-token"
 BOOTSTRAP_TOKEN = "test-bootstrap-token"
 IDENTITY_SIGNING_KEY = b"test-identity-signing-key"
+HEALTH_TOKEN = "test-health-token"
 BROKER_WRITE_KEY = b"test-s8-broker-write-key"
 
 
@@ -223,20 +224,89 @@ class ArgusM0RuntimeServiceTests(unittest.TestCase):
 
     def test_runtime_http_routes_require_bearer_authentication(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            s8 = S8WriterApp(FileSystemArtifactStore(tmp), data_dir=tmp, auth=_runtime_auth())
-            s10 = S10SupervisorApp(signing_key=b"test-key", auth=_runtime_auth())
+            s8 = S8WriterApp(
+                FileSystemArtifactStore(tmp),
+                data_dir=tmp,
+                auth=_signed_runtime_auth(),
+                health_token=HEALTH_TOKEN,
+            )
+            s10 = S10SupervisorApp(
+                signing_key=b"test-key",
+                auth=_signed_runtime_auth(),
+                runtime_identity_mint_policy=_runtime_identity_mint_policy(),
+                health_token=HEALTH_TOKEN,
+            )
 
-            s8_status, s8_payload = s8.http.handle(
+            s8_no_auth_status, s8_no_auth_payload = s8.http.handle(
                 JsonRequest(method="GET", path="/healthz", query={}, body=None)
             )
-            s10_status, s10_payload = s10.http.handle(
+            s8_bootstrap_status, s8_bootstrap_payload = s8.http.handle(
+                JsonRequest(
+                    method="GET",
+                    path="/healthz",
+                    query={},
+                    body=None,
+                    headers=_auth_headers(BOOTSTRAP_TOKEN),
+                )
+            )
+            s8_health_status, s8_health_payload = s8.http.handle(
+                JsonRequest(method="GET", path="/healthz", query={}, body=None, headers=_auth_headers(HEALTH_TOKEN))
+            )
+            s10_no_auth_status, s10_no_auth_payload = s10.http.handle(
+                JsonRequest(method="GET", path="/healthz", query={}, body=None)
+            )
+            s10_bootstrap_status, s10_bootstrap_payload = s10.http.handle(
+                JsonRequest(
+                    method="GET",
+                    path="/healthz",
+                    query={},
+                    body=None,
+                    headers=_auth_headers(BOOTSTRAP_TOKEN),
+                )
+            )
+            s10_health_status, s10_health_payload = s10.http.handle(
+                JsonRequest(method="GET", path="/healthz", query={}, body=None, headers=_auth_headers(HEALTH_TOKEN))
+            )
+            s10_scope_status, s10_scope_payload = s10.http.handle(
                 JsonRequest(method="POST", path="/v1/scope-tokens", query={}, body={})
             )
+            s10_mint_with_health_status, s10_mint_with_health_payload = s10.http.handle(
+                JsonRequest(
+                    method="POST",
+                    path="/v1/runtime-identities",
+                    query={},
+                    body={"caller_id": "sandbox-1"},
+                    headers=_auth_headers(HEALTH_TOKEN),
+                )
+            )
+            s8_write_with_health_status, s8_write_with_health_payload = s8.http.handle(
+                JsonRequest(
+                    method="POST",
+                    path="/v1/artifacts",
+                    query={},
+                    body={},
+                    headers=_auth_headers(HEALTH_TOKEN),
+                )
+            )
 
-            self.assertEqual(s8_status, 401)
-            self.assertEqual(s8_payload["error"], "Unauthorized")
-            self.assertEqual(s10_status, 401)
-            self.assertEqual(s10_payload["error"], "Unauthorized")
+            self.assertEqual(s8_no_auth_status, 401)
+            self.assertEqual(s8_no_auth_payload["error"], "Unauthorized")
+            self.assertEqual(s8_bootstrap_status, 401)
+            self.assertEqual(s8_bootstrap_payload["error"], "Unauthorized")
+            self.assertEqual(s8_health_status, 200)
+            self.assertEqual(s8_health_payload["status"], "ok")
+            self.assertEqual(s10_no_auth_status, 401)
+            self.assertEqual(s10_no_auth_payload["error"], "Unauthorized")
+            self.assertEqual(s10_bootstrap_status, 401)
+            self.assertEqual(s10_bootstrap_payload["error"], "Unauthorized")
+            self.assertEqual(s10_health_status, 200)
+            self.assertEqual(s10_health_payload["status"], "ok")
+            self.assertEqual(s10_scope_status, 401)
+            self.assertEqual(s10_scope_payload["error"], "Unauthorized")
+            self.assertEqual(s10_mint_with_health_status, 401)
+            self.assertEqual(s10_mint_with_health_payload["error"], "Unauthorized")
+            self.assertEqual(s8_write_with_health_status, 401)
+            self.assertEqual(s8_write_with_health_payload["error"], "Unauthorized")
 
     def test_s10_http_mint_binds_tokens_to_authenticated_identity(self) -> None:
         app = S10SupervisorApp(signing_key=b"test-key", auth=_runtime_auth())
@@ -550,6 +620,7 @@ class ArgusM0ComposeTests(unittest.TestCase):
                 "ARGUS_RUNTIME_BOOTSTRAP_TOKEN": BOOTSTRAP_TOKEN,
                 "ARGUS_RUNTIME_IDENTITY_SIGNING_KEY": IDENTITY_SIGNING_KEY.decode("utf-8"),
                 "ARGUS_RUNTIME_IDENTITY_MINT_POLICY_JSON": _runtime_identity_mint_policy_json(),
+                "ARGUS_M0_HEALTH_TOKEN": HEALTH_TOKEN,
                 "ARGUS_S10_SIGNING_KEY": "test-s10-signing-key",
                 "ARGUS_S8_BROKER_WRITE_KEY": BROKER_WRITE_KEY.decode("utf-8"),
             },
@@ -578,9 +649,13 @@ class ArgusM0ComposeTests(unittest.TestCase):
         self.assertNotIn("volumes", services["s8-writer"])
         self.assertIn("ARGUS_RUNTIME_BOOTSTRAP_TOKEN", services["s8-writer"]["environment"])
         self.assertIn("ARGUS_RUNTIME_IDENTITY_SIGNING_KEY", services["s8-writer"]["environment"])
+        self.assertEqual(services["s8-writer"]["environment"]["ARGUS_M0_HEALTH_TOKEN"], HEALTH_TOKEN)
+        self.assertNotEqual(services["s8-writer"]["environment"]["ARGUS_M0_HEALTH_TOKEN"], BOOTSTRAP_TOKEN)
         self.assertIn("ARGUS_RUNTIME_BOOTSTRAP_TOKEN", services["s10-supervisor"]["environment"])
         self.assertIn("ARGUS_RUNTIME_IDENTITY_SIGNING_KEY", services["s10-supervisor"]["environment"])
         self.assertIn("ARGUS_RUNTIME_IDENTITY_MINT_POLICY_JSON", services["s10-supervisor"]["environment"])
+        self.assertEqual(services["s10-supervisor"]["environment"]["ARGUS_M0_HEALTH_TOKEN"], HEALTH_TOKEN)
+        self.assertNotEqual(services["s10-supervisor"]["environment"]["ARGUS_M0_HEALTH_TOKEN"], BOOTSTRAP_TOKEN)
         self.assertIn("ARGUS_S8_BROKER_WRITE_KEY", services["s8-writer"]["environment"])
         self.assertEqual(
             services["s10-supervisor"]["environment"]["ARGUS_S8_BROKER_URL"],
