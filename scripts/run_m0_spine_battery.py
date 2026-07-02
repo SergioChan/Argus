@@ -53,6 +53,7 @@ from argusverify import C3ReportSigner, InMemoryVerifierTrustStore, verify_repor
 
 
 DEFAULT_IMAGE = "busybox@sha256:73aaf090f3d85aa34ee199857f03fa3a95c8ede2ffd4cc2cdb5b94e566b11662"
+M0_C3_VERIFIER_KEY_ID = "argus-m0-c3-verifier"
 
 
 def main() -> int:
@@ -93,6 +94,11 @@ def main() -> int:
         "ARGUS_S10_POLICY_SIGNING_KEY": runtime_secrets["s10_policy_signing_key"],
         "ARGUS_S8_BROKER_WRITE_KEY": runtime_secrets["s8_broker_write_key"],
         "ARGUS_S8_CHECKPOINT_SIGNING_KEY": runtime_secrets["s8_checkpoint_signing_key"],
+        "ARGUS_S8_C3_VERIFIER_KEYS_JSON": json.dumps(
+            {M0_C3_VERIFIER_KEY_ID: runtime_secrets["c3_verifier_signing_key"]},
+            separators=(",", ":"),
+            sort_keys=True,
+        ),
     }
     s8_url = f"http://127.0.0.1:{ports['ARGUS_M0_S8_PORT']}"
     s10_url = f"http://127.0.0.1:{ports['ARGUS_M0_S10_PORT']}"
@@ -102,7 +108,7 @@ def main() -> int:
         "s10_url": s10_url,
         "ports": ports,
         "persistence": "postgres-minio",
-        "auth_callers": ["read", "write", "spine", "halt"],
+        "auth_callers": ["read", "write", "spine", "halt", "verify"],
     }
 
     try:
@@ -128,6 +134,16 @@ def main() -> int:
         _battery_forged_scope_token_denied(evidence, s10_url, write_scope_json, token=auth_tokens["write"])
         _battery_b_incomplete_lineage(evidence, s10_url, write_scope_json, token=auth_tokens["write"])
         _battery_c_write_once(evidence, s10_url, write_scope_json, token=auth_tokens["write"])
+        verifier_scope_json = _mint_store_scope(s10_url=s10_url, token=auth_tokens["verify"])
+        _battery_deployed_report_verifier(
+            evidence,
+            s10_url,
+            verifier_scope_json=verifier_scope_json,
+            verifier_token=auth_tokens["verify"],
+            model_scope_json=write_scope_json,
+            model_token=auth_tokens["write"],
+            verifier_signing_key=runtime_secrets["c3_verifier_signing_key"].encode("utf-8"),
+        )
         _battery_signed_policy_service(
             evidence,
             policy_signing_key=runtime_secrets["s10_policy_signing_key"].encode("utf-8"),
@@ -259,6 +275,7 @@ def _m0_runtime_secrets() -> dict[str, str]:
         "s10_policy_signing_key": f"argus-s10-policy-key-{uuid4().hex}",
         "s8_broker_write_key": f"argus-s8-broker-key-{uuid4().hex}",
         "s8_checkpoint_signing_key": f"argus-s8-checkpoint-key-{uuid4().hex}",
+        "c3_verifier_signing_key": f"argus-c3-verifier-key-{uuid4().hex}",
     }
 
 
@@ -296,6 +313,16 @@ def _m0_identity_requests() -> dict[str, dict[str, Any]]:
             "root_request_id": "m0-budget-halt-root",
             "budget_caps": {"max_compute_units": 1, "max_wallclock_s": 1, "max_cost_usd": 5},
             "scopes": {"sandbox_risk_class": "standard"},
+        },
+        "verify": {
+            "caller_id": "m0-verifier",
+            "job_id": "m0-verifier-job",
+            "root_request_id": "m0-verifier-root",
+            "scopes": {
+                "broker_audiences": ["store"],
+                "producer_subsystems": ["S3"],
+                "sandbox_risk_class": "standard",
+            },
         },
     }
 
@@ -402,6 +429,8 @@ def _battery_runtime_auth_required(
         raise AssertionError(f"unexpected health payloads: s8={s8_health}, s10={s10_health}")
     if s8_health.get("ledger_writer") != "rust-subprocess":
         raise AssertionError(f"S8 did not activate the Rust ledger writer boundary: {s8_health}")
+    if s8_health.get("report_verifier") != "argusverify":
+        raise AssertionError(f"S8 did not activate the C3 report verifier: {s8_health}")
     _record(
         evidence,
         "auth",
@@ -410,6 +439,7 @@ def _battery_runtime_auth_required(
             **errors,
             "s8_health": s8_health["status"],
             "s8_ledger_writer": s8_health["ledger_writer"],
+            "s8_report_verifier": s8_health["report_verifier"],
             "s10_health": s10_health["status"],
         },
     )
@@ -519,6 +549,93 @@ def _battery_c_write_once(
         "c",
         "brokered write-once overwrite blocked",
         {"artifact_ref": first["artifact_ref"], "error": second},
+    )
+
+
+def _battery_deployed_report_verifier(
+    evidence: dict[str, Any],
+    s10_url: str,
+    *,
+    verifier_scope_json: dict[str, Any],
+    verifier_token: str,
+    model_scope_json: dict[str, Any],
+    model_token: str,
+    verifier_signing_key: bytes,
+) -> None:
+    signer = C3ReportSigner(key_id=M0_C3_VERIFIER_KEY_ID, secret=verifier_signing_key)
+    report_record = _post_json(
+        f"{s10_url}/v1/store/artifacts",
+        {
+            "scope_token": verifier_scope_json,
+            "kind": "report",
+            "payload": signer.sign(_m0_validation_report(claim_tier="recapitulated-known")),
+            "producer": {"subsystem": "S3", "version": "0.0.0"},
+            "lineage": {"input_refs": [], "code_ref": "git:m0-verifier", "environment_digest": "oci:m0-verifier"},
+        },
+        expected_status=201,
+        token=verifier_token,
+    )
+    promoted = _post_json(
+        f"{s10_url}/v1/store/artifacts",
+        {
+            "scope_token": model_scope_json,
+            "kind": "model",
+            "payload": {
+                "weights": [3, 2, 1],
+                "source": "signed-report",
+                "uncertainty_tag": {"kind": "interval", "radius": 0.1},
+            },
+            "producer": {"subsystem": "S2", "version": "0.0.0"},
+            "lineage": {"input_refs": [], "code_ref": "git:m0-promoted", "environment_digest": "oci:m0-promoted"},
+            "claim_tier": "recapitulated-known",
+            "validation_report_ref": report_record["artifact_ref"],
+        },
+        expected_status=201,
+        token=model_token,
+    )
+    tampered = signer.sign(_m0_validation_report(claim_tier="recapitulated-known"))
+    tampered["aggregate"]["score"] = 0.1
+    tampered_rejected = _post_json(
+        f"{s10_url}/v1/store/artifacts",
+        {
+            "scope_token": verifier_scope_json,
+            "kind": "report",
+            "payload": tampered,
+            "producer": {"subsystem": "S3", "version": "0.0.0"},
+            "lineage": {"input_refs": [], "code_ref": "git:m0-tampered", "environment_digest": "oci:m0-verifier"},
+        },
+        expected_status=400,
+        token=verifier_token,
+    )
+    mismatch_rejected = _post_json(
+        f"{s10_url}/v1/store/artifacts",
+        {
+            "scope_token": model_scope_json,
+            "kind": "model",
+            "payload": {"weights": [9], "uncertainty_tag": {"kind": "interval", "radius": 0.1}},
+            "producer": {"subsystem": "S2", "version": "0.0.0"},
+            "lineage": {"input_refs": [], "code_ref": "git:m0-mismatch", "environment_digest": "oci:m0-promoted"},
+            "claim_tier": "novel-needs-human",
+            "validation_report_ref": report_record["artifact_ref"],
+        },
+        expected_status=400,
+        token=model_token,
+    )
+    if "signature_invalid" not in str(tampered_rejected.get("message", "")):
+        raise AssertionError(f"tampered report was not rejected by the deployed verifier: {tampered_rejected}")
+    if "tier must match validation report claim_tier" not in str(mismatch_rejected.get("message", "")):
+        raise AssertionError(f"tier mismatch was not rejected by the deployed verifier: {mismatch_rejected}")
+    _record(
+        evidence,
+        "report-verifier",
+        "deployed S8 Postgres path used argusverify for signed-report tier coupling",
+        {
+            "report_ref": report_record["artifact_ref"],
+            "promoted_model_ref": promoted["artifact_ref"],
+            "claim_tier": promoted["claim_tier"],
+            "tampered_report_rejected": tampered_rejected["message"],
+            "tier_mismatch_rejected": mismatch_rejected["message"],
+        },
     )
 
 
@@ -916,6 +1033,48 @@ def _battery_g_argusverify(evidence: dict[str, Any]) -> None:
         "argusverify accepted signed report and rejected tampered signature",
         {"valid_key_id": valid.key_id, "tampered_reason": invalid.reason},
     )
+
+
+def _m0_validation_report(*, claim_tier: str, aggregate_passed: bool = True) -> dict[str, Any]:
+    return {
+        "report_id": "vr-m0-spine",
+        "profile_ref": "c4://profile/m0-spine/v1",
+        "frozen_pipeline_ref": "c4://pipeline/m0-spine/baseline",
+        "checks": [
+            {"check": "INJECTION", "status": "PASS"},
+            {"check": "LEAKAGE", "status": "PASS"},
+            {"check": "CROSS_CODE", "status": "PASS"},
+        ],
+        "aggregate": {
+            "passed": aggregate_passed,
+            "score": 0.98 if aggregate_passed else 0.0,
+        },
+        "claim_tier": claim_tier,
+        "claim_tier_is_candidate": claim_tier == "novel-needs-human",
+        "signature": {
+            "algorithm": "placeholder",
+            "key_id": "placeholder",
+            "value": "placeholder",
+        },
+        "perturbation_pairs": [
+            {"perturbation_id": "must-react-1", "kind": "must_react", "verdict": "pass"},
+            {"perturbation_id": "must-not-react-1", "kind": "must_not_react", "verdict": "pass"},
+        ],
+        "insensitivity_flags": [],
+        "challenger_panel": {"challenger_ids": ["challenger-a", "challenger-b"], "min_required": 2},
+        "independence_attestation_debate": {
+            "min_independent_challengers": 2,
+            "lineage_disjoint": True,
+            "correlation_warning": False,
+        },
+        "referee": {
+            "referee_id": "s3-referee",
+            "non_gameable": True,
+            "signed_by": M0_C3_VERIFIER_KEY_ID,
+            "distinct_from_proponent": True,
+        },
+        "debate_ref": "c4://debate/m0-spine/example",
+    }
 
 
 def _battery_signed_policy_service(evidence: dict[str, Any], *, policy_signing_key: bytes) -> None:

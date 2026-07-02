@@ -39,6 +39,11 @@ IDENTITY_SIGNING_KEY = b"test-identity-signing-key"
 HEALTH_TOKEN = "test-health-token"
 BROKER_WRITE_KEY = b"test-s8-broker-write-key"
 POLICY_SIGNING_KEY = "test-s10-policy-signing-key"
+C3_VERIFIER_KEYS_JSON = json.dumps(
+    {"argus-m0-c3-verifier": "test-c3-verifier-key"},
+    separators=(",", ":"),
+    sort_keys=True,
+)
 
 
 class ArgusM0RuntimeServiceTests(unittest.TestCase):
@@ -328,6 +333,7 @@ class ArgusM0RuntimeServiceTests(unittest.TestCase):
             self.assertEqual(s8_health_status, 200)
             self.assertEqual(s8_health_payload["status"], "ok")
             self.assertEqual(s8_health_payload["ledger_writer"], "filesystem")
+            self.assertEqual(s8_health_payload["report_verifier"], "unconfigured")
             self.assertEqual(s10_no_auth_status, 401)
             self.assertEqual(s10_no_auth_payload["error"], "Unauthorized")
             self.assertEqual(s10_bootstrap_status, 401)
@@ -681,6 +687,7 @@ class ArgusM0ComposeTests(unittest.TestCase):
                 "ARGUS_S10_POLICY_SIGNING_KEY": POLICY_SIGNING_KEY,
                 "ARGUS_S8_BROKER_WRITE_KEY": BROKER_WRITE_KEY.decode("utf-8"),
                 "ARGUS_S8_CHECKPOINT_SIGNING_KEY": "test-s8-checkpoint-signing-key",
+                "ARGUS_S8_C3_VERIFIER_KEYS_JSON": C3_VERIFIER_KEYS_JSON,
             },
         )
         if config.returncode != 0:
@@ -707,6 +714,8 @@ class ArgusM0ComposeTests(unittest.TestCase):
             services["s8-writer"]["environment"]["ARGUS_S8_CHECKPOINT_SIGNER_KEY_ID"],
             "argus-m0-s8-checkpoint",
         )
+        self.assertEqual(services["s8-writer"]["environment"]["ARGUS_S8_REQUIRE_REPORT_VERIFIER"], "1")
+        self.assertEqual(services["s8-writer"]["environment"]["ARGUS_S8_C3_VERIFIER_KEYS_JSON"], C3_VERIFIER_KEYS_JSON)
         self.assertEqual(services["s8-writer"]["environment"]["ARGUS_S8_MINIO_ENDPOINT"], "minio:9000")
         self.assertEqual(services["s8-writer"]["environment"]["ARGUS_S8_MINIO_BUCKET"], "argus-s8-objects")
         self.assertNotIn("ARGUS_S8_DATA_DIR", services["s8-writer"]["environment"])

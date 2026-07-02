@@ -140,6 +140,7 @@ class S8WriterApp:
                 "status": "ok",
                 "record_count": self.store.record_count,
                 "ledger_writer": getattr(self.store, "ledger_writer_kind", "filesystem"),
+                "report_verifier": getattr(self.store, "report_verifier_kind", "unconfigured"),
             }
 
         @self.http.route("POST", "/v1/artifacts")

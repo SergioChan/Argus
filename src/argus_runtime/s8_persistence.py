@@ -13,6 +13,8 @@ import shlex
 import subprocess
 from typing import Any
 
+from argusverify import C3ReportVerifier, InMemoryVerifierTrustStore
+
 from argus_core import (
     ArtifactRecord,
     ArtifactQueryFilter,
@@ -219,17 +221,20 @@ class PostgresArtifactStore:
         object_store: MinioObjectStore,
         db_role: str | None = None,
         ledger_writer: SubprocessRustLedgerWriter | None = None,
+        report_verifier: C3ReportVerifier | None = None,
     ) -> None:
         self._dsn = dsn
         self._object_store = object_store
         self._db_role = db_role
         self._ledger_writer = ledger_writer
+        self._report_verifier = report_verifier
         self.ledger_writer_kind = "rust-subprocess" if ledger_writer is not None else "python-sql"
-        self._snapshot = InMemoryArtifactStore(object_store=object_store)
+        self.report_verifier_kind = "argusverify" if report_verifier is not None else "unconfigured"
+        self._snapshot = self._snapshot_store()
         self.refresh()
 
     def refresh(self) -> None:
-        snapshot = InMemoryArtifactStore(object_store=self._object_store)
+        snapshot = self._snapshot_store()
         for row in self._fetch_records():
             payload_bytes = self._object_store.get(str(row["content_hash"]))
             record = _record_from_row(row, size_bytes=len(payload_bytes))
@@ -245,6 +250,12 @@ class PostgresArtifactStore:
                 created_at=record.created_at,
             )
         self._snapshot = snapshot
+
+    def _snapshot_store(self) -> InMemoryArtifactStore:
+        return InMemoryArtifactStore(
+            object_store=self._object_store,
+            report_verifier=self._report_verifier,
+        )
 
     def create_artifact(
         self,
@@ -496,7 +507,53 @@ def build_postgres_minio_store_from_env(env: dict[str, str]) -> PostgresArtifact
         object_store=object_store,
         db_role=env.get("ARGUS_S8_POSTGRES_ROLE") or None,
         ledger_writer=ledger_writer,
+        report_verifier=report_verifier_from_env(env),
     )
+
+
+def report_verifier_from_env(env: dict[str, str]) -> C3ReportVerifier | None:
+    raw_keys = env.get("ARGUS_S8_C3_VERIFIER_KEYS_JSON")
+    required = env.get("ARGUS_S8_REQUIRE_REPORT_VERIFIER", "0") == "1"
+    if not raw_keys:
+        if required:
+            raise RuntimeError("ARGUS_S8_C3_VERIFIER_KEYS_JSON is required")
+        return None
+    try:
+        parsed = json.loads(raw_keys)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("ARGUS_S8_C3_VERIFIER_KEYS_JSON must be valid JSON") from exc
+
+    trust_store = InMemoryVerifierTrustStore()
+    for key in _verifier_key_items(parsed):
+        key_id = key["key_id"]
+        secret = key["secret"]
+        trust_store.register_key(key_id, secret.encode("utf-8"))
+        if key.get("revoked"):
+            trust_store.revoke_key(key_id)
+    return C3ReportVerifier(trust_store)
+
+
+def _verifier_key_items(value: Any) -> list[dict[str, Any]]:
+    if isinstance(value, dict):
+        if all(isinstance(secret, str) for secret in value.values()):
+            return [{"key_id": str(key_id), "secret": secret} for key_id, secret in value.items()]
+        keys = value.get("keys")
+        if isinstance(keys, list):
+            value = keys
+    if not isinstance(value, list):
+        raise RuntimeError("ARGUS_S8_C3_VERIFIER_KEYS_JSON must be an object map or a list of key objects")
+    items: list[dict[str, Any]] = []
+    for item in value:
+        if not isinstance(item, dict):
+            raise RuntimeError("verifier key entries must be objects")
+        key_id = item.get("key_id")
+        secret = item.get("secret")
+        if not isinstance(key_id, str) or not key_id:
+            raise RuntimeError("verifier key entry key_id is required")
+        if not isinstance(secret, str) or not secret:
+            raise RuntimeError("verifier key entry secret is required")
+        items.append({"key_id": key_id, "secret": secret, "revoked": bool(item.get("revoked", False))})
+    return items
 
 
 def _rust_ledger_writer_from_env(

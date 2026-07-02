@@ -16,14 +16,17 @@ from argus_core import (
     DatasetRegistry,
     DatasetSplit,
     HashMismatchError,
+    IllegalTierError,
     InMemoryArtifactStore,
     InMemoryObjectStore,
     Lineage,
     Producer,
+    SignatureInvalidError,
     hash_bytes,
     hash_json,
 )
-from argus_runtime.s8_persistence import PostgresArtifactStore
+from argus_runtime.s8_persistence import PostgresArtifactStore, report_verifier_from_env
+from argusverify import C3ReportSigner, C3ReportVerifier, InMemoryVerifierTrustStore
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -770,6 +773,81 @@ class S8PostgresSchemaTests(unittest.TestCase):
         self.assertEqual(store.ledger_writer_kind, "rust-subprocess")
         self.assertEqual(ledger_writer.records, [record])
         self.assertEqual(record_count.stdout.strip(), "0")
+
+    def test_postgres_store_uses_report_verifier_for_tier_coupling(self) -> None:
+        trust_store = InMemoryVerifierTrustStore()
+        trust_store.register_key("s3-key", b"s3-secret")
+        signer = C3ReportSigner(key_id="s3-key", secret=b"s3-secret")
+        object_store = InMemoryObjectStore()
+        store = PostgresArtifactStore(
+            dsn=self._postgres_dsn(),
+            object_store=object_store,
+            db_role="argus_s8_ledger_writer",
+            report_verifier=C3ReportVerifier(trust_store),
+        )
+        report = store.create_artifact(
+            kind="report",
+            payload=signer.sign(self._validation_report(claim_tier="recapitulated-known")),
+            producer=Producer(subsystem="S3", version="0.0.0"),
+            lineage=Lineage(input_refs=(), code_ref="git:verify", environment_digest="oci:verify"),
+        )
+        model = store.create_artifact(
+            kind="model",
+            payload={"weights": [1, 2, 3], "uncertainty_tag": {"kind": "interval", "radius": 0.1}},
+            producer=Producer(subsystem="S2", version="0.0.0"),
+            lineage=Lineage(input_refs=(), code_ref="git:model", environment_digest="oci:model"),
+            claim_tier="recapitulated-known",
+            validation_report_ref=report.artifact_ref,
+        )
+        count_after_valid = store.record_count
+
+        tampered = signer.sign(self._validation_report(claim_tier="recapitulated-known"))
+        tampered["aggregate"]["score"] = 0.1
+        with self.assertRaises(SignatureInvalidError) as invalid:
+            store.create_artifact(
+                kind="report",
+                payload=tampered,
+                producer=Producer(subsystem="S3", version="0.0.0"),
+                lineage=Lineage(input_refs=(), code_ref="git:verify-tamper", environment_digest="oci:verify"),
+            )
+        with self.assertRaises(IllegalTierError) as mismatch:
+            store.create_artifact(
+                kind="model",
+                payload={"weights": [4], "uncertainty_tag": {"kind": "interval", "radius": 0.1}},
+                producer=Producer(subsystem="S2", version="0.0.0"),
+                lineage=Lineage(input_refs=(), code_ref="git:model-mismatch", environment_digest="oci:model"),
+                claim_tier="novel-needs-human",
+                validation_report_ref=report.artifact_ref,
+            )
+
+        refreshed = PostgresArtifactStore(
+            dsn=self._postgres_dsn(),
+            object_store=object_store,
+            db_role="argus_s8_ledger_writer",
+            report_verifier=C3ReportVerifier(trust_store),
+        )
+        self.assertEqual(store.report_verifier_kind, "argusverify")
+        self.assertEqual(model.validation_report_ref, report.artifact_ref)
+        self.assertEqual(refreshed.get_artifact_record(model.artifact_ref).claim_tier, "recapitulated-known")
+        self.assertEqual(invalid.exception.reason, "signature_invalid")
+        self.assertEqual(mismatch.exception.reason, "tier must match validation report claim_tier")
+        self.assertEqual(store.record_count, count_after_valid)
+
+    def test_report_verifier_env_requires_and_parses_keys(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "ARGUS_S8_C3_VERIFIER_KEYS_JSON"):
+            report_verifier_from_env({"ARGUS_S8_REQUIRE_REPORT_VERIFIER": "1"})
+
+        verifier = report_verifier_from_env(
+            {
+                "ARGUS_S8_REQUIRE_REPORT_VERIFIER": "1",
+                "ARGUS_S8_C3_VERIFIER_KEYS_JSON": json.dumps({"s3-key": "s3-secret"}),
+            }
+        )
+        self.assertIsNotNone(verifier)
+        signed = C3ReportSigner(key_id="s3-key", secret=b"s3-secret").sign(
+            self._validation_report(claim_tier="recapitulated-known")
+        )
+        self.assertTrue(verifier.verify(signed).valid)
 
     def test_read_query_functions_resolve_refs_filter_page_and_grant_reader(self) -> None:
         self._commit_record(
@@ -1713,6 +1791,48 @@ class S8PostgresSchemaTests(unittest.TestCase):
         self.assertIn("permission denied", reader_record_denied.stderr)
         self.assertEqual(check_count.stdout.strip(), "1")
         self.assertEqual(final_hash.stdout.strip(), original_hash.stdout.strip())
+
+    @staticmethod
+    def _validation_report(*, claim_tier: str, aggregate_passed: bool = True) -> dict[str, object]:
+        return {
+            "report_id": "33333333-3333-4333-8333-333333333333",
+            "profile_ref": "c4://profile/ewpt-toy/v1",
+            "frozen_pipeline_ref": "c4://pipeline/ewpt-toy/baseline",
+            "checks": [
+                {"check": "INJECTION", "status": "PASS"},
+                {"check": "LEAKAGE", "status": "PASS"},
+                {"check": "CROSS_CODE", "status": "PASS"},
+            ],
+            "aggregate": {
+                "passed": aggregate_passed,
+                "score": 0.98 if aggregate_passed else 0.0,
+            },
+            "claim_tier": claim_tier,
+            "claim_tier_is_candidate": claim_tier == "novel-needs-human",
+            "signature": {
+                "algorithm": "placeholder",
+                "key_id": "placeholder",
+                "value": "placeholder",
+            },
+            "perturbation_pairs": [
+                {"perturbation_id": "must-react-1", "kind": "must_react", "verdict": "pass"},
+                {"perturbation_id": "must-not-react-1", "kind": "must_not_react", "verdict": "pass"},
+            ],
+            "insensitivity_flags": [],
+            "challenger_panel": {"challenger_ids": ["challenger-a", "challenger-b"], "min_required": 2},
+            "independence_attestation_debate": {
+                "min_independent_challengers": 2,
+                "lineage_disjoint": True,
+                "correlation_warning": False,
+            },
+            "referee": {
+                "referee_id": "s3-referee",
+                "non_gameable": True,
+                "signed_by": "s3-key",
+                "distinct_from_proponent": True,
+            },
+            "debate_ref": "c4://debate/ewpt-toy/example",
+        }
 
     def _commit_record(
         self,
