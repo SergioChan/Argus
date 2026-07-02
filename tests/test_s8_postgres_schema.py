@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
+import secrets
 import shutil
 import socket
 import subprocess
@@ -24,43 +26,124 @@ def _free_port() -> int:
     "PostgreSQL command-line tools are required for S8 schema tests",
 )
 class S8PostgresSchemaTests(unittest.TestCase):
-    def setUp(self) -> None:
-        self.tempdir = TemporaryDirectory()
-        self.root = Path(self.tempdir.name)
-        self.data_dir = self.root / "pgdata"
-        self.socket_dir = self.root / "socket"
-        self.socket_dir.mkdir()
-        self.port = _free_port()
-        subprocess.run(
-            ["initdb", "-A", "trust", "--nosync", "-D", str(self.data_dir)],
-            check=True,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        subprocess.run(
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.tempdir = TemporaryDirectory()
+        cls.root = Path(cls.tempdir.name)
+        cls.data_dir = cls.root / "pgdata"
+        cls.socket_dir = cls.root / "socket"
+        cls.socket_dir.mkdir()
+        cls.port = _free_port()
+        try:
+            _run_checked(["initdb", "-A", "trust", "--nosync", "-D", str(cls.data_dir)])
+        except RuntimeError as exc:
+            cls.tempdir.cleanup()
+            if "could not create shared memory segment" in str(exc):
+                cls._start_existing_postgres_database()
+                return
+            raise
+        _run_checked(
             [
                 "pg_ctl",
                 "-D",
-                str(self.data_dir),
+                str(cls.data_dir),
+                "-l",
+                str(cls.root / "postgres.log"),
                 "-o",
-                f"-k {self.socket_dir} -p {self.port} -c listen_addresses=''",
+                f"-k {cls.socket_dir} -p {cls.port} -c listen_addresses=''",
                 "-w",
                 "start",
-            ],
-            check=True,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            ]
         )
-        self._psql_file(SCHEMA_SQL)
+        cls.pg_host = str(cls.socket_dir)
+        cls.pg_port = cls.port
+        cls.pg_database = "postgres"
+        cls.uses_existing_postgres = False
+        cls.preexisting_roles = set()
 
-    def tearDown(self) -> None:
-        subprocess.run(
-            ["pg_ctl", "-D", str(self.data_dir), "-m", "fast", "-w", "stop"],
-            check=False,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+    @classmethod
+    def _start_existing_postgres_database(cls) -> None:
+        cls.uses_existing_postgres = True
+        cls.pg_host = "127.0.0.1"
+        cls.pg_port = None
+        cls.pg_database = f"argus_s8_py_test_{os.getpid()}_{secrets.token_hex(4)}"
+        roles = _run_checked(
+            [
+                "psql",
+                "-X",
+                "-q",
+                "-t",
+                "-A",
+                "-h",
+                cls.pg_host,
+                "-d",
+                "postgres",
+                "-c",
+                (
+                    "SELECT rolname FROM pg_roles "
+                    "WHERE rolname IN ('argus_s8_reader', 'argus_s8_ledger_writer') "
+                    "ORDER BY rolname;"
+                ),
+            ]
         )
-        self.tempdir.cleanup()
+        cls.preexisting_roles = {line.strip() for line in roles.stdout.splitlines() if line.strip()}
+        _run_checked(
+            [
+                "psql",
+                "-X",
+                "-q",
+                "-h",
+                cls.pg_host,
+                "-d",
+                "postgres",
+                "-c",
+                f"CREATE DATABASE {cls.pg_database};",
+            ]
+        )
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        if getattr(cls, "uses_existing_postgres", False):
+            _run_checked(
+                [
+                    "psql",
+                    "-X",
+                    "-q",
+                    "-h",
+                    cls.pg_host,
+                    "-d",
+                    "postgres",
+                    "-c",
+                    f"DROP DATABASE IF EXISTS {cls.pg_database};",
+                ]
+            )
+            for role in ("argus_s8_ledger_writer", "argus_s8_reader"):
+                if role not in cls.preexisting_roles:
+                    _run_checked(
+                        [
+                            "psql",
+                            "-X",
+                            "-q",
+                            "-h",
+                            cls.pg_host,
+                            "-d",
+                            "postgres",
+                            "-c",
+                            f"DROP ROLE IF EXISTS {role};",
+                        ]
+                    )
+        else:
+            subprocess.run(
+                ["pg_ctl", "-D", str(cls.data_dir), "-m", "fast", "-w", "stop"],
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            cls.tempdir.cleanup()
+
+    def setUp(self) -> None:
+        self._psql("DROP SCHEMA IF EXISTS s8 CASCADE;")
+        self._psql_file(SCHEMA_SQL)
 
     def test_ledger_writer_commits_records_and_lineage_through_function(self) -> None:
         self._commit_record("c4://artifact/a", sequence=1, kind="dataset")
@@ -305,7 +388,7 @@ class S8PostgresSchemaTests(unittest.TestCase):
         )
 
     def _psql_base(self) -> list[str]:
-        return [
+        command = [
             "psql",
             "-v",
             "ON_ERROR_STOP=1",
@@ -314,12 +397,18 @@ class S8PostgresSchemaTests(unittest.TestCase):
             "-t",
             "-A",
             "-h",
-            str(self.socket_dir),
-            "-p",
-            str(self.port),
-            "-d",
-            "postgres",
+            str(self.pg_host),
         ]
+        if self.pg_port is not None:
+            command.extend(["-p", str(self.pg_port)])
+        command.extend(
+            [
+                "-d",
+                self.pg_database,
+            ]
+        )
+        return command
+
 
 def _sql_literal(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
@@ -334,6 +423,20 @@ def _text_array_literal(values: list[str]) -> str:
     if not values:
         return "ARRAY[]::text[]"
     return "ARRAY[" + ", ".join(_sql_literal(value) for value in values) + "]::text[]"
+
+
+def _run_checked(args: list[str]) -> subprocess.CompletedProcess[str]:
+    result = subprocess.run(args, check=False, text=True, capture_output=True)
+    if result.returncode != 0:
+        raise RuntimeError(
+            "command failed: "
+            + " ".join(args)
+            + "\nstdout:\n"
+            + result.stdout
+            + "\nstderr:\n"
+            + result.stderr
+        )
+    return result
 
 
 if __name__ == "__main__":

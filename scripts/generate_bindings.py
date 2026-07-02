@@ -165,6 +165,8 @@ def render_rust_manifest() -> str:
             "",
             "[dependencies]",
             'blake3 = "1"',
+            'postgres = { version = "0.19", features = ["with-serde_json-1"] }',
+            'serde_json = "1"',
             "",
         ]
     )
@@ -189,8 +191,10 @@ def render_rust_lib(items: list[dict]) -> str:
             f"// {HEADER}",
             "",
             "pub mod hash;",
+            "pub mod ledger;",
             "",
             "pub use hash::{hash_blob, hash_blob_stream, hash_bytes, BlobHasher, HashBlob, HashBlobError, BLAKE3_PREFIX, CANON_VERSION};",
+            "pub use ledger::{ArtifactRecordDraft, PostgresLedgerWriter};",
             "",
             "#[derive(Debug, Clone, Copy, PartialEq, Eq)]",
             "pub struct Contract {",
