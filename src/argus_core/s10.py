@@ -1095,6 +1095,8 @@ class DockerSandboxOrchestrator(InMemorySandboxOrchestrator):
         artifact_store: InMemoryArtifactStore | None = None,
         supervisor: DockerSandboxSupervisor | None = None,
     ) -> None:
+        if artifact_store is None:
+            raise PolicyDeniedError("artifact_store is required for Docker launch provenance")
         super().__init__(
             token_service=token_service,
             quota_ledger=quota_ledger,

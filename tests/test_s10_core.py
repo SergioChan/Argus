@@ -761,6 +761,7 @@ class S10DockerOrchestratorTests(unittest.TestCase):
             audit_ledger=self.audit,
             policy_bundle=self.bundle,
             supervisor=_FixedUsageSupervisor(over_budget_usage),
+            artifact_store=InMemoryArtifactStore(),
         )
         request = self._launch_request(args=("-c", "true"), env={}, env_allowlist=(), wallclock_s=1)
 
@@ -858,6 +859,16 @@ class S10DockerOrchestratorFailureTests(unittest.TestCase):
             signature="test-signature",
         )
 
+    def test_docker_orchestrator_requires_artifact_store_for_launch_provenance(self) -> None:
+        with self.assertRaisesRegex(PolicyDeniedError, "artifact_store is required"):
+            DockerSandboxOrchestrator(
+                token_service=self.tokens,
+                quota_ledger=self.quota,
+                audit_ledger=self.audit,
+                policy_bundle=self.bundle,
+                supervisor=_RaisingSupervisor(PermissionError("not reached")),
+            )
+
     def test_supervisor_exceptions_release_reserved_quota_and_fail_handle(self) -> None:
         for exc in (
             SandboxRuntimeUnavailableError("docker runtime is unavailable"),
@@ -871,6 +882,7 @@ class S10DockerOrchestratorFailureTests(unittest.TestCase):
                     quota_ledger=quota,
                     audit_ledger=audit,
                     policy_bundle=self.bundle,
+                    artifact_store=InMemoryArtifactStore(),
                     supervisor=_RaisingSupervisor(exc),
                 )
                 request = self._launch_request()
