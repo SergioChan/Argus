@@ -65,6 +65,15 @@ CREATE TABLE IF NOT EXISTS s8.merkle_checkpoint (
     created_at timestamptz NOT NULL DEFAULT now()
 );
 
+CREATE TABLE IF NOT EXISTS s8.ledger_leaf (
+    sequence bigint PRIMARY KEY,
+    artifact_id text NOT NULL UNIQUE REFERENCES s8.artifact_record(artifact_id),
+    record_hash text NOT NULL UNIQUE,
+    previous_root text NOT NULL,
+    root text NOT NULL UNIQUE,
+    created_at timestamptz NOT NULL DEFAULT now()
+);
+
 CREATE TABLE IF NOT EXISTS s8.reproducibility_check (
     check_id text PRIMARY KEY,
     artifact_id text NOT NULL REFERENCES s8.artifact_record(artifact_id),
@@ -154,6 +163,7 @@ BEGIN
 END;
 $$;
 
+DROP FUNCTION IF EXISTS s8.commit_artifact_record(text, text, text, jsonb, jsonb, text, bigint, text, text, text[]);
 CREATE OR REPLACE FUNCTION s8.commit_artifact_record(
     p_artifact_id text,
     p_content_hash text,
@@ -166,7 +176,7 @@ CREATE OR REPLACE FUNCTION s8.commit_artifact_record(
     p_validation_report_ref text DEFAULT NULL,
     p_input_refs text[] DEFAULT ARRAY[]::text[]
 )
-RETURNS void
+RETURNS boolean
 LANGUAGE plpgsql
 SECURITY DEFINER
 SET search_path = s8, pg_temp
@@ -191,7 +201,7 @@ BEGIN
            AND existing_record.validation_report_ref IS NOT DISTINCT FROM p_validation_report_ref
            AND existing_record.record_hash = p_record_hash
            AND existing_record.merkle_seq = p_merkle_seq THEN
-            RETURN;
+            RETURN FALSE;
         END IF;
 
         RAISE EXCEPTION 'artifact record % already exists with different payload', p_artifact_id
@@ -227,6 +237,79 @@ BEGIN
     IF p_validation_report_ref IS NOT NULL THEN
         PERFORM s8.insert_lineage_edge(p_validation_report_ref, p_artifact_id, 'validation_report', NULL);
     END IF;
+
+    RETURN TRUE;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION s8.append_ledger_leaf(
+    p_artifact_id text,
+    p_record_hash text,
+    p_sequence bigint,
+    p_previous_root text,
+    p_root text
+)
+RETURNS void
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = s8, pg_temp
+AS $$
+DECLARE
+    existing_leaf s8.ledger_leaf%ROWTYPE;
+    latest_leaf s8.ledger_leaf%ROWTYPE;
+    artifact_record_hash text;
+    zero_root text := 'blake3:' || repeat('0', 64);
+BEGIN
+    SELECT record_hash
+    INTO artifact_record_hash
+    FROM s8.artifact_record
+    WHERE artifact_id = p_artifact_id;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'artifact record % does not exist', p_artifact_id
+            USING ERRCODE = '23503';
+    END IF;
+
+    IF artifact_record_hash <> p_record_hash THEN
+        RAISE EXCEPTION 'ledger leaf record hash mismatch for %', p_artifact_id
+            USING ERRCODE = '23514';
+    END IF;
+
+    SELECT *
+    INTO existing_leaf
+    FROM s8.ledger_leaf
+    WHERE artifact_id = p_artifact_id;
+
+    IF FOUND THEN
+        IF existing_leaf.record_hash = p_record_hash
+           AND existing_leaf.sequence = p_sequence
+           AND existing_leaf.previous_root = p_previous_root
+           AND existing_leaf.root = p_root THEN
+            RETURN;
+        END IF;
+
+        RAISE EXCEPTION 'ledger leaf already exists with different payload for %', p_artifact_id
+            USING ERRCODE = '23505';
+    END IF;
+
+    SELECT *
+    INTO latest_leaf
+    FROM s8.ledger_leaf
+    ORDER BY sequence DESC
+    LIMIT 1;
+
+    IF NOT FOUND THEN
+        IF p_sequence <> 1 OR p_previous_root <> zero_root THEN
+            RAISE EXCEPTION 'ledger sequence mismatch for first leaf'
+                USING ERRCODE = '23514';
+        END IF;
+    ELSIF p_sequence <> latest_leaf.sequence + 1 OR p_previous_root <> latest_leaf.root THEN
+        RAISE EXCEPTION 'ledger sequence mismatch after %', latest_leaf.sequence
+            USING ERRCODE = '23514';
+    END IF;
+
+    INSERT INTO s8.ledger_leaf (sequence, artifact_id, record_hash, previous_root, root)
+    VALUES (p_sequence, p_artifact_id, p_record_hash, p_previous_root, p_root);
 END;
 $$;
 
@@ -255,6 +338,11 @@ CREATE TRIGGER merkle_checkpoint_append_only
     BEFORE UPDATE OR DELETE ON s8.merkle_checkpoint
     FOR EACH STATEMENT EXECUTE FUNCTION s8.reject_append_only_mutation();
 
+DROP TRIGGER IF EXISTS ledger_leaf_append_only ON s8.ledger_leaf;
+CREATE TRIGGER ledger_leaf_append_only
+    BEFORE UPDATE OR DELETE ON s8.ledger_leaf
+    FOR EACH STATEMENT EXECUTE FUNCTION s8.reject_append_only_mutation();
+
 DROP TRIGGER IF EXISTS reproducibility_check_append_only ON s8.reproducibility_check;
 CREATE TRIGGER reproducibility_check_append_only
     BEFORE UPDATE OR DELETE ON s8.reproducibility_check
@@ -270,7 +358,8 @@ GRANT SELECT ON ALL TABLES IN SCHEMA s8 TO argus_s8_reader, argus_s8_ledger_writ
 REVOKE INSERT ON
     s8.artifact_record,
     s8.lineage_edge,
-    s8.lineage_closure
+    s8.lineage_closure,
+    s8.ledger_leaf
 FROM argus_s8_ledger_writer;
 
 GRANT INSERT ON
@@ -284,5 +373,7 @@ REVOKE ALL ON FUNCTION s8.insert_lineage_edge(text, text, text, text) FROM PUBLI
 GRANT EXECUTE ON FUNCTION s8.insert_lineage_edge(text, text, text, text) TO argus_s8_ledger_writer;
 REVOKE ALL ON FUNCTION s8.commit_artifact_record(text, text, text, jsonb, jsonb, text, bigint, text, text, text[]) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION s8.commit_artifact_record(text, text, text, jsonb, jsonb, text, bigint, text, text, text[]) TO argus_s8_ledger_writer;
+REVOKE ALL ON FUNCTION s8.append_ledger_leaf(text, text, bigint, text, text) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION s8.append_ledger_leaf(text, text, bigint, text, text) TO argus_s8_ledger_writer;
 
 COMMIT;

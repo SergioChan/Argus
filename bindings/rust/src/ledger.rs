@@ -1,5 +1,6 @@
+use crate::hash::{hash_bytes, BLAKE3_PREFIX};
 use postgres::types::Json;
-use postgres::{Client, NoTls};
+use postgres::{Client, GenericClient, NoTls};
 use serde_json::Value;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -60,33 +61,88 @@ impl PostgresLedgerWriter {
         &mut self,
         draft: &ArtifactRecordDraft,
     ) -> Result<(), postgres::Error> {
-        let producer = Json(&draft.producer);
-        let lineage = Json(&draft.lineage);
-        self.client.execute(
-            "
-            SELECT s8.commit_artifact_record(
-                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10
-            );
-            ",
-            &[
-                &draft.artifact_id,
-                &draft.content_hash,
-                &draft.kind,
-                &producer,
-                &lineage,
-                &draft.record_hash,
-                &draft.merkle_seq,
-                &draft.claim_tier,
-                &draft.validation_report_ref,
-                &draft.input_refs,
-            ],
-        )?;
+        let mut transaction = self.client.transaction()?;
+        let inserted = commit_artifact_record(&mut transaction, draft)?;
+        if inserted {
+            let (sequence, previous_root) = next_ledger_position(&mut transaction)?;
+            let root = next_ledger_root(&previous_root, &draft.record_hash, sequence);
+            transaction.execute(
+                "
+                SELECT s8.append_ledger_leaf($1, $2, $3, $4, $5);
+                ",
+                &[
+                    &draft.artifact_id,
+                    &draft.record_hash,
+                    &sequence,
+                    &previous_root,
+                    &root,
+                ],
+            )?;
+        }
+        transaction.commit()?;
         Ok(())
     }
 
     pub fn into_client(self) -> Client {
         self.client
     }
+}
+
+fn commit_artifact_record<C: GenericClient>(
+    client: &mut C,
+    draft: &ArtifactRecordDraft,
+) -> Result<bool, postgres::Error> {
+    let producer = Json(&draft.producer);
+    let lineage = Json(&draft.lineage);
+    let row = client.query_one(
+        "
+            SELECT s8.commit_artifact_record(
+                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10
+            );
+            ",
+        &[
+            &draft.artifact_id,
+            &draft.content_hash,
+            &draft.kind,
+            &producer,
+            &lineage,
+            &draft.record_hash,
+            &draft.merkle_seq,
+            &draft.claim_tier,
+            &draft.validation_report_ref,
+            &draft.input_refs,
+        ],
+    )?;
+    Ok(row.get(0))
+}
+
+fn next_ledger_position<C: GenericClient>(
+    client: &mut C,
+) -> Result<(i64, String), postgres::Error> {
+    let latest = client.query_opt(
+        "
+        SELECT sequence, root
+        FROM s8.ledger_leaf
+        ORDER BY sequence DESC
+        LIMIT 1;
+        ",
+        &[],
+    )?;
+    if let Some(row) = latest {
+        let sequence: i64 = row.get(0);
+        let root: String = row.get(1);
+        Ok((sequence + 1, root))
+    } else {
+        Ok((1, zero_ledger_root()))
+    }
+}
+
+fn next_ledger_root(previous_root: &str, record_hash: &str, sequence: i64) -> String {
+    hash_bytes(format!("{previous_root}|{record_hash}|{sequence}").as_bytes())
+}
+
+fn zero_ledger_root() -> String {
+    format!("{BLAKE3_PREFIX}{}", "0".repeat(64))
 }
 
 #[cfg(test)]
@@ -175,6 +231,26 @@ mod tests {
             &mut admin,
             "SELECT count(*) FROM s8.artifact_record WHERE artifact_id = 'c4://artifact/rollback-model';",
         )?;
+        let leaf_count = scalar_i64(&mut admin, "SELECT count(*) FROM s8.ledger_leaf;")?;
+        let latest_leaf = admin.query_one(
+            "
+            SELECT sequence, root
+            FROM s8.ledger_leaf
+            ORDER BY sequence DESC
+            LIMIT 1;
+            ",
+            &[],
+        )?;
+        let latest_sequence: i64 = latest_leaf.get(0);
+        let latest_root: String = latest_leaf.get(1);
+        let mut expected_root = zero_ledger_root();
+        for (sequence, draft) in [&dataset, &report, &model, &idempotent_dataset]
+            .into_iter()
+            .enumerate()
+        {
+            expected_root =
+                next_ledger_root(&expected_root, &draft.record_hash, (sequence + 1) as i64);
+        }
 
         drop(admin);
         let mut ledger_client = postgres.ledger_client()?;
@@ -196,11 +272,30 @@ mod tests {
                 &[],
             )
             .expect_err("writer role must not insert records directly");
+        let direct_leaf_insert_error = ledger_client
+            .execute(
+                "
+                INSERT INTO s8.ledger_leaf (
+                    sequence, artifact_id, record_hash, previous_root, root
+                ) VALUES (
+                    99,
+                    'c4://artifact/happy-dataset',
+                    'blake3:0000000000000000000000000000000000000000000000000000000000001001',
+                    'blake3:0000000000000000000000000000000000000000000000000000000000000000',
+                    'blake3:0000000000000000000000000000000000000000000000000000000000009999'
+                );
+                ",
+                &[],
+            )
+            .expect_err("writer role must not insert ledger leaves directly");
 
         assert_eq!(record_count, 4);
         assert_eq!(input_edge_count, 1);
         assert_eq!(report_edge_count, 1);
         assert_eq!(idempotent_count, 1);
+        assert_eq!(leaf_count, 4);
+        assert_eq!(latest_sequence, 4);
+        assert_eq!(latest_root, expected_root);
         assert_eq!(
             sqlstate(&rollback_error).as_deref(),
             Some("23503"),
@@ -211,6 +306,11 @@ mod tests {
             sqlstate(&direct_insert_error).as_deref(),
             Some("42501"),
             "{direct_insert_error:?}"
+        );
+        assert_eq!(
+            sqlstate(&direct_leaf_insert_error).as_deref(),
+            Some("42501"),
+            "{direct_leaf_insert_error:?}"
         );
         Ok(())
     }

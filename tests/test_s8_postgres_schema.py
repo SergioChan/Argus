@@ -181,11 +181,13 @@ class S8PostgresSchemaTests(unittest.TestCase):
         self.assertEqual(record_count.stdout.strip(), "3")
 
     def test_commit_function_is_idempotent_for_identical_record(self) -> None:
-        self._commit_record("c4://artifact/a", sequence=1)
-        self._commit_record("c4://artifact/a", sequence=1)
+        first = self._commit_record("c4://artifact/a", sequence=1)
+        second = self._commit_record("c4://artifact/a", sequence=1)
 
         result = self._psql("SELECT count(*) FROM s8.artifact_record WHERE artifact_id = 'c4://artifact/a';")
 
+        self.assertEqual(first.stdout.strip(), "t")
+        self.assertEqual(second.stdout.strip(), "f")
         self.assertEqual(result.stdout.strip(), "1")
 
     def test_commit_function_rejects_conflicting_artifact_ref(self) -> None:
@@ -244,6 +246,53 @@ class S8PostgresSchemaTests(unittest.TestCase):
         self.assertEqual(transitive.stdout.strip(), "2")
         self.assertNotEqual(cyclic.returncode, 0)
         self.assertIn("lineage cycle detected", cyclic.stderr)
+
+    def test_ledger_leaf_function_enforces_sequence_and_denies_direct_insert(self) -> None:
+        zero_root = "blake3:" + ("0" * 64)
+        first_root = "blake3:leaf-root-1"
+        self._commit_record("c4://artifact/a", sequence=1)
+        self._commit_record("c4://artifact/b", sequence=2)
+        self._psql(
+            f"""
+            SET ROLE argus_s8_ledger_writer;
+            SELECT s8.append_ledger_leaf(
+                'c4://artifact/a',
+                'blake3:record-1',
+                1,
+                '{zero_root}',
+                '{first_root}'
+            );
+            RESET ROLE;
+            """
+        )
+        wrong_sequence = self._psql(
+            f"""
+            SET ROLE argus_s8_ledger_writer;
+            SELECT s8.append_ledger_leaf(
+                'c4://artifact/b',
+                'blake3:record-2',
+                3,
+                '{first_root}',
+                'blake3:leaf-root-2'
+            );
+            """,
+            check=False,
+        )
+        direct_leaf = self._psql(
+            f"""
+            SET ROLE argus_s8_ledger_writer;
+            INSERT INTO s8.ledger_leaf (sequence, artifact_id, record_hash, previous_root, root)
+            VALUES (2, 'c4://artifact/b', 'blake3:record-2', '{first_root}', 'blake3:leaf-root-2');
+            """,
+            check=False,
+        )
+        leaf_count = self._psql("SELECT count(*) FROM s8.ledger_leaf;")
+
+        self.assertNotEqual(wrong_sequence.returncode, 0)
+        self.assertIn("ledger sequence mismatch", wrong_sequence.stderr)
+        self.assertNotEqual(direct_leaf.returncode, 0)
+        self.assertIn("permission denied", direct_leaf.stderr)
+        self.assertEqual(leaf_count.stdout.strip(), "1")
 
     def test_writer_role_cannot_bypass_lineage_function(self) -> None:
         self._commit_record("c4://artifact/a", sequence=1)
@@ -366,7 +415,6 @@ class S8PostgresSchemaTests(unittest.TestCase):
                 {validation_ref_sql},
                 {_text_array_literal(input_refs)}
             );
-            RESET ROLE;
             """,
             check=check,
         )
