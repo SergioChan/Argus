@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 import json
 from pathlib import Path
-from typing import Any, Mapping, Protocol
+from typing import Any, Callable, Mapping, Protocol
 
 from .canonical import canonical_json_bytes
 from .c3 import C3ReportVerifier
@@ -155,6 +155,97 @@ class AuditSlice:
 class AuditVerification:
     valid: bool
     break_sequence: int | None = None
+
+
+@dataclass(frozen=True)
+class ReproducibilityManifest:
+    artifact_ref: str
+    content_hash: str
+    kind: str
+    producer: Producer
+    lineage: Lineage
+    claim_tier: str
+    validation_report_ref: str | None
+    nondeterminism_tolerance: Mapping[str, Any] | None = None
+
+
+@dataclass(frozen=True)
+class ReproducibilityCheck:
+    check_id: str
+    artifact_ref: str
+    rerun_content_hash: str
+    verdict: str
+    comparator_id: str
+    tolerance_id: str | None = None
+    divergence: float | None = None
+    reason: str | None = None
+
+
+ReproducibilityComparator = Callable[..., tuple[bool, float | None, str | None]]
+
+
+class ReproducibilityComparatorRegistry:
+    def __init__(self) -> None:
+        self._comparators: dict[str, ReproducibilityComparator] = {}
+        self.register("hash_equal", self._hash_equal)
+        self.register("numeric_abs_tolerance", self._numeric_abs_tolerance)
+
+    def register(self, comparator_id: str, comparator: ReproducibilityComparator) -> None:
+        self._comparators[comparator_id] = comparator
+
+    def compare(
+        self,
+        comparator_id: str,
+        *,
+        original_payload: Any,
+        rerun_payload: Any | None,
+        original_hash: str,
+        rerun_hash: str,
+        params: Mapping[str, Any],
+    ) -> tuple[bool, float | None, str | None]:
+        comparator = self._comparators.get(comparator_id)
+        if comparator is None:
+            return False, None, "comparator_unknown"
+        return comparator(
+            original_payload=original_payload,
+            rerun_payload=rerun_payload,
+            original_hash=original_hash,
+            rerun_hash=rerun_hash,
+            params=params,
+        )
+
+    @staticmethod
+    def _hash_equal(
+        *,
+        original_payload: Any,
+        rerun_payload: Any | None,
+        original_hash: str,
+        rerun_hash: str,
+        params: Mapping[str, Any],
+    ) -> tuple[bool, float | None, str | None]:
+        return original_hash == rerun_hash, None, None
+
+    @staticmethod
+    def _numeric_abs_tolerance(
+        *,
+        original_payload: Any,
+        rerun_payload: Any | None,
+        original_hash: str,
+        rerun_hash: str,
+        params: Mapping[str, Any],
+    ) -> tuple[bool, float | None, str | None]:
+        if rerun_payload is None:
+            return False, None, "rerun_payload_required"
+        field = params.get("field")
+        tolerance = params.get("abs_tolerance", params.get("tolerance"))
+        if not isinstance(field, str) or not isinstance(tolerance, int | float):
+            return False, None, "tolerance_params_invalid"
+        original_value = _numeric_field(original_payload, field)
+        rerun_value = _numeric_field(rerun_payload, field)
+        if original_value is None or rerun_value is None:
+            return False, None, "numeric_field_missing"
+        divergence = abs(original_value - rerun_value)
+        return divergence <= float(tolerance), divergence, None
 
 
 @dataclass(frozen=True)
@@ -370,6 +461,9 @@ class InMemoryArtifactStore:
         self._edge_types: dict[tuple[str, str], set[str]] = {}
         self._audit_leaves: list[AuditLeaf] = []
         self._report_verifier = report_verifier
+        self._reproducibility_comparators = ReproducibilityComparatorRegistry()
+        self._reproducibility_checks: list[ReproducibilityCheck] = []
+        self._non_reproducible_artifacts: set[str] = set()
 
     def create_artifact(
         self,
@@ -504,6 +598,86 @@ class InMemoryArtifactStore:
             impacted_refs.update(visited_refs - {seed_ref})
         return tuple(self._records[ref] for ref in sorted(impacted_refs) if ref in self._records)
 
+    def register_reproducibility_comparator(
+        self,
+        comparator_id: str,
+        comparator: ReproducibilityComparator,
+    ) -> None:
+        self._reproducibility_comparators.register(comparator_id, comparator)
+
+    def get_reproducibility_manifest(self, artifact_ref: str) -> ReproducibilityManifest:
+        record = self.get_record(artifact_ref)
+        payload = self._payload_for_record(record)
+        return ReproducibilityManifest(
+            artifact_ref=record.artifact_ref,
+            content_hash=record.content_hash,
+            kind=record.kind,
+            producer=record.producer,
+            lineage=record.lineage,
+            claim_tier=record.claim_tier,
+            validation_report_ref=record.validation_report_ref,
+            nondeterminism_tolerance=self._nondeterminism_tolerance(payload),
+        )
+
+    def record_reproducibility_check(
+        self,
+        artifact_ref: str,
+        *,
+        rerun_payload: Any | None = None,
+        rerun_content_hash: str | None = None,
+        comparator_id: str | None = None,
+        tolerance_id: str | None = None,
+    ) -> ReproducibilityCheck:
+        record = self.get_record(artifact_ref)
+        original_payload = self._payload_for_record(record)
+        tolerance = self._nondeterminism_tolerance(original_payload) or {}
+        tolerance_params = tolerance.get("params") if isinstance(tolerance.get("params"), Mapping) else {}
+        selected_comparator = comparator_id or (
+            tolerance.get("comparator_id") if isinstance(tolerance.get("comparator_id"), str) else "hash_equal"
+        )
+        if rerun_content_hash is None:
+            if rerun_payload is None:
+                raise ValueError("rerun_payload or rerun_content_hash is required")
+            rerun_content_hash = hash_bytes(canonical_json_bytes(rerun_payload))
+        passed, divergence, reason = self._reproducibility_comparators.compare(
+            selected_comparator,
+            original_payload=original_payload,
+            rerun_payload=rerun_payload,
+            original_hash=record.content_hash,
+            rerun_hash=rerun_content_hash,
+            params=tolerance_params,
+        )
+        verdict = "PASS" if passed else "FAIL"
+        check_id = "s8-repro-" + hash_json(
+            {
+                "artifact_ref": artifact_ref,
+                "rerun_content_hash": rerun_content_hash,
+                "comparator_id": selected_comparator,
+                "tolerance_id": tolerance_id,
+                "sequence": len(self._reproducibility_checks) + 1,
+            }
+        )[:16]
+        check = ReproducibilityCheck(
+            check_id=check_id,
+            artifact_ref=artifact_ref,
+            rerun_content_hash=rerun_content_hash,
+            verdict=verdict,
+            comparator_id=selected_comparator,
+            tolerance_id=tolerance_id,
+            divergence=divergence,
+            reason=reason,
+        )
+        self._reproducibility_checks.append(check)
+        if verdict == "FAIL":
+            self._non_reproducible_artifacts.add(artifact_ref)
+        return check
+
+    def reproducibility_checks(self, artifact_ref: str) -> tuple[ReproducibilityCheck, ...]:
+        return tuple(check for check in self._reproducibility_checks if check.artifact_ref == artifact_ref)
+
+    def is_non_reproducible(self, artifact_ref: str) -> bool:
+        return artifact_ref in self._non_reproducible_artifacts
+
     def export_audit_slice(self, artifact_refs: tuple[str, ...]) -> AuditSlice:
         wanted = set(artifact_refs)
         leaves = tuple(leaf for leaf in self._audit_leaves if leaf.artifact_ref in wanted)
@@ -595,6 +769,15 @@ class InMemoryArtifactStore:
         if not isinstance(payload, dict):
             raise IllegalTierError("validation_report_ref does not point to a report object")
         return payload
+
+    def _payload_for_record(self, record: ArtifactRecord) -> Any:
+        return json.loads(self.get_artifact(record.artifact_ref).decode("utf-8"))
+
+    @staticmethod
+    def _nondeterminism_tolerance(payload: Any) -> Mapping[str, Any] | None:
+        if isinstance(payload, Mapping) and isinstance(payload.get("nondeterminism_tolerance"), Mapping):
+            return dict(payload["nondeterminism_tolerance"])
+        return None
 
     def _verify_report_payload(self, report_payload: dict[str, Any]):
         if self._report_verifier is None:
@@ -913,6 +1096,15 @@ def _merged_bucket_class(existing: str | None, incoming: str) -> str:
     if existing == WRITE_ONCE_BUCKET or incoming == WRITE_ONCE_BUCKET:
         return WRITE_ONCE_BUCKET
     return incoming
+
+
+def _numeric_field(payload: Any, field: str) -> float | None:
+    if not isinstance(payload, Mapping):
+        return None
+    value = payload.get(field)
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return None
+    return float(value)
 
 
 def _object_name(content_hash: str) -> str:

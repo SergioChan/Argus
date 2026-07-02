@@ -645,11 +645,126 @@ class S8PostgresSchemaTests(unittest.TestCase):
         )
         drift = self._apply_s8_migrations(check=False)
 
-        self.assertEqual(first_count.stdout.strip(), "2")
+        self.assertEqual(first_count.stdout.strip(), "3")
         self.assertIn("already applied with matching checksum", reapplied.stdout)
-        self.assertEqual(second_count.stdout.strip(), "2")
+        self.assertEqual(second_count.stdout.strip(), "3")
         self.assertNotEqual(drift.returncode, 0)
         self.assertIn("checksum drift", drift.stderr)
+
+    def test_reproducibility_manifest_and_check_functions_are_append_only(self) -> None:
+        self._commit_record("c4://artifact/model", sequence=1, kind="model")
+        original_hash = self._psql(
+            """
+            SELECT content_hash
+            FROM s8.artifact_record
+            WHERE artifact_id = 'c4://artifact/model';
+            """
+        )
+        manifest = self._psql(
+            """
+            WITH manifest AS (
+                SELECT s8.get_reproducibility_manifest('c4://artifact/model') AS payload
+            )
+            SELECT (payload->>'content_hash') || '|' || (payload->>'kind')
+            FROM manifest;
+            """
+        )
+        first = self._psql(
+            """
+            SET ROLE argus_s8_ledger_writer;
+            SELECT s8.record_reproducibility_check(
+                's8-check-1',
+                'c4://artifact/model',
+                'blake3:rerun',
+                'PASS',
+                'numeric_abs_tolerance'
+            );
+            """
+        )
+        second = self._psql(
+            """
+            SET ROLE argus_s8_ledger_writer;
+            SELECT s8.record_reproducibility_check(
+                's8-check-1',
+                'c4://artifact/model',
+                'blake3:rerun',
+                'PASS',
+                'numeric_abs_tolerance'
+            );
+            """
+        )
+        conflict = self._psql(
+            """
+            SET ROLE argus_s8_ledger_writer;
+            SELECT s8.record_reproducibility_check(
+                's8-check-1',
+                'c4://artifact/model',
+                'blake3:changed',
+                'FAIL',
+                'numeric_abs_tolerance'
+            );
+            """,
+            check=False,
+        )
+        direct_insert = self._psql(
+            """
+            SET ROLE argus_s8_ledger_writer;
+            INSERT INTO s8.reproducibility_check (
+                check_id,
+                artifact_id,
+                rerun_content_hash,
+                verdict,
+                tolerance_id
+            ) VALUES (
+                's8-check-direct',
+                'c4://artifact/model',
+                'blake3:direct',
+                'PASS',
+                'hash_equal'
+            );
+            """,
+            check=False,
+        )
+        reader_manifest = self._psql(
+            """
+            SET ROLE argus_s8_reader;
+            SELECT s8.get_reproducibility_manifest('c4://artifact/model')->>'kind';
+            """
+        )
+        reader_record_denied = self._psql(
+            """
+            SET ROLE argus_s8_reader;
+            SELECT s8.record_reproducibility_check(
+                's8-check-reader',
+                'c4://artifact/model',
+                'blake3:reader',
+                'PASS',
+                NULL
+            );
+            """,
+            check=False,
+        )
+        check_count = self._psql("SELECT count(*) FROM s8.reproducibility_check;")
+        final_hash = self._psql(
+            """
+            SELECT content_hash
+            FROM s8.artifact_record
+            WHERE artifact_id = 'c4://artifact/model';
+            """
+        )
+
+        self.assertEqual(manifest.stdout.strip(), "blake3:1|model")
+        self.assertEqual(first.stdout.strip(), "t")
+        self.assertEqual(second.stdout.strip(), "f")
+        self.assertNotEqual(conflict.returncode, 0)
+        self.assertIn("already exists with different payload", conflict.stderr)
+        self.assertNotEqual(direct_insert.returncode, 0)
+        self.assertIn("permission denied", direct_insert.stderr)
+        self.assertEqual(reader_manifest.stdout.strip(), "model")
+        self.assertNotEqual(reader_record_denied.returncode, 0)
+        self.assertIn("permission denied", reader_record_denied.stderr)
+        self.assertEqual(check_count.stdout.strip(), "1")
+        self.assertEqual(final_hash.stdout.strip(), original_hash.stdout.strip())
 
     def _commit_record(
         self,
