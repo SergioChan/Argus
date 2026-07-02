@@ -554,7 +554,7 @@ def _battery_real_persistence(evidence: dict[str, Any], ports: dict[str, str]) -
             record_count = int(cur.fetchone()[0])
             cur.execute("SELECT count(*) FROM s8.ledger_leaf;")
             leaf_count = int(cur.fetchone()[0])
-            update_denied = _postgres_append_only_update_denied(cur)
+    append_only_denials = _postgres_append_only_denials(dsn)
     minio = Minio(
         f"127.0.0.1:{ports['ARGUS_M0_MINIO_PORT']}",
         access_key="argus",
@@ -562,11 +562,17 @@ def _battery_real_persistence(evidence: dict[str, Any], ports: dict[str, str]) -
         secure=False,
     )
     object_count = sum(1 for _ in minio.list_objects("argus-s8-objects", recursive=True))
-    if migration_count < 1 or record_count < 2 or leaf_count < 2 or object_count < 2 or not update_denied:
+    if (
+        migration_count < 1
+        or record_count < 2
+        or leaf_count < 2
+        or object_count < 2
+        or not all(append_only_denials.values())
+    ):
         raise AssertionError(
             "Postgres/MinIO persistence did not record expected deployed S8 artifacts: "
             f"migrations={migration_count} records={record_count} leaves={leaf_count} "
-            f"objects={object_count} update_denied={update_denied}"
+            f"objects={object_count} append_only_denials={append_only_denials}"
         )
     _record(
         evidence,
@@ -577,28 +583,63 @@ def _battery_real_persistence(evidence: dict[str, Any], ports: dict[str, str]) -
             "artifact_records": record_count,
             "ledger_leaves": leaf_count,
             "minio_objects": object_count,
-            "append_only_update_denied": update_denied,
+            **append_only_denials,
         },
     )
 
 
-def _postgres_append_only_update_denied(cur: Any) -> bool:
-    try:
-        cur.execute(
+def _postgres_append_only_denials(dsn: str) -> dict[str, bool]:
+    return {
+        "append_only_update_denied": _postgres_statement_denied(
+            dsn,
             """
             UPDATE s8.artifact_record
             SET kind = 'tampered'
             WHERE artifact_id = (
                 SELECT artifact_id FROM s8.artifact_record ORDER BY merkle_seq LIMIT 1
             );
+            """,
+            "append-only table artifact_record",
+        ),
+        "append_only_truncate_denied": _postgres_statement_denied(
+            dsn,
+            "TRUNCATE s8.ledger_leaf;",
+            "append-only table ledger_leaf",
+        ),
+        "writer_role_update_denied": _postgres_statement_denied(
+            dsn,
             """
-        )
+            SET ROLE argus_s8_ledger_writer;
+            UPDATE s8.artifact_record
+            SET kind = 'tampered'
+            WHERE artifact_id = (
+                SELECT artifact_id FROM s8.artifact_record ORDER BY merkle_seq LIMIT 1
+            );
+            """,
+            "permission denied",
+        ),
+        "writer_role_truncate_denied": _postgres_statement_denied(
+            dsn,
+            """
+            SET ROLE argus_s8_ledger_writer;
+            TRUNCATE s8.ledger_leaf;
+            """,
+            "permission denied",
+        ),
+    }
+
+
+def _postgres_statement_denied(dsn: str, sql: str, expected_message: str) -> bool:
+    import psycopg
+
+    try:
+        with psycopg.connect(dsn) as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql)
+                conn.rollback()
+                return False
     except Exception as exc:
-        message = str(exc)
-        cur.connection.rollback()
-        return "append-only table artifact_record" in message
-    cur.connection.rollback()
-    return False
+        return expected_message in str(exc)
 
 
 def _battery_d_tamper_detected(

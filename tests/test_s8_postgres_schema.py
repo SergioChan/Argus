@@ -579,6 +579,13 @@ class S8PostgresSchemaTests(unittest.TestCase):
             """,
             check=False,
         )
+        direct_truncate = self._psql(
+            """
+            SET ROLE argus_s8_ledger_writer;
+            TRUNCATE s8.ledger_leaf;
+            """,
+            check=False,
+        )
 
         self.assertNotEqual(direct_record.returncode, 0)
         self.assertIn("permission denied", direct_record.stderr)
@@ -586,8 +593,10 @@ class S8PostgresSchemaTests(unittest.TestCase):
         self.assertIn("permission denied", direct_edge.stderr)
         self.assertNotEqual(direct_closure.returncode, 0)
         self.assertIn("permission denied", direct_closure.stderr)
+        self.assertNotEqual(direct_truncate.returncode, 0)
+        self.assertIn("permission denied", direct_truncate.stderr)
 
-    def test_update_and_delete_are_rejected_even_for_owner(self) -> None:
+    def test_update_delete_and_truncate_are_rejected_even_for_owner(self) -> None:
         self._commit_record("c4://artifact/a", sequence=1)
 
         update = self._psql(
@@ -595,11 +604,14 @@ class S8PostgresSchemaTests(unittest.TestCase):
             check=False,
         )
         delete = self._psql("DELETE FROM s8.artifact_record WHERE artifact_id = 'c4://artifact/a';", check=False)
+        truncate = self._psql("TRUNCATE s8.ledger_leaf;", check=False)
 
         self.assertNotEqual(update.returncode, 0)
         self.assertIn("append-only table artifact_record", update.stderr)
         self.assertNotEqual(delete.returncode, 0)
         self.assertIn("append-only table artifact_record", delete.stderr)
+        self.assertNotEqual(truncate.returncode, 0)
+        self.assertIn("append-only table ledger_leaf", truncate.stderr)
 
     def test_reader_role_cannot_insert(self) -> None:
         denied = self._psql(
@@ -647,9 +659,9 @@ class S8PostgresSchemaTests(unittest.TestCase):
         )
         drift = self._apply_s8_migrations(check=False)
 
-        self.assertEqual(first_count.stdout.strip(), "7")
+        self.assertEqual(first_count.stdout.strip(), "8")
         self.assertIn("already applied with matching checksum", reapplied.stdout)
-        self.assertEqual(second_count.stdout.strip(), "7")
+        self.assertEqual(second_count.stdout.strip(), "8")
         self.assertNotEqual(drift.returncode, 0)
         self.assertIn("checksum drift", drift.stderr)
 

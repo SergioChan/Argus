@@ -164,9 +164,10 @@ class MinioObjectStore:
 class PostgresArtifactStore:
     """C4 store that writes payload bytes to MinIO and the append-only ledger to PostgreSQL."""
 
-    def __init__(self, *, dsn: str, object_store: MinioObjectStore) -> None:
+    def __init__(self, *, dsn: str, object_store: MinioObjectStore, db_role: str | None = None) -> None:
         self._dsn = dsn
         self._object_store = object_store
+        self._db_role = db_role
         self._snapshot = InMemoryArtifactStore(object_store=object_store)
         self.refresh()
 
@@ -284,6 +285,7 @@ class PostgresArtifactStore:
         from psycopg.rows import dict_row
 
         with psycopg.connect(self._dsn, row_factory=dict_row) as conn:
+            _set_role(conn, self._db_role)
             with conn.cursor() as cur:
                 cur.execute(
                     """
@@ -309,6 +311,7 @@ class PostgresArtifactStore:
         record_hash = hash_json(asdict(record))
         with psycopg.connect(self._dsn) as conn:
             with conn.transaction():
+                _set_role(conn, self._db_role)
                 with conn.cursor() as cur:
                     cur.execute(
                         """
@@ -369,7 +372,20 @@ def build_postgres_minio_store_from_env(env: dict[str, str]) -> PostgresArtifact
         bucket=env.get("ARGUS_S8_MINIO_BUCKET", "argus-s8-objects"),
         secure=env.get("ARGUS_S8_MINIO_SECURE", "0") == "1",
     )
-    return PostgresArtifactStore(dsn=dsn, object_store=object_store)
+    return PostgresArtifactStore(
+        dsn=dsn,
+        object_store=object_store,
+        db_role=env.get("ARGUS_S8_POSTGRES_ROLE") or None,
+    )
+
+
+def _set_role(conn: Any, db_role: str | None) -> None:
+    if not db_role:
+        return
+    from psycopg import sql
+
+    with conn.cursor() as cur:
+        cur.execute(sql.SQL("SET ROLE {};").format(sql.Identifier(db_role)))
 
 
 def apply_s8_migrations(*, dsn: str, migrations_dir: Path) -> None:

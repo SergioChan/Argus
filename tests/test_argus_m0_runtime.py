@@ -640,6 +640,7 @@ class ArgusM0ComposeTests(unittest.TestCase):
             services["s8-writer"]["environment"]["ARGUS_S8_POSTGRES_DSN"],
             "postgresql://argus:argus-dev-password@postgres:5432/argus",
         )
+        self.assertEqual(services["s8-writer"]["environment"]["ARGUS_S8_POSTGRES_ROLE"], "argus_s8_ledger_writer")
         self.assertEqual(services["s8-writer"]["environment"]["ARGUS_S8_MINIO_ENDPOINT"], "minio:9000")
         self.assertEqual(services["s8-writer"]["environment"]["ARGUS_S8_MINIO_BUCKET"], "argus-s8-objects")
         self.assertNotIn("ARGUS_S8_DATA_DIR", services["s8-writer"]["environment"])
