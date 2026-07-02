@@ -10,7 +10,7 @@ import os
 from pathlib import Path
 from typing import Any
 
-from argus_core import FileSystemArtifactStore, Lineage, Producer, canonical_json_bytes
+from argus_core import ArtifactQueryFilter, FileSystemArtifactStore, Lineage, Producer, canonical_json_bytes
 
 from .auth import RuntimeAuth, UnauthorizedError, health_token_from_env, require_static_bearer_token, runtime_auth_from_env
 from .http_json import JsonHttpApp, JsonRequest, serve_json_app
@@ -85,6 +85,20 @@ class S8WriterApp:
         self._refresh_store()
         return json.loads(self.store.get_artifact(ref).decode("utf-8"))
 
+    def query_artifacts(
+        self,
+        query: ArtifactQueryFilter,
+        *,
+        page_size: int | None = None,
+        page_token: int | None = None,
+    ) -> dict[str, Any]:
+        self._refresh_store()
+        page = self.store.query_artifacts_page(query, page_size=page_size, page_token=page_token)
+        return {
+            "records": [asdict(record) for record in page.records],
+            "next_page_token": page.next_page_token,
+        }
+
     def get_lineage(self, ref: str, *, direction: str) -> dict[str, Any]:
         self._refresh_store()
         graph = self.store.get_lineage(ref, direction=direction)
@@ -158,6 +172,20 @@ class S8WriterApp:
                 "error": "DirectWriteDenied",
                 "message": "artifact writes must use the S10 store broker",
             }
+
+        @self.http.route("GET", "/v1/artifacts")
+        def query_artifacts(request: JsonRequest) -> tuple[int, Any]:
+            authenticated, error_response = self._authenticate(request)
+            if not authenticated:
+                return 401, error_response
+            try:
+                return 200, self.query_artifacts(
+                    _artifact_query_filter_from_query(request.query),
+                    page_size=_query_int(request.query, "page_size"),
+                    page_token=_query_int(request.query, "page_token"),
+                )
+            except Exception as exc:
+                return 400, {"error": type(exc).__name__, "message": str(exc)}
 
         @self.http.route("POST", "/v1/internal/brokered-artifacts")
         def create_brokered(request: JsonRequest) -> tuple[int, Any]:
@@ -266,6 +294,41 @@ def _normalize_lineage(value: dict[str, Any]) -> dict[str, Any]:
     normalized["input_refs"] = tuple(normalized.get("input_refs") or ())
     normalized["seeds"] = tuple(normalized.get("seeds") or ())
     return normalized
+
+
+def _artifact_query_filter_from_query(query: dict[str, list[str]]) -> ArtifactQueryFilter:
+    return ArtifactQueryFilter(
+        artifact_ref=_query_str(query, "artifact_ref"),
+        content_hash=_query_str(query, "content_hash"),
+        kind=_query_str(query, "kind"),
+        actor_id=_query_str(query, "actor_id"),
+        job_id=_query_str(query, "job_id"),
+        producer_subsystem=_query_str(query, "producer_subsystem"),
+        producer_version=_query_str(query, "producer_version"),
+        claim_tier=_query_str(query, "claim_tier"),
+        validation_report_ref=_query_str(query, "validation_report_ref"),
+        contamination_index_version=_query_str(query, "contamination_index_version"),
+        created_after=_query_str(query, "created_after"),
+        created_before=_query_str(query, "created_before"),
+    )
+
+
+def _query_str(query: dict[str, list[str]], name: str) -> str | None:
+    values = query.get(name) or ()
+    if not values:
+        return None
+    value = values[0]
+    return value if value else None
+
+
+def _query_int(query: dict[str, list[str]], name: str) -> int | None:
+    value = _query_str(query, name)
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be an integer") from exc
 
 
 if __name__ == "__main__":

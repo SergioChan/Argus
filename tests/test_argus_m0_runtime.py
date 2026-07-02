@@ -337,6 +337,32 @@ class ArgusM0RuntimeServiceTests(unittest.TestCase):
                     headers=_auth_headers(),
                 )
             )
+            query_status, query_payload = app.http.handle(
+                JsonRequest(
+                    method="GET",
+                    path="/v1/artifacts",
+                    query={"kind": ["model"], "producer_subsystem": ["S2"], "page_size": ["10"]},
+                    body=None,
+                    headers=_auth_headers(),
+                )
+            )
+            unauth_query_status, unauth_query_payload = app.http.handle(
+                JsonRequest(
+                    method="GET",
+                    path="/v1/artifacts",
+                    query={"kind": ["model"]},
+                    body=None,
+                )
+            )
+            bad_page_status, bad_page_payload = app.http.handle(
+                JsonRequest(
+                    method="GET",
+                    path="/v1/artifacts",
+                    query={"kind": ["model"], "page_size": ["not-an-int"]},
+                    body=None,
+                    headers=_auth_headers(),
+                )
+            )
 
             self.assertEqual(impact_status, 200)
             self.assertEqual(
@@ -347,6 +373,16 @@ class ArgusM0RuntimeServiceTests(unittest.TestCase):
             self.assertEqual(unauth_impact_payload["error"], "Unauthorized")
             self.assertEqual(missing_seed_status, 400)
             self.assertEqual(missing_seed_payload["error"], "seed_ref_required")
+            self.assertEqual(query_status, 200)
+            self.assertIn(
+                chained_payload["artifact_ref"],
+                [record["artifact_ref"] for record in query_payload["records"]],
+            )
+            self.assertIsNone(query_payload["next_page_token"])
+            self.assertEqual(unauth_query_status, 401)
+            self.assertEqual(unauth_query_payload["error"], "Unauthorized")
+            self.assertEqual(bad_page_status, 400)
+            self.assertEqual(bad_page_payload["error"], "ValueError")
 
     def test_runtime_http_routes_require_bearer_authentication(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
