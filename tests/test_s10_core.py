@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 from dataclasses import asdict, replace
+import os
+import shutil
+import subprocess
 import unittest
 
 from argus_core import (
     BudgetCaps,
     BudgetExceededError,
     BudgetUsage,
+    DockerSandboxSupervisor,
     EgressProxy,
     EgressRule,
     InMemoryAuditLedger,
@@ -18,6 +22,7 @@ from argus_core import (
     PolicyBundle,
     PolicyDeniedError,
     ResourceCeilings,
+    SandboxHandle,
     ScopeGrant,
     ScopeWideningError,
     TokenInvalidError,
@@ -380,6 +385,150 @@ class S10OrchestratorAndAuditTests(unittest.TestCase):
                 estimated_cost_usd=estimated_cost_usd,
             ),
         )
+
+
+class S10DockerSupervisorTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.docker_bin = shutil.which("docker")
+        if cls.docker_bin is None:
+            cls._skip_or_fail("docker CLI is unavailable")
+        version = subprocess.run(
+            [cls.docker_bin, "version", "--format", "{{.Server.Version}}"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if version.returncode != 0:
+            cls._skip_or_fail(f"docker daemon is unavailable: {version.stderr.strip()}")
+        cls.image = cls._resolve_digest_pinned_busybox()
+
+    def setUp(self) -> None:
+        self.supervisor = DockerSandboxSupervisor(docker_bin=self.docker_bin)
+
+    def test_launches_digest_pinned_container_with_no_network_route(self) -> None:
+        request = self._launch_request(
+            entrypoint=("/bin/sh",),
+            args=("-c", "cat /proc/net/route; printf '\\nARGUS_SAFE=%s\\n' \"$ARGUS_SAFE\""),
+            env={"ARGUS_SAFE": "visible", "ARGUS_SECRET": "hidden"},
+            env_allowlist=("ARGUS_SAFE",),
+            wallclock_s=5,
+        )
+        handle = self._handle()
+
+        result = self.supervisor.run(
+            handle=handle,
+            request=request,
+            materialized_env=materialize_sandbox_env(request.env, request.env_allowlist),
+        )
+
+        self.assertFalse(result.timed_out)
+        self.assertEqual(result.exit_code, 0, result.stderr)
+        self.assertIn("ARGUS_SAFE=visible", result.stdout)
+        self.assertNotIn("hidden", result.stdout)
+        self.assertFalse(_has_default_route(result.stdout), result.stdout)
+        self.assertGreater(result.duration_s, 0)
+        self.assertGreater(result.budget_usage.wallclock_s, 0)
+
+    def test_timeout_kills_container(self) -> None:
+        request = self._launch_request(
+            entrypoint=("/bin/sh",),
+            args=("-c", "sleep 5"),
+            env={},
+            env_allowlist=(),
+            wallclock_s=1,
+        )
+        handle = self._handle()
+
+        result = self.supervisor.run(handle=handle, request=request, materialized_env={})
+
+        self.assertTrue(result.timed_out)
+        self.assertIsNone(result.exit_code)
+        self.assertGreaterEqual(result.duration_s, 1)
+
+    @classmethod
+    def _resolve_digest_pinned_busybox(cls) -> str:
+        image = os.environ.get("ARGUS_S10_TEST_IMAGE", "busybox@sha256:73aaf090f3d85aa34ee199857f03fa3a95c8ede2ffd4cc2cdb5b94e566b11662")
+        inspect = subprocess.run(
+            [cls.docker_bin, "image", "inspect", image],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if inspect.returncode != 0:
+            pull = subprocess.run(
+                [cls.docker_bin, "pull", image],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            if pull.returncode != 0:
+                cls._skip_or_fail(f"cannot pull S10 test image {image}: {pull.stderr.strip()}")
+        return image
+
+    @classmethod
+    def _skip_or_fail(cls, reason: str) -> None:
+        if os.environ.get("ARGUS_REQUIRE_DOCKER_TESTS") == "1":
+            raise AssertionError(reason)
+        raise unittest.SkipTest(reason)
+
+    def _launch_request(
+        self,
+        *,
+        entrypoint: tuple[str, ...],
+        args: tuple[str, ...],
+        env: dict[str, str],
+        env_allowlist: tuple[str, ...],
+        wallclock_s: int,
+    ) -> LaunchRequest:
+        tokens = InMemoryTokenService(signing_key=b"test-key", now_fn=lambda: 1_000)
+        budget = tokens.mint_budget(
+            caps=BudgetCaps(max_compute_units=10, max_wallclock_s=10, max_cost_usd=1),
+            job_id="job-1",
+            root_request_id="root-1",
+        )
+        scope = tokens.mint_scope(job_id="job-1", scopes=ScopeGrant())
+        return LaunchRequest(
+            job_id="job-1",
+            subagent_id="subagent-1",
+            trace_id="trace-1",
+            budget_token=budget,
+            scope_token=scope,
+            image=self.image,
+            entrypoint=entrypoint,
+            args=args,
+            env=env,
+            env_allowlist=env_allowlist,
+            requested_envelope=LaunchEnvelope(
+                cpu_m=500,
+                mem_bytes=64 * 1024 * 1024,
+                gpu_count=0,
+                wallclock_s=wallclock_s,
+                scratch_bytes=1024 * 1024,
+                pids=16,
+                estimated_cost_usd=0.01,
+            ),
+        )
+
+    @staticmethod
+    def _handle() -> SandboxHandle:
+        return SandboxHandle(
+            sandbox_id="sandbox-test",
+            job_id="job-1",
+            runtime_class="docker",
+            budget_epoch=1,
+            policy_bundle_version="1.0.0",
+            seccomp_profile_hash="blake3:" + "a" * 64,
+            state="ADMITTED",
+        )
+
+
+def _has_default_route(route_table: str) -> bool:
+    for line in route_table.splitlines():
+        fields = line.split()
+        if len(fields) >= 2 and fields[0] != "Iface" and fields[1] == "00000000":
+            return True
+    return False
 
 
 if __name__ == "__main__":

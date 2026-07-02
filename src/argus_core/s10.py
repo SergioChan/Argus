@@ -1,9 +1,11 @@
-"""In-memory S10 token, quota, policy, and sandbox admission semantics."""
+"""S10 token, quota, policy, and sandbox launch semantics."""
 
 from __future__ import annotations
 
 import hmac
 import re
+import shutil
+import subprocess
 import time
 from dataclasses import asdict, dataclass, replace
 from hashlib import sha256
@@ -23,6 +25,7 @@ SECRET_VALUE_PATTERNS = (
     re.compile(r"\bsk-[A-Za-z0-9_-]{16,}\b"),
     re.compile(r"(?i)(password|secret|api[_-]?key|token)=?[A-Za-z0-9_./+=:-]{8,}"),
 )
+DIGEST_PINNED_IMAGE = re.compile(r"^(?:[^\s@]+@)?sha256:[0-9a-f]{64}$")
 
 
 class S10Error(Exception):
@@ -51,6 +54,10 @@ class BudgetExceededError(S10Error):
 
 class PolicyDeniedError(S10Error):
     """Raised when policy or admission denies a sandbox launch."""
+
+
+class SandboxRuntimeUnavailableError(S10Error):
+    """Raised when the configured sandbox runtime cannot be invoked."""
 
 
 @dataclass(frozen=True)
@@ -205,6 +212,17 @@ class SandboxHandle:
     seccomp_profile_hash: str
     state: str
     launch_provenance_ref: str | None = None
+
+
+@dataclass(frozen=True)
+class SandboxExecutionResult:
+    handle: SandboxHandle
+    exit_code: int | None
+    stdout: str
+    stderr: str
+    timed_out: bool
+    duration_s: float
+    budget_usage: BudgetUsage
 
 
 @dataclass(frozen=True)
@@ -650,6 +668,29 @@ def _looks_secret_shaped(value: str) -> bool:
     return any(pattern.search(value) for pattern in SECRET_VALUE_PATTERNS)
 
 
+def _is_digest_pinned_image(image: str) -> bool:
+    return DIGEST_PINNED_IMAGE.match(image) is not None
+
+
+def _runtime_budget_usage(envelope: LaunchEnvelope, duration_s: float) -> BudgetUsage:
+    bounded_wallclock_s = max(duration_s, 0.0)
+    wallclock_ratio = bounded_wallclock_s / envelope.wallclock_s if envelope.wallclock_s > 0 else 1.0
+    return BudgetUsage(
+        compute_units=(envelope.cpu_m / 1000.0) * bounded_wallclock_s,
+        gpu_seconds=envelope.gpu_count * bounded_wallclock_s,
+        wallclock_s=bounded_wallclock_s,
+        cost_usd=envelope.estimated_cost_usd * wallclock_ratio,
+    )
+
+
+def _timeout_stream(value: bytes | str | None) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return value
+
+
 class EgressProxy:
     """Default-deny egress decision helper."""
 
@@ -764,6 +805,104 @@ class StoreWriterBroker:
         return record
 
 
+class DockerSandboxSupervisor:
+    """Node-level Docker supervisor that launches digest-pinned containers with no network."""
+
+    def __init__(self, *, docker_bin: str | None = None) -> None:
+        self._docker_bin = docker_bin or shutil.which("docker") or "docker"
+
+    def run(
+        self,
+        *,
+        handle: SandboxHandle,
+        request: LaunchRequest,
+        materialized_env: dict[str, str],
+    ) -> SandboxExecutionResult:
+        if not _is_digest_pinned_image(request.image):
+            raise PolicyDeniedError("image must be digest-pinned")
+        if not request.entrypoint:
+            raise PolicyDeniedError("entrypoint is required")
+        if shutil.which(self._docker_bin) is None and "/" not in self._docker_bin:
+            raise SandboxRuntimeUnavailableError("docker runtime is unavailable")
+
+        container_name = f"argus-{handle.sandbox_id.replace('-', '')[:24]}"
+        command = self._docker_command(container_name, request, materialized_env)
+        started_at = time.monotonic()
+        try:
+            completed = subprocess.run(
+                command,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=max(request.requested_envelope.wallclock_s, 1),
+            )
+            duration_s = time.monotonic() - started_at
+            return SandboxExecutionResult(
+                handle=handle,
+                exit_code=completed.returncode,
+                stdout=completed.stdout,
+                stderr=completed.stderr,
+                timed_out=False,
+                duration_s=duration_s,
+                budget_usage=_runtime_budget_usage(request.requested_envelope, duration_s),
+            )
+        except FileNotFoundError as exc:
+            raise SandboxRuntimeUnavailableError("docker runtime is unavailable") from exc
+        except subprocess.TimeoutExpired as exc:
+            self._force_remove(container_name)
+            duration_s = time.monotonic() - started_at
+            return SandboxExecutionResult(
+                handle=handle,
+                exit_code=None,
+                stdout=_timeout_stream(exc.stdout),
+                stderr=_timeout_stream(exc.stderr),
+                timed_out=True,
+                duration_s=duration_s,
+                budget_usage=_runtime_budget_usage(request.requested_envelope, duration_s),
+            )
+
+    def _docker_command(self, container_name: str, request: LaunchRequest, env: dict[str, str]) -> list[str]:
+        envelope = request.requested_envelope
+        command = [
+            self._docker_bin,
+            "run",
+            "--rm",
+            "--pull=never",
+            "--name",
+            container_name,
+            "--network",
+            "none",
+            "--read-only",
+            "--cap-drop",
+            "ALL",
+            "--security-opt",
+            "no-new-privileges",
+            "--pids-limit",
+            str(max(envelope.pids, 1)),
+            "--memory",
+            str(max(envelope.mem_bytes, 4 * 1024 * 1024)),
+            "--cpus",
+            f"{max(envelope.cpu_m, 1) / 1000:.3f}",
+            "--tmpfs",
+            f"/tmp:rw,noexec,nosuid,nodev,size={max(envelope.scratch_bytes, 1024 * 1024)}",
+        ]
+        for key in sorted(env):
+            command.extend(("--env", f"{key}={env[key]}"))
+        command.extend(("--entrypoint", request.entrypoint[0]))
+        command.append(request.image)
+        command.extend(request.entrypoint[1:])
+        command.extend(request.args)
+        return command
+
+    def _force_remove(self, container_name: str) -> None:
+        subprocess.run(
+            [self._docker_bin, "rm", "-f", container_name],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+
 class InMemorySandboxOrchestrator:
     """Admission-only sandbox orchestrator for M0 S10 contract semantics."""
 
@@ -797,7 +936,7 @@ class InMemorySandboxOrchestrator:
                 {"job_id": request.job_id, "env_keys": sorted(set(request.env) & set(request.env_allowlist))},
             )
             raise PolicyDeniedError("env contains secret-shaped value") from exc
-        if "@sha256:" not in request.image:
+        if not _is_digest_pinned_image(request.image):
             self._audit_ledger.append("image.verify_fail", {"image": request.image, "job_id": request.job_id})
             raise PolicyDeniedError("image must be digest-pinned")
 
