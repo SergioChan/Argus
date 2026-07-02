@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from dataclasses import replace
+from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
 
@@ -10,6 +11,7 @@ from argus_core import (
     C3ReportSigner,
     C3ReportVerifier,
     CycleDetectedError,
+    FileSystemArtifactStore,
     FileSystemObjectStore,
     HashMismatchError,
     IllegalTierError,
@@ -17,6 +19,7 @@ from argus_core import (
     InMemoryObjectStore,
     InMemoryVerifierTrustStore,
     IncompleteLineageError,
+    LedgerReplayError,
     Lineage,
     Producer,
     SCRATCH_BUCKET,
@@ -411,6 +414,62 @@ class FileSystemObjectStoreTests(unittest.TestCase):
 
         with self.assertRaises(HashMismatchError):
             self.object_store.put(record.content_hash, b'{"weights":[2]}', bucket_class=SCRATCH_BUCKET)
+
+
+class FileSystemArtifactStoreTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tempdir = TemporaryDirectory()
+        self.root = Path(self.tempdir.name)
+        self.producer = Producer(subsystem="S2", version="0.0.0")
+
+    def tearDown(self) -> None:
+        self.tempdir.cleanup()
+
+    def test_reopen_replays_records_lineage_and_audit_chain(self) -> None:
+        store = FileSystemArtifactStore(self.root)
+        dataset = store.create_artifact(
+            kind="dataset",
+            payload={"rows": [1]},
+            producer=self.producer,
+            lineage=Lineage(input_refs=(), code_ref="git:data", environment_digest="oci:data"),
+        )
+        model = store.create_artifact(
+            kind="model",
+            payload={"weights": [1]},
+            producer=self.producer,
+            lineage=Lineage(
+                input_refs=(dataset.artifact_ref,),
+                code_ref="git:model",
+                environment_digest="oci:model",
+            ),
+        )
+
+        reopened = FileSystemArtifactStore(self.root)
+        lineage_graph = reopened.get_lineage(model.artifact_ref, direction="ancestors")
+
+        self.assertEqual(reopened.record_count, 2)
+        self.assertEqual(reopened.object_count, 2)
+        self.assertEqual(reopened.get_artifact(model.artifact_ref), b'{"weights":[1]}')
+        self.assertTrue(reopened.verify_audit_chain().valid)
+        self.assertEqual({node.artifact_ref for node in lineage_graph.nodes}, {dataset.artifact_ref, model.artifact_ref})
+        self.assertEqual(len(lineage_graph.edges), 1)
+
+    def test_reopen_rejects_tampered_append_only_ledger(self) -> None:
+        store = FileSystemArtifactStore(self.root)
+        store.create_artifact(
+            kind="model",
+            payload={"weights": [1]},
+            producer=self.producer,
+            lineage=Lineage(input_refs=(), code_ref="git:model", environment_digest="oci:model"),
+        )
+        ledger_path = self.root / "artifact_ledger.jsonl"
+        ledger_bytes = ledger_path.read_bytes()
+        ledger_path.write_bytes(ledger_bytes.replace(b'"kind":"model"', b'"kind":"tampered"', 1))
+
+        with self.assertRaises(LedgerReplayError) as raised:
+            FileSystemArtifactStore(self.root)
+
+        self.assertEqual(raised.exception.category, "LEDGER_REPLAY_FAILED")
 
 
 class S8TierCouplingTests(unittest.TestCase):

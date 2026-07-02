@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 import json
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, Protocol
 
 from .canonical import canonical_json_bytes
 from .c3 import C3ReportVerifier
@@ -68,6 +68,15 @@ class CycleDetectedError(S8Error):
     def __init__(self, reason: str) -> None:
         super().__init__(reason)
         self.category = "CYCLE_DETECTED"
+        self.reason = reason
+
+
+class LedgerReplayError(S8Error):
+    """Raised when a durable ledger cannot be replayed without tamper evidence."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.category = "LEDGER_REPLAY_FAILED"
         self.reason = reason
 
 
@@ -166,22 +175,22 @@ WRITE_ONCE_BUCKET = "write_once"
 SCRATCH_BUCKET = "scratch"
 
 
-class ObjectStoreFacade:
+class ObjectStoreFacade(Protocol):
     def put(self, content_hash: str, payload: bytes, *, bucket_class: str) -> None:
-        raise NotImplementedError
+        ...
 
     def get(self, content_hash: str) -> bytes:
-        raise NotImplementedError
+        ...
 
     def promote_to_write_once(self, content_hash: str) -> None:
-        raise NotImplementedError
+        ...
 
     def bucket_class(self, content_hash: str) -> str:
-        raise NotImplementedError
+        ...
 
     @property
     def object_count(self) -> int:
-        raise NotImplementedError
+        ...
 
 
 class InMemoryObjectStore(ObjectStoreFacade):
@@ -749,6 +758,96 @@ class InMemoryArtifactStore:
         return AuditCheckpoint(sequence=latest_leaf.sequence, root=latest_leaf.root)
 
 
+class FileSystemArtifactStore(InMemoryArtifactStore):
+    """Durable local C4 store backed by filesystem objects and an append-only ledger."""
+
+    def __init__(self, root: str | Path, *, report_verifier: C3ReportVerifier | None = None) -> None:
+        self.root = Path(root)
+        self.root.mkdir(parents=True, exist_ok=True)
+        self._ledger_path = self.root / "artifact_ledger.jsonl"
+        self._replaying_ledger = True
+        super().__init__(
+            report_verifier=report_verifier,
+            object_store=FileSystemObjectStore(self.root / "objects"),
+        )
+        self._replay_ledger()
+        self._replaying_ledger = False
+
+    def create_artifact(
+        self,
+        *,
+        kind: str,
+        payload: Any,
+        producer: Producer,
+        lineage: Lineage,
+        artifact_ref: str | None = None,
+        claim_tier: str = "ran-toy",
+        validation_report_ref: str | None = None,
+    ) -> ArtifactRecord:
+        previous_sequence = self._latest_checkpoint().sequence
+        record = super().create_artifact(
+            kind=kind,
+            payload=payload,
+            producer=producer,
+            lineage=lineage,
+            artifact_ref=artifact_ref,
+            claim_tier=claim_tier,
+            validation_report_ref=validation_report_ref,
+        )
+        if not self._replaying_ledger and self._latest_checkpoint().sequence > previous_sequence:
+            self._append_ledger_event(record)
+        return record
+
+    def _replay_ledger(self) -> None:
+        if not self._ledger_path.exists():
+            return
+        with self._ledger_path.open("rb") as handle:
+            for line_number, raw_line in enumerate(handle, start=1):
+                if not raw_line.strip():
+                    continue
+                try:
+                    event = json.loads(raw_line)
+                    record = _record_from_ledger_event(event)
+                    payload = json.loads(self._object_store.get(record.content_hash).decode("utf-8"))
+                    replayed = super().create_artifact(
+                        artifact_ref=record.artifact_ref,
+                        kind=record.kind,
+                        payload=payload,
+                        producer=record.producer,
+                        lineage=record.lineage,
+                        claim_tier=record.claim_tier,
+                        validation_report_ref=record.validation_report_ref,
+                    )
+                    self._assert_replayed_event(event, replayed)
+                except Exception as exc:
+                    if isinstance(exc, LedgerReplayError):
+                        raise
+                    raise LedgerReplayError(f"ledger replay failed at line {line_number}: {exc}") from exc
+
+    def _append_ledger_event(self, record: ArtifactRecord) -> None:
+        event = {
+            "record": asdict(record),
+            "record_hash": self._record_hash(record),
+            "audit_leaf": asdict(self._audit_leaves[-1]),
+        }
+        with self._ledger_path.open("ab") as handle:
+            handle.write(canonical_json_bytes(event))
+            handle.write(b"\n")
+
+    def _assert_replayed_event(self, event: Mapping[str, Any], record: ArtifactRecord) -> None:
+        expected_record = event.get("record")
+        if canonical_json_bytes(asdict(record)) != canonical_json_bytes(expected_record):
+            raise LedgerReplayError(f"record payload mismatch for {record.artifact_ref}")
+        expected_record_hash = event.get("record_hash")
+        if expected_record_hash != self._record_hash(record):
+            raise LedgerReplayError(f"record hash mismatch for {record.artifact_ref}")
+        expected_leaf = event.get("audit_leaf")
+        if not self._audit_leaves:
+            raise LedgerReplayError(f"missing audit leaf for {record.artifact_ref}")
+        if canonical_json_bytes(asdict(self._audit_leaves[-1])) != canonical_json_bytes(expected_leaf):
+            raise LedgerReplayError(f"audit leaf mismatch for {record.artifact_ref}")
+
+
 class ExternalSourceRegistry:
     """Immutable C4-backed registry for external-source ingestion records."""
 
@@ -781,6 +880,33 @@ def _assert_known_bucket_class(bucket_class: str) -> None:
 def _assert_payload_matches_hash(content_hash: str, payload: bytes) -> None:
     if hash_bytes(payload) != content_hash:
         raise HashMismatchError(f"hash mismatch for {content_hash}")
+
+
+def _record_from_ledger_event(event: Mapping[str, Any]) -> ArtifactRecord:
+    record = event.get("record")
+    if not isinstance(record, Mapping):
+        raise LedgerReplayError("ledger event missing record")
+    producer = record.get("producer")
+    lineage = record.get("lineage")
+    if not isinstance(producer, Mapping) or not isinstance(lineage, Mapping):
+        raise LedgerReplayError("ledger event has invalid producer or lineage")
+    return ArtifactRecord(
+        artifact_ref=str(record["artifact_ref"]),
+        kind=str(record["kind"]),
+        content_hash=str(record["content_hash"]),
+        size_bytes=int(record["size_bytes"]),
+        producer=Producer(subsystem=str(producer["subsystem"]), version=str(producer["version"])),
+        lineage=Lineage(
+            input_refs=tuple(lineage.get("input_refs", ())),
+            code_ref=str(lineage["code_ref"]),
+            environment_digest=str(lineage["environment_digest"]),
+            seeds=tuple(lineage.get("seeds", ())),
+        ),
+        claim_tier=str(record.get("claim_tier", "ran-toy")),
+        validation_report_ref=(
+            str(record["validation_report_ref"]) if record.get("validation_report_ref") is not None else None
+        ),
+    )
 
 
 def _merged_bucket_class(existing: str | None, incoming: str) -> str:
