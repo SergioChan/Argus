@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from dataclasses import replace
+from tempfile import TemporaryDirectory
 import unittest
 
 from argus_core import (
@@ -9,14 +10,18 @@ from argus_core import (
     C3ReportSigner,
     C3ReportVerifier,
     CycleDetectedError,
+    FileSystemObjectStore,
     HashMismatchError,
     IllegalTierError,
     InMemoryArtifactStore,
+    InMemoryObjectStore,
     InMemoryVerifierTrustStore,
     IncompleteLineageError,
     Lineage,
     Producer,
+    SCRATCH_BUCKET,
     SignatureInvalidError,
+    WRITE_ONCE_BUCKET,
     WriteOnceViolationError,
     canonical_json_bytes,
     hash_bytes,
@@ -50,7 +55,8 @@ class Blake3HashTests(unittest.TestCase):
 
 class InMemoryArtifactStoreTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.store = InMemoryArtifactStore()
+        self.object_store = InMemoryObjectStore()
+        self.store = InMemoryArtifactStore(object_store=self.object_store)
         self.producer = Producer(subsystem="S2", version="0.0.0")
         self.lineage = Lineage(
             input_refs=("c4://dataset/example",),
@@ -117,7 +123,7 @@ class InMemoryArtifactStoreTests(unittest.TestCase):
 
     def test_explicit_ref_is_write_once(self) -> None:
         artifact_ref = "c4://artifact/fixed-ref"
-        self.store.create_artifact(
+        original = self.store.create_artifact(
             artifact_ref=artifact_ref,
             kind="model",
             payload={"weights": [1]},
@@ -125,7 +131,7 @@ class InMemoryArtifactStoreTests(unittest.TestCase):
             lineage=self.lineage,
         )
 
-        with self.assertRaises(WriteOnceViolationError):
+        with self.assertRaises(WriteOnceViolationError) as raised:
             self.store.create_artifact(
                 artifact_ref=artifact_ref,
                 kind="model",
@@ -133,6 +139,44 @@ class InMemoryArtifactStoreTests(unittest.TestCase):
                 producer=self.producer,
                 lineage=self.lineage,
             )
+
+        self.assertEqual(raised.exception.category, "IMMUTABLE_VIOLATION")
+        self.assertEqual(self.store.get_record(artifact_ref), original)
+        self.assertEqual(self.store.get_artifact(artifact_ref), b'{"weights":[1]}')
+
+    def test_scratch_object_promotes_to_write_once_when_referenced(self) -> None:
+        dataset = self.store.create_artifact(
+            kind="dataset",
+            payload={"rows": [1]},
+            producer=self.producer,
+            lineage=Lineage(input_refs=(), code_ref="git:data", environment_digest="oci:data"),
+        )
+
+        self.assertEqual(self.store.bucket_class_for_artifact(dataset.artifact_ref), SCRATCH_BUCKET)
+
+        model = self.store.create_artifact(
+            kind="model",
+            payload={"weights": [1]},
+            producer=self.producer,
+            lineage=Lineage(
+                input_refs=(dataset.artifact_ref,),
+                code_ref="git:model",
+                environment_digest="oci:model",
+            ),
+        )
+
+        self.assertEqual(self.store.bucket_class_for_artifact(dataset.artifact_ref), WRITE_ONCE_BUCKET)
+        self.assertEqual(self.store.bucket_class_for_artifact(model.artifact_ref), SCRATCH_BUCKET)
+
+    def test_report_artifact_is_written_to_write_once_bucket(self) -> None:
+        report = self.store.create_artifact(
+            kind="report",
+            payload={"report": "unsigned-test-report"},
+            producer=Producer(subsystem="S3", version="0.0.0"),
+            lineage=Lineage(input_refs=(), code_ref="git:verify", environment_digest="oci:verify"),
+        )
+
+        self.assertEqual(self.store.bucket_class_for_artifact(report.artifact_ref), WRITE_ONCE_BUCKET)
 
     def test_incomplete_lineage_fails_closed(self) -> None:
         with self.assertRaises(IncompleteLineageError):
@@ -162,10 +206,12 @@ class InMemoryArtifactStoreTests(unittest.TestCase):
             producer=self.producer,
             lineage=self.lineage,
         )
-        self.store._objects[record.content_hash] = b'{"weights":[2]}'
+        self.object_store._objects[record.content_hash] = b'{"weights":[2]}'
 
-        with self.assertRaises(HashMismatchError):
+        with self.assertRaises(HashMismatchError) as raised:
             self.store.get_artifact(record.artifact_ref)
+
+        self.assertEqual(raised.exception.category, "HASH_MISMATCH")
 
     def test_self_cycle_is_rejected(self) -> None:
         artifact_ref = "c4://artifact/self-cycle"
@@ -284,6 +330,87 @@ class InMemoryArtifactStoreTests(unittest.TestCase):
         self.assertFalse(slice_verification.valid)
         self.assertFalse(chain_verification.valid)
         self.assertEqual(chain_verification.break_sequence, 2)
+
+
+class FileSystemObjectStoreTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tempdir = TemporaryDirectory()
+        self.object_store = FileSystemObjectStore(self.tempdir.name)
+        self.store = InMemoryArtifactStore(object_store=self.object_store)
+        self.producer = Producer(subsystem="S2", version="0.0.0")
+
+    def tearDown(self) -> None:
+        self.tempdir.cleanup()
+
+    def test_filesystem_store_persists_and_reads_canonical_bytes(self) -> None:
+        record = self.store.create_artifact(
+            kind="model",
+            payload={"weights": [1]},
+            producer=self.producer,
+            lineage=Lineage(input_refs=(), code_ref="git:model", environment_digest="oci:model"),
+        )
+        stored_path = self.object_store.object_path(record.content_hash)
+
+        self.assertIsNotNone(stored_path)
+        self.assertEqual(self.object_store.bucket_class(record.content_hash), SCRATCH_BUCKET)
+        self.assertEqual(self.store.get_artifact(record.artifact_ref), b'{"weights":[1]}')
+
+    def test_filesystem_store_promotes_referenced_scratch_input_to_write_once(self) -> None:
+        dataset = self.store.create_artifact(
+            kind="dataset",
+            payload={"rows": [1]},
+            producer=self.producer,
+            lineage=Lineage(input_refs=(), code_ref="git:data", environment_digest="oci:data"),
+        )
+        scratch_path = self.object_store.object_path(dataset.content_hash)
+
+        self.assertIsNotNone(scratch_path)
+        assert scratch_path is not None
+        self.assertEqual(scratch_path.parent.name, SCRATCH_BUCKET)
+
+        self.store.create_artifact(
+            kind="model",
+            payload={"weights": [1]},
+            producer=self.producer,
+            lineage=Lineage(
+                input_refs=(dataset.artifact_ref,),
+                code_ref="git:model",
+                environment_digest="oci:model",
+            ),
+        )
+        promoted_path = self.object_store.object_path(dataset.content_hash)
+
+        self.assertIsNotNone(promoted_path)
+        assert promoted_path is not None
+        self.assertEqual(promoted_path.parent.name, WRITE_ONCE_BUCKET)
+        self.assertFalse(scratch_path.exists())
+
+    def test_filesystem_store_verify_on_read_detects_tampering(self) -> None:
+        record = self.store.create_artifact(
+            kind="model",
+            payload={"weights": [1]},
+            producer=self.producer,
+            lineage=Lineage(input_refs=(), code_ref="git:model", environment_digest="oci:model"),
+        )
+        stored_path = self.object_store.object_path(record.content_hash)
+        assert stored_path is not None
+        stored_path.write_bytes(b'{"weights":[2]}')
+
+        with self.assertRaises(HashMismatchError) as raised:
+            self.store.get_artifact(record.artifact_ref)
+
+        self.assertEqual(raised.exception.category, "HASH_MISMATCH")
+
+    def test_filesystem_store_rejects_write_to_mismatched_hash(self) -> None:
+        record = self.store.create_artifact(
+            kind="model",
+            payload={"weights": [1]},
+            producer=self.producer,
+            lineage=Lineage(input_refs=(), code_ref="git:model", environment_digest="oci:model"),
+        )
+
+        with self.assertRaises(HashMismatchError):
+            self.object_store.put(record.content_hash, b'{"weights":[2]}', bucket_class=SCRATCH_BUCKET)
 
 
 class S8TierCouplingTests(unittest.TestCase):

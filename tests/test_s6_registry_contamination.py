@@ -8,6 +8,7 @@ from argus_core import (
     DescriptorRevokedError,
     HashMismatchError,
     InMemoryArtifactStore,
+    InMemoryObjectStore,
     InMemoryRegistry,
     RegistryError,
     SourceDocument,
@@ -118,7 +119,8 @@ class S6RegistryTests(unittest.TestCase):
 
 class S6ContaminationIndexTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.store = InMemoryArtifactStore()
+        self.object_store = InMemoryObjectStore()
+        self.store = InMemoryArtifactStore(object_store=self.object_store)
         self.index = ContaminationIndex(artifact_store=self.store)
 
     def test_freeze_writes_snapshot_and_query_flags_overlap(self) -> None:
@@ -155,7 +157,7 @@ class S6ContaminationIndexTests(unittest.TestCase):
             documents=(SourceDocument(doc_id="paper-1", text="known result", source_ref="c4://source/paper-1"),),
         )
         record = self.store.get_record(snapshot.snapshot_ref)
-        self.store._objects[record.content_hash] = b'{"tampered":true}'
+        self.object_store._objects[record.content_hash] = b'{"tampered":true}'
 
         with self.assertRaises(HashMismatchError):
             self.index.verify_snapshot(snapshot)

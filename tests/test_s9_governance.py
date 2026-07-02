@@ -8,6 +8,7 @@ from argus_core import (
     EmissionAuthorizationMinter,
     GovernanceLedger,
     InMemoryArtifactStore,
+    InMemoryObjectStore,
     InMemoryVerifierTrustStore,
     Lineage,
     Producer,
@@ -22,7 +23,8 @@ class S9GovernanceTests(unittest.TestCase):
         self.trust_store = InMemoryVerifierTrustStore()
         self.trust_store.register_key("s3-key", b"s3-secret")
         self.signer = C3ReportSigner(key_id="s3-key", secret=b"s3-secret")
-        self.store = InMemoryArtifactStore()
+        self.object_store = InMemoryObjectStore()
+        self.store = InMemoryArtifactStore(object_store=self.object_store)
         self.minter = EmissionAuthorizationMinter(signer_key_id="s9-hsm", secret=b"s9-secret")
         self.s9 = S9Governance(
             report_verifier=C3ReportVerifier(self.trust_store),
@@ -48,7 +50,7 @@ class S9GovernanceTests(unittest.TestCase):
 
     def test_intake_rejects_content_hash_mismatch(self) -> None:
         artifact = self._artifact()
-        self.store._objects[artifact.content_hash] = b'{"tampered":true}'
+        self.object_store._objects[artifact.content_hash] = b'{"tampered":true}'
 
         task = self.s9.create_review_task(
             report_payload=self._signed_report(claim_tier="recapitulated-known"),

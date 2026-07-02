@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 import json
+from pathlib import Path
 from typing import Any, Mapping
 
 from .canonical import canonical_json_bytes
@@ -36,6 +37,11 @@ class IllegalTierError(S8Error):
 
 class HashMismatchError(S8Error):
     """Raised when verify-on-read detects payload tampering."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.category = "HASH_MISMATCH"
+        self.reason = reason
 
 
 class WriteOnceViolationError(S8Error):
@@ -156,6 +162,147 @@ class ExternalSourceRef:
         return f"{self.source}:{self.external_id}"
 
 
+WRITE_ONCE_BUCKET = "write_once"
+SCRATCH_BUCKET = "scratch"
+
+
+class ObjectStoreFacade:
+    def put(self, content_hash: str, payload: bytes, *, bucket_class: str) -> None:
+        raise NotImplementedError
+
+    def get(self, content_hash: str) -> bytes:
+        raise NotImplementedError
+
+    def promote_to_write_once(self, content_hash: str) -> None:
+        raise NotImplementedError
+
+    def bucket_class(self, content_hash: str) -> str:
+        raise NotImplementedError
+
+    @property
+    def object_count(self) -> int:
+        raise NotImplementedError
+
+
+class InMemoryObjectStore(ObjectStoreFacade):
+    def __init__(self) -> None:
+        self._objects: dict[str, bytes] = {}
+        self._bucket_classes: dict[str, str] = {}
+
+    def put(self, content_hash: str, payload: bytes, *, bucket_class: str) -> None:
+        _assert_known_bucket_class(bucket_class)
+        _assert_payload_matches_hash(content_hash, payload)
+        existing = self._objects.get(content_hash)
+        if existing is None:
+            self._objects[content_hash] = payload
+        elif existing != payload:
+            raise HashMismatchError(f"existing object bytes do not match {content_hash}")
+        self._bucket_classes[content_hash] = _merged_bucket_class(
+            self._bucket_classes.get(content_hash),
+            bucket_class,
+        )
+
+    def get(self, content_hash: str) -> bytes:
+        payload = self._objects[content_hash]
+        _assert_payload_matches_hash(content_hash, payload)
+        return payload
+
+    def promote_to_write_once(self, content_hash: str) -> None:
+        if content_hash not in self._objects:
+            raise KeyError(content_hash)
+        self._bucket_classes[content_hash] = WRITE_ONCE_BUCKET
+
+    def bucket_class(self, content_hash: str) -> str:
+        return self._bucket_classes[content_hash]
+
+    @property
+    def object_count(self) -> int:
+        return len(self._objects)
+
+
+class FileSystemObjectStore(ObjectStoreFacade):
+    def __init__(self, root: str | Path) -> None:
+        self.root = Path(root)
+        (self.root / WRITE_ONCE_BUCKET).mkdir(parents=True, exist_ok=True)
+        (self.root / SCRATCH_BUCKET).mkdir(parents=True, exist_ok=True)
+
+    def put(self, content_hash: str, payload: bytes, *, bucket_class: str) -> None:
+        _assert_known_bucket_class(bucket_class)
+        _assert_payload_matches_hash(content_hash, payload)
+        existing_path = self.object_path(content_hash)
+        if existing_path is not None:
+            existing = existing_path.read_bytes()
+            _assert_payload_matches_hash(content_hash, existing)
+            if existing != payload:
+                raise HashMismatchError(f"existing object bytes do not match {content_hash}")
+            if bucket_class == WRITE_ONCE_BUCKET and existing_path.parent.name == SCRATCH_BUCKET:
+                self.promote_to_write_once(content_hash)
+            return
+
+        destination = self._path_for(content_hash, bucket_class)
+        try:
+            with destination.open("xb") as handle:
+                handle.write(payload)
+        except FileExistsError:
+            existing = destination.read_bytes()
+            if existing != payload:
+                raise HashMismatchError(f"existing object bytes do not match {content_hash}")
+
+    def get(self, content_hash: str) -> bytes:
+        existing_path = self.object_path(content_hash)
+        if existing_path is None:
+            raise KeyError(content_hash)
+        payload = existing_path.read_bytes()
+        _assert_payload_matches_hash(content_hash, payload)
+        return payload
+
+    def promote_to_write_once(self, content_hash: str) -> None:
+        write_once_path = self._path_for(content_hash, WRITE_ONCE_BUCKET)
+        scratch_path = self._path_for(content_hash, SCRATCH_BUCKET)
+        if write_once_path.exists():
+            _assert_payload_matches_hash(content_hash, write_once_path.read_bytes())
+            if scratch_path.exists():
+                scratch_payload = scratch_path.read_bytes()
+                _assert_payload_matches_hash(content_hash, scratch_payload)
+                if scratch_payload != write_once_path.read_bytes():
+                    raise HashMismatchError(f"scratch object bytes do not match {content_hash}")
+                scratch_path.unlink()
+            return
+        if not scratch_path.exists():
+            raise KeyError(content_hash)
+        scratch_payload = scratch_path.read_bytes()
+        _assert_payload_matches_hash(content_hash, scratch_payload)
+        scratch_path.replace(write_once_path)
+
+    def bucket_class(self, content_hash: str) -> str:
+        existing_path = self.object_path(content_hash)
+        if existing_path is None:
+            raise KeyError(content_hash)
+        return existing_path.parent.name
+
+    @property
+    def object_count(self) -> int:
+        names = {
+            path.name
+            for bucket in (WRITE_ONCE_BUCKET, SCRATCH_BUCKET)
+            for path in (self.root / bucket).iterdir()
+            if path.is_file()
+        }
+        return len(names)
+
+    def object_path(self, content_hash: str) -> Path | None:
+        write_once_path = self._path_for(content_hash, WRITE_ONCE_BUCKET)
+        if write_once_path.exists():
+            return write_once_path
+        scratch_path = self._path_for(content_hash, SCRATCH_BUCKET)
+        if scratch_path.exists():
+            return scratch_path
+        return None
+
+    def _path_for(self, content_hash: str, bucket_class: str) -> Path:
+        return self.root / bucket_class / _object_name(content_hash)
+
+
 def assert_lineage_complete(
     lineage: Lineage | Mapping[str, Any],
     *,
@@ -200,8 +347,13 @@ def _missing_lineage_fields(lineage: Lineage | Mapping[str, Any]) -> list[str]:
 class InMemoryArtifactStore:
     """A small write-once C4 store for exercising S8 invariants."""
 
-    def __init__(self, *, report_verifier: C3ReportVerifier | None = None) -> None:
-        self._objects: dict[str, bytes] = {}
+    def __init__(
+        self,
+        *,
+        report_verifier: C3ReportVerifier | None = None,
+        object_store: ObjectStoreFacade | None = None,
+    ) -> None:
+        self._object_store = object_store or InMemoryObjectStore()
         self._records: dict[str, ArtifactRecord] = {}
         self._record_hashes: dict[str, str] = {}
         self._parents: dict[str, set[str]] = {}
@@ -247,7 +399,7 @@ class InMemoryArtifactStore:
         if artifact_ref in self._records:
             existing = self._records[artifact_ref]
             if (
-                self._objects[existing.content_hash] != payload_bytes
+                self._object_store.get(existing.content_hash) != payload_bytes
                 or self._record_hashes[artifact_ref] != record_hash
             ):
                 raise WriteOnceViolationError(f"artifact_ref already exists: {artifact_ref}")
@@ -263,19 +415,21 @@ class InMemoryArtifactStore:
             claim_tier=claim_tier,
             validation_report_ref=validation_report_ref,
         )
-        self._objects.setdefault(content_hash, payload_bytes)
+        self._object_store.put(
+            content_hash,
+            payload_bytes,
+            bucket_class=self._bucket_class_for_record(kind=kind, claim_tier=claim_tier),
+        )
         self._records[artifact_ref] = record
         self._record_hashes[artifact_ref] = record_hash
         self._insert_lineage(record)
+        self._promote_referenced_inputs(record)
         self._append_audit_leaf(record)
         return record
 
     def get_artifact(self, artifact_ref: str) -> bytes:
         record = self._records[artifact_ref]
-        payload = self._objects[record.content_hash]
-        if hash_bytes(payload) != record.content_hash:
-            raise HashMismatchError(f"hash mismatch for {artifact_ref}")
-        return payload
+        return self._object_store.get(record.content_hash)
 
     def get_record(self, artifact_ref: str) -> ArtifactRecord:
         self.get_artifact(artifact_ref)
@@ -373,7 +527,7 @@ class InMemoryArtifactStore:
 
     @property
     def object_count(self) -> int:
-        return len(self._objects)
+        return self._object_store.object_count
 
     @property
     def record_count(self) -> int:
@@ -382,6 +536,10 @@ class InMemoryArtifactStore:
     @property
     def edge_count(self) -> int:
         return sum(len(edge_types) for edge_types in self._edge_types.values())
+
+    def bucket_class_for_artifact(self, artifact_ref: str) -> str:
+        record = self._records[artifact_ref]
+        return self._object_store.bucket_class(record.content_hash)
 
     def __len__(self) -> int:
         return len(self._records)
@@ -499,6 +657,14 @@ class InMemoryArtifactStore:
         if record.validation_report_ref:
             self._insert_edge(record.validation_report_ref, record.artifact_ref, "validation_report")
 
+    def _promote_referenced_inputs(self, record: ArtifactRecord) -> None:
+        for parent_ref in tuple(record.lineage.input_refs) + (
+            (record.validation_report_ref,) if record.validation_report_ref else ()
+        ):
+            if parent_ref in self._records:
+                parent_hash = self._records[parent_ref].content_hash
+                self._object_store.promote_to_write_once(parent_hash)
+
     def _insert_edge(self, source_ref: str, target_ref: str, edge_type: str) -> None:
         self._children.setdefault(source_ref, set()).add(target_ref)
         self._parents.setdefault(target_ref, set()).add(source_ref)
@@ -570,6 +736,12 @@ class InMemoryArtifactStore:
     def _zero_root() -> str:
         return f"{BLAKE3_PREFIX}{'0' * 64}"
 
+    @staticmethod
+    def _bucket_class_for_record(*, kind: str, claim_tier: str) -> str:
+        if kind == "report" or claim_tier != "ran-toy":
+            return WRITE_ONCE_BUCKET
+        return SCRATCH_BUCKET
+
     def _latest_checkpoint(self) -> AuditCheckpoint:
         if not self._audit_leaves:
             return AuditCheckpoint(sequence=0, root=self._zero_root())
@@ -599,3 +771,25 @@ class ExternalSourceRegistry:
     @staticmethod
     def _artifact_ref(source_id: str) -> str:
         return f"c4://external_source/{source_id}"
+
+
+def _assert_known_bucket_class(bucket_class: str) -> None:
+    if bucket_class not in {WRITE_ONCE_BUCKET, SCRATCH_BUCKET}:
+        raise ValueError(f"unknown bucket_class: {bucket_class}")
+
+
+def _assert_payload_matches_hash(content_hash: str, payload: bytes) -> None:
+    if hash_bytes(payload) != content_hash:
+        raise HashMismatchError(f"hash mismatch for {content_hash}")
+
+
+def _merged_bucket_class(existing: str | None, incoming: str) -> str:
+    if existing == WRITE_ONCE_BUCKET or incoming == WRITE_ONCE_BUCKET:
+        return WRITE_ONCE_BUCKET
+    return incoming
+
+
+def _object_name(content_hash: str) -> str:
+    if content_hash.startswith(BLAKE3_PREFIX):
+        return content_hash.removeprefix(BLAKE3_PREFIX)
+    return content_hash.replace(":", "_")
