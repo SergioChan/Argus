@@ -182,16 +182,9 @@ class ArgusM0RuntimeServiceTests(unittest.TestCase):
                 dsn="postgresql://argus@example/argus",
                 db_role=None,
             )
-        with self.assertRaisesRegex(RuntimeError, "ARGUS_S8_RUST_LEDGER_WRITER_CMD"):
-            _rust_ledger_writer_from_env(
-                {"ARGUS_S8_REQUIRE_RUST_LEDGER_WRITER": "1"},
-                dsn="postgresql://argus@example/argus",
-                db_role=None,
-            )
         with self.assertRaisesRegex(RuntimeError, "ARGUS_S8_CHECKPOINT_SIGNER_URL"):
             _rust_ledger_writer_from_env(
                 {
-                    "ARGUS_S8_REQUIRE_RUST_LEDGER_WRITER": "1",
                     "ARGUS_S8_RUST_LEDGER_WRITER_CMD": "argus-s8-ledger-writer",
                 },
                 dsn="postgresql://argus@example/argus",
@@ -872,7 +865,7 @@ class ArgusM0ComposeTests(unittest.TestCase):
             services["s8-writer"]["environment"]["ARGUS_S8_RUST_LEDGER_WRITER_CMD"],
             "/usr/local/bin/argus-s8-ledger-writer",
         )
-        self.assertEqual(services["s8-writer"]["environment"]["ARGUS_S8_REQUIRE_RUST_LEDGER_WRITER"], "1")
+        self.assertNotIn("ARGUS_S8_REQUIRE_RUST_LEDGER_WRITER", services["s8-writer"]["environment"])
         self.assertEqual(
             services["s8-writer"]["environment"]["ARGUS_S8_CHECKPOINT_SIGNER_URL"],
             "http://s10-supervisor:8080/v1/internal/s8-checkpoint-signatures",
