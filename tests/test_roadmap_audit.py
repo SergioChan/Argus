@@ -77,6 +77,79 @@ class RoadmapAuditTests(unittest.TestCase):
         self.assertIn("acceptance", errors[0])
         self.assertIn("push", errors[0])
 
+    def test_complete_task_requires_verifiable_evidence_anchor(self) -> None:
+        tasks = (
+            BacklogTask(
+                task_id="S1-T01",
+                title="Author canonical C1 JSON Schema",
+                estimate="M",
+                depends_on="C1",
+                interfaces_touched="C1",
+                acceptance_criteria="schema validates",
+            ),
+        )
+        stages = {"M0": StageStatus("M0", "not_started", "-", "-")}
+        stage_map = {"S1-T01": "M0"}
+        evidence_prefix = "acceptance=x; impl=x; unit=x; local=x; commit=x; push=x"
+
+        local_path_errors = validate_status(
+            tasks=tasks,
+            stage_map=stage_map,
+            stages=stages,
+            statuses={
+                "S1-T01": TaskStatus(
+                    task_id="S1-T01",
+                    stage="M0",
+                    status="complete",
+                    evidence=f"{evidence_prefix}; ci=GitHub Actions CI run 28605979333; local=/tmp/evidence.json",
+                )
+            },
+        )
+        no_anchor_errors = validate_status(
+            tasks=tasks,
+            stage_map=stage_map,
+            stages=stages,
+            statuses={
+                "S1-T01": TaskStatus(
+                    task_id="S1-T01",
+                    stage="M0",
+                    status="complete",
+                    evidence=evidence_prefix,
+                )
+            },
+        )
+        ci_anchor_errors = validate_status(
+            tasks=tasks,
+            stage_map=stage_map,
+            stages=stages,
+            statuses={
+                "S1-T01": TaskStatus(
+                    task_id="S1-T01",
+                    stage="M0",
+                    status="complete",
+                    evidence=f"{evidence_prefix}; ci=GitHub Actions CI run 28605979333",
+                )
+            },
+        )
+        repo_anchor_errors = validate_status(
+            tasks=tasks,
+            stage_map=stage_map,
+            stages=stages,
+            statuses={
+                "S1-T01": TaskStatus(
+                    task_id="S1-T01",
+                    stage="M0",
+                    status="complete",
+                    evidence=f"{evidence_prefix}; ci=docs/RoadmapStatus.md",
+                )
+            },
+        )
+
+        self.assertTrue(any("local-only path" in error for error in local_path_errors))
+        self.assertTrue(any("lacks a verifiable" in error for error in no_anchor_errors))
+        self.assertFalse(ci_anchor_errors)
+        self.assertFalse(repo_anchor_errors)
+
     def test_complete_stage_requires_all_stage_tasks_and_real_gates(self) -> None:
         tasks = (
             BacklogTask("S1-T01", "Author canonical C1 JSON Schema", "M", "C1", "C1", "schema validates"),

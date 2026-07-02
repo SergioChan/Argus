@@ -34,7 +34,7 @@ STAGE_DEPLOYED_STATES = {"deployed", "e2e_passed", "complete"}
 STAGE_E2E_STATES = {"e2e_passed", "complete"}
 LOCAL_ONLY_EVIDENCE_PATTERNS = ("/tmp/", "/Users/")
 CI_RUN_RE = re.compile(r"\b(?:github actions|ci)[^|`]*\brun\s+\d{8,}\b", re.I)
-REPO_EVIDENCE_FILE_RE = re.compile(r"(?:^|\s|`)((?:docs|artifacts|evidence|ci|reports)/[A-Za-z0-9._/+:-]+)")
+REPO_EVIDENCE_FILE_RE = re.compile(r"(?:^|\s|`|=)((?:docs|artifacts|evidence|ci|reports)/[A-Za-z0-9._/+:-]+)")
 
 TASK_ROW = re.compile(
     r"^\|\s*(S\d+-(?:T\d+[a-z]?|TPR\d+|TDB\d+))\s*"
@@ -240,6 +240,9 @@ def validate_status(
             missing_keys = [key for key in COMPLETE_EVIDENCE_KEYS if f"{key}=" not in status.evidence]
             if missing_keys:
                 errors.append(f"{status.task_id} complete without required evidence keys: {missing_keys}")
+            anchor_error = stage_evidence_anchor_error(status.evidence)
+            if anchor_error is not None:
+                errors.append(f"{status.task_id} complete evidence {anchor_error}")
 
     expected_gate_counts = count_stage_gates(stages)
     if summary_counts is not None:
