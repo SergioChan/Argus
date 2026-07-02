@@ -23,6 +23,7 @@ from argus_core import (
     PolicyBundle,
     PolicyDeniedError,
     ResourceCeilings,
+    SandboxExecutionResult,
     SandboxHandle,
     ScopeGrant,
     ScopeWideningError,
@@ -583,10 +584,12 @@ class S10DockerOrchestratorTests(unittest.TestCase):
         self.assertIn("ARGUS_SAFE=visible", result.stdout)
         self.assertNotIn("hidden", result.stdout)
         self.assertFalse(_has_default_route(result.stdout), result.stdout)
-        self.assertGreater(self.quota.state(request.budget_token.budget_id).reserved.wallclock_s, 0)
+        quota_state = self.quota.state(request.budget_token.budget_id)
+        self.assertEqual(quota_state.reserved, BudgetUsage())
+        self.assertGreater(quota_state.actual.wallclock_s, 0)
         self.assertEqual(
-            [event.event_type for event in self.audit.events()[-3:]],
-            ["sandbox.launched", "sandbox.started", "sandbox.exited"],
+            [event.event_type for event in self.audit.events()[-5:]],
+            ["sandbox.launched", "sandbox.started", "sandbox.exited", "budget.consume", "budget.release"],
         )
 
     def test_timeout_launch_records_timed_out_state(self) -> None:
@@ -597,7 +600,34 @@ class S10DockerOrchestratorTests(unittest.TestCase):
         self.assertEqual(result.handle.state, "TIMED_OUT")
         self.assertTrue(result.timed_out)
         self.assertEqual(self.orchestrator.get(result.handle.sandbox_id).state, "TIMED_OUT")
-        self.assertEqual(self.audit.events()[-1].event_type, "sandbox.timeout")
+        quota_state = self.quota.state(request.budget_token.budget_id)
+        self.assertEqual(quota_state.reserved, BudgetUsage())
+        self.assertGreater(quota_state.actual.wallclock_s, 0)
+        self.assertEqual(
+            [event.event_type for event in self.audit.events()[-5:]],
+            ["sandbox.launched", "sandbox.started", "sandbox.timeout", "budget.consume", "budget.release"],
+        )
+
+    def test_runtime_budget_exceed_halts_and_releases_reservation(self) -> None:
+        over_budget_usage = BudgetUsage(compute_units=11, wallclock_s=11)
+        self.orchestrator = DockerSandboxOrchestrator(
+            token_service=self.tokens,
+            quota_ledger=self.quota,
+            audit_ledger=self.audit,
+            policy_bundle=self.bundle,
+            supervisor=_FixedUsageSupervisor(over_budget_usage),
+        )
+        request = self._launch_request(args=("-c", "true"), env={}, env_allowlist=(), wallclock_s=1)
+
+        with self.assertRaises(BudgetExceededError):
+            self.orchestrator.launch_and_wait(request)
+
+        quota_state = self.quota.state(request.budget_token.budget_id)
+        self.assertTrue(quota_state.halted)
+        self.assertEqual(quota_state.reserved, BudgetUsage())
+        self.assertEqual(quota_state.actual.wallclock_s, 11)
+        self.assertIn("budget.halt", [event.event_type for event in self.audit.events()])
+        self.assertEqual(next(iter(self.orchestrator._handles.values())).state, "BUDGET_HALTED")
 
     @classmethod
     def _resolve_digest_pinned_busybox(cls) -> str:
@@ -668,6 +698,28 @@ def _has_default_route(route_table: str) -> bool:
         if len(fields) >= 2 and fields[0] != "Iface" and fields[1] == "00000000":
             return True
     return False
+
+
+class _FixedUsageSupervisor:
+    def __init__(self, budget_usage: BudgetUsage) -> None:
+        self._budget_usage = budget_usage
+
+    def run(
+        self,
+        *,
+        handle: SandboxHandle,
+        request: LaunchRequest,
+        materialized_env: dict[str, str],
+    ) -> SandboxExecutionResult:
+        return SandboxExecutionResult(
+            handle=handle,
+            exit_code=0,
+            stdout="",
+            stderr="",
+            timed_out=False,
+            duration_s=self._budget_usage.wallclock_s,
+            budget_usage=self._budget_usage,
+        )
 
 
 if __name__ == "__main__":

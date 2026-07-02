@@ -1034,6 +1034,7 @@ class DockerSandboxOrchestrator(InMemorySandboxOrchestrator):
     def launch_and_wait(self, request: LaunchRequest) -> SandboxExecutionResult:
         handle = super().launch(request)
         materialized_env = materialize_sandbox_env(request.env, request.env_allowlist)
+        reserved_usage = request.requested_envelope.budget_usage()
         self._audit_ledger.append(
             "sandbox.started",
             {"sandbox_id": handle.sandbox_id, "job_id": request.job_id, "runtime_class": handle.runtime_class},
@@ -1045,6 +1046,7 @@ class DockerSandboxOrchestrator(InMemorySandboxOrchestrator):
                 materialized_env=materialized_env,
             )
         except S10Error:
+            self._release_runtime_reservation(request, reserved_usage)
             failed_handle = replace(handle, state="FAILED")
             self._handles[handle.sandbox_id] = failed_handle
             self._audit_ledger.append(
@@ -1066,7 +1068,41 @@ class DockerSandboxOrchestrator(InMemorySandboxOrchestrator):
                 "duration_s": round(result.duration_s, 6),
             },
         )
+        try:
+            self._quota_ledger.consume(request.budget_token.budget_id, result.budget_usage)
+        except BudgetExceededError:
+            self._release_runtime_reservation(request, reserved_usage)
+            halted_handle = replace(handle, state="BUDGET_HALTED")
+            self._handles[handle.sandbox_id] = halted_handle
+            self._audit_ledger.append(
+                "budget.halt",
+                {
+                    "sandbox_id": handle.sandbox_id,
+                    "budget_id": request.budget_token.budget_id,
+                    "usage": asdict(result.budget_usage),
+                },
+            )
+            raise
+        self._audit_ledger.append(
+            "budget.consume",
+            {
+                "sandbox_id": handle.sandbox_id,
+                "budget_id": request.budget_token.budget_id,
+                "usage": asdict(result.budget_usage),
+            },
+        )
+        self._release_runtime_reservation(request, reserved_usage)
         return replace(result, handle=final_handle)
+
+    def _release_runtime_reservation(self, request: LaunchRequest, reserved_usage: BudgetUsage) -> None:
+        self._quota_ledger.release(request.budget_token.budget_id, reserved_usage)
+        self._audit_ledger.append(
+            "budget.release",
+            {
+                "budget_id": request.budget_token.budget_id,
+                "usage": asdict(reserved_usage),
+            },
+        )
 
 
 def _final_sandbox_state(result: SandboxExecutionResult) -> str:
