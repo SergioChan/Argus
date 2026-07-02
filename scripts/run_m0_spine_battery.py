@@ -214,8 +214,10 @@ def main() -> int:
             evidence,
             s8_url=s8_url,
             token=auth_tokens["read"],
+            health_token=runtime_secrets["health_token"],
             minio_port=ports["ARGUS_M0_MINIO_PORT"],
             model_record=model_record,
+            unrelated_ref=launch_result["launch_provenance_ref"],
         )
 
         if args.evidence_file:
@@ -695,8 +697,10 @@ def _battery_d_tamper_detected(
     *,
     s8_url: str,
     token: str,
+    health_token: str,
     minio_port: str,
     model_record: dict[str, Any],
+    unrelated_ref: str,
 ) -> None:
     from minio import Minio
 
@@ -714,11 +718,27 @@ def _battery_d_tamper_detected(
     response = _get_json(payload_url, token=token, expected_status=404)
     if response["error"] != "HashMismatchError":
         raise AssertionError(f"unexpected tamper detection payload: {response}")
+    tampered_record = _get_json(f"{s8_url}/v1/artifacts/{model_record['artifact_ref']}/record", token=token)
+    unrelated = _get_json(f"{s8_url}/v1/artifacts/{unrelated_ref}/record", token=token)
+    health = _get_json(f"{s8_url}/healthz", token=health_token)
+    if tampered_record["artifact_ref"] != model_record["artifact_ref"]:
+        raise AssertionError(f"tampered targeted record read returned wrong artifact: {tampered_record}")
+    if unrelated["artifact_ref"] != unrelated_ref:
+        raise AssertionError(f"unrelated targeted record read returned wrong artifact: {unrelated}")
+    if int(health["record_count"]) < 2:
+        raise AssertionError(f"unexpected S8 health record count after tamper: {health}")
     _record(
         evidence,
         "d",
-        "tampered MinIO object bytes detected by S8 verify-on-read",
-        {"error": response["error"], "artifact_ref": model_record["artifact_ref"]},
+        "tampered MinIO object bytes detected by S8 verify-on-read without breaking unrelated targeted reads",
+        {
+            "error": response["error"],
+            "artifact_ref": model_record["artifact_ref"],
+            "tampered_record_read_after_tamper": tampered_record["artifact_ref"],
+            "tampered_record_size_bytes_after_tamper": tampered_record["size_bytes"],
+            "unrelated_record_read_after_tamper": unrelated_ref,
+            "health_record_count_after_tamper": health["record_count"],
+        },
     )
 
 

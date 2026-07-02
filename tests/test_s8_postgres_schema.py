@@ -14,6 +14,7 @@ import unittest
 from argus_core import (
     DatasetRegistry,
     DatasetSplit,
+    HashMismatchError,
     InMemoryArtifactStore,
     InMemoryObjectStore,
     Lineage,
@@ -669,9 +670,9 @@ class S8PostgresSchemaTests(unittest.TestCase):
         )
         drift = self._apply_s8_migrations(check=False)
 
-        self.assertEqual(first_count.stdout.strip(), "9")
+        self.assertEqual(first_count.stdout.strip(), "10")
         self.assertIn("already applied with matching checksum", reapplied.stdout)
-        self.assertEqual(second_count.stdout.strip(), "9")
+        self.assertEqual(second_count.stdout.strip(), "10")
         self.assertNotEqual(drift.returncode, 0)
         self.assertIn("checksum drift", drift.stderr)
 
@@ -700,6 +701,38 @@ class S8PostgresSchemaTests(unittest.TestCase):
 
         self.assertEqual(refreshed.created_at, record.created_at)
         self.assertEqual(hash_json(asdict(refreshed)), stored_hash)
+
+    def test_postgres_store_targeted_reads_ignore_unrelated_tampered_object(self) -> None:
+        object_store = InMemoryObjectStore()
+        store = PostgresArtifactStore(
+            dsn=self._postgres_dsn(),
+            object_store=object_store,
+            db_role="argus_s8_ledger_writer",
+        )
+        good = store.create_artifact(
+            artifact_ref="c4://r8-m6/good",
+            kind="model",
+            payload={"weights": [1]},
+            producer=Producer(subsystem="S2", version="0.0.0"),
+            lineage=Lineage(input_refs=(), code_ref="git:r8-m6-good", environment_digest="oci:r8-m6-good"),
+        )
+        tampered = store.create_artifact(
+            artifact_ref="c4://r8-m6/tampered",
+            kind="model",
+            payload={"weights": [2]},
+            producer=Producer(subsystem="S2", version="0.0.0"),
+            lineage=Lineage(input_refs=(), code_ref="git:r8-m6-tampered", environment_digest="oci:r8-m6-tampered"),
+        )
+        object_store._objects[tampered.content_hash] = b'{"tampered":true}'
+
+        self.assertEqual(store.record_count, 2)
+        self.assertEqual(store.get_artifact_record(good.artifact_ref).artifact_ref, good.artifact_ref)
+        self.assertEqual(store.get_artifact_record(tampered.artifact_ref).size_bytes, len(b'{"weights":[2]}'))
+        self.assertEqual(store.get_artifact(good.artifact_ref), b'{"weights":[1]}')
+        with self.assertRaises(HashMismatchError):
+            store.get_artifact(tampered.artifact_ref)
+        with self.assertRaises(HashMismatchError):
+            store.get_record(tampered.artifact_ref)
 
     def test_read_query_functions_resolve_refs_filter_page_and_grant_reader(self) -> None:
         self._commit_record(

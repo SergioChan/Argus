@@ -164,6 +164,8 @@ class MinioObjectStore:
 class PostgresArtifactStore:
     """C4 store that writes payload bytes to MinIO and the append-only ledger to PostgreSQL."""
 
+    requires_service_refresh = False
+
     def __init__(self, *, dsn: str, object_store: MinioObjectStore, db_role: str | None = None) -> None:
         self._dsn = dsn
         self._object_store = object_store
@@ -216,20 +218,20 @@ class PostgresArtifactStore:
         if self._snapshot.record_count == before_count:
             return record
         self._commit_record(record)
-        self.refresh()
         return self.get_artifact_record(record.artifact_ref)
 
     def get_artifact(self, ref: str) -> bytes:
-        self.refresh()
-        return self._snapshot.get_artifact(ref)
+        row = self._fetch_record(ref, require_unique_record=False)
+        return self._object_store.get(str(row["content_hash"]))
 
     def get_record(self, artifact_ref: str) -> ArtifactRecord:
-        self.refresh()
-        return self._snapshot.get_record(artifact_ref)
+        row = self._fetch_record(artifact_ref, require_unique_record=True)
+        payload_bytes = self._object_store.get(str(row["content_hash"]))
+        return _record_from_row(row, size_bytes=len(payload_bytes))
 
     def get_artifact_record(self, ref: str) -> ArtifactRecord:
-        self.refresh()
-        return self._snapshot.get_artifact_record(ref)
+        row = self._fetch_record(ref, require_unique_record=True)
+        return self._record_from_row_with_metadata_size(row)
 
     def get_lineage(
         self,
@@ -269,16 +271,61 @@ class PostgresArtifactStore:
 
     @property
     def record_count(self) -> int:
-        self.refresh()
-        return self._snapshot.record_count
+        import psycopg
+
+        with psycopg.connect(self._dsn) as conn:
+            _set_role(conn, self._db_role)
+            with conn.cursor() as cur:
+                cur.execute("SELECT count(*) FROM s8.artifact_record;")
+                return int(cur.fetchone()[0])
 
     @property
     def object_count(self) -> int:
         return self._object_store.object_count
 
     def bucket_class_for_artifact(self, artifact_ref: str) -> str:
-        self.refresh()
-        return self._snapshot.bucket_class_for_artifact(artifact_ref)
+        row = self._fetch_record(artifact_ref, require_unique_record=True)
+        return self._object_store.bucket_class(str(row["content_hash"]))
+
+    def _fetch_record(self, ref: str, *, require_unique_record: bool) -> dict[str, Any]:
+        rows = self._fetch_records_by_ref(ref)
+        if not rows:
+            raise KeyError(ref)
+        exact = [row for row in rows if str(row["artifact_id"]) == ref]
+        if exact:
+            return exact[0]
+        if require_unique_record and len(rows) > 1:
+            raise KeyError(f"ambiguous content_hash: {ref}")
+        return rows[0]
+
+    def _fetch_records_by_ref(self, ref: str) -> list[dict[str, Any]]:
+        import psycopg
+        from psycopg.rows import dict_row
+
+        with psycopg.connect(self._dsn, row_factory=dict_row) as conn:
+            _set_role(conn, self._db_role)
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT
+                        artifact_id,
+                        content_hash,
+                        kind,
+                        producer,
+                        lineage,
+                        claim_tier,
+                        validation_report_ref,
+                        size_bytes,
+                        created_at
+                    FROM s8.artifact_record
+                    WHERE artifact_id = %s OR content_hash = %s
+                    ORDER BY
+                        CASE WHEN artifact_id = %s THEN 0 ELSE 1 END,
+                        merkle_seq;
+                    """,
+                    (ref, ref, ref),
+                )
+                return list(cur.fetchall())
 
     def _fetch_records(self) -> list[dict[str, Any]]:
         import psycopg
@@ -297,6 +344,7 @@ class PostgresArtifactStore:
                         lineage,
                         claim_tier,
                         validation_report_ref,
+                        size_bytes,
                         created_at
                     FROM s8.artifact_record
                     ORDER BY merkle_seq;
@@ -332,7 +380,7 @@ class PostgresArtifactStore:
                     cur.execute(
                         """
                         SELECT s8.commit_artifact_record(
-                            %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+                            %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
                         );
                         """,
                         (
@@ -347,6 +395,7 @@ class PostgresArtifactStore:
                             record.validation_report_ref,
                             list(record.lineage.input_refs),
                             record.created_at,
+                            record.size_bytes,
                         ),
                     )
                     inserted = bool(cur.fetchone()[0])
@@ -357,6 +406,13 @@ class PostgresArtifactStore:
                             """,
                             (record.artifact_ref, record_hash, sequence, previous_root, root),
                         )
+
+    def _record_from_row_with_metadata_size(self, row: dict[str, Any]) -> ArtifactRecord:
+        size_bytes = row.get("size_bytes")
+        if size_bytes is None:
+            payload_bytes = self._object_store.get(str(row["content_hash"]))
+            size_bytes = len(payload_bytes)
+        return _record_from_row(row, size_bytes=int(size_bytes))
 
 
 def build_postgres_minio_store_from_env(env: dict[str, str]) -> PostgresArtifactStore:

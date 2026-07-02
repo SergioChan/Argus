@@ -12,7 +12,16 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from argus_core import BudgetCaps, BudgetToken, FileSystemArtifactStore, Lineage, Producer, ScopeGrant, ScopeToken
+from argus_core import (
+    ArtifactRecord,
+    BudgetCaps,
+    BudgetToken,
+    FileSystemArtifactStore,
+    Lineage,
+    Producer,
+    ScopeGrant,
+    ScopeToken,
+)
 from argus_core import canonical_json_bytes
 from argus_runtime.auth import RuntimeAuth, RuntimeIdentity
 from argus_runtime.http_json import JsonRequest
@@ -102,6 +111,28 @@ class ArgusM0RuntimeServiceTests(unittest.TestCase):
 
             self.assertEqual(fetched["artifact_ref"], external.artifact_ref)
             self.assertEqual(app.store.record_count, 1)
+
+    def test_s8_writer_skips_service_refresh_for_live_store(self) -> None:
+        class LiveStore:
+            requires_service_refresh = False
+
+            def refresh(self) -> None:
+                raise AssertionError("live store should not be service-refreshed")
+
+            def get_artifact_record(self, ref: str) -> ArtifactRecord:
+                return ArtifactRecord(
+                    artifact_ref=ref,
+                    kind="model",
+                    content_hash="blake3:" + "0" * 64,
+                    size_bytes=2,
+                    producer=Producer(subsystem="S2", version="0.0.0"),
+                    lineage=Lineage(input_refs=(), code_ref="git:live", environment_digest="oci:live"),
+                    created_at="2026-07-02T00:00:00Z",
+                )
+
+        app = S8WriterApp(LiveStore())
+
+        self.assertEqual(app.get_artifact_record("c4://live")["artifact_ref"], "c4://live")
 
     def test_s8_writer_http_denies_direct_artifact_writes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

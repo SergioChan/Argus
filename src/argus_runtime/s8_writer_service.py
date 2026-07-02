@@ -96,7 +96,7 @@ class S8WriterApp:
     def _refresh_store(self) -> None:
         if self._data_dir is not None:
             self.store = FileSystemArtifactStore(self._data_dir)
-        elif hasattr(self.store, "refresh"):
+        elif hasattr(self.store, "refresh") and getattr(self.store, "requires_service_refresh", True):
             self.store.refresh()
 
     def _authenticate(self, request: JsonRequest) -> tuple[bool, dict[str, Any] | None]:
