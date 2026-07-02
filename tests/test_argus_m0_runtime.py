@@ -600,6 +600,26 @@ class ArgusM0RuntimeServiceTests(unittest.TestCase):
         self.assertEqual(payload["policy_signer_key_id"], "argus-m0-policy")
         self.assertEqual(payload["checkpoint_signer"], "s10-kms")
 
+    def test_s10_env_build_requires_checkpoint_signer_material_and_auth_token(self) -> None:
+        base_env = {
+            "ARGUS_S10_SIGNING_KEY": "test-s10-signing-key",
+            "ARGUS_RUNTIME_BOOTSTRAP_TOKEN": BOOTSTRAP_TOKEN,
+            "ARGUS_RUNTIME_IDENTITY_SIGNING_KEY": IDENTITY_SIGNING_KEY.decode("utf-8"),
+            "ARGUS_RUNTIME_IDENTITY_MINT_POLICY_JSON": _runtime_identity_mint_policy_json(),
+            "ARGUS_M0_HEALTH_TOKEN": HEALTH_TOKEN,
+            "ARGUS_S10_POLICY_SIGNING_KEY": POLICY_SIGNING_KEY,
+        }
+        with patch.dict(os.environ, base_env, clear=True):
+            with self.assertRaisesRegex(RuntimeError, "ARGUS_S10_CHECKPOINT_SIGNING_KEY"):
+                build_s10_app_from_env()
+        with patch.dict(
+            os.environ,
+            {**base_env, "ARGUS_S10_CHECKPOINT_SIGNING_KEY": CHECKPOINT_SIGNING_KEY},
+            clear=True,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "ARGUS_S10_CHECKPOINT_SIGNER_AUTH_TOKEN"):
+                build_s10_app_from_env()
+
     def test_s10_checkpoint_signer_route_is_internal_and_s10_owned(self) -> None:
         app = S10SupervisorApp(
             signing_key=b"test-key",
@@ -639,6 +659,21 @@ class ArgusM0RuntimeServiceTests(unittest.TestCase):
                 headers=_auth_headers(CHECKPOINT_SIGNER_AUTH_TOKEN),
             )
         )
+        unconfigured_app = S10SupervisorApp(
+            signing_key=b"test-key",
+            auth=_runtime_auth(),
+            checkpoint_signer=None,
+            checkpoint_signer_auth_token=CHECKPOINT_SIGNER_AUTH_TOKEN,
+        )
+        missing_signer_status, missing_signer_payload = unconfigured_app.http.handle(
+            JsonRequest(
+                method="POST",
+                path="/v1/internal/s8-checkpoint-signatures",
+                query={},
+                body=body,
+                headers=_auth_headers(CHECKPOINT_SIGNER_AUTH_TOKEN),
+            )
+        )
         tampered_status, tampered_payload = app.http.handle(
             JsonRequest(
                 method="POST",
@@ -658,6 +693,9 @@ class ArgusM0RuntimeServiceTests(unittest.TestCase):
         self.assertEqual(signed_payload["root"], body["root"])
         self.assertEqual(signed_payload["signer_key_id"], "argus-m0-s8-checkpoint")
         self.assertTrue(signed_payload["signature"].startswith("hmac-sha256:"))
+        self.assertEqual(missing_signer_status, 403)
+        self.assertEqual(missing_signer_payload["error"], "PermissionError")
+        self.assertEqual(missing_signer_payload["message"], "checkpoint signer is not configured")
         self.assertEqual(tampered_status, 400)
         self.assertEqual(tampered_payload["error"], "ValueError")
 

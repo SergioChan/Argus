@@ -774,6 +774,15 @@ class S8PostgresSchemaTests(unittest.TestCase):
         self.assertEqual(ledger_writer.records, [record])
         self.assertEqual(record_count.stdout.strip(), "0")
 
+    def test_postgres_store_requires_ledger_writer_when_flag_set(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "S8 Rust ledger writer is required"):
+            PostgresArtifactStore(
+                dsn=self._postgres_dsn(),
+                object_store=InMemoryObjectStore(),
+                db_role="argus_s8_ledger_writer",
+                require_ledger_writer=True,
+            )
+
     def test_postgres_store_uses_report_verifier_for_tier_coupling(self) -> None:
         trust_store = InMemoryVerifierTrustStore()
         trust_store.register_key("s3-key", b"s3-secret")
