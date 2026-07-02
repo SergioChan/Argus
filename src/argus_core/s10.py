@@ -1114,14 +1114,8 @@ class DockerSandboxOrchestrator(InMemorySandboxOrchestrator):
                 request=request,
                 materialized_env=materialized_env,
             )
-        except S10Error:
-            self._release_runtime_reservation(request, reserved_usage)
-            failed_handle = replace(handle, state="FAILED")
-            self._handles[handle.sandbox_id] = failed_handle
-            self._audit_ledger.append(
-                "sandbox.runtime_failed",
-                {"sandbox_id": handle.sandbox_id, "job_id": request.job_id},
-            )
+        except Exception as exc:
+            self._record_runtime_failure(handle, request, reserved_usage, exc)
             raise
 
         final_state = _final_sandbox_state(result)
@@ -1170,6 +1164,25 @@ class DockerSandboxOrchestrator(InMemorySandboxOrchestrator):
             {
                 "budget_id": request.budget_token.budget_id,
                 "usage": asdict(reserved_usage),
+            },
+        )
+
+    def _record_runtime_failure(
+        self,
+        handle: SandboxHandle,
+        request: LaunchRequest,
+        reserved_usage: BudgetUsage,
+        exc: Exception,
+    ) -> None:
+        self._release_runtime_reservation(request, reserved_usage)
+        failed_handle = replace(handle, state="FAILED")
+        self._handles[handle.sandbox_id] = failed_handle
+        self._audit_ledger.append(
+            "sandbox.runtime_failed",
+            {
+                "sandbox_id": handle.sandbox_id,
+                "job_id": request.job_id,
+                "error_type": type(exc).__name__,
             },
         )
 

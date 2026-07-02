@@ -29,6 +29,7 @@ from argus_core import (
     ResourceCeilings,
     SandboxExecutionResult,
     SandboxHandle,
+    SandboxRuntimeUnavailableError,
     ScopeDeniedError,
     ScopeGrant,
     ScopeWideningError,
@@ -813,6 +814,87 @@ class S10DockerOrchestratorTests(unittest.TestCase):
         )
 
 
+class S10DockerOrchestratorFailureTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tokens = InMemoryTokenService(signing_key=b"test-key", now_fn=lambda: 1_000)
+        self.quota = InMemoryQuotaLedger()
+        self.audit = InMemoryAuditLedger()
+        self.bundle = PolicyBundle(
+            bundle_version="1.0.0",
+            egress_allowlist=(),
+            resource_ceilings=ResourceCeilings(
+                cpu_m=1_000,
+                mem_bytes=128 * 1024 * 1024,
+                gpu_count=0,
+                wallclock_s=10,
+                max_cost_usd=1,
+            ),
+            risk_to_runtime={"standard": "docker"},
+            seccomp_profile_hash="blake3:" + "a" * 64,
+            signer_key_id="security",
+            signature="test-signature",
+        )
+
+    def test_supervisor_exceptions_release_reserved_quota_and_fail_handle(self) -> None:
+        for exc in (
+            SandboxRuntimeUnavailableError("docker runtime is unavailable"),
+            PermissionError("docker binary is not executable"),
+        ):
+            with self.subTest(error_type=type(exc).__name__):
+                quota = InMemoryQuotaLedger()
+                audit = InMemoryAuditLedger()
+                orchestrator = DockerSandboxOrchestrator(
+                    token_service=self.tokens,
+                    quota_ledger=quota,
+                    audit_ledger=audit,
+                    policy_bundle=self.bundle,
+                    supervisor=_RaisingSupervisor(exc),
+                )
+                request = self._launch_request()
+
+                with self.assertRaises(type(exc)):
+                    orchestrator.launch_and_wait(request)
+
+                quota_state = quota.state(request.budget_token.budget_id)
+                self.assertEqual(quota_state.reserved, BudgetUsage())
+                self.assertEqual(quota_state.actual, BudgetUsage())
+                self.assertEqual(next(iter(orchestrator._handles.values())).state, "FAILED")
+                self.assertEqual(
+                    [event.event_type for event in audit.events()[-4:]],
+                    ["sandbox.launched", "sandbox.started", "budget.release", "sandbox.runtime_failed"],
+                )
+                self.assertEqual(audit.events()[-1].payload["error_type"], type(exc).__name__)
+
+    def _launch_request(self) -> LaunchRequest:
+        budget = self.tokens.mint_budget(
+            caps=BudgetCaps(max_compute_units=10, max_wallclock_s=10, max_cost_usd=1),
+            job_id="job-1",
+            root_request_id="root-1",
+        )
+        scope = self.tokens.mint_scope(job_id="job-1", scopes=ScopeGrant())
+        return LaunchRequest(
+            job_id="job-1",
+            subagent_id="subagent-1",
+            trace_id="trace-1",
+            budget_token=budget,
+            scope_token=scope,
+            image="registry.local/argus@sha256:" + "b" * 64,
+            entrypoint=("/bin/sh",),
+            args=("-c", "true"),
+            env={},
+            env_allowlist=(),
+            requested_envelope=LaunchEnvelope(
+                cpu_m=500,
+                mem_bytes=64 * 1024 * 1024,
+                gpu_count=0,
+                wallclock_s=1,
+                scratch_bytes=1024 * 1024,
+                pids=16,
+                estimated_cost_usd=0.01,
+            ),
+        )
+
+
 def _has_default_route(route_table: str) -> bool:
     for line in route_table.splitlines():
         fields = line.split()
@@ -841,6 +923,20 @@ class _FixedUsageSupervisor:
             duration_s=self._budget_usage.wallclock_s,
             budget_usage=self._budget_usage,
         )
+
+
+class _RaisingSupervisor:
+    def __init__(self, exc: Exception) -> None:
+        self._exc = exc
+
+    def run(
+        self,
+        *,
+        handle: SandboxHandle,
+        request: LaunchRequest,
+        materialized_env: dict[str, str],
+    ) -> SandboxExecutionResult:
+        raise self._exc
 
 
 if __name__ == "__main__":
