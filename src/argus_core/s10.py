@@ -1007,3 +1007,71 @@ class InMemorySandboxOrchestrator:
             ),
         )
         return record.artifact_ref
+
+
+class DockerSandboxOrchestrator(InMemorySandboxOrchestrator):
+    """S10 admission path wired to the Docker node supervisor."""
+
+    def __init__(
+        self,
+        *,
+        token_service: InMemoryTokenService,
+        quota_ledger: InMemoryQuotaLedger,
+        audit_ledger: InMemoryAuditLedger,
+        policy_bundle: PolicyBundle,
+        artifact_store: InMemoryArtifactStore | None = None,
+        supervisor: DockerSandboxSupervisor | None = None,
+    ) -> None:
+        super().__init__(
+            token_service=token_service,
+            quota_ledger=quota_ledger,
+            audit_ledger=audit_ledger,
+            policy_bundle=policy_bundle,
+            artifact_store=artifact_store,
+        )
+        self._supervisor = supervisor or DockerSandboxSupervisor()
+
+    def launch_and_wait(self, request: LaunchRequest) -> SandboxExecutionResult:
+        handle = super().launch(request)
+        materialized_env = materialize_sandbox_env(request.env, request.env_allowlist)
+        self._audit_ledger.append(
+            "sandbox.started",
+            {"sandbox_id": handle.sandbox_id, "job_id": request.job_id, "runtime_class": handle.runtime_class},
+        )
+        try:
+            result = self._supervisor.run(
+                handle=handle,
+                request=request,
+                materialized_env=materialized_env,
+            )
+        except S10Error:
+            failed_handle = replace(handle, state="FAILED")
+            self._handles[handle.sandbox_id] = failed_handle
+            self._audit_ledger.append(
+                "sandbox.runtime_failed",
+                {"sandbox_id": handle.sandbox_id, "job_id": request.job_id},
+            )
+            raise
+
+        final_state = _final_sandbox_state(result)
+        final_handle = replace(handle, state=final_state)
+        self._handles[handle.sandbox_id] = final_handle
+        event_type = "sandbox.timeout" if result.timed_out else "sandbox.exited"
+        self._audit_ledger.append(
+            event_type,
+            {
+                "sandbox_id": handle.sandbox_id,
+                "job_id": request.job_id,
+                "exit_code": result.exit_code,
+                "duration_s": round(result.duration_s, 6),
+            },
+        )
+        return replace(result, handle=final_handle)
+
+
+def _final_sandbox_state(result: SandboxExecutionResult) -> str:
+    if result.timed_out:
+        return "TIMED_OUT"
+    if result.exit_code == 0:
+        return "SUCCEEDED"
+    return "FAILED"

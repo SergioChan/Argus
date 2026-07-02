@@ -10,6 +10,7 @@ from argus_core import (
     BudgetCaps,
     BudgetExceededError,
     BudgetUsage,
+    DockerSandboxOrchestrator,
     DockerSandboxSupervisor,
     EgressProxy,
     EgressRule,
@@ -520,6 +521,144 @@ class S10DockerSupervisorTests(unittest.TestCase):
             policy_bundle_version="1.0.0",
             seccomp_profile_hash="blake3:" + "a" * 64,
             state="ADMITTED",
+        )
+
+
+class S10DockerOrchestratorTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.docker_bin = shutil.which("docker")
+        if cls.docker_bin is None:
+            cls._skip_or_fail("docker CLI is unavailable")
+        version = subprocess.run(
+            [cls.docker_bin, "version", "--format", "{{.Server.Version}}"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if version.returncode != 0:
+            cls._skip_or_fail(f"docker daemon is unavailable: {version.stderr.strip()}")
+        cls.image = cls._resolve_digest_pinned_busybox()
+
+    def setUp(self) -> None:
+        self.tokens = InMemoryTokenService(signing_key=b"test-key", now_fn=lambda: 1_000)
+        self.quota = InMemoryQuotaLedger()
+        self.audit = InMemoryAuditLedger()
+        self.bundle = PolicyBundle(
+            bundle_version="1.0.0",
+            egress_allowlist=(),
+            resource_ceilings=ResourceCeilings(
+                cpu_m=1_000,
+                mem_bytes=128 * 1024 * 1024,
+                gpu_count=0,
+                wallclock_s=10,
+                max_cost_usd=1,
+            ),
+            risk_to_runtime={"standard": "docker"},
+            seccomp_profile_hash="blake3:" + "a" * 64,
+            signer_key_id="security",
+            signature="test-signature",
+        )
+        self.orchestrator = DockerSandboxOrchestrator(
+            token_service=self.tokens,
+            quota_ledger=self.quota,
+            audit_ledger=self.audit,
+            policy_bundle=self.bundle,
+            supervisor=DockerSandboxSupervisor(docker_bin=self.docker_bin),
+        )
+
+    def test_admission_launches_real_container_and_records_final_state(self) -> None:
+        request = self._launch_request(
+            args=("-c", "cat /proc/net/route; printf '\\nARGUS_SAFE=%s\\n' \"$ARGUS_SAFE\""),
+            env={"ARGUS_SAFE": "visible", "ARGUS_SECRET": "hidden"},
+            env_allowlist=("ARGUS_SAFE",),
+            wallclock_s=5,
+        )
+
+        result = self.orchestrator.launch_and_wait(request)
+
+        self.assertEqual(result.handle.state, "SUCCEEDED", result.stderr)
+        self.assertEqual(result.exit_code, 0, result.stderr)
+        self.assertEqual(self.orchestrator.get(result.handle.sandbox_id).state, "SUCCEEDED")
+        self.assertIn("ARGUS_SAFE=visible", result.stdout)
+        self.assertNotIn("hidden", result.stdout)
+        self.assertFalse(_has_default_route(result.stdout), result.stdout)
+        self.assertGreater(self.quota.state(request.budget_token.budget_id).reserved.wallclock_s, 0)
+        self.assertEqual(
+            [event.event_type for event in self.audit.events()[-3:]],
+            ["sandbox.launched", "sandbox.started", "sandbox.exited"],
+        )
+
+    def test_timeout_launch_records_timed_out_state(self) -> None:
+        request = self._launch_request(args=("-c", "sleep 5"), env={}, env_allowlist=(), wallclock_s=1)
+
+        result = self.orchestrator.launch_and_wait(request)
+
+        self.assertEqual(result.handle.state, "TIMED_OUT")
+        self.assertTrue(result.timed_out)
+        self.assertEqual(self.orchestrator.get(result.handle.sandbox_id).state, "TIMED_OUT")
+        self.assertEqual(self.audit.events()[-1].event_type, "sandbox.timeout")
+
+    @classmethod
+    def _resolve_digest_pinned_busybox(cls) -> str:
+        image = os.environ.get("ARGUS_S10_TEST_IMAGE", "busybox@sha256:73aaf090f3d85aa34ee199857f03fa3a95c8ede2ffd4cc2cdb5b94e566b11662")
+        inspect = subprocess.run(
+            [cls.docker_bin, "image", "inspect", image],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if inspect.returncode != 0:
+            pull = subprocess.run(
+                [cls.docker_bin, "pull", image],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            if pull.returncode != 0:
+                cls._skip_or_fail(f"cannot pull S10 test image {image}: {pull.stderr.strip()}")
+        return image
+
+    @classmethod
+    def _skip_or_fail(cls, reason: str) -> None:
+        if os.environ.get("ARGUS_REQUIRE_DOCKER_TESTS") == "1":
+            raise AssertionError(reason)
+        raise unittest.SkipTest(reason)
+
+    def _launch_request(
+        self,
+        *,
+        args: tuple[str, ...],
+        env: dict[str, str],
+        env_allowlist: tuple[str, ...],
+        wallclock_s: int,
+    ) -> LaunchRequest:
+        budget = self.tokens.mint_budget(
+            caps=BudgetCaps(max_compute_units=10, max_wallclock_s=10, max_cost_usd=1),
+            job_id="job-1",
+            root_request_id="root-1",
+        )
+        scope = self.tokens.mint_scope(job_id="job-1", scopes=ScopeGrant())
+        return LaunchRequest(
+            job_id="job-1",
+            subagent_id="subagent-1",
+            trace_id="trace-1",
+            budget_token=budget,
+            scope_token=scope,
+            image=self.image,
+            entrypoint=("/bin/sh",),
+            args=args,
+            env=env,
+            env_allowlist=env_allowlist,
+            requested_envelope=LaunchEnvelope(
+                cpu_m=500,
+                mem_bytes=64 * 1024 * 1024,
+                gpu_count=0,
+                wallclock_s=wallclock_s,
+                scratch_bytes=1024 * 1024,
+                pids=16,
+                estimated_cost_usd=0.01,
+            ),
         )
 
 
