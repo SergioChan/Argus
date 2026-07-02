@@ -1,0 +1,20 @@
+{
+  "budget_id": "budget-s10-golden",
+  "job_id": "job-s10-golden",
+  "root_request_id": "root-s10-golden",
+  "budget_epoch": 1,
+  "caps": {
+    "max_compute_units": 10,
+    "max_gpu_seconds": 0,
+    "max_model_tokens": 1000,
+    "max_wallclock_s": 60,
+    "max_cost_usd": 1.5
+  },
+  "risk_class": "standard",
+  "issued_at": 1782921600,
+  "expires_at": 1782925200,
+  "ttl_s": 3600,
+  "parent_budget_id": null,
+  "signer_key_id": "s10-key",
+  "signature": "hmac-sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+}

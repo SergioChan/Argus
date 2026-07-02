@@ -1,0 +1,397 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://argus.local/schemas/contracts/c10.s10-runtime.schema.json",
+  "title": "C10 S10 Runtime Wire Models",
+  "description": "Canonical wire schemas for S10 token, policy, quota, sandbox, audit, and checkpoint-signing payloads.",
+  "x-argus-contract": {
+    "id": "C10",
+    "owner": "S10",
+    "version": "1.0.0"
+  },
+  "oneOf": [
+    { "$ref": "#/$defs/BudgetToken" },
+    { "$ref": "#/$defs/ScopeToken" },
+    { "$ref": "#/$defs/PolicyBundle" },
+    { "$ref": "#/$defs/LaunchRequest" },
+    { "$ref": "#/$defs/PolicyVerdict" },
+    { "$ref": "#/$defs/SandboxHandle" },
+    { "$ref": "#/$defs/SandboxExecutionResult" },
+    { "$ref": "#/$defs/QuotaState" },
+    { "$ref": "#/$defs/AuditEvent" },
+    { "$ref": "#/$defs/EgressDecision" },
+    { "$ref": "#/$defs/StoreBrokerHandle" },
+    { "$ref": "#/$defs/S8CheckpointSignature" }
+  ],
+  "$defs": {
+    "ArtifactRef": {
+      "type": "string",
+      "pattern": "^c4://[A-Za-z0-9._:/-]+$"
+    },
+    "HashRef": {
+      "type": "string",
+      "pattern": "^blake3:[a-f0-9]{64}$"
+    },
+    "Signature": {
+      "type": "string",
+      "pattern": "^hmac-sha256:[a-f0-9]{64}$"
+    },
+    "SemVer": {
+      "type": "string",
+      "pattern": "^\\d+\\.\\d+\\.\\d+$"
+    },
+    "RuntimeClass": {
+      "type": "string",
+      "enum": ["auto", "gvisor", "firecracker", "docker"]
+    },
+    "RiskClass": {
+      "type": "string",
+      "enum": ["standard", "federated", "high"]
+    },
+    "BudgetCaps": {
+      "type": "object",
+      "required": ["max_compute_units", "max_gpu_seconds", "max_model_tokens", "max_wallclock_s", "max_cost_usd"],
+      "additionalProperties": false,
+      "properties": {
+        "max_compute_units": { "type": "number", "minimum": 0 },
+        "max_gpu_seconds": { "type": "number", "minimum": 0 },
+        "max_model_tokens": { "type": "number", "minimum": 0 },
+        "max_wallclock_s": { "type": "number", "minimum": 0 },
+        "max_cost_usd": { "type": "number", "minimum": 0 }
+      }
+    },
+    "BudgetUsage": {
+      "type": "object",
+      "required": ["compute_units", "gpu_seconds", "model_tokens", "wallclock_s", "cost_usd"],
+      "additionalProperties": false,
+      "properties": {
+        "compute_units": { "type": "number", "minimum": 0 },
+        "gpu_seconds": { "type": "number", "minimum": 0 },
+        "model_tokens": { "type": "number", "minimum": 0 },
+        "wallclock_s": { "type": "number", "minimum": 0 },
+        "cost_usd": { "type": "number", "minimum": 0 }
+      }
+    },
+    "EgressRule": {
+      "type": "object",
+      "required": ["host", "port", "proto"],
+      "additionalProperties": false,
+      "properties": {
+        "host": { "type": "string", "minLength": 1 },
+        "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
+        "proto": { "type": "string", "enum": ["https", "grpc", "tcp"] }
+      }
+    },
+    "ScopeGrant": {
+      "type": "object",
+      "required": [
+        "allowed_adapters",
+        "allowed_datasets",
+        "egress_allowlist",
+        "broker_audiences",
+        "producer_subsystems",
+        "sandbox_risk_class",
+        "disallowed_actions"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "allowed_adapters": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "uniqueItems": true
+        },
+        "allowed_datasets": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/ArtifactRef" },
+          "uniqueItems": true
+        },
+        "egress_allowlist": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/EgressRule" },
+          "uniqueItems": true
+        },
+        "broker_audiences": {
+          "type": "array",
+          "items": { "type": "string", "pattern": "^(store|model|adapter:[A-Za-z0-9._:-]+)$" },
+          "uniqueItems": true
+        },
+        "producer_subsystems": {
+          "type": "array",
+          "items": { "type": "string", "pattern": "^S\\d+$" },
+          "uniqueItems": true
+        },
+        "sandbox_risk_class": { "$ref": "#/$defs/RiskClass" },
+        "disallowed_actions": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "uniqueItems": true
+        }
+      }
+    },
+    "BudgetToken": {
+      "type": "object",
+      "required": [
+        "budget_id",
+        "job_id",
+        "root_request_id",
+        "budget_epoch",
+        "caps",
+        "risk_class",
+        "issued_at",
+        "expires_at",
+        "ttl_s",
+        "parent_budget_id",
+        "signer_key_id",
+        "signature"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "budget_id": { "type": "string", "minLength": 1 },
+        "job_id": { "type": "string", "minLength": 1 },
+        "root_request_id": { "type": "string", "minLength": 1 },
+        "budget_epoch": { "type": "integer", "minimum": 1 },
+        "caps": { "$ref": "#/$defs/BudgetCaps" },
+        "risk_class": { "$ref": "#/$defs/RiskClass" },
+        "issued_at": { "type": "integer", "minimum": 0 },
+        "expires_at": { "type": "integer", "minimum": 0 },
+        "ttl_s": { "type": "integer", "minimum": 1 },
+        "parent_budget_id": { "type": ["string", "null"], "minLength": 1 },
+        "signer_key_id": { "type": "string", "minLength": 1 },
+        "signature": { "$ref": "#/$defs/Signature" }
+      }
+    },
+    "ScopeToken": {
+      "type": "object",
+      "required": [
+        "scope_id",
+        "job_id",
+        "scopes",
+        "issued_at",
+        "expires_at",
+        "ttl_s",
+        "parent_scope_id",
+        "signer_key_id",
+        "signature"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "scope_id": { "type": "string", "minLength": 1 },
+        "job_id": { "type": "string", "minLength": 1 },
+        "scopes": { "$ref": "#/$defs/ScopeGrant" },
+        "issued_at": { "type": "integer", "minimum": 0 },
+        "expires_at": { "type": "integer", "minimum": 0 },
+        "ttl_s": { "type": "integer", "minimum": 1 },
+        "parent_scope_id": { "type": ["string", "null"], "minLength": 1 },
+        "signer_key_id": { "type": "string", "minLength": 1 },
+        "signature": { "$ref": "#/$defs/Signature" }
+      }
+    },
+    "ResourceCeilings": {
+      "type": "object",
+      "required": ["cpu_m", "mem_bytes", "gpu_count", "wallclock_s", "max_cost_usd"],
+      "additionalProperties": false,
+      "properties": {
+        "cpu_m": { "type": "integer", "minimum": 1 },
+        "mem_bytes": { "type": "integer", "minimum": 1 },
+        "gpu_count": { "type": "integer", "minimum": 0 },
+        "wallclock_s": { "type": "integer", "minimum": 1 },
+        "max_cost_usd": { "type": "number", "minimum": 0 }
+      }
+    },
+    "PolicyBundle": {
+      "type": "object",
+      "required": [
+        "bundle_version",
+        "egress_allowlist",
+        "resource_ceilings",
+        "risk_to_runtime",
+        "seccomp_profile_hash",
+        "signer_key_id",
+        "signature"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "bundle_version": { "$ref": "#/$defs/SemVer" },
+        "egress_allowlist": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/EgressRule" },
+          "uniqueItems": true
+        },
+        "resource_ceilings": { "$ref": "#/$defs/ResourceCeilings" },
+        "risk_to_runtime": {
+          "type": "object",
+          "minProperties": 1,
+          "additionalProperties": { "$ref": "#/$defs/RuntimeClass" }
+        },
+        "seccomp_profile_hash": { "$ref": "#/$defs/HashRef" },
+        "signer_key_id": { "type": "string", "minLength": 1 },
+        "signature": { "$ref": "#/$defs/Signature" }
+      }
+    },
+    "LaunchEnvelope": {
+      "type": "object",
+      "required": ["cpu_m", "mem_bytes", "gpu_count", "wallclock_s", "scratch_bytes", "pids", "estimated_cost_usd"],
+      "additionalProperties": false,
+      "properties": {
+        "cpu_m": { "type": "integer", "minimum": 1 },
+        "mem_bytes": { "type": "integer", "minimum": 1 },
+        "gpu_count": { "type": "integer", "minimum": 0 },
+        "wallclock_s": { "type": "integer", "minimum": 1 },
+        "scratch_bytes": { "type": "integer", "minimum": 0 },
+        "pids": { "type": "integer", "minimum": 1 },
+        "estimated_cost_usd": { "type": "number", "minimum": 0 }
+      }
+    },
+    "LaunchRequest": {
+      "type": "object",
+      "required": [
+        "job_id",
+        "subagent_id",
+        "trace_id",
+        "budget_token",
+        "scope_token",
+        "image",
+        "entrypoint",
+        "args",
+        "env",
+        "env_allowlist",
+        "requested_envelope",
+        "runtime_class_hint",
+        "policy_pin"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "job_id": { "type": "string", "minLength": 1 },
+        "subagent_id": { "type": "string", "minLength": 1 },
+        "trace_id": { "type": "string", "minLength": 1 },
+        "budget_token": { "$ref": "#/$defs/BudgetToken" },
+        "scope_token": { "$ref": "#/$defs/ScopeToken" },
+        "image": {
+          "type": "string",
+          "pattern": "^(?:[^\\s@]+@)?sha256:[0-9a-f]{64}$"
+        },
+        "entrypoint": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "args": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "env": {
+          "type": "object",
+          "additionalProperties": { "type": "string" }
+        },
+        "env_allowlist": {
+          "type": "array",
+          "items": { "type": "string", "pattern": "^[A-Z_][A-Z0-9_]*$" },
+          "uniqueItems": true
+        },
+        "requested_envelope": { "$ref": "#/$defs/LaunchEnvelope" },
+        "runtime_class_hint": { "$ref": "#/$defs/RuntimeClass" },
+        "policy_pin": { "type": ["string", "null"], "minLength": 1 }
+      }
+    },
+    "PolicyVerdict": {
+      "type": "object",
+      "required": ["allowed", "runtime_class", "egress_acl", "deny_reason"],
+      "additionalProperties": false,
+      "properties": {
+        "allowed": { "type": "boolean" },
+        "runtime_class": { "type": ["string", "null"], "enum": ["auto", "gvisor", "firecracker", "docker", null] },
+        "egress_acl": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/EgressRule" },
+          "uniqueItems": true
+        },
+        "deny_reason": { "type": ["string", "null"], "minLength": 1 }
+      }
+    },
+    "SandboxHandle": {
+      "type": "object",
+      "required": ["sandbox_id", "job_id", "runtime_class", "budget_epoch", "policy_bundle_version", "state", "launch_provenance_ref"],
+      "additionalProperties": false,
+      "properties": {
+        "sandbox_id": { "type": "string", "minLength": 1 },
+        "job_id": { "type": "string", "minLength": 1 },
+        "runtime_class": { "$ref": "#/$defs/RuntimeClass" },
+        "budget_epoch": { "type": "integer", "minimum": 1 },
+        "policy_bundle_version": { "$ref": "#/$defs/SemVer" },
+        "state": {
+          "type": "string",
+          "enum": ["ADMITTED", "RUNNING", "SUCCEEDED", "FAILED", "TIMED_OUT", "FROZEN", "TERMINATED", "QUARANTINED"]
+        },
+        "launch_provenance_ref": { "type": ["string", "null"], "pattern": "^c4://[A-Za-z0-9._:/-]+$" }
+      }
+    },
+    "SandboxExecutionResult": {
+      "type": "object",
+      "required": ["handle", "exit_code", "stdout", "stderr", "timed_out", "duration_s", "budget_usage"],
+      "additionalProperties": false,
+      "properties": {
+        "handle": { "$ref": "#/$defs/SandboxHandle" },
+        "exit_code": { "type": ["integer", "null"] },
+        "stdout": { "type": "string" },
+        "stderr": { "type": "string" },
+        "timed_out": { "type": "boolean" },
+        "duration_s": { "type": "number", "minimum": 0 },
+        "budget_usage": { "$ref": "#/$defs/BudgetUsage" }
+      }
+    },
+    "QuotaState": {
+      "type": "object",
+      "required": ["caps", "reserved", "actual", "halted"],
+      "additionalProperties": false,
+      "properties": {
+        "caps": { "$ref": "#/$defs/BudgetCaps" },
+        "reserved": { "$ref": "#/$defs/BudgetUsage" },
+        "actual": { "$ref": "#/$defs/BudgetUsage" },
+        "halted": { "type": "boolean" }
+      }
+    },
+    "AuditEvent": {
+      "type": "object",
+      "required": ["sequence", "event_type", "payload", "previous_hash", "event_hash"],
+      "additionalProperties": false,
+      "properties": {
+        "sequence": { "type": "integer", "minimum": 1 },
+        "event_type": { "type": "string", "minLength": 1 },
+        "payload": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "previous_hash": { "$ref": "#/$defs/HashRef" },
+        "event_hash": { "$ref": "#/$defs/HashRef" }
+      }
+    },
+    "EgressDecision": {
+      "type": "object",
+      "required": ["allowed", "reason"],
+      "additionalProperties": false,
+      "properties": {
+        "allowed": { "type": "boolean" },
+        "reason": { "type": "string" }
+      }
+    },
+    "StoreBrokerHandle": {
+      "type": "object",
+      "required": ["handle_id", "scope_id", "expires_at"],
+      "additionalProperties": false,
+      "properties": {
+        "handle_id": { "type": "string", "minLength": 1 },
+        "scope_id": { "type": "string", "minLength": 1 },
+        "expires_at": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "S8CheckpointSignature": {
+      "type": "object",
+      "required": ["sequence", "root", "signature", "signer_key_id"],
+      "additionalProperties": false,
+      "properties": {
+        "sequence": { "type": "integer", "minimum": 1 },
+        "root": { "$ref": "#/$defs/HashRef" },
+        "signature": { "$ref": "#/$defs/Signature" },
+        "signer_key_id": { "type": "string", "minLength": 1 }
+      }
+    }
+  }
+}

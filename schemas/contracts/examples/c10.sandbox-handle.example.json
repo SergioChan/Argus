@@ -1,0 +1,9 @@
+{
+  "sandbox_id": "sandbox-s10-golden",
+  "job_id": "job-s10-golden",
+  "runtime_class": "gvisor",
+  "budget_epoch": 1,
+  "policy_bundle_version": "1.0.0",
+  "state": "ADMITTED",
+  "launch_provenance_ref": "c4://artifact/launch-provenance"
+}

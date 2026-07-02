@@ -1,0 +1,10 @@
+{
+  "sequence": 1,
+  "event_type": "sandbox.started",
+  "payload": {
+    "sandbox_id": "sandbox-s10-golden",
+    "job_id": "job-s10-golden"
+  },
+  "previous_hash": "blake3:af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262",
+  "event_hash": "blake3:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+}

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate the local C1-C6 contract schema source tree."""
+"""Validate the local contract schema source tree."""
 
 from __future__ import annotations
 
@@ -21,6 +21,7 @@ EXPECTED_CONTRACT_CONSUMERS = {
     "C4": {"S1", "S2", "S3", "S4", "S5", "S6", "S7", "S9", "S10", "S11", "S12"},
     "C5": {"S1", "S2", "S3", "S4", "S5", "S7", "S9", "S10", "S11"},
     "C6": {"S1", "S2", "S3", "S5", "S6", "S10", "S11", "S12"},
+    "C10": {"S1", "S2", "S3", "S4", "S5", "S6", "S7", "S8", "S9", "S11", "S12"},
 }
 
 EXPECTED_CONTRACT_VERSIONS = {
@@ -30,6 +31,7 @@ EXPECTED_CONTRACT_VERSIONS = {
     "C4": "1.0.0",
     "C5": "1.0.0",
     "C6": "1.0.0",
+    "C10": "1.0.0",
 }
 
 C3_V11_FIELDS = {
@@ -69,6 +71,27 @@ C6_REQUIRED_DEFS = {
     "EvalResult",
     "OutputQuantity",
     "Quantity",
+}
+
+C10_REQUIRED_DEFS = {
+    "AuditEvent",
+    "BudgetCaps",
+    "BudgetToken",
+    "BudgetUsage",
+    "EgressDecision",
+    "EgressRule",
+    "LaunchEnvelope",
+    "LaunchRequest",
+    "PolicyBundle",
+    "PolicyVerdict",
+    "QuotaState",
+    "ResourceCeilings",
+    "S8CheckpointSignature",
+    "SandboxExecutionResult",
+    "SandboxHandle",
+    "ScopeGrant",
+    "ScopeToken",
+    "StoreBrokerHandle",
 }
 
 
@@ -205,6 +228,26 @@ def validate_contract_schema(entry: dict) -> None:
         if eval_result_outputs.get("$ref") != "#/$defs/OutputQuantity":
             fail("C6 EvalResult.outputs must reference OutputQuantity")
 
+    if contract_id == "C10":
+        definitions = schema.get("$defs", {})
+        missing_defs = sorted(C10_REQUIRED_DEFS - set(definitions))
+        if missing_defs:
+            fail(f"C10 schema missing canonical public definitions: {missing_defs}")
+        launch_request = definitions.get("LaunchRequest", {})
+        launch_required = set(launch_request.get("required", []))
+        for field in ("budget_token", "scope_token", "image", "requested_envelope", "runtime_class_hint"):
+            if field not in launch_required:
+                fail(f"C10 LaunchRequest missing required field: {field}")
+        image_schema = launch_request.get("properties", {}).get("image", {})
+        if "sha256" not in image_schema.get("pattern", ""):
+            fail("C10 LaunchRequest.image must require a digest-pinned image")
+        scope_grant = definitions.get("ScopeGrant", {})
+        if scope_grant.get("additionalProperties") is not False:
+            fail("C10 ScopeGrant must set additionalProperties=false")
+        policy_bundle = definitions.get("PolicyBundle", {})
+        if policy_bundle.get("properties", {}).get("signature", {}).get("$ref") != "#/$defs/Signature":
+            fail("C10 PolicyBundle.signature must reference Signature")
+
     example_path = EXAMPLES / f"{contract_id.lower()}.example.json"
     if not example_path.is_file():
         fail(f"{contract_id} example file does not exist: {example_path.relative_to(ROOT)}")
@@ -215,6 +258,16 @@ def validate_contract_schema(entry: dict) -> None:
         first = errors[0]
         location = ".".join(str(part) for part in first.path) or "<root>"
         fail(f"{example_path.relative_to(ROOT)} does not validate against {contract_id} at {location}: {first.message}")
+    if contract_id == "C10":
+        for golden_path in sorted(EXAMPLES.glob("c10.*.example.json")):
+            golden = load_json(golden_path)
+            golden_errors = sorted(validator.iter_errors(golden), key=lambda error: list(error.path))
+            if golden_errors:
+                first = golden_errors[0]
+                location = ".".join(str(part) for part in first.path) or "<root>"
+                fail(
+                    f"{golden_path.relative_to(ROOT)} does not validate against C10 at {location}: {first.message}"
+                )
 
 
 def main() -> int:

@@ -5,12 +5,13 @@
   "type": "module",
   "scripts": {
     "build": "tsc --project tsconfig.json",
-    "test": "npm run build && node dist/test/c4-smoke.js && node dist/test/argusverify-smoke.js"
+    "test": "npm run build && node dist/test/c4-smoke.js && node dist/test/s10-smoke.js && node dist/test/argusverify-smoke.js"
   },
   "exports": {
     ".": "./src/contracts.ts",
     "./argusverify": "./src/argusverify.ts",
-    "./c4": "./src/c4.ts"
+    "./c4": "./src/c4.ts",
+    "./s10": "./src/s10.ts"
   },
   "dependencies": {
     "@noble/hashes": "1.8.0"

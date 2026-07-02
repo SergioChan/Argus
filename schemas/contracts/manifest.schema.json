@@ -12,8 +12,8 @@
     },
     "contracts": {
       "type": "array",
-      "minItems": 6,
-      "maxItems": 6,
+      "minItems": 7,
+      "maxItems": 7,
       "items": {
         "type": "object",
         "required": ["id", "name", "owner", "version", "schema", "consumers"],
@@ -21,7 +21,7 @@
         "properties": {
           "id": {
             "type": "string",
-            "enum": ["C1", "C2", "C3", "C4", "C5", "C6"]
+            "enum": ["C1", "C2", "C3", "C4", "C5", "C6", "C10"]
           },
           "name": {
             "type": "string",
@@ -37,7 +37,7 @@
           },
           "schema": {
             "type": "string",
-            "pattern": "^c[1-6]\\..*\\.schema\\.json$"
+            "pattern": "^c(?:[1-6]|10)\\..*\\.schema\\.json$"
           },
           "consumers": {
             "type": "array",

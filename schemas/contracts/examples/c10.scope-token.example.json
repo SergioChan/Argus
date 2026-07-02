@@ -1,0 +1,25 @@
+{
+  "scope_id": "scope-s10-golden",
+  "job_id": "job-s10-golden",
+  "scopes": {
+    "allowed_adapters": ["adapter:toy-solver"],
+    "allowed_datasets": ["c4://dataset/golden"],
+    "egress_allowlist": [
+      {
+        "host": "store.local",
+        "port": 443,
+        "proto": "https"
+      }
+    ],
+    "broker_audiences": ["store", "adapter:toy-solver"],
+    "producer_subsystems": ["S2"],
+    "sandbox_risk_class": "standard",
+    "disallowed_actions": ["direct_store_write"]
+  },
+  "issued_at": 1782921600,
+  "expires_at": 1782925200,
+  "ttl_s": 3600,
+  "parent_scope_id": null,
+  "signer_key_id": "s10-key",
+  "signature": "hmac-sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+}

@@ -1,7 +1,8 @@
 # Generated Contract Bindings
 
-This directory contains generated binding metadata for C1-C6 and generated C4
-ArtifactRecord bindings for Python, TypeScript, and Rust.
+This directory contains generated binding metadata for C1-C6/C10, generated C4
+ArtifactRecord bindings, and generated C10 S10 runtime wire bindings for Python,
+TypeScript, and Rust.
 
 Do not edit generated files directly. Run:
 

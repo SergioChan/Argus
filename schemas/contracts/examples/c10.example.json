@@ -1,0 +1,68 @@
+{
+  "job_id": "job-s10-golden",
+  "subagent_id": "subagent-s10-golden",
+  "trace_id": "trace-s10-golden",
+  "budget_token": {
+    "budget_id": "budget-s10-golden",
+    "job_id": "job-s10-golden",
+    "root_request_id": "root-s10-golden",
+    "budget_epoch": 1,
+    "caps": {
+      "max_compute_units": 10,
+      "max_gpu_seconds": 0,
+      "max_model_tokens": 1000,
+      "max_wallclock_s": 60,
+      "max_cost_usd": 1.5
+    },
+    "risk_class": "standard",
+    "issued_at": 1782921600,
+    "expires_at": 1782925200,
+    "ttl_s": 3600,
+    "parent_budget_id": null,
+    "signer_key_id": "s10-key",
+    "signature": "hmac-sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  },
+  "scope_token": {
+    "scope_id": "scope-s10-golden",
+    "job_id": "job-s10-golden",
+    "scopes": {
+      "allowed_adapters": ["adapter:toy-solver"],
+      "allowed_datasets": ["c4://dataset/golden"],
+      "egress_allowlist": [
+        {
+          "host": "store.local",
+          "port": 443,
+          "proto": "https"
+        }
+      ],
+      "broker_audiences": ["store", "adapter:toy-solver"],
+      "producer_subsystems": ["S2"],
+      "sandbox_risk_class": "standard",
+      "disallowed_actions": ["direct_store_write"]
+    },
+    "issued_at": 1782921600,
+    "expires_at": 1782925200,
+    "ttl_s": 3600,
+    "parent_scope_id": null,
+    "signer_key_id": "s10-key",
+    "signature": "hmac-sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+  },
+  "image": "ghcr.io/project-argus/sandbox@sha256:1111111111111111111111111111111111111111111111111111111111111111",
+  "entrypoint": ["/bin/sh"],
+  "args": ["-lc", "echo argus"],
+  "env": {
+    "ARGUS_MODE": "golden"
+  },
+  "env_allowlist": ["ARGUS_MODE"],
+  "requested_envelope": {
+    "cpu_m": 250,
+    "mem_bytes": 134217728,
+    "gpu_count": 0,
+    "wallclock_s": 30,
+    "scratch_bytes": 1048576,
+    "pids": 32,
+    "estimated_cost_usd": 0.01
+  },
+  "runtime_class_hint": "auto",
+  "policy_pin": null
+}

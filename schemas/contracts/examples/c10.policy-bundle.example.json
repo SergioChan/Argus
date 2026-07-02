@@ -1,0 +1,25 @@
+{
+  "bundle_version": "1.0.0",
+  "egress_allowlist": [
+    {
+      "host": "store.local",
+      "port": 443,
+      "proto": "https"
+    }
+  ],
+  "resource_ceilings": {
+    "cpu_m": 1000,
+    "mem_bytes": 536870912,
+    "gpu_count": 0,
+    "wallclock_s": 120,
+    "max_cost_usd": 2.0
+  },
+  "risk_to_runtime": {
+    "standard": "gvisor",
+    "federated": "firecracker",
+    "high": "firecracker"
+  },
+  "seccomp_profile_hash": "blake3:af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262",
+  "signer_key_id": "s10-policy-key",
+  "signature": "hmac-sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+}

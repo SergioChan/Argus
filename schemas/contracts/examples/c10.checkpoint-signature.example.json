@@ -1,0 +1,6 @@
+{
+  "sequence": 1,
+  "root": "blake3:af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262",
+  "signature": "hmac-sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+  "signer_key_id": "argus-m0-s8-checkpoint"
+}
