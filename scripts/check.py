@@ -14,6 +14,7 @@ CHECKS = (
     ("schema-compat", ("python3", "scripts/schema_compatibility.py", "--check-manifest")),
     ("bindings", ("python3", "scripts/generate_bindings.py", "--check")),
     ("rust-bindings", ("cargo", "check", "--manifest-path", "bindings/rust/Cargo.toml")),
+    ("rust-tests", ("cargo", "test", "--manifest-path", "bindings/rust/Cargo.toml")),
     ("unit-tests", ("python3", "-m", "unittest", "discover", "-s", "tests")),
     (
         "py-compile",

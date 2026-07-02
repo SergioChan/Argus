@@ -163,6 +163,9 @@ def render_rust_manifest() -> str:
             "[lib]",
             'path = "src/lib.rs"',
             "",
+            "[dependencies]",
+            'blake3 = "1"',
+            "",
         ]
     )
 
@@ -184,6 +187,10 @@ def render_rust_lib(items: list[dict]) -> str:
     return "\n".join(
         [
             f"// {HEADER}",
+            "",
+            "pub mod hash;",
+            "",
+            "pub use hash::{hash_blob, hash_blob_stream, hash_bytes, BlobHasher, HashBlob, HashBlobError, BLAKE3_PREFIX, CANON_VERSION};",
             "",
             "#[derive(Debug, Clone, Copy, PartialEq, Eq)]",
             "pub struct Contract {",

@@ -1,6 +1,6 @@
-.PHONY: check docs roadmap-audit schemas schema-compat bindings rust-bindings test lint
+.PHONY: check docs roadmap-audit schemas schema-compat bindings rust-bindings rust-test test lint
 
-check: docs roadmap-audit schemas schema-compat bindings rust-bindings test lint
+check: docs roadmap-audit schemas schema-compat bindings rust-bindings rust-test test lint
 
 docs:
 	python3 scripts/validate_docs.py
@@ -19,6 +19,9 @@ bindings:
 
 rust-bindings:
 	cargo check --manifest-path bindings/rust/Cargo.toml
+
+rust-test:
+	cargo test --manifest-path bindings/rust/Cargo.toml
 
 test:
 	python3 -m unittest discover -s tests
