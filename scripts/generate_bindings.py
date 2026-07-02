@@ -742,6 +742,13 @@ import {{ createHmac, type BinaryLike }} from "node:crypto";
 
 export const C3_SIGNATURE_ALGORITHM = "hmac-sha256";
 export const C3_SIGNATURE_PREFIX = "hmac-sha256:";
+export const SIGNATURE_VERIFICATION_ACCEPTED = "signature_accepted";
+export const SIGNATURE_VERIFICATION_ABSTAIN = "signature_abstain";
+export type SignatureVerificationDelegationResult =
+  | typeof SIGNATURE_VERIFICATION_ACCEPTED
+  | typeof SIGNATURE_VERIFICATION_ABSTAIN
+  | string
+  | undefined;
 
 export interface VerifierKey {{
   key_id: string;
@@ -764,7 +771,7 @@ export interface VerifierTrustStore {{
     key_id: string;
     report_with_empty_signature: Record<string, unknown>;
     signature_value: string;
-  }}): string | undefined;
+  }}): SignatureVerificationDelegationResult;
 }}
 
 export class InMemoryVerifierTrustStore implements VerifierTrustStore {{
@@ -784,6 +791,10 @@ export class InMemoryVerifierTrustStore implements VerifierTrustStore {{
 
   getKey(keyId: string): VerifierKey | undefined {{
     return this.keys.get(keyId);
+  }}
+
+  verifySignatureValue(): SignatureVerificationDelegationResult {{
+    return SIGNATURE_VERIFICATION_ABSTAIN;
   }}
 }}
 
@@ -845,18 +856,25 @@ export function verifyReport(
     key_id: keyId,
     value: "",
   }};
-  const delegatedReason = trustStore.verifySignatureValue?.({{
+  const delegation = trustStore.verifySignatureValue?.({{
     key_id: keyId,
     report_with_empty_signature: unsigned,
     signature_value: value,
   }});
-  if (delegatedReason !== undefined) {{
-    return invalid(delegatedReason, keyId);
+  if (delegation === SIGNATURE_VERIFICATION_ACCEPTED) {{
+    return validVerification(report, keyId);
   }}
-  if (trustStore.verifySignatureValue === undefined && !constantTimeStringEqual(value, signatureValue(unsigned, key.secret))) {{
+  if (delegation !== undefined && delegation !== SIGNATURE_VERIFICATION_ABSTAIN) {{
+    return invalid(delegation, keyId);
+  }}
+  if (!constantTimeStringEqual(value, signatureValue(unsigned, key.secret))) {{
     return invalid("signature_invalid", keyId);
   }}
 
+  return validVerification(report, keyId);
+}}
+
+function validVerification(report: Record<string, unknown>, keyId: string): C3SignatureVerification {{
   return {{
     valid: true,
     key_id: keyId,
@@ -983,6 +1001,10 @@ import assert from "node:assert/strict";
 
 import {{
   InMemoryVerifierTrustStore,
+  SIGNATURE_VERIFICATION_ABSTAIN,
+  SIGNATURE_VERIFICATION_ACCEPTED,
+  type SignatureVerificationDelegationResult,
+  type VerifierKey,
   signReport,
   verifyReport,
 }} from "../src/argusverify.js";
@@ -1012,6 +1034,64 @@ const tampered = JSON.parse(JSON.stringify(signed)) as Record<string, unknown>;
 const tamperedVerification = verifyReport(tampered, trustStore);
 assert.equal(tamperedVerification.valid, false);
 assert.equal(tamperedVerification.error_code, "SIGNATURE_INVALID");
+
+class SecretlessDelegatingTrustStore {{
+  getKey(keyId: string): VerifierKey | undefined {{
+    if (keyId !== "{C3_ARGUSVERIFY_KEY_ID}") {{
+      return undefined;
+    }}
+    return {{ key_id: keyId, secret: "" }};
+  }}
+
+  verifySignatureValue(args: {{
+    key_id: string;
+    report_with_empty_signature: Record<string, unknown>;
+    signature_value: string;
+  }}): SignatureVerificationDelegationResult {{
+    assert.equal(args.key_id, "{C3_ARGUSVERIFY_KEY_ID}");
+    assert.equal((args.report_with_empty_signature.signature as Record<string, unknown>).value, "");
+    if (args.signature_value === (signed.signature as Record<string, unknown>).value) {{
+      return SIGNATURE_VERIFICATION_ACCEPTED;
+    }}
+    return "signature_invalid";
+  }}
+}}
+
+const delegatedValid = verifyReport(signed, new SecretlessDelegatingTrustStore());
+assert.equal(delegatedValid.valid, true);
+const forgedSignature = JSON.parse(JSON.stringify(signed)) as Record<string, unknown>;
+(forgedSignature.signature as Record<string, unknown>).value = "hmac-sha256:bad";
+const delegatedInvalid = verifyReport(forgedSignature, new SecretlessDelegatingTrustStore());
+assert.equal(delegatedInvalid.valid, false);
+assert.equal(delegatedInvalid.error_code, "SIGNATURE_INVALID");
+
+class AbstainingTrustStore {{
+  constructor(private readonly delegation: SignatureVerificationDelegationResult) {{}}
+
+  getKey(keyId: string): VerifierKey | undefined {{
+    if (keyId !== "{C3_ARGUSVERIFY_KEY_ID}") {{
+      return undefined;
+    }}
+    return {{ key_id: keyId, secret: "" }};
+  }}
+
+  verifySignatureValue(args: {{
+    key_id: string;
+    report_with_empty_signature: Record<string, unknown>;
+    signature_value: string;
+  }}): SignatureVerificationDelegationResult {{
+    assert.equal(args.key_id, "{C3_ARGUSVERIFY_KEY_ID}");
+    assert.equal((args.report_with_empty_signature.signature as Record<string, unknown>).value, "");
+    assert.equal(args.signature_value, (signed.signature as Record<string, unknown>).value);
+    return this.delegation;
+  }}
+}}
+
+for (const delegation of [undefined, SIGNATURE_VERIFICATION_ABSTAIN]) {{
+  const abstained = verifyReport(signed, new AbstainingTrustStore(delegation));
+  assert.equal(abstained.valid, false);
+  assert.equal(abstained.error_code, "SIGNATURE_INVALID");
+}}
 
 const unsigned = JSON.parse(JSON.stringify(signed)) as Record<string, unknown>;
 delete unsigned.signature;
@@ -1077,7 +1157,7 @@ def render_rust_lib(items: list[dict]) -> str:
             "pub mod hash;",
             "pub mod ledger;",
             "",
-            "pub use argusverify::{sign_report, verify_report, C3SignatureVerification, InMemoryVerifierTrustStore, VerifierKey, VerifierTrustStore, C3_SIGNATURE_ALGORITHM, C3_SIGNATURE_PREFIX};",
+            "pub use argusverify::{sign_report, verify_report, C3SignatureVerification, InMemoryVerifierTrustStore, VerifierKey, VerifierTrustStore, C3_SIGNATURE_ALGORITHM, C3_SIGNATURE_PREFIX, SIGNATURE_VERIFICATION_ABSTAIN, SIGNATURE_VERIFICATION_ACCEPTED};",
             "pub use c4::{ArtifactRecord, ClaimTier, Lineage, Producer, RetentionPolicy, C4_SCHEMA_SHA256};",
             "pub use hash::{hash_blob, hash_blob_stream, hash_bytes, BlobHasher, HashBlob, HashBlobError, BLAKE3_PREFIX, CANON_VERSION};",
             "pub use ledger::{ArtifactRecordDraft, CheckpointSigner, MerkleCheckpoint, PostgresLedgerWriter};",
@@ -1250,6 +1330,8 @@ use std::collections::BTreeMap;
 
 pub const C3_SIGNATURE_ALGORITHM: &str = "hmac-sha256";
 pub const C3_SIGNATURE_PREFIX: &str = "hmac-sha256:";
+pub const SIGNATURE_VERIFICATION_ACCEPTED: &str = "signature_accepted";
+pub const SIGNATURE_VERIFICATION_ABSTAIN: &str = "signature_abstain";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifierKey {{
@@ -1281,6 +1363,7 @@ pub struct C3SignatureVerification {{
 pub trait VerifierTrustStore {{
     fn get_key(&self, key_id: &str) -> Option<&VerifierKey>;
 
+    /// Return Some(Ok(())) to accept, Some(Err(reason)) to reject, or None to abstain.
     fn verify_signature_value(
         &self,
         _key_id: &str,
@@ -1681,6 +1764,50 @@ mod tests {{
         bad_signature["signature"]["value"] = Value::String("hmac-sha256:bad".to_string());
         let invalid = verify_report(&bad_signature, &trust_store);
         assert!(!invalid.valid);
+        assert_eq!(invalid.error_code.as_deref(), Some("SIGNATURE_INVALID"));
+    }}
+
+    struct AbstainingTrustStore {{
+        key: VerifierKey,
+    }}
+
+    impl VerifierTrustStore for AbstainingTrustStore {{
+        fn get_key(&self, key_id: &str) -> Option<&VerifierKey> {{
+            if key_id == self.key.key_id {{
+                Some(&self.key)
+            }} else {{
+                None
+            }}
+        }}
+
+        fn verify_signature_value(
+            &self,
+            key_id: &str,
+            report_with_empty_signature: &Value,
+            signature_value: &str,
+        ) -> Option<Result<(), String>> {{
+            assert_eq!(key_id, self.key.key_id);
+            assert_eq!(report_with_empty_signature["signature"]["value"], "");
+            assert!(signature_value.starts_with(C3_SIGNATURE_PREFIX));
+            None
+        }}
+    }}
+
+    #[test]
+    fn argusverify_abstaining_delegate_falls_back_and_fails_closed() {{
+        let signed = sign_report(
+            &vector_report(),
+            "{C3_ARGUSVERIFY_KEY_ID}",
+            "{C3_ARGUSVERIFY_SECRET}".as_bytes(),
+        )
+        .expect("sign vector");
+        let trust_store = AbstainingTrustStore {{
+            key: VerifierKey::new("{C3_ARGUSVERIFY_KEY_ID}", Vec::<u8>::new()),
+        }};
+
+        let invalid = verify_report(&signed, &trust_store);
+        assert!(!invalid.valid);
+        assert_eq!(invalid.reason.as_deref(), Some("signature_invalid"));
         assert_eq!(invalid.error_code.as_deref(), Some("SIGNATURE_INVALID"));
     }}
 }}

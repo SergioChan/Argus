@@ -13,6 +13,8 @@ import math
 
 C3_SIGNATURE_ALGORITHM = "hmac-sha256"
 C3_SIGNATURE_PREFIX = "hmac-sha256:"
+SIGNATURE_VERIFICATION_ACCEPTED = "signature_accepted"
+SIGNATURE_VERIFICATION_ABSTAIN = "signature_abstain"
 
 _ERROR_CODES = {
     "signature_missing": "UNSIGNED",
@@ -46,6 +48,15 @@ class VerifierTrustStore(Protocol):
     def get_key(self, key_id: str) -> VerifierKey | None:
         ...
 
+    def verify_signature_value(
+        self,
+        *,
+        key_id: str,
+        report_with_empty_signature: dict[str, Any],
+        signature_value: str,
+    ) -> str | None:
+        ...
+
 
 class InMemoryVerifierTrustStore:
     """Read-only verifier-key trust store used by early S8/S3 tests."""
@@ -62,6 +73,15 @@ class InMemoryVerifierTrustStore:
 
     def get_key(self, key_id: str) -> VerifierKey | None:
         return self._keys.get(key_id)
+
+    def verify_signature_value(
+        self,
+        *,
+        key_id: str,
+        report_with_empty_signature: dict[str, Any],
+        signature_value: str,
+    ) -> str | None:
+        return SIGNATURE_VERIFICATION_ABSTAIN
 
 
 class C3ReportSigner:
@@ -130,16 +150,24 @@ def verify_report(report: dict[str, Any], trust_store: VerifierTrustStore) -> C3
         "key_id": key_id,
         "value": "",
     }
+    delegation: str | None = SIGNATURE_VERIFICATION_ABSTAIN
     verify_signature_value = getattr(trust_store, "verify_signature_value", None)
     if callable(verify_signature_value):
-        reason = verify_signature_value(
+        delegation = verify_signature_value(
             key_id=key_id,
             report_with_empty_signature=unsigned,
             signature_value=value,
         )
-        if reason is not None:
-            return _invalid(str(reason), key_id=key_id)
-    else:
+    if delegation == SIGNATURE_VERIFICATION_ACCEPTED:
+        return C3SignatureVerification(
+            valid=True,
+            key_id=key_id,
+            claim_tier=report.get("claim_tier") if isinstance(report.get("claim_tier"), str) else None,
+            aggregate_passed=_aggregate_passed(report),
+        )
+    if delegation not in (None, SIGNATURE_VERIFICATION_ABSTAIN):
+        return _invalid(str(delegation), key_id=key_id)
+    if delegation in (None, SIGNATURE_VERIFICATION_ABSTAIN):
         expected = C3ReportSigner._signature_value(unsigned, key.secret)
         if not hmac.compare_digest(value, expected):
             return _invalid("signature_invalid", key_id=key_id)
@@ -263,6 +291,8 @@ __all__ = [
     "C3_SIGNATURE_ALGORITHM",
     "C3_SIGNATURE_PREFIX",
     "InMemoryVerifierTrustStore",
+    "SIGNATURE_VERIFICATION_ABSTAIN",
+    "SIGNATURE_VERIFICATION_ACCEPTED",
     "VerifierKey",
     "VerifierTrustStore",
     "sign_report",

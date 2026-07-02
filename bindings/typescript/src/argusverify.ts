@@ -4,6 +4,13 @@ import { createHmac, type BinaryLike } from "node:crypto";
 
 export const C3_SIGNATURE_ALGORITHM = "hmac-sha256";
 export const C3_SIGNATURE_PREFIX = "hmac-sha256:";
+export const SIGNATURE_VERIFICATION_ACCEPTED = "signature_accepted";
+export const SIGNATURE_VERIFICATION_ABSTAIN = "signature_abstain";
+export type SignatureVerificationDelegationResult =
+  | typeof SIGNATURE_VERIFICATION_ACCEPTED
+  | typeof SIGNATURE_VERIFICATION_ABSTAIN
+  | string
+  | undefined;
 
 export interface VerifierKey {
   key_id: string;
@@ -26,7 +33,7 @@ export interface VerifierTrustStore {
     key_id: string;
     report_with_empty_signature: Record<string, unknown>;
     signature_value: string;
-  }): string | undefined;
+  }): SignatureVerificationDelegationResult;
 }
 
 export class InMemoryVerifierTrustStore implements VerifierTrustStore {
@@ -46,6 +53,10 @@ export class InMemoryVerifierTrustStore implements VerifierTrustStore {
 
   getKey(keyId: string): VerifierKey | undefined {
     return this.keys.get(keyId);
+  }
+
+  verifySignatureValue(): SignatureVerificationDelegationResult {
+    return SIGNATURE_VERIFICATION_ABSTAIN;
   }
 }
 
@@ -107,18 +118,25 @@ export function verifyReport(
     key_id: keyId,
     value: "",
   };
-  const delegatedReason = trustStore.verifySignatureValue?.({
+  const delegation = trustStore.verifySignatureValue?.({
     key_id: keyId,
     report_with_empty_signature: unsigned,
     signature_value: value,
   });
-  if (delegatedReason !== undefined) {
-    return invalid(delegatedReason, keyId);
+  if (delegation === SIGNATURE_VERIFICATION_ACCEPTED) {
+    return validVerification(report, keyId);
   }
-  if (trustStore.verifySignatureValue === undefined && !constantTimeStringEqual(value, signatureValue(unsigned, key.secret))) {
+  if (delegation !== undefined && delegation !== SIGNATURE_VERIFICATION_ABSTAIN) {
+    return invalid(delegation, keyId);
+  }
+  if (!constantTimeStringEqual(value, signatureValue(unsigned, key.secret))) {
     return invalid("signature_invalid", keyId);
   }
 
+  return validVerification(report, keyId);
+}
+
+function validVerification(report: Record<string, unknown>, keyId: string): C3SignatureVerification {
   return {
     valid: true,
     key_id: keyId,

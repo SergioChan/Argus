@@ -7,6 +7,8 @@ use std::collections::BTreeMap;
 
 pub const C3_SIGNATURE_ALGORITHM: &str = "hmac-sha256";
 pub const C3_SIGNATURE_PREFIX: &str = "hmac-sha256:";
+pub const SIGNATURE_VERIFICATION_ACCEPTED: &str = "signature_accepted";
+pub const SIGNATURE_VERIFICATION_ABSTAIN: &str = "signature_abstain";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifierKey {
@@ -38,6 +40,7 @@ pub struct C3SignatureVerification {
 pub trait VerifierTrustStore {
     fn get_key(&self, key_id: &str) -> Option<&VerifierKey>;
 
+    /// Return Some(Ok(())) to accept, Some(Err(reason)) to reject, or None to abstain.
     fn verify_signature_value(
         &self,
         _key_id: &str,
@@ -488,6 +491,50 @@ mod tests {
         bad_signature["signature"]["value"] = Value::String("hmac-sha256:bad".to_string());
         let invalid = verify_report(&bad_signature, &trust_store);
         assert!(!invalid.valid);
+        assert_eq!(invalid.error_code.as_deref(), Some("SIGNATURE_INVALID"));
+    }
+
+    struct AbstainingTrustStore {
+        key: VerifierKey,
+    }
+
+    impl VerifierTrustStore for AbstainingTrustStore {
+        fn get_key(&self, key_id: &str) -> Option<&VerifierKey> {
+            if key_id == self.key.key_id {
+                Some(&self.key)
+            } else {
+                None
+            }
+        }
+
+        fn verify_signature_value(
+            &self,
+            key_id: &str,
+            report_with_empty_signature: &Value,
+            signature_value: &str,
+        ) -> Option<Result<(), String>> {
+            assert_eq!(key_id, self.key.key_id);
+            assert_eq!(report_with_empty_signature["signature"]["value"], "");
+            assert!(signature_value.starts_with(C3_SIGNATURE_PREFIX));
+            None
+        }
+    }
+
+    #[test]
+    fn argusverify_abstaining_delegate_falls_back_and_fails_closed() {
+        let signed = sign_report(
+            &vector_report(),
+            "s3-key",
+            "s3-secret".as_bytes(),
+        )
+        .expect("sign vector");
+        let trust_store = AbstainingTrustStore {
+            key: VerifierKey::new("s3-key", Vec::<u8>::new()),
+        };
+
+        let invalid = verify_report(&signed, &trust_store);
+        assert!(!invalid.valid);
+        assert_eq!(invalid.reason.as_deref(), Some("signature_invalid"));
         assert_eq!(invalid.error_code.as_deref(), Some("SIGNATURE_INVALID"));
     }
 }

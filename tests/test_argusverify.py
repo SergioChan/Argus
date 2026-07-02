@@ -5,7 +5,15 @@ import unittest
 
 import argusverify
 from argus_core import C3ReportVerifier
-from argusverify import C3ReportSigner, InMemoryVerifierTrustStore, sign_report, verify_report
+from argusverify import (
+    C3ReportSigner,
+    InMemoryVerifierTrustStore,
+    SIGNATURE_VERIFICATION_ABSTAIN,
+    SIGNATURE_VERIFICATION_ACCEPTED,
+    VerifierKey,
+    sign_report,
+    verify_report,
+)
 
 
 VECTOR_REPORT = {
@@ -106,6 +114,70 @@ class ArgusVerifyTests(unittest.TestCase):
         self.assertFalse(revoked_verification.valid)
         self.assertEqual(revoked_verification.reason, "revoked_key")
         self.assertEqual(revoked_verification.error_code, "REVOKED_KEY")
+
+    def test_secretless_delegating_trust_store_requires_explicit_accept(self) -> None:
+        signed = sign_report(VECTOR_REPORT, key_id="s3-key", secret=b"s3-secret")
+        case = self
+
+        class SecretlessDelegatingTrustStore:
+            def get_key(self, key_id: str) -> VerifierKey | None:
+                if key_id != "s3-key":
+                    return None
+                return VerifierKey(key_id=key_id, secret=b"")
+
+            def verify_signature_value(
+                self,
+                *,
+                key_id: str,
+                report_with_empty_signature: dict[str, object],
+                signature_value: str,
+            ) -> str | None:
+                case.assertEqual(key_id, "s3-key")
+                case.assertEqual(report_with_empty_signature["signature"]["value"], "")
+                if signature_value == signed["signature"]["value"]:
+                    return SIGNATURE_VERIFICATION_ACCEPTED
+                return "signature_invalid"
+
+        valid = verify_report(signed, SecretlessDelegatingTrustStore())
+        self.assertTrue(valid.valid)
+
+        forged = deepcopy(signed)
+        forged["signature"]["value"] = "hmac-sha256:bad"
+        invalid = verify_report(forged, SecretlessDelegatingTrustStore())
+        self.assertFalse(invalid.valid)
+        self.assertEqual(invalid.error_code, "SIGNATURE_INVALID")
+
+    def test_delegating_trust_store_abstain_falls_back_and_fails_closed(self) -> None:
+        signed = sign_report(VECTOR_REPORT, key_id="s3-key", secret=b"s3-secret")
+        case = self
+
+        class AbstainingTrustStore:
+            def __init__(self, delegation: str | None) -> None:
+                self._delegation = delegation
+
+            def get_key(self, key_id: str) -> VerifierKey | None:
+                if key_id != "s3-key":
+                    return None
+                return VerifierKey(key_id=key_id, secret=b"")
+
+            def verify_signature_value(
+                self,
+                *,
+                key_id: str,
+                report_with_empty_signature: dict[str, object],
+                signature_value: str,
+            ) -> str | None:
+                case.assertEqual(key_id, "s3-key")
+                case.assertEqual(report_with_empty_signature["signature"]["value"], "")
+                case.assertEqual(signature_value, signed["signature"]["value"])
+                return self._delegation
+
+        for delegation in (None, SIGNATURE_VERIFICATION_ABSTAIN):
+            with self.subTest(delegation=delegation):
+                verification = verify_report(signed, AbstainingTrustStore(delegation))
+                self.assertFalse(verification.valid)
+                self.assertEqual(verification.reason, "signature_invalid")
+                self.assertEqual(verification.error_code, "SIGNATURE_INVALID")
 
     def test_canonical_number_policy_matches_cross_language_boundaries(self) -> None:
         rendered = argusverify._canonical_json_text(

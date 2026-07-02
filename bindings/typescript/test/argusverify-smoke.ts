@@ -4,6 +4,10 @@ import assert from "node:assert/strict";
 
 import {
   InMemoryVerifierTrustStore,
+  SIGNATURE_VERIFICATION_ABSTAIN,
+  SIGNATURE_VERIFICATION_ACCEPTED,
+  type SignatureVerificationDelegationResult,
+  type VerifierKey,
   signReport,
   verifyReport,
 } from "../src/argusverify.js";
@@ -83,6 +87,64 @@ const tampered = JSON.parse(JSON.stringify(signed)) as Record<string, unknown>;
 const tamperedVerification = verifyReport(tampered, trustStore);
 assert.equal(tamperedVerification.valid, false);
 assert.equal(tamperedVerification.error_code, "SIGNATURE_INVALID");
+
+class SecretlessDelegatingTrustStore {
+  getKey(keyId: string): VerifierKey | undefined {
+    if (keyId !== "s3-key") {
+      return undefined;
+    }
+    return { key_id: keyId, secret: "" };
+  }
+
+  verifySignatureValue(args: {
+    key_id: string;
+    report_with_empty_signature: Record<string, unknown>;
+    signature_value: string;
+  }): SignatureVerificationDelegationResult {
+    assert.equal(args.key_id, "s3-key");
+    assert.equal((args.report_with_empty_signature.signature as Record<string, unknown>).value, "");
+    if (args.signature_value === (signed.signature as Record<string, unknown>).value) {
+      return SIGNATURE_VERIFICATION_ACCEPTED;
+    }
+    return "signature_invalid";
+  }
+}
+
+const delegatedValid = verifyReport(signed, new SecretlessDelegatingTrustStore());
+assert.equal(delegatedValid.valid, true);
+const forgedSignature = JSON.parse(JSON.stringify(signed)) as Record<string, unknown>;
+(forgedSignature.signature as Record<string, unknown>).value = "hmac-sha256:bad";
+const delegatedInvalid = verifyReport(forgedSignature, new SecretlessDelegatingTrustStore());
+assert.equal(delegatedInvalid.valid, false);
+assert.equal(delegatedInvalid.error_code, "SIGNATURE_INVALID");
+
+class AbstainingTrustStore {
+  constructor(private readonly delegation: SignatureVerificationDelegationResult) {}
+
+  getKey(keyId: string): VerifierKey | undefined {
+    if (keyId !== "s3-key") {
+      return undefined;
+    }
+    return { key_id: keyId, secret: "" };
+  }
+
+  verifySignatureValue(args: {
+    key_id: string;
+    report_with_empty_signature: Record<string, unknown>;
+    signature_value: string;
+  }): SignatureVerificationDelegationResult {
+    assert.equal(args.key_id, "s3-key");
+    assert.equal((args.report_with_empty_signature.signature as Record<string, unknown>).value, "");
+    assert.equal(args.signature_value, (signed.signature as Record<string, unknown>).value);
+    return this.delegation;
+  }
+}
+
+for (const delegation of [undefined, SIGNATURE_VERIFICATION_ABSTAIN]) {
+  const abstained = verifyReport(signed, new AbstainingTrustStore(delegation));
+  assert.equal(abstained.valid, false);
+  assert.equal(abstained.error_code, "SIGNATURE_INVALID");
+}
 
 const unsigned = JSON.parse(JSON.stringify(signed)) as Record<string, unknown>;
 delete unsigned.signature;

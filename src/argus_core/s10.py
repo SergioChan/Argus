@@ -13,7 +13,7 @@ from typing import Any, Callable
 from uuid import uuid4
 
 from .canonical import canonical_json_bytes
-from .c3 import C3_SIGNATURE_PREFIX, VerifierKey
+from .c3 import C3_SIGNATURE_PREFIX, SIGNATURE_VERIFICATION_ACCEPTED, VerifierKey
 from .hashing import BLAKE3_PREFIX, hash_json
 from .s8 import ArtifactRecord, InMemoryArtifactStore, Lineage, Producer
 
@@ -316,7 +316,7 @@ class InMemoryS10KmsVerifierKeyProvider:
         expected = f"{C3_SIGNATURE_PREFIX}{digest}"
         if not hmac.compare_digest(signature_value, expected):
             return "signature_invalid"
-        return None
+        return SIGNATURE_VERIFICATION_ACCEPTED
 
 
 class S10VerifierTrustStoreClient:
