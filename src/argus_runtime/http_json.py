@@ -13,11 +13,20 @@ JsonHandler = Callable[["JsonRequest"], tuple[int, Any]]
 
 
 class JsonRequest:
-    def __init__(self, *, method: str, path: str, query: dict[str, list[str]], body: Any | None) -> None:
+    def __init__(
+        self,
+        *,
+        method: str,
+        path: str,
+        query: dict[str, list[str]],
+        body: Any | None,
+        headers: dict[str, str] | None = None,
+    ) -> None:
         self.method = method
         self.path = path
         self.query = query
         self.body = body
+        self.headers = {key.lower(): value for key, value in (headers or {}).items()}
 
 
 class JsonHttpApp:
@@ -68,6 +77,7 @@ def serve_json_app(app: JsonHttpApp, *, host: str, port: int) -> None:
                     path=unquote(parsed.path),
                     query=parse_qs(parsed.query),
                     body=self._read_body(),
+                    headers={key.lower(): value for key, value in self.headers.items()},
                 )
             )
             encoded = json.dumps(_jsonable(payload), sort_keys=True).encode("utf-8")
@@ -97,4 +107,3 @@ def _jsonable(value: Any) -> Any:
     if isinstance(value, (list, tuple)):
         return [_jsonable(item) for item in value]
     return value
-

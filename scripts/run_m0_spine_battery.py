@@ -70,6 +70,7 @@ def main() -> int:
     data_tmp = tempfile.TemporaryDirectory(prefix="argus-m0-s8-")
     data_dir = Path(data_tmp.name)
     _prepare_shared_data_dir(data_dir)
+    auth_tokens = _m0_auth_tokens()
     ports = {
         "ARGUS_M0_POSTGRES_PORT": str(_free_port()),
         "ARGUS_M0_MINIO_PORT": str(_free_port()),
@@ -81,6 +82,8 @@ def main() -> int:
         **os.environ,
         **ports,
         "ARGUS_M0_S8_DATA_DIR": str(data_dir),
+        "ARGUS_RUNTIME_AUTH_TOKENS_JSON": json.dumps(_m0_auth_config(auth_tokens), sort_keys=True),
+        "ARGUS_M0_HEALTH_TOKEN": auth_tokens["health"],
     }
     s8_url = f"http://127.0.0.1:{ports['ARGUS_M0_S8_PORT']}"
     s10_url = f"http://127.0.0.1:{ports['ARGUS_M0_S10_PORT']}"
@@ -90,42 +93,35 @@ def main() -> int:
         "s10_url": s10_url,
         "s8_data_dir": str(data_dir),
         "ports": ports,
+        "auth_callers": ["health", "write", "spine", "halt"],
     }
 
     try:
         if not args.skip_compose_up:
             _record(evidence, "deploy", "argus-m0 compose up --build --wait")
             _run([docker, "compose", "-f", args.compose_file, "up", "-d", "--build", "--wait"], env=env, timeout=240)
-        _wait_health(f"{s8_url}/healthz")
-        _wait_health(f"{s10_url}/healthz")
+        _wait_health(f"{s8_url}/healthz", token=auth_tokens["health"])
+        _wait_health(f"{s10_url}/healthz", token=auth_tokens["health"])
         _ensure_image(docker, args.image)
 
         _battery_a_contracts(evidence)
-        write_scope_json = _mint_store_scope(s10_url=s10_url, job_id="m0-spine-write-tests")
-        _battery_direct_s8_write_denied(evidence, s8_url)
-        _battery_b_incomplete_lineage(evidence, s10_url, write_scope_json)
-        _battery_c_write_once(evidence, s10_url, write_scope_json)
+        _battery_runtime_auth_required(evidence, s8_url, s10_url)
+        write_scope_json = _mint_store_scope(s10_url=s10_url, token=auth_tokens["write"])
+        _battery_direct_s8_write_denied(evidence, s8_url, token=auth_tokens["health"])
+        _battery_b_incomplete_lineage(evidence, s10_url, write_scope_json, token=auth_tokens["write"])
+        _battery_c_write_once(evidence, s10_url, write_scope_json, token=auth_tokens["write"])
 
         budget_json = _post_json(
             f"{s10_url}/v1/budget-tokens",
-            {
-                "job_id": "m0-spine-job",
-                "root_request_id": "m0-spine-root",
-                "caps": {"max_compute_units": 10, "max_wallclock_s": 10, "max_cost_usd": 5},
-            },
+            {},
             expected_status=201,
+            token=auth_tokens["spine"],
         )
         scope_json = _post_json(
             f"{s10_url}/v1/scope-tokens",
-            {
-                "job_id": "m0-spine-job",
-                "scopes": {
-                    "broker_audiences": ["store"],
-                    "producer_subsystems": ["S2"],
-                    "sandbox_risk_class": "standard",
-                },
-            },
+            {},
             expected_status=201,
+            token=auth_tokens["spine"],
         )
         launch_result = _run_no_network_launch(
             image=args.image,
@@ -148,9 +144,13 @@ def main() -> int:
                 },
             },
             expected_status=201,
+            token=auth_tokens["spine"],
         )
-        fetched = _get_json(f"{s8_url}/v1/artifacts/{model_record['artifact_ref']}/record")
-        lineage = _get_json(f"{s8_url}/v1/lineage/{model_record['artifact_ref']}?direction=ancestors")
+        fetched = _get_json(f"{s8_url}/v1/artifacts/{model_record['artifact_ref']}/record", token=auth_tokens["health"])
+        lineage = _get_json(
+            f"{s8_url}/v1/lineage/{model_record['artifact_ref']}?direction=ancestors",
+            token=auth_tokens["health"],
+        )
         ancestor_refs = {node["artifact_ref"] for node in lineage["nodes"]}
         if fetched["producer"]["job_id"] != "m0-spine-job":
             raise AssertionError("broker did not seal producer job_id")
@@ -167,7 +167,7 @@ def main() -> int:
             },
         )
 
-        _battery_e_budget_halt(evidence, s10_url, args.image, data_dir)
+        _battery_e_budget_halt(evidence, s10_url, args.image, data_dir, token=auth_tokens["halt"])
         _battery_g_argusverify(evidence)
         _battery_d_tamper_detected(evidence, data_dir)
 
@@ -195,22 +195,76 @@ def _battery_a_contracts(evidence: dict[str, Any]) -> None:
     _record(evidence, "a", "schemas meta-validated and Python/TypeScript/Rust binding gates passed")
 
 
-def _mint_store_scope(*, s10_url: str, job_id: str) -> dict[str, Any]:
-    return _post_json(
-        f"{s10_url}/v1/scope-tokens",
-        {
-            "job_id": job_id,
+def _m0_auth_tokens() -> dict[str, str]:
+    return {
+        "health": f"argus-health-{uuid4().hex}",
+        "write": f"argus-write-{uuid4().hex}",
+        "spine": f"argus-spine-{uuid4().hex}",
+        "halt": f"argus-halt-{uuid4().hex}",
+    }
+
+
+def _m0_auth_config(tokens: dict[str, str]) -> dict[str, Any]:
+    return {
+        tokens["health"]: {
+            "caller_id": "m0-health",
+            "job_id": "m0-health",
+            "root_request_id": "m0-health-root",
+        },
+        tokens["write"]: {
+            "caller_id": "m0-spine-write",
+            "job_id": "m0-spine-write-tests",
+            "root_request_id": "m0-spine-write-root",
             "scopes": {
                 "broker_audiences": ["store"],
                 "producer_subsystems": ["S2"],
                 "sandbox_risk_class": "standard",
             },
         },
-        expected_status=201,
+        tokens["spine"]: {
+            "caller_id": "m0-spine-launch",
+            "job_id": "m0-spine-job",
+            "root_request_id": "m0-spine-root",
+            "budget_caps": {"max_compute_units": 10, "max_wallclock_s": 10, "max_cost_usd": 5},
+            "scopes": {
+                "broker_audiences": ["store"],
+                "producer_subsystems": ["S2"],
+                "sandbox_risk_class": "standard",
+            },
+        },
+        tokens["halt"]: {
+            "caller_id": "m0-budget-halt",
+            "job_id": "m0-budget-halt-job",
+            "root_request_id": "m0-budget-halt-root",
+            "budget_caps": {"max_compute_units": 1, "max_wallclock_s": 1, "max_cost_usd": 5},
+            "scopes": {"sandbox_risk_class": "standard"},
+        },
+    }
+
+
+def _battery_runtime_auth_required(evidence: dict[str, Any], s8_url: str, s10_url: str) -> None:
+    s8_health = _get_json(f"{s8_url}/healthz", expected_status=401)
+    s10_scope = _post_json(f"{s10_url}/v1/scope-tokens", {}, expected_status=401)
+    if s8_health["error"] != "Unauthorized" or s10_scope["error"] != "Unauthorized":
+        raise AssertionError(f"unexpected auth denial payloads: {s8_health}, {s10_scope}")
+    _record(
+        evidence,
+        "auth",
+        "runtime HTTP routes require bearer authentication before health or token mint",
+        {"s8_health": s8_health["error"], "s10_scope": s10_scope["error"]},
     )
 
 
-def _battery_direct_s8_write_denied(evidence: dict[str, Any], s8_url: str) -> None:
+def _mint_store_scope(*, s10_url: str, token: str) -> dict[str, Any]:
+    return _post_json(
+        f"{s10_url}/v1/scope-tokens",
+        {},
+        expected_status=201,
+        token=token,
+    )
+
+
+def _battery_direct_s8_write_denied(evidence: dict[str, Any], s8_url: str, *, token: str) -> None:
     response = _post_json(
         f"{s8_url}/v1/artifacts",
         {
@@ -220,13 +274,20 @@ def _battery_direct_s8_write_denied(evidence: dict[str, Any], s8_url: str) -> No
             "lineage": {"input_refs": [], "code_ref": "git:model", "environment_digest": "oci:model"},
         },
         expected_status=403,
+        token=token,
     )
     if response["error"] != "DirectWriteDenied":
         raise AssertionError(f"unexpected direct-write denial error: {response}")
     _record(evidence, "f-direct", "direct S8 HTTP artifact write denied", response)
 
 
-def _battery_b_incomplete_lineage(evidence: dict[str, Any], s10_url: str, scope_json: dict[str, Any]) -> None:
+def _battery_b_incomplete_lineage(
+    evidence: dict[str, Any],
+    s10_url: str,
+    scope_json: dict[str, Any],
+    *,
+    token: str,
+) -> None:
     response = _post_json(
         f"{s10_url}/v1/store/artifacts",
         {
@@ -237,13 +298,20 @@ def _battery_b_incomplete_lineage(evidence: dict[str, Any], s10_url: str, scope_
             "lineage": {"input_refs": [], "code_ref": "", "environment_digest": ""},
         },
         expected_status=400,
+        token=token,
     )
     if response["error"] != "IncompleteLineageError":
         raise AssertionError(f"unexpected incomplete-lineage error: {response}")
     _record(evidence, "b", "brokered incomplete lineage write rejected fail-closed", response)
 
 
-def _battery_c_write_once(evidence: dict[str, Any], s10_url: str, scope_json: dict[str, Any]) -> None:
+def _battery_c_write_once(
+    evidence: dict[str, Any],
+    s10_url: str,
+    scope_json: dict[str, Any],
+    *,
+    token: str,
+) -> None:
     body = {
         "scope_token": scope_json,
         "artifact_ref": "c4://m0-spine/overwrite-guard",
@@ -252,11 +320,12 @@ def _battery_c_write_once(evidence: dict[str, Any], s10_url: str, scope_json: di
         "producer": {"subsystem": "S2", "version": "0.0.0"},
         "lineage": {"input_refs": [], "code_ref": "git:model", "environment_digest": "oci:model"},
     }
-    first = _post_json(f"{s10_url}/v1/store/artifacts", body, expected_status=201)
+    first = _post_json(f"{s10_url}/v1/store/artifacts", body, expected_status=201, token=token)
     second = _post_json(
         f"{s10_url}/v1/store/artifacts",
         {**body, "payload": {"weights": [2]}},
         expected_status=400,
+        token=token,
     )
     if second["error"] != "WriteOnceViolationError":
         raise AssertionError(f"unexpected overwrite error: {second}")
@@ -286,20 +355,25 @@ def _battery_d_tamper_detected(evidence: dict[str, Any], data_dir: Path) -> None
     raise AssertionError("tampered ledger replay unexpectedly succeeded")
 
 
-def _battery_e_budget_halt(evidence: dict[str, Any], s10_url: str, image: str, data_dir: Path) -> None:
+def _battery_e_budget_halt(
+    evidence: dict[str, Any],
+    s10_url: str,
+    image: str,
+    data_dir: Path,
+    *,
+    token: str,
+) -> None:
     budget_json = _post_json(
         f"{s10_url}/v1/budget-tokens",
-        {
-            "job_id": "m0-budget-halt-job",
-            "root_request_id": "m0-budget-halt-root",
-            "caps": {"max_compute_units": 1, "max_wallclock_s": 1, "max_cost_usd": 5},
-        },
+        {},
         expected_status=201,
+        token=token,
     )
     scope_json = _post_json(
         f"{s10_url}/v1/scope-tokens",
-        {"job_id": "m0-budget-halt-job", "scopes": {"sandbox_risk_class": "standard"}},
+        {},
         expected_status=201,
+        token=token,
     )
     tokens = InMemoryTokenService(signing_key=SIGNING_KEY)
     quota = InMemoryQuotaLedger()
@@ -488,14 +562,21 @@ def _scope_token_from_json(value: dict[str, Any]) -> ScopeToken:
     )
 
 
-def _post_json(url: str, body: dict[str, Any], *, expected_status: int) -> dict[str, Any]:
+def _post_json(url: str, body: dict[str, Any], *, expected_status: int, token: str | None = None) -> dict[str, Any]:
     encoded = json.dumps(body, sort_keys=True).encode("utf-8")
-    req = request.Request(url, data=encoded, method="POST", headers={"Content-Type": "application/json"})
+    headers = {"Content-Type": "application/json", **_auth_headers(token)}
+    req = request.Request(url, data=encoded, method="POST", headers=headers)
     return _open_json(req, expected_status=expected_status)
 
 
-def _get_json(url: str) -> dict[str, Any]:
-    return _open_json(request.Request(url, method="GET"), expected_status=200)
+def _get_json(url: str, *, token: str | None = None, expected_status: int = 200) -> dict[str, Any]:
+    return _open_json(request.Request(url, method="GET", headers=_auth_headers(token)), expected_status=expected_status)
+
+
+def _auth_headers(token: str | None) -> dict[str, str]:
+    if token is None:
+        return {}
+    return {"Authorization": f"Bearer {token}"}
 
 
 def _open_json(req: request.Request, *, expected_status: int) -> dict[str, Any]:
@@ -511,11 +592,11 @@ def _open_json(req: request.Request, *, expected_status: int) -> dict[str, Any]:
     return payload
 
 
-def _wait_health(url: str, *, timeout_s: int = 60) -> None:
+def _wait_health(url: str, *, token: str, timeout_s: int = 60) -> None:
     deadline = time.time() + timeout_s
     while time.time() < deadline:
         try:
-            payload = _get_json(url)
+            payload = _get_json(url, token=token)
             if payload.get("status") == "ok":
                 return
         except Exception:

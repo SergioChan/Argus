@@ -9,13 +9,21 @@ from typing import Any
 
 from argus_core import FileSystemArtifactStore, Lineage, Producer
 
+from .auth import RuntimeAuth, UnauthorizedError, runtime_auth_from_env
 from .http_json import JsonHttpApp, JsonRequest, serve_json_app
 
 
 class S8WriterApp:
-    def __init__(self, store: FileSystemArtifactStore, *, data_dir: str | os.PathLike[str] | None = None) -> None:
+    def __init__(
+        self,
+        store: FileSystemArtifactStore,
+        *,
+        data_dir: str | os.PathLike[str] | None = None,
+        auth: RuntimeAuth | None = None,
+    ) -> None:
         self.store = store
         self._data_dir = Path(data_dir) if data_dir is not None else None
+        self.auth = auth
         self.http = JsonHttpApp()
         self._register_routes()
 
@@ -49,14 +57,29 @@ class S8WriterApp:
         if self._data_dir is not None:
             self.store = FileSystemArtifactStore(self._data_dir)
 
+    def _authenticate(self, request: JsonRequest) -> tuple[bool, dict[str, Any] | None]:
+        try:
+            if self.auth is None:
+                raise UnauthorizedError("runtime auth is not configured")
+            self.auth.authenticate(request)
+            return True, None
+        except UnauthorizedError as exc:
+            return False, {"error": "Unauthorized", "message": str(exc)}
+
     def _register_routes(self) -> None:
         @self.http.route("GET", "/healthz")
-        def health(_: JsonRequest) -> tuple[int, Any]:
+        def health(request: JsonRequest) -> tuple[int, Any]:
+            authenticated, error_response = self._authenticate(request)
+            if not authenticated:
+                return 401, error_response
             self._refresh_store()
             return 200, {"service": "s8-writer", "status": "ok", "record_count": self.store.record_count}
 
         @self.http.route("POST", "/v1/artifacts")
         def create(request: JsonRequest) -> tuple[int, Any]:
+            authenticated, error_response = self._authenticate(request)
+            if not authenticated:
+                return 401, error_response
             return 403, {
                 "error": "DirectWriteDenied",
                 "message": "artifact writes must use the S10 store broker",
@@ -64,6 +87,9 @@ class S8WriterApp:
 
         @self.http.prefix("GET", "/v1/artifacts/")
         def get_record(request: JsonRequest) -> tuple[int, Any]:
+            authenticated, error_response = self._authenticate(request)
+            if not authenticated:
+                return 401, error_response
             suffix = request.path.removeprefix("/v1/artifacts/")
             if not suffix.endswith("/record"):
                 return 404, {"error": "not_found"}
@@ -75,6 +101,9 @@ class S8WriterApp:
 
         @self.http.prefix("GET", "/v1/lineage/")
         def lineage(request: JsonRequest) -> tuple[int, Any]:
+            authenticated, error_response = self._authenticate(request)
+            if not authenticated:
+                return 401, error_response
             artifact_ref = request.path.removeprefix("/v1/lineage/")
             direction = request.query.get("direction", ["both"])[0]
             try:
@@ -85,11 +114,11 @@ class S8WriterApp:
 
 def build_app_from_env() -> S8WriterApp:
     data_dir = os.environ.get("ARGUS_S8_DATA_DIR", "/var/lib/argus/s8")
-    return S8WriterApp(FileSystemArtifactStore(data_dir), data_dir=data_dir)
+    return S8WriterApp(FileSystemArtifactStore(data_dir), data_dir=data_dir, auth=runtime_auth_from_env())
 
 
 def main() -> None:
-    host = os.environ.get("ARGUS_S8_HOST", "0.0.0.0")
+    host = os.environ.get("ARGUS_S8_HOST", "127.0.0.1")
     port = int(os.environ.get("ARGUS_S8_PORT", "8080"))
     serve_json_app(build_app_from_env().http, host=host, port=port)
 

@@ -24,6 +24,14 @@ from argus_core import (
     StoreWriterBroker,
 )
 
+from .auth import (
+    IdentityOverrideError,
+    RuntimeAuth,
+    RuntimeIdentity,
+    UnauthorizedError,
+    reject_identity_overrides,
+    runtime_auth_from_env,
+)
 from .http_json import JsonHttpApp, JsonRequest, serve_json_app
 
 
@@ -34,12 +42,14 @@ class S10SupervisorApp:
         signing_key: bytes,
         artifact_store: InMemoryArtifactStore | None = None,
         artifact_store_path: str | os.PathLike[str] | None = None,
+        auth: RuntimeAuth | None = None,
     ) -> None:
         self.tokens = InMemoryTokenService(signing_key=signing_key)
         self.quota = InMemoryQuotaLedger()
         self.audit = InMemoryAuditLedger()
         self.artifacts = artifact_store or InMemoryArtifactStore()
         self._artifact_store_path = Path(artifact_store_path) if artifact_store_path is not None else None
+        self.auth = auth
         self.policy = _default_policy_bundle()
         self.broker = StoreWriterBroker(
             token_service=self.tokens,
@@ -59,6 +69,18 @@ class S10SupervisorApp:
         )
         return asdict(token)
 
+    def mint_budget_for_identity(self, identity: RuntimeIdentity, body: dict[str, Any]) -> dict[str, Any]:
+        reject_identity_overrides(body, ("job_id", "root_request_id", "caps", "risk_class"))
+        ttl_s = _bounded_ttl(body, identity.max_ttl_s)
+        token = self.tokens.mint_budget(
+            caps=identity.budget_caps,
+            job_id=identity.job_id,
+            root_request_id=identity.root_request_id,
+            risk_class=identity.scopes.sandbox_risk_class,
+            ttl_s=ttl_s,
+        )
+        return asdict(token)
+
     def mint_scope(self, body: dict[str, Any]) -> dict[str, Any]:
         scopes_body = dict(body.get("scopes") or {})
         scopes = _scope_grant_from_dict(scopes_body)
@@ -69,9 +91,38 @@ class S10SupervisorApp:
         )
         return asdict(token)
 
+    def mint_scope_for_identity(self, identity: RuntimeIdentity, body: dict[str, Any]) -> dict[str, Any]:
+        reject_identity_overrides(body, ("job_id", "scopes"))
+        ttl_s = _bounded_ttl(body, identity.max_ttl_s)
+        token = self.tokens.mint_scope(
+            job_id=identity.job_id,
+            scopes=identity.scopes,
+            ttl_s=ttl_s,
+        )
+        return asdict(token)
+
     def broker_put_artifact(self, body: dict[str, Any]) -> dict[str, Any]:
         self._refresh_artifacts()
         record = self.broker.client_for(_scope_token_from_dict(_required_dict(body, "scope_token"))).put_artifact(
+            kind=_required_str(body, "kind"),
+            payload=body.get("payload"),
+            producer=Producer(**_required_dict(body, "producer")),
+            lineage=Lineage(**_normalize_lineage(_required_dict(body, "lineage"))),
+            artifact_ref=body.get("artifact_ref") if isinstance(body.get("artifact_ref"), str) else None,
+            claim_tier=body.get("claim_tier") if isinstance(body.get("claim_tier"), str) else "ran-toy",
+            validation_report_ref=body.get("validation_report_ref")
+            if isinstance(body.get("validation_report_ref"), str)
+            else None,
+        )
+        return asdict(record)
+
+    def broker_put_artifact_for_identity(self, identity: RuntimeIdentity, body: dict[str, Any]) -> dict[str, Any]:
+        scope_token = _scope_token_from_dict(_required_dict(body, "scope_token"))
+        if scope_token.job_id != identity.job_id:
+            raise PermissionError("scope token is not bound to the authenticated runtime identity")
+        _require_scope_subset(scope_token.scopes, identity.scopes)
+        self._refresh_artifacts()
+        record = self.broker.client_for(scope_token).put_artifact(
             kind=_required_str(body, "kind"),
             payload=body.get("payload"),
             producer=Producer(**_required_dict(body, "producer")),
@@ -93,9 +144,18 @@ class S10SupervisorApp:
                 audit_ledger=self.audit,
             )
 
+    def _authenticate(self, request: JsonRequest) -> RuntimeIdentity:
+        if self.auth is None:
+            raise UnauthorizedError("runtime auth is not configured")
+        return self.auth.authenticate(request)
+
     def _register_routes(self) -> None:
         @self.http.route("GET", "/healthz")
-        def health(_: JsonRequest) -> tuple[int, Any]:
+        def health(request: JsonRequest) -> tuple[int, Any]:
+            try:
+                self._authenticate(request)
+            except UnauthorizedError as exc:
+                return 401, {"error": "Unauthorized", "message": str(exc)}
             return 200, {
                 "service": "s10-supervisor",
                 "status": "ok",
@@ -106,27 +166,42 @@ class S10SupervisorApp:
         @self.http.route("POST", "/v1/budget-tokens")
         def budget(request: JsonRequest) -> tuple[int, Any]:
             try:
+                identity = self._authenticate(request)
                 if not isinstance(request.body, dict):
                     return 400, {"error": "json_object_required"}
-                return 201, self.mint_budget(request.body)
+                return 201, self.mint_budget_for_identity(identity, request.body)
+            except UnauthorizedError as exc:
+                return 401, {"error": "Unauthorized", "message": str(exc)}
+            except IdentityOverrideError as exc:
+                return 403, {"error": type(exc).__name__, "message": str(exc)}
             except Exception as exc:
                 return 400, {"error": type(exc).__name__, "message": str(exc)}
 
         @self.http.route("POST", "/v1/scope-tokens")
         def scope(request: JsonRequest) -> tuple[int, Any]:
             try:
+                identity = self._authenticate(request)
                 if not isinstance(request.body, dict):
                     return 400, {"error": "json_object_required"}
-                return 201, self.mint_scope(request.body)
+                return 201, self.mint_scope_for_identity(identity, request.body)
+            except UnauthorizedError as exc:
+                return 401, {"error": "Unauthorized", "message": str(exc)}
+            except IdentityOverrideError as exc:
+                return 403, {"error": type(exc).__name__, "message": str(exc)}
             except Exception as exc:
                 return 400, {"error": type(exc).__name__, "message": str(exc)}
 
         @self.http.route("POST", "/v1/store/artifacts")
         def store_artifact(request: JsonRequest) -> tuple[int, Any]:
             try:
+                identity = self._authenticate(request)
                 if not isinstance(request.body, dict):
                     return 400, {"error": "json_object_required"}
-                return 201, self.broker_put_artifact(request.body)
+                return 201, self.broker_put_artifact_for_identity(identity, request.body)
+            except UnauthorizedError as exc:
+                return 401, {"error": "Unauthorized", "message": str(exc)}
+            except PermissionError as exc:
+                return 403, {"error": type(exc).__name__, "message": str(exc)}
             except Exception as exc:
                 return 400, {"error": type(exc).__name__, "message": str(exc)}
 
@@ -143,12 +218,13 @@ def build_app_from_env() -> S10SupervisorApp:
             signing_key=signing_key,
             artifact_store=FileSystemArtifactStore(data_dir),
             artifact_store_path=data_dir,
+            auth=runtime_auth_from_env(),
         )
-    return S10SupervisorApp(signing_key=signing_key)
+    return S10SupervisorApp(signing_key=signing_key, auth=runtime_auth_from_env())
 
 
 def main() -> None:
-    host = os.environ.get("ARGUS_S10_HOST", "0.0.0.0")
+    host = os.environ.get("ARGUS_S10_HOST", "127.0.0.1")
     port = int(os.environ.get("ARGUS_S10_PORT", "8080"))
     serve_json_app(build_app_from_env().http, host=host, port=port)
 
@@ -185,6 +261,13 @@ def _required_dict(body: dict[str, Any], field: str) -> dict[str, Any]:
     return dict(value)
 
 
+def _bounded_ttl(body: dict[str, Any], max_ttl_s: int) -> int:
+    requested = int(body.get("ttl_s", max_ttl_s))
+    if requested <= 0:
+        raise ValueError("ttl_s must be positive")
+    return min(requested, max_ttl_s)
+
+
 def _scope_grant_from_dict(value: dict[str, Any]) -> ScopeGrant:
     return ScopeGrant(
         allowed_adapters=tuple(value.get("allowed_adapters") or ()),
@@ -195,6 +278,23 @@ def _scope_grant_from_dict(value: dict[str, Any]) -> ScopeGrant:
         disallowed_actions=tuple(value.get("disallowed_actions") or ()),
         sandbox_risk_class=str(value.get("sandbox_risk_class", "standard")),
     )
+
+
+def _require_scope_subset(child: ScopeGrant, parent: ScopeGrant) -> None:
+    if not set(child.allowed_adapters).issubset(parent.allowed_adapters):
+        raise PermissionError("scope token allowed_adapters exceeds authenticated identity")
+    if not set(child.allowed_datasets).issubset(parent.allowed_datasets):
+        raise PermissionError("scope token allowed_datasets exceeds authenticated identity")
+    if not set(child.egress_allowlist).issubset(parent.egress_allowlist):
+        raise PermissionError("scope token egress_allowlist exceeds authenticated identity")
+    if not set(child.broker_audiences).issubset(parent.broker_audiences):
+        raise PermissionError("scope token broker_audiences exceeds authenticated identity")
+    if not set(child.producer_subsystems).issubset(parent.producer_subsystems):
+        raise PermissionError("scope token producer_subsystems exceeds authenticated identity")
+    if not set(parent.disallowed_actions).issubset(child.disallowed_actions):
+        raise PermissionError("scope token disallowed_actions exceeds authenticated identity")
+    if child.sandbox_risk_class != parent.sandbox_risk_class:
+        raise PermissionError("scope token sandbox_risk_class exceeds authenticated identity")
 
 
 def _scope_token_from_dict(value: dict[str, Any]) -> ScopeToken:
