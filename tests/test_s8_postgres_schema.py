@@ -764,7 +764,7 @@ class S8PostgresSchemaTests(unittest.TestCase):
                     job_id="job-42",
                     contamination_index_version="contam-v1",
                 ),
-                created_at="2026-07-02T00:00:00Z",
+                created_at="2026-07-02T00:00:00.125Z",
             ),
             python_store.create_artifact(
                 artifact_ref="c4://parity/report-a",
@@ -778,7 +778,7 @@ class S8PostgresSchemaTests(unittest.TestCase):
                     actor_id="verifier-lineage",
                     job_id="job-42",
                 ),
-                created_at="2026-07-02T00:05:00Z",
+                created_at="2026-07-01T17:05:00-07:00",
             ),
             python_store.create_artifact(
                 artifact_ref="c4://parity/model-a",
@@ -793,7 +793,7 @@ class S8PostgresSchemaTests(unittest.TestCase):
                     contamination_index_version="contam-v1",
                 ),
                 validation_report_ref="c4://parity/report-a",
-                created_at="2026-07-02T01:00:00Z",
+                created_at="2026-07-02T01:00:00.500+00:00",
             ),
             python_store.create_artifact(
                 artifact_ref="c4://parity/model-b",
@@ -807,7 +807,7 @@ class S8PostgresSchemaTests(unittest.TestCase):
                     job_id="job-99",
                     contamination_index_version="contam-v2",
                 ),
-                created_at="2026-07-02T02:00:00Z",
+                created_at="2026-07-01T19:00:00-07:00",
             ),
         ]
         for sequence, record in enumerate(python_records, start=1):
@@ -830,6 +830,7 @@ class S8PostgresSchemaTests(unittest.TestCase):
                     "contamination_index_version": record.lineage.contamination_index_version,
                 },
                 content_hash=record.content_hash,
+                created_at=record.created_at,
             )
 
         query_filters = (
@@ -846,6 +847,10 @@ class S8PostgresSchemaTests(unittest.TestCase):
             {"created_after": "3000-01-01T00:00:00Z"},
             {"created_before": "3000-01-01T00:00:00Z"},
             {"created_before": "2000-01-01T00:00:00Z"},
+            {"created_after": "2026-07-01T17:30:00-07:00"},
+            {"created_after": "2026-07-02T00:05:00.250+00:00"},
+            {"created_before": "2026-07-01T17:30:00-07:00"},
+            {"created_before": "2026-07-02T00:05:00.250+00:00"},
         )
 
         for query_filter in query_filters:
@@ -1603,6 +1608,7 @@ class S8PostgresSchemaTests(unittest.TestCase):
         producer: dict[str, object] | None = None,
         lineage_extra: dict[str, object] | None = None,
         content_hash: str | None = None,
+        created_at: str | None = None,
         check: bool = True,
     ) -> subprocess.CompletedProcess[str]:
         input_refs = input_refs or []
@@ -1617,8 +1623,7 @@ class S8PostgresSchemaTests(unittest.TestCase):
         validation_ref_sql = "NULL"
         if validation_report_ref is not None:
             validation_ref_sql = _sql_literal(validation_report_ref)
-
-        return self._psql(
+        commit_result = self._psql(
             f"""
             SET ROLE argus_s8_ledger_writer;
             SELECT s8.commit_artifact_record(
@@ -1636,6 +1641,17 @@ class S8PostgresSchemaTests(unittest.TestCase):
             """,
             check=check,
         )
+        if created_at is not None and commit_result.returncode == 0:
+            self._psql(
+                f"""
+                ALTER TABLE s8.artifact_record DISABLE TRIGGER artifact_record_append_only;
+                UPDATE s8.artifact_record
+                SET created_at = {_sql_literal(created_at)}::timestamptz
+                WHERE artifact_id = {_sql_literal(artifact_ref)};
+                ALTER TABLE s8.artifact_record ENABLE TRIGGER artifact_record_append_only;
+                """
+            )
+        return commit_result
 
     def _postgres_query_refs(self, query_filter: dict[str, object]) -> tuple[str, ...]:
         result = self._psql(

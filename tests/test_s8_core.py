@@ -298,8 +298,16 @@ class InMemoryArtifactStoreTests(unittest.TestCase):
             {dataset.artifact_ref, model.artifact_ref},
         )
         self.assertEqual(self.store.query_artifacts({"created_after": "2026-07-02T00:30:00Z"}), (model,))
+        self.assertEqual(self.store.query_artifacts({"created_after": "2026-07-01T17:30:00-07:00"}), (model,))
         self.assertEqual(
             {record.artifact_ref for record in self.store.query_artifacts({"created_before": "2026-07-02T00:30:00Z"})},
+            {dataset.artifact_ref, report.artifact_ref},
+        )
+        self.assertEqual(
+            {
+                record.artifact_ref
+                for record in self.store.query_artifacts({"created_before": "2026-07-02T00:05:00.500+00:00"})
+            },
             {dataset.artifact_ref, report.artifact_ref},
         )
         with self.assertRaises(ValueError):

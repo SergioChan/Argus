@@ -592,12 +592,24 @@ def _artifact_record_matches_filter(record: ArtifactRecord, query: ArtifactQuery
     for field_name, expected in expected_values.items():
         if expected is not None and _artifact_filter_value(record, field_name) != expected:
             return False
-    created_at = _artifact_filter_value(record, "created_at")
-    if query.created_after is not None and (created_at is None or created_at < query.created_after):
-        return False
-    if query.created_before is not None and (created_at is None or created_at > query.created_before):
-        return False
+    if query.created_after is not None or query.created_before is not None:
+        created_at_value = _artifact_filter_value(record, "created_at")
+        if created_at_value is None:
+            return False
+        created_at = _parse_iso_instant(created_at_value)
+        if query.created_after is not None and created_at < _parse_iso_instant(query.created_after):
+            return False
+        if query.created_before is not None and created_at > _parse_iso_instant(query.created_before):
+            return False
     return True
+
+
+def _parse_iso_instant(value: str) -> datetime:
+    normalized = value[:-1] + "+00:00" if value.endswith("Z") else value
+    parsed = datetime.fromisoformat(normalized)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
 
 
 def _artifact_filter_value(record: ArtifactRecord, field_name: str) -> str | None:
