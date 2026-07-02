@@ -946,6 +946,32 @@ class S8PostgresSchemaTests(unittest.TestCase):
         self.assertTrue(slice_verification["valid"])
         self.assertTrue(chain_verification["valid"])
 
+        tampered_root = "blake3:" + ("f" * 64)
+        self._psql(
+            f"""
+            ALTER TABLE s8.ledger_leaf DISABLE TRIGGER ledger_leaf_append_only;
+            ALTER TABLE s8.merkle_checkpoint DISABLE TRIGGER merkle_checkpoint_append_only;
+            UPDATE s8.ledger_leaf
+            SET root = '{tampered_root}'
+            WHERE sequence = 2;
+            UPDATE s8.merkle_checkpoint
+            SET root = '{tampered_root}'
+            WHERE seq = 2;
+            ALTER TABLE s8.ledger_leaf ENABLE TRIGGER ledger_leaf_append_only;
+            ALTER TABLE s8.merkle_checkpoint ENABLE TRIGGER merkle_checkpoint_append_only;
+            """
+        )
+        tampered_slice = store.export_audit_slice((model.artifact_ref,))
+        tampered_slice_verification = store.verify_audit_slice(tampered_slice)
+        tampered_chain_verification = store.verify_audit_chain()
+
+        self.assertFalse(tampered_slice_verification["valid"])
+        self.assertEqual(tampered_slice_verification["break_sequence"], 2)
+        self.assertEqual(tampered_slice_verification["reason"], "root_mismatch")
+        self.assertFalse(tampered_chain_verification["valid"])
+        self.assertEqual(tampered_chain_verification["break_sequence"], 2)
+        self.assertEqual(tampered_chain_verification["reason"], "root_mismatch")
+
     def test_postgres_store_uses_report_verifier_for_tier_coupling(self) -> None:
         trust_store = InMemoryVerifierTrustStore()
         trust_store.register_key("s3-key", b"s3-secret")

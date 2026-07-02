@@ -28,6 +28,7 @@ from argus_core import (
     ReproducibilityManifest,
     SCRATCH_BUCKET,
     WRITE_ONCE_BUCKET,
+    hash_bytes,
     hash_json,
 )
 from argus_core.s8 import _assert_known_bucket_class, _assert_payload_matches_hash, _object_name
@@ -395,22 +396,172 @@ class PostgresArtifactStore:
                 return _jsonb_object(cur.fetchone()[0])
 
     def verify_audit_slice(self, audit_slice: dict[str, Any]) -> dict[str, Any]:
-        import psycopg
+        if not isinstance(audit_slice, dict):
+            return _audit_verification(False, reason="slice_not_object")
+        try:
+            checkpoint = _latest_checkpoint_from_slice(audit_slice)
+            checkpoint_sequence = int(checkpoint["sequence"])
+            checkpoint_root = str(checkpoint["root"])
+            checkpoint_signature = str(checkpoint["signature"])
+            checkpoint_signer_key_id = str(checkpoint["signer_key_id"])
+        except (KeyError, TypeError, ValueError):
+            return _audit_verification(False, reason="checkpoint_missing")
 
-        with psycopg.connect(self._dsn) as conn:
-            _set_role(conn, self._db_role)
-            with conn.cursor() as cur:
-                cur.execute("SELECT s8.verify_audit_slice(%s::jsonb);", (json.dumps(audit_slice, sort_keys=True),))
-                return _jsonb_object(cur.fetchone()[0])
+        db_checkpoint = self._fetch_audit_checkpoint(checkpoint_sequence)
+        if (
+            db_checkpoint is None
+            or str(db_checkpoint["root"]) != checkpoint_root
+            or str(db_checkpoint["signature"]) != checkpoint_signature
+            or str(db_checkpoint["signer_key_id"]) != checkpoint_signer_key_id
+        ):
+            return _audit_verification(False, break_sequence=checkpoint_sequence, reason="checkpoint_mismatch")
+        if not checkpoint_signature.startswith("hmac-sha256:"):
+            return _audit_verification(
+                False,
+                break_sequence=checkpoint_sequence,
+                reason="checkpoint_signature_unsupported",
+            )
+
+        db_leaves = {int(row["sequence"]): row for row in self._fetch_audit_leaves()}
+        record_hashes = self._fetch_audit_record_hashes()
+        proofs_by_sequence = {
+            int(proof["sequence"]): proof
+            for proof in audit_slice.get("inclusion_proofs", [])
+            if isinstance(proof, dict) and "sequence" in proof
+        }
+
+        try:
+            leaves = sorted(
+                (leaf for leaf in audit_slice.get("leaves", []) if isinstance(leaf, dict)),
+                key=lambda leaf: int(leaf["sequence"]),
+            )
+        except (KeyError, TypeError, ValueError):
+            return _audit_verification(False, reason="leaf_malformed")
+
+        for leaf in leaves:
+            try:
+                leaf_sequence = int(leaf["sequence"])
+                leaf_artifact_id = str(leaf["artifact_id"])
+                leaf_record_hash = str(leaf["record_hash"])
+                leaf_previous_root = str(leaf["previous_root"])
+                leaf_root = str(leaf["root"])
+            except (KeyError, TypeError, ValueError):
+                return _audit_verification(False, reason="leaf_malformed")
+
+            db_leaf = db_leaves.get(leaf_sequence)
+            if (
+                db_leaf is None
+                or str(db_leaf["artifact_id"]) != leaf_artifact_id
+                or str(db_leaf["record_hash"]) != leaf_record_hash
+                or str(db_leaf["previous_root"]) != leaf_previous_root
+                or str(db_leaf["root"]) != leaf_root
+            ):
+                return _audit_verification(False, break_sequence=leaf_sequence, reason="leaf_mismatch")
+
+            if record_hashes.get(leaf_artifact_id) != leaf_record_hash:
+                return _audit_verification(False, break_sequence=leaf_sequence, reason="record_hash_mismatch")
+
+            expected_leaf_root = _next_audit_root(leaf_previous_root, leaf_record_hash, leaf_sequence)
+            if leaf_root != expected_leaf_root:
+                return _audit_verification(False, break_sequence=leaf_sequence, reason="root_mismatch")
+
+            proof = proofs_by_sequence.get(leaf_sequence)
+            if (
+                proof is None
+                or str(proof.get("artifact_id")) != leaf_artifact_id
+                or str(proof.get("record_hash")) != leaf_record_hash
+                or str(proof.get("anchor_previous_root")) != leaf_previous_root
+            ):
+                return _audit_verification(False, break_sequence=leaf_sequence, reason="proof_mismatch")
+
+            current_sequence = leaf_sequence
+            current_root = leaf_root
+            try:
+                steps = sorted(
+                    (step for step in proof.get("steps", []) if isinstance(step, dict)),
+                    key=lambda step: int(step["sequence"]),
+                )
+            except (KeyError, TypeError, ValueError):
+                return _audit_verification(False, break_sequence=leaf_sequence, reason="proof_step_malformed")
+
+            for step in steps:
+                try:
+                    step_sequence = int(step["sequence"])
+                    step_artifact_id = str(step["artifact_id"])
+                    step_record_hash = str(step["record_hash"])
+                    step_previous_root = str(step["previous_root"])
+                    step_root = str(step["root"])
+                except (KeyError, TypeError, ValueError):
+                    return _audit_verification(False, break_sequence=current_sequence, reason="proof_step_malformed")
+
+                if step_sequence != current_sequence + 1 or step_previous_root != current_root:
+                    return _audit_verification(False, break_sequence=step_sequence, reason="proof_step_mismatch")
+
+                db_step = db_leaves.get(step_sequence)
+                if (
+                    db_step is None
+                    or str(db_step["artifact_id"]) != step_artifact_id
+                    or str(db_step["record_hash"]) != step_record_hash
+                    or str(db_step["previous_root"]) != step_previous_root
+                    or str(db_step["root"]) != step_root
+                ):
+                    return _audit_verification(False, break_sequence=step_sequence, reason="proof_step_db_mismatch")
+
+                if record_hashes.get(step_artifact_id) != step_record_hash:
+                    return _audit_verification(False, break_sequence=step_sequence, reason="record_hash_mismatch")
+
+                expected_step_root = _next_audit_root(step_previous_root, step_record_hash, step_sequence)
+                if step_root != expected_step_root:
+                    return _audit_verification(False, break_sequence=step_sequence, reason="root_mismatch")
+                current_sequence = step_sequence
+                current_root = step_root
+
+            if current_sequence != checkpoint_sequence or current_root != checkpoint_root:
+                return _audit_verification(
+                    False,
+                    break_sequence=checkpoint_sequence,
+                    reason="proof_checkpoint_mismatch",
+                )
+
+        return _audit_verification(True, checkpoint_sequence=checkpoint_sequence)
 
     def verify_audit_chain(self) -> dict[str, Any]:
-        import psycopg
+        expected_sequence = 1
+        previous_root = _zero_audit_root()
+        record_hashes = self._fetch_audit_record_hashes()
+        for leaf in self._fetch_audit_leaves():
+            sequence = int(leaf["sequence"])
+            if sequence != expected_sequence:
+                return _audit_verification(False, break_sequence=sequence, reason="sequence_gap")
+            if str(leaf["previous_root"]) != previous_root:
+                return _audit_verification(False, break_sequence=sequence, reason="previous_root_mismatch")
+            artifact_id = str(leaf["artifact_id"])
+            record_hash = str(leaf["record_hash"])
+            if record_hashes.get(artifact_id) != record_hash:
+                return _audit_verification(False, break_sequence=sequence, reason="record_hash_mismatch")
+            expected_root = _next_audit_root(previous_root, record_hash, sequence)
+            if str(leaf["root"]) != expected_root:
+                return _audit_verification(False, break_sequence=sequence, reason="root_mismatch")
+            expected_sequence += 1
+            previous_root = expected_root
 
-        with psycopg.connect(self._dsn) as conn:
-            _set_role(conn, self._db_role)
-            with conn.cursor() as cur:
-                cur.execute("SELECT s8.verify_audit_chain();")
-                return _jsonb_object(cur.fetchone()[0])
+        if expected_sequence == 1:
+            return _audit_verification(True, checkpoint_sequence=0)
+
+        latest_checkpoint = self._fetch_latest_audit_checkpoint()
+        if latest_checkpoint is None:
+            return _audit_verification(False, break_sequence=expected_sequence - 1, reason="checkpoint_missing")
+        checkpoint_sequence = int(latest_checkpoint["seq"])
+        checkpoint_root = str(latest_checkpoint["root"])
+        if checkpoint_sequence != expected_sequence - 1 or checkpoint_root != previous_root:
+            return _audit_verification(False, break_sequence=checkpoint_sequence, reason="checkpoint_mismatch")
+        if not str(latest_checkpoint["signature"]).startswith("hmac-sha256:"):
+            return _audit_verification(
+                False,
+                break_sequence=checkpoint_sequence,
+                reason="checkpoint_signature_unsupported",
+            )
+        return _audit_verification(True, checkpoint_sequence=checkpoint_sequence)
 
     @property
     def record_count(self) -> int:
@@ -494,6 +645,67 @@ class PostgresArtifactStore:
                     """
                 )
                 return list(cur.fetchall())
+
+    def _fetch_audit_leaves(self) -> list[dict[str, Any]]:
+        import psycopg
+        from psycopg.rows import dict_row
+
+        with psycopg.connect(self._dsn, row_factory=dict_row) as conn:
+            _set_role(conn, self._db_role)
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT sequence, artifact_id, record_hash, previous_root, root
+                    FROM s8.ledger_leaf
+                    ORDER BY sequence;
+                    """
+                )
+                return list(cur.fetchall())
+
+    def _fetch_audit_record_hashes(self) -> dict[str, str]:
+        import psycopg
+
+        with psycopg.connect(self._dsn) as conn:
+            _set_role(conn, self._db_role)
+            with conn.cursor() as cur:
+                cur.execute("SELECT artifact_id, record_hash FROM s8.artifact_record;")
+                return {str(artifact_id): str(record_hash) for artifact_id, record_hash in cur.fetchall()}
+
+    def _fetch_latest_audit_checkpoint(self) -> dict[str, Any] | None:
+        import psycopg
+        from psycopg.rows import dict_row
+
+        with psycopg.connect(self._dsn, row_factory=dict_row) as conn:
+            _set_role(conn, self._db_role)
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT seq, root, signature, signer_key_id, created_at
+                    FROM s8.merkle_checkpoint
+                    ORDER BY seq DESC
+                    LIMIT 1;
+                    """
+                )
+                row = cur.fetchone()
+                return dict(row) if row is not None else None
+
+    def _fetch_audit_checkpoint(self, sequence: int) -> dict[str, Any] | None:
+        import psycopg
+        from psycopg.rows import dict_row
+
+        with psycopg.connect(self._dsn, row_factory=dict_row) as conn:
+            _set_role(conn, self._db_role)
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT seq, root, signature, signer_key_id, created_at
+                    FROM s8.merkle_checkpoint
+                    WHERE seq = %s;
+                    """,
+                    (sequence,),
+                )
+                row = cur.fetchone()
+                return dict(row) if row is not None else None
 
     def _commit_record(self, record: ArtifactRecord) -> None:
         self._ledger_writer.commit_record(record)
@@ -747,6 +959,40 @@ def _jsonb_object(value: Any) -> dict[str, Any]:
         if isinstance(parsed, dict):
             return parsed
     raise TypeError(f"expected json object, got {type(value).__name__}")
+
+
+def _latest_checkpoint_from_slice(audit_slice: dict[str, Any]) -> dict[str, Any]:
+    checkpoints = audit_slice.get("merkle_checkpoints")
+    if not isinstance(checkpoints, list) or not checkpoints:
+        raise KeyError("merkle_checkpoints")
+    checkpoint = max(
+        (item for item in checkpoints if isinstance(item, dict)),
+        key=lambda item: int(item["sequence"]),
+    )
+    return checkpoint
+
+
+def _audit_verification(
+    valid: bool,
+    *,
+    break_sequence: int | None = None,
+    reason: str | None = None,
+    checkpoint_sequence: int | None = None,
+) -> dict[str, Any]:
+    return {
+        "valid": valid,
+        "break_sequence": break_sequence,
+        "reason": reason,
+        "checkpoint_sequence": checkpoint_sequence,
+    }
+
+
+def _next_audit_root(previous_root: str, record_hash: str, sequence: int) -> str:
+    return hash_bytes(f"{previous_root}|{record_hash}|{sequence}".encode("utf-8"))
+
+
+def _zero_audit_root() -> str:
+    return "blake3:" + ("0" * 64)
 
 
 def _sha256(path: Path) -> str:

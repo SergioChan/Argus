@@ -882,6 +882,7 @@ def _battery_real_persistence(
             f"objects={object_count} append_only_denials={append_only_denials} "
             f"record_hashes_match_refreshed_records={record_hashes_match}"
         )
+    audit_root_tamper_denial = _postgres_audit_root_tamper_denial(dsn, s8_url=s8_url, token=token)
     _record(
         evidence,
         "persist",
@@ -897,6 +898,7 @@ def _battery_real_persistence(
             "checkpoint_signature_valid": checkpoint_signature_valid,
             "minio_objects": object_count,
             "record_hashes_match_refreshed_records": record_hashes_match,
+            "audit_root_tamper_denied": audit_root_tamper_denial,
             **append_only_denials,
         },
     )
@@ -925,6 +927,73 @@ def _postgres_record_hashes_match_refreshed_records(
         if hash_json(asdict(record)) != record_hash:
             return False
     return True
+
+
+def _postgres_audit_root_tamper_denial(
+    dsn: str,
+    *,
+    s8_url: str,
+    token: str,
+) -> dict[str, Any]:
+    import psycopg
+
+    tampered_root = "blake3:" + ("f" * 64)
+    with psycopg.connect(dsn) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT leaf.sequence, leaf.artifact_id, leaf.root, checkpoint.root
+                FROM s8.ledger_leaf AS leaf
+                JOIN s8.merkle_checkpoint AS checkpoint
+                  ON checkpoint.seq = leaf.sequence
+                ORDER BY leaf.sequence DESC
+                LIMIT 1;
+                """
+            )
+            row = cur.fetchone()
+            if row is None:
+                raise AssertionError("no deployed audit leaf/checkpoint available for tamper-negative verification")
+            sequence = int(row[0])
+            artifact_ref = str(row[1])
+            original_leaf_root = str(row[2])
+            original_checkpoint_root = str(row[3])
+            if original_leaf_root == tampered_root:
+                tampered_root = "blake3:" + ("e" * 64)
+            cur.execute("ALTER TABLE s8.ledger_leaf DISABLE TRIGGER ledger_leaf_append_only;")
+            cur.execute("ALTER TABLE s8.merkle_checkpoint DISABLE TRIGGER merkle_checkpoint_append_only;")
+            cur.execute("UPDATE s8.ledger_leaf SET root = %s WHERE sequence = %s;", (tampered_root, sequence))
+            cur.execute("UPDATE s8.merkle_checkpoint SET root = %s WHERE seq = %s;", (tampered_root, sequence))
+            cur.execute("ALTER TABLE s8.ledger_leaf ENABLE TRIGGER ledger_leaf_append_only;")
+            cur.execute("ALTER TABLE s8.merkle_checkpoint ENABLE TRIGGER merkle_checkpoint_append_only;")
+
+    try:
+        tampered_audit = _get_json(
+            f"{s8_url}/v1/audit-slice?artifact_ref={parse.quote(artifact_ref, safe='')}",
+            token=token,
+        )
+        verification = dict(tampered_audit["verification"])
+        if verification.get("valid"):
+            raise AssertionError(f"deployed audit verifier accepted tampered audit root: {verification}")
+        return {
+            "artifact_ref": artifact_ref,
+            "break_sequence": verification.get("break_sequence"),
+            "reason": verification.get("reason"),
+        }
+    finally:
+        with psycopg.connect(dsn) as conn:
+            with conn.cursor() as cur:
+                cur.execute("ALTER TABLE s8.ledger_leaf DISABLE TRIGGER ledger_leaf_append_only;")
+                cur.execute("ALTER TABLE s8.merkle_checkpoint DISABLE TRIGGER merkle_checkpoint_append_only;")
+                cur.execute(
+                    "UPDATE s8.ledger_leaf SET root = %s WHERE sequence = %s;",
+                    (original_leaf_root, sequence),
+                )
+                cur.execute(
+                    "UPDATE s8.merkle_checkpoint SET root = %s WHERE seq = %s;",
+                    (original_checkpoint_root, sequence),
+                )
+                cur.execute("ALTER TABLE s8.ledger_leaf ENABLE TRIGGER ledger_leaf_append_only;")
+                cur.execute("ALTER TABLE s8.merkle_checkpoint ENABLE TRIGGER merkle_checkpoint_append_only;")
 
 
 def _postgres_append_only_denials(dsn: str) -> dict[str, bool]:
