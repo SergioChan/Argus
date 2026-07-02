@@ -3,6 +3,7 @@ from __future__ import annotations
 from copy import deepcopy
 import unittest
 
+import argusverify
 from argus_core import C3ReportVerifier
 from argusverify import C3ReportSigner, InMemoryVerifierTrustStore, sign_report, verify_report
 
@@ -15,11 +16,20 @@ VECTOR_REPORT = {
         {
             "check": "INJECTION",
             "status": "PASS",
-            "metrics": {"recovery_rate": 0.98},
+            "metrics": {
+                "recovery_rate": 0.98,
+                "integer_float": 1.0,
+                "zero_float": 0.0,
+                "z_max": 3.0,
+                "tiny_signal": 0.0000001,
+                "micro_signal": 0.000001,
+                "large_fixed": 1e20,
+                "large_exponent": 1e21,
+            },
             "evidence_refs": ["c4://evidence/injection/example"],
         }
     ],
-    "aggregate": {"passed": True, "score": 0.98},
+    "aggregate": {"passed": True, "score": 1.0},
     "claim_tier": "recapitulated-known",
     "claim_tier_is_candidate": False,
     "perturbation_pairs": [],
@@ -39,7 +49,7 @@ VECTOR_REPORT = {
     "debate_ref": "c4://debate/ewpt-toy/example",
 }
 
-EXPECTED_SIGNATURE = "hmac-sha256:923abc6bc8e3f4c574f1f338b73deecbab51716f79bac62588b38b6b83f311d0"
+EXPECTED_SIGNATURE = "hmac-sha256:49bb4f2abf5cf349d510031b6838e527f663c7b7c844cccf2487609c1da9cc54"
 
 
 class ArgusVerifyTests(unittest.TestCase):
@@ -96,6 +106,28 @@ class ArgusVerifyTests(unittest.TestCase):
         self.assertFalse(revoked_verification.valid)
         self.assertEqual(revoked_verification.reason, "revoked_key")
         self.assertEqual(revoked_verification.error_code, "REVOKED_KEY")
+
+    def test_canonical_number_policy_matches_cross_language_boundaries(self) -> None:
+        rendered = argusverify._canonical_json_text(
+            {
+                "integer_float": 1.0,
+                "large_exponent": 1e21,
+                "large_fixed": 1e20,
+                "micro_signal": 0.000001,
+                "negative_zero": -0.0,
+                "tiny_signal": 0.0000001,
+                "z_max": 3.0,
+                "zero_float": 0.0,
+            }
+        )
+
+        self.assertEqual(
+            rendered,
+            '{"integer_float":1,"large_exponent":1e21,"large_fixed":100000000000000000000,'
+            '"micro_signal":0.000001,"negative_zero":0,"tiny_signal":1e-7,"z_max":3,"zero_float":0}',
+        )
+        with self.assertRaises(ValueError):
+            argusverify._canonical_json_text({"bad": float("nan")})
 
 
 if __name__ == "__main__":

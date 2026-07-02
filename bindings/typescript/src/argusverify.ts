@@ -159,10 +159,7 @@ function canonicalJson(value: unknown): string {
     return JSON.stringify(value);
   }
   if (typeof value === "number") {
-    if (!Number.isFinite(value)) {
-      throw new TypeError("canonical JSON rejects non-finite numbers");
-    }
-    return JSON.stringify(value);
+    return canonicalNumber(value);
   }
   if (typeof value === "boolean") {
     return value ? "true" : "false";
@@ -177,6 +174,39 @@ function canonicalJson(value: unknown): string {
       .join(",")}}`;
   }
   throw new TypeError("canonical JSON only accepts JSON-compatible values");
+}
+
+function canonicalNumber(value: number): string {
+  if (!Number.isFinite(value)) {
+    throw new TypeError("canonical JSON rejects non-finite numbers");
+  }
+  if (value === 0) {
+    return "0";
+  }
+  const text = JSON.stringify(value).replace("E", "e");
+  if (text.includes("e")) {
+    const [mantissa, exponent] = text.split("e", 2);
+    return `${trimDecimalText(mantissa)}e${normalizeExponent(exponent)}`;
+  }
+  return trimDecimalText(text);
+}
+
+function trimDecimalText(text: string): string {
+  if (text.includes(".")) {
+    text = text.replace(/0+$/, "").replace(/\.$/, "");
+  }
+  return text === "-0" ? "0" : text;
+}
+
+function normalizeExponent(exponent: string): string {
+  let sign = "";
+  let digits = exponent;
+  if (digits.startsWith("+") || digits.startsWith("-")) {
+    sign = digits.startsWith("-") ? "-" : "";
+    digits = digits.slice(1);
+  }
+  digits = digits.replace(/^0+/, "") || "0";
+  return `${sign}${digits}`;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

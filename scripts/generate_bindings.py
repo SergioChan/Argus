@@ -7,6 +7,7 @@ import argparse
 import hashlib
 import hmac
 import json
+import math
 import sys
 from pathlib import Path
 
@@ -40,11 +41,20 @@ C3_ARGUSVERIFY_VECTOR_REPORT = {
         {
             "check": "INJECTION",
             "status": "PASS",
-            "metrics": {"recovery_rate": 0.98},
+            "metrics": {
+                "recovery_rate": 0.98,
+                "integer_float": 1.0,
+                "zero_float": 0.0,
+                "z_max": 3.0,
+                "tiny_signal": 0.0000001,
+                "micro_signal": 0.000001,
+                "large_fixed": 1e20,
+                "large_exponent": 1e21,
+            },
             "evidence_refs": ["c4://evidence/injection/example"],
         }
     ],
-    "aggregate": {"passed": True, "score": 0.98},
+    "aggregate": {"passed": True, "score": 1.0},
     "claim_tier": "recapitulated-known",
     "claim_tier_is_candidate": False,
     "perturbation_pairs": [],
@@ -87,7 +97,85 @@ def schema_sha256(path: Path) -> str:
 
 
 def canonical_json_text(value: object) -> str:
-    return json.dumps(value, allow_nan=False, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, str):
+        return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float):
+        return canonical_number(value)
+    if isinstance(value, list):
+        return "[" + ",".join(canonical_json_text(item) for item in value) + "]"
+    if isinstance(value, dict):
+        return (
+            "{"
+            + ",".join(
+                f"{json.dumps(key, ensure_ascii=False, separators=(',', ':'))}:{canonical_json_text(value[key])}"
+                for key in sorted(value)
+            )
+            + "}"
+        )
+    raise TypeError("canonical JSON only accepts JSON-compatible values")
+
+
+def canonical_number(value: float) -> str:
+    if not math.isfinite(value):
+        raise ValueError("canonical JSON rejects non-finite numbers")
+    if value == 0:
+        return "0"
+    text = json.dumps(value, allow_nan=False, separators=(",", ":")).replace("E", "e")
+    if "e" in text:
+        mantissa, exponent = text.split("e", 1)
+        normalized_exponent = normalize_exponent(exponent)
+        fixed = exponent_to_fixed_if_javascript_decimal(mantissa, normalized_exponent)
+        if fixed is not None:
+            return fixed
+        return f"{trim_decimal_text(mantissa)}e{normalized_exponent}"
+    return trim_decimal_text(text)
+
+
+def trim_decimal_text(text: str) -> str:
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
+    return "0" if text == "-0" else text
+
+
+def normalize_exponent(exponent: str) -> str:
+    sign = ""
+    digits = exponent
+    if digits.startswith(("+", "-")):
+        sign = "-" if digits[0] == "-" else ""
+        digits = digits[1:]
+    digits = digits.lstrip("0") or "0"
+    return f"{sign}{digits}"
+
+
+def exponent_to_fixed_if_javascript_decimal(mantissa: str, exponent: str) -> str | None:
+    exponent_value = int(exponent)
+    sign = ""
+    body = mantissa
+    if body.startswith("-"):
+        sign = "-"
+        body = body[1:]
+    integer, dot, fraction = body.partition(".")
+    digits = integer + (fraction if dot else "")
+    if not digits or set(digits) == {"0"}:
+        return "0"
+    decimal_exponent = exponent_value + len(digits) - len(fraction) - 1
+    if decimal_exponent < -6 or decimal_exponent >= 21:
+        return None
+    scale = exponent_value - len(fraction)
+    if scale >= 0:
+        return sign + digits + ("0" * scale)
+    decimal_position = len(digits) + scale
+    if decimal_position > 0:
+        fixed = sign + digits[:decimal_position] + "." + digits[decimal_position:]
+    else:
+        fixed = sign + "0." + ("0" * abs(decimal_position)) + digits
+    return trim_decimal_text(fixed)
 
 
 def c3_argusverify_vector_signature() -> str:
@@ -809,10 +897,7 @@ function canonicalJson(value: unknown): string {{
     return JSON.stringify(value);
   }}
   if (typeof value === "number") {{
-    if (!Number.isFinite(value)) {{
-      throw new TypeError("canonical JSON rejects non-finite numbers");
-    }}
-    return JSON.stringify(value);
+    return canonicalNumber(value);
   }}
   if (typeof value === "boolean") {{
     return value ? "true" : "false";
@@ -827,6 +912,39 @@ function canonicalJson(value: unknown): string {{
       .join(",")}}}}`;
   }}
   throw new TypeError("canonical JSON only accepts JSON-compatible values");
+}}
+
+function canonicalNumber(value: number): string {{
+  if (!Number.isFinite(value)) {{
+    throw new TypeError("canonical JSON rejects non-finite numbers");
+  }}
+  if (value === 0) {{
+    return "0";
+  }}
+  const text = JSON.stringify(value).replace("E", "e");
+  if (text.includes("e")) {{
+    const [mantissa, exponent] = text.split("e", 2);
+    return `${{trimDecimalText(mantissa)}}e${{normalizeExponent(exponent)}}`;
+  }}
+  return trimDecimalText(text);
+}}
+
+function trimDecimalText(text: string): string {{
+  if (text.includes(".")) {{
+    text = text.replace(/0+$/, "").replace(/\\.$/, "");
+  }}
+  return text === "-0" ? "0" : text;
+}}
+
+function normalizeExponent(exponent: string): string {{
+  let sign = "";
+  let digits = exponent;
+  if (digits.startsWith("+") || digits.startsWith("-")) {{
+    sign = digits.startsWith("-") ? "-" : "";
+    digits = digits.slice(1);
+  }}
+  digits = digits.replace(/^0+/, "") || "0";
+  return `${{sign}}${{digits}}`;
 }}
 
 function isRecord(value: unknown): value is Record<string, unknown> {{
@@ -1315,7 +1433,7 @@ fn canonical_json(value: &Value) -> Result<String, String> {{
     match value {{
         Value::Null => Ok("null".to_string()),
         Value::Bool(value) => Ok(if *value {{ "true" }} else {{ "false" }}.to_string()),
-        Value::Number(value) => Ok(value.to_string()),
+        Value::Number(value) => Ok(canonical_number(value)),
         Value::String(value) => serde_json::to_string(value).map_err(|error| error.to_string()),
         Value::Array(values) => {{
             let rendered = values
@@ -1345,6 +1463,86 @@ fn canonical_json(value: &Value) -> Result<String, String> {{
             Ok(output)
         }}
     }}
+}}
+
+fn canonical_number(value: &serde_json::Number) -> String {{
+    let text = value.to_string().replace('E', "e");
+    if let Some((mantissa, exponent)) = text.split_once('e') {{
+        let normalized_exponent = normalize_exponent(exponent);
+        if let Some(fixed) = exponent_to_fixed_if_javascript_decimal(mantissa, &normalized_exponent) {{
+            return fixed;
+        }}
+        return format!(
+            "{{}}e{{}}",
+            trim_decimal_text(mantissa),
+            normalized_exponent
+        );
+    }}
+    trim_decimal_text(&text)
+}}
+
+fn trim_decimal_text(text: &str) -> String {{
+    let mut trimmed = text;
+    if text.contains('.') {{
+        trimmed = trimmed.trim_end_matches('0').trim_end_matches('.');
+    }}
+    if trimmed == "-0" {{
+        "0".to_string()
+    }} else {{
+        trimmed.to_string()
+    }}
+}}
+
+fn normalize_exponent(exponent: &str) -> String {{
+    let (sign, digits) = match exponent.as_bytes().first().copied() {{
+        Some(b'+') => ("", &exponent[1..]),
+        Some(b'-') => ("-", &exponent[1..]),
+        _ => ("", exponent),
+    }};
+    let digits = digits.trim_start_matches('0');
+    let digits = if digits.is_empty() {{ "0" }} else {{ digits }};
+    format!("{{sign}}{{digits}}")
+}}
+
+fn exponent_to_fixed_if_javascript_decimal(mantissa: &str, exponent: &str) -> Option<String> {{
+    let exponent_value = exponent.parse::<isize>().ok()?;
+    let (sign, body) = if let Some(body) = mantissa.strip_prefix('-') {{
+        ("-", body)
+    }} else {{
+        ("", mantissa)
+    }};
+    let (integer, fraction) = if let Some((integer, fraction)) = body.split_once('.') {{
+        (integer, fraction)
+    }} else {{
+        (body, "")
+    }};
+    let digits = format!("{{integer}}{{fraction}}");
+    if digits.is_empty() || digits.chars().all(|character| character == '0') {{
+        return Some("0".to_string());
+    }}
+    let decimal_exponent = exponent_value + digits.len() as isize - fraction.len() as isize - 1;
+    if !(-6..21).contains(&decimal_exponent) {{
+        return None;
+    }}
+    let scale = exponent_value - fraction.len() as isize;
+    if scale >= 0 {{
+        return Some(format!("{{sign}}{{digits}}{{}}", "0".repeat(scale as usize)));
+    }}
+    let decimal_position = digits.len() as isize + scale;
+    let fixed = if decimal_position > 0 {{
+        let decimal_position = decimal_position as usize;
+        format!(
+            "{{sign}}{{}}.{{}}",
+            &digits[..decimal_position],
+            &digits[decimal_position..]
+        )
+    }} else {{
+        format!(
+            "{{sign}}0.{{}}{{digits}}",
+            "0".repeat(decimal_position.unsigned_abs())
+        )
+    }};
+    Some(trim_decimal_text(&fixed))
 }}
 
 fn hex_lower(bytes: &[u8]) -> String {{

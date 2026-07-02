@@ -190,7 +190,7 @@ fn canonical_json(value: &Value) -> Result<String, String> {
     match value {
         Value::Null => Ok("null".to_string()),
         Value::Bool(value) => Ok(if *value { "true" } else { "false" }.to_string()),
-        Value::Number(value) => Ok(value.to_string()),
+        Value::Number(value) => Ok(canonical_number(value)),
         Value::String(value) => serde_json::to_string(value).map_err(|error| error.to_string()),
         Value::Array(values) => {
             let rendered = values
@@ -220,6 +220,86 @@ fn canonical_json(value: &Value) -> Result<String, String> {
             Ok(output)
         }
     }
+}
+
+fn canonical_number(value: &serde_json::Number) -> String {
+    let text = value.to_string().replace('E', "e");
+    if let Some((mantissa, exponent)) = text.split_once('e') {
+        let normalized_exponent = normalize_exponent(exponent);
+        if let Some(fixed) = exponent_to_fixed_if_javascript_decimal(mantissa, &normalized_exponent) {
+            return fixed;
+        }
+        return format!(
+            "{}e{}",
+            trim_decimal_text(mantissa),
+            normalized_exponent
+        );
+    }
+    trim_decimal_text(&text)
+}
+
+fn trim_decimal_text(text: &str) -> String {
+    let mut trimmed = text;
+    if text.contains('.') {
+        trimmed = trimmed.trim_end_matches('0').trim_end_matches('.');
+    }
+    if trimmed == "-0" {
+        "0".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn normalize_exponent(exponent: &str) -> String {
+    let (sign, digits) = match exponent.as_bytes().first().copied() {
+        Some(b'+') => ("", &exponent[1..]),
+        Some(b'-') => ("-", &exponent[1..]),
+        _ => ("", exponent),
+    };
+    let digits = digits.trim_start_matches('0');
+    let digits = if digits.is_empty() { "0" } else { digits };
+    format!("{sign}{digits}")
+}
+
+fn exponent_to_fixed_if_javascript_decimal(mantissa: &str, exponent: &str) -> Option<String> {
+    let exponent_value = exponent.parse::<isize>().ok()?;
+    let (sign, body) = if let Some(body) = mantissa.strip_prefix('-') {
+        ("-", body)
+    } else {
+        ("", mantissa)
+    };
+    let (integer, fraction) = if let Some((integer, fraction)) = body.split_once('.') {
+        (integer, fraction)
+    } else {
+        (body, "")
+    };
+    let digits = format!("{integer}{fraction}");
+    if digits.is_empty() || digits.chars().all(|character| character == '0') {
+        return Some("0".to_string());
+    }
+    let decimal_exponent = exponent_value + digits.len() as isize - fraction.len() as isize - 1;
+    if !(-6..21).contains(&decimal_exponent) {
+        return None;
+    }
+    let scale = exponent_value - fraction.len() as isize;
+    if scale >= 0 {
+        return Some(format!("{sign}{digits}{}", "0".repeat(scale as usize)));
+    }
+    let decimal_position = digits.len() as isize + scale;
+    let fixed = if decimal_position > 0 {
+        let decimal_position = decimal_position as usize;
+        format!(
+            "{sign}{}.{}",
+            &digits[..decimal_position],
+            &digits[decimal_position..]
+        )
+    } else {
+        format!(
+            "{sign}0.{}{digits}",
+            "0".repeat(decimal_position.unsigned_abs())
+        )
+    };
+    Some(trim_decimal_text(&fixed))
 }
 
 fn hex_lower(bytes: &[u8]) -> String {
@@ -256,7 +336,14 @@ mod tests {
                                     "check": "INJECTION",
                                     "status": "PASS",
                                     "metrics": {
-                                                "recovery_rate": 0.98
+                                                "recovery_rate": 0.98,
+                                                "integer_float": 1.0,
+                                                "zero_float": 0.0,
+                                                "z_max": 3.0,
+                                                "tiny_signal": 1e-07,
+                                                "micro_signal": 1e-06,
+                                                "large_fixed": 1e+20,
+                                                "large_exponent": 1e+21
                                     },
                                     "evidence_refs": [
                                                 "c4://evidence/injection/example"
@@ -265,7 +352,7 @@ mod tests {
             ],
             "aggregate": {
                         "passed": true,
-                        "score": 0.98
+                        "score": 1.0
             },
             "claim_tier": "recapitulated-known",
             "claim_tier_is_candidate": false,
@@ -304,7 +391,7 @@ mod tests {
             "s3-secret".as_bytes(),
         )
         .expect("sign vector");
-        assert_eq!(signed["signature"]["value"], "hmac-sha256:923abc6bc8e3f4c574f1f338b73deecbab51716f79bac62588b38b6b83f311d0");
+        assert_eq!(signed["signature"]["value"], "hmac-sha256:49bb4f2abf5cf349d510031b6838e527f663c7b7c844cccf2487609c1da9cc54");
 
         let valid = verify_report(&signed, &trust_store);
         assert!(valid.valid);

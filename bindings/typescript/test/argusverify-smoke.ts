@@ -17,7 +17,14 @@ const report = {
       "check": "INJECTION",
       "status": "PASS",
       "metrics": {
-        "recovery_rate": 0.98
+        "recovery_rate": 0.98,
+        "integer_float": 1.0,
+        "zero_float": 0.0,
+        "z_max": 3.0,
+        "tiny_signal": 1e-07,
+        "micro_signal": 1e-06,
+        "large_fixed": 1e+20,
+        "large_exponent": 1e+21
       },
       "evidence_refs": [
         "c4://evidence/injection/example"
@@ -26,7 +33,7 @@ const report = {
   ],
   "aggregate": {
     "passed": true,
-    "score": 0.98
+    "score": 1.0
   },
   "claim_tier": "recapitulated-known",
   "claim_tier_is_candidate": false,
@@ -52,7 +59,7 @@ const report = {
   },
   "debate_ref": "c4://debate/ewpt-toy/example"
 } as Record<string, unknown>;
-const expectedSignature = "hmac-sha256:923abc6bc8e3f4c574f1f338b73deecbab51716f79bac62588b38b6b83f311d0";
+const expectedSignature = "hmac-sha256:49bb4f2abf5cf349d510031b6838e527f663c7b7c844cccf2487609c1da9cc54";
 
 const trustStore = new InMemoryVerifierTrustStore();
 trustStore.registerKey("s3-key", "s3-secret");

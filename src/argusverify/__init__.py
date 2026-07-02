@@ -8,6 +8,7 @@ from hashlib import sha256
 from typing import Any, Protocol
 import hmac
 import json
+import math
 
 
 C3_SIGNATURE_ALGORITHM = "hmac-sha256"
@@ -169,13 +170,90 @@ def _aggregate_passed(report: dict[str, Any]) -> bool | None:
 
 
 def _canonical_json_bytes(value: Any) -> bytes:
-    return json.dumps(
-        value,
-        allow_nan=False,
-        ensure_ascii=False,
-        separators=(",", ":"),
-        sort_keys=True,
-    ).encode("utf-8")
+    return _canonical_json_text(value).encode("utf-8")
+
+
+def _canonical_json_text(value: Any) -> str:
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, str):
+        return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float):
+        return _canonical_number(value)
+    if isinstance(value, list):
+        return "[" + ",".join(_canonical_json_text(item) for item in value) + "]"
+    if isinstance(value, dict):
+        return (
+            "{"
+            + ",".join(
+                f"{json.dumps(key, ensure_ascii=False, separators=(',', ':'))}:{_canonical_json_text(value[key])}"
+                for key in sorted(value)
+            )
+            + "}"
+        )
+    raise TypeError("canonical JSON only accepts JSON-compatible values")
+
+
+def _canonical_number(value: float) -> str:
+    if not math.isfinite(value):
+        raise ValueError("canonical JSON rejects non-finite numbers")
+    if value == 0:
+        return "0"
+    text = json.dumps(value, allow_nan=False, separators=(",", ":"))
+    text = text.replace("E", "e")
+    if "e" in text:
+        mantissa, exponent = text.split("e", 1)
+        normalized_exponent = _normalize_exponent(exponent)
+        fixed = _exponent_to_fixed_if_javascript_decimal(mantissa, normalized_exponent)
+        if fixed is not None:
+            return fixed
+        return f"{_trim_decimal_text(mantissa)}e{normalized_exponent}"
+    return _trim_decimal_text(text)
+
+
+def _trim_decimal_text(text: str) -> str:
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
+    return "0" if text == "-0" else text
+
+
+def _normalize_exponent(exponent: str) -> str:
+    sign = ""
+    digits = exponent
+    if digits.startswith(("+", "-")):
+        sign = "-" if digits[0] == "-" else ""
+        digits = digits[1:]
+    digits = digits.lstrip("0") or "0"
+    return f"{sign}{digits}"
+
+
+def _exponent_to_fixed_if_javascript_decimal(mantissa: str, exponent: str) -> str | None:
+    exponent_value = int(exponent)
+    sign = ""
+    body = mantissa
+    if body.startswith("-"):
+        sign = "-"
+        body = body[1:]
+    integer, dot, fraction = body.partition(".")
+    digits = integer + (fraction if dot else "")
+    if not digits or set(digits) == {"0"}:
+        return "0"
+    decimal_exponent = exponent_value + len(digits) - len(fraction) - 1
+    if decimal_exponent < -6 or decimal_exponent >= 21:
+        return None
+    scale = exponent_value - len(fraction)
+    if scale >= 0:
+        return sign + digits + ("0" * scale)
+    decimal_position = len(digits) + scale
+    if decimal_position > 0:
+        fixed = sign + digits[:decimal_position] + "." + digits[decimal_position:]
+    else:
+        fixed = sign + "0." + ("0" * abs(decimal_position)) + digits
+    return _trim_decimal_text(fixed)
 
 
 __all__ = [
