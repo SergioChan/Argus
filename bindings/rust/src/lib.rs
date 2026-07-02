@@ -5,7 +5,7 @@ pub mod c4;
 pub mod hash;
 pub mod ledger;
 
-pub use argusverify::{sign_report, verify_report, C3SignatureVerification, InMemoryVerifierTrustStore, VerifierKey, C3_SIGNATURE_ALGORITHM, C3_SIGNATURE_PREFIX};
+pub use argusverify::{sign_report, verify_report, C3SignatureVerification, InMemoryVerifierTrustStore, VerifierKey, VerifierTrustStore, C3_SIGNATURE_ALGORITHM, C3_SIGNATURE_PREFIX};
 pub use c4::{ArtifactRecord, ClaimTier, Lineage, Producer, RetentionPolicy, C4_SCHEMA_SHA256};
 pub use hash::{hash_blob, hash_blob_stream, hash_bytes, BlobHasher, HashBlob, HashBlobError, BLAKE3_PREFIX, CANON_VERSION};
 pub use ledger::{ArtifactRecordDraft, CheckpointSigner, MerkleCheckpoint, PostgresLedgerWriter};

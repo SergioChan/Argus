@@ -959,7 +959,7 @@ def render_rust_lib(items: list[dict]) -> str:
             "pub mod hash;",
             "pub mod ledger;",
             "",
-            "pub use argusverify::{sign_report, verify_report, C3SignatureVerification, InMemoryVerifierTrustStore, VerifierKey, C3_SIGNATURE_ALGORITHM, C3_SIGNATURE_PREFIX};",
+            "pub use argusverify::{sign_report, verify_report, C3SignatureVerification, InMemoryVerifierTrustStore, VerifierKey, VerifierTrustStore, C3_SIGNATURE_ALGORITHM, C3_SIGNATURE_PREFIX};",
             "pub use c4::{ArtifactRecord, ClaimTier, Lineage, Producer, RetentionPolicy, C4_SCHEMA_SHA256};",
             "pub use hash::{hash_blob, hash_blob_stream, hash_bytes, BlobHasher, HashBlob, HashBlobError, BLAKE3_PREFIX, CANON_VERSION};",
             "pub use ledger::{ArtifactRecordDraft, CheckpointSigner, MerkleCheckpoint, PostgresLedgerWriter};",
@@ -1162,6 +1162,15 @@ pub struct C3SignatureVerification {{
 
 pub trait VerifierTrustStore {{
     fn get_key(&self, key_id: &str) -> Option<&VerifierKey>;
+
+    fn verify_signature_value(
+        &self,
+        _key_id: &str,
+        _report_with_empty_signature: &Value,
+        _signature_value: &str,
+    ) -> Option<Result<(), String>> {{
+        None
+    }}
 }}
 
 #[derive(Debug, Default)]
@@ -1243,11 +1252,17 @@ pub fn verify_report(report: &Value, trust_store: &impl VerifierTrustStore) -> C
         "key_id": key_id,
         "value": "",
     }});
-    let Ok(expected) = signature_value(&unsigned, &key.secret) else {{
-        return invalid("signature_invalid", Some(key_id));
-    }};
-    if !constant_time_eq(value.as_bytes(), expected.as_bytes()) {{
-        return invalid("signature_invalid", Some(key_id));
+    if let Some(delegated) = trust_store.verify_signature_value(key_id, &unsigned, value) {{
+        if let Err(reason) = delegated {{
+            return invalid(&reason, Some(key_id));
+        }}
+    }} else {{
+        let Ok(expected) = signature_value(&unsigned, &key.secret) else {{
+            return invalid("signature_invalid", Some(key_id));
+        }};
+        if !constant_time_eq(value.as_bytes(), expected.as_bytes()) {{
+            return invalid("signature_invalid", Some(key_id));
+        }}
     }}
 
     C3SignatureVerification {{
@@ -1412,6 +1427,63 @@ mod tests {{
         let revoked_verification = verify_report(&signed, &trust_store);
         assert!(!revoked_verification.valid);
         assert_eq!(revoked_verification.error_code.as_deref(), Some("REVOKED_KEY"));
+    }}
+
+    struct DelegatingTrustStore {{
+        key: VerifierKey,
+        accepted_signature: String,
+    }}
+
+    impl VerifierTrustStore for DelegatingTrustStore {{
+        fn get_key(&self, key_id: &str) -> Option<&VerifierKey> {{
+            if key_id == self.key.key_id {{
+                Some(&self.key)
+            }} else {{
+                None
+            }}
+        }}
+
+        fn verify_signature_value(
+            &self,
+            key_id: &str,
+            report_with_empty_signature: &Value,
+            signature_value: &str,
+        ) -> Option<Result<(), String>> {{
+            assert_eq!(key_id, self.key.key_id);
+            assert_eq!(report_with_empty_signature["signature"]["value"], "");
+            if signature_value == self.accepted_signature {{
+                Some(Ok(()))
+            }} else {{
+                Some(Err("signature_invalid".to_string()))
+            }}
+        }}
+    }}
+
+    #[test]
+    fn argusverify_delegates_signature_value_for_secretless_trust_store() {{
+        let signed = sign_report(
+            &vector_report(),
+            "{C3_ARGUSVERIFY_KEY_ID}",
+            "{C3_ARGUSVERIFY_SECRET}".as_bytes(),
+        )
+        .expect("sign vector");
+        let accepted_signature = signed["signature"]["value"]
+            .as_str()
+            .expect("signature string")
+            .to_string();
+        let trust_store = DelegatingTrustStore {{
+            key: VerifierKey::new("{C3_ARGUSVERIFY_KEY_ID}", Vec::<u8>::new()),
+            accepted_signature,
+        }};
+
+        let valid = verify_report(&signed, &trust_store);
+        assert!(valid.valid);
+
+        let mut bad_signature = signed.clone();
+        bad_signature["signature"]["value"] = Value::String("hmac-sha256:bad".to_string());
+        let invalid = verify_report(&bad_signature, &trust_store);
+        assert!(!invalid.valid);
+        assert_eq!(invalid.error_code.as_deref(), Some("SIGNATURE_INVALID"));
     }}
 }}
 '''
