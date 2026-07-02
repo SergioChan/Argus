@@ -769,6 +769,9 @@ class StoreWriterBroker:
         self._artifact_store = artifact_store
         self._audit_ledger = audit_ledger
 
+    def client_for(self, scope_token: ScopeToken) -> "BrokeredStoreClient":
+        return BrokeredStoreClient(broker=self, scope_token=scope_token)
+
     def put_artifact(
         self,
         *,
@@ -788,7 +791,7 @@ class StoreWriterBroker:
             )
             raise TokenInvalidError(verification.reason or "invalid scope token")
         if "store" not in scope_token.scopes.broker_audiences:
-            self._audit_ledger.append("secret.denied", {"audience": "store", "reason": "scope_denied"})
+            self._audit_ledger.append("store.denied", {"audience": "store", "reason": "scope_denied"})
             raise ScopeDeniedError("scope does not allow store broker audience")
         record = self._artifact_store.create_artifact(
             kind=kind,
@@ -799,10 +802,48 @@ class StoreWriterBroker:
             validation_report_ref=validation_report_ref,
         )
         self._audit_ledger.append(
-            "secret.brokered",
+            "store.put",
             {"audience": "store", "op": "put_artifact", "artifact_ref": record.artifact_ref},
         )
         return record
+
+    def deny_direct_write(self, *, scope_token: ScopeToken, op: str) -> None:
+        self._audit_ledger.append(
+            "store.direct_write_denied",
+            {"audience": "store", "op": op, "scope_id": scope_token.scope_id},
+        )
+        raise ScopeDeniedError("direct S8 writes are denied; use StoreWriterBroker.put_artifact")
+
+
+class BrokeredStoreClient:
+    """Sandbox-facing store client exposing only the brokered artifact put path."""
+
+    def __init__(self, *, broker: StoreWriterBroker, scope_token: ScopeToken) -> None:
+        self._broker = broker
+        self._scope_token = scope_token
+
+    def put_artifact(
+        self,
+        *,
+        kind: str,
+        payload: Any,
+        producer: Producer,
+        lineage: Lineage,
+        claim_tier: str = "ran-toy",
+        validation_report_ref: str | None = None,
+    ) -> ArtifactRecord:
+        return self._broker.put_artifact(
+            scope_token=self._scope_token,
+            kind=kind,
+            payload=payload,
+            producer=producer,
+            lineage=lineage,
+            claim_tier=claim_tier,
+            validation_report_ref=validation_report_ref,
+        )
+
+    def create_artifact(self, *args: Any, **kwargs: Any) -> ArtifactRecord:
+        self._broker.deny_direct_write(scope_token=self._scope_token, op="create_artifact")
 
 
 class DockerSandboxSupervisor:

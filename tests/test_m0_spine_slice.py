@@ -97,8 +97,7 @@ class M0SpineIntegrationSliceTests(unittest.TestCase):
             artifact_store=self.artifacts,
             audit_ledger=self.audit,
         )
-        model = broker.put_artifact(
-            scope_token=scope,
+        model = broker.client_for(scope).put_artifact(
             kind="model",
             payload={"weights": [1, 2, 3]},
             producer=Producer(subsystem="S2", version="0.0.0"),
@@ -117,7 +116,7 @@ class M0SpineIntegrationSliceTests(unittest.TestCase):
         self.assertEqual(self.artifacts.record_count, 2)
         self.assertTrue(self.artifacts.verify_audit_chain().valid)
         self.assertTrue(self.audit.verify_chain().valid)
-        self.assertEqual(self.audit.events()[-1].event_type, "secret.brokered")
+        self.assertEqual(self.audit.events()[-1].event_type, "store.put")
 
     def test_store_broker_denies_scope_without_store_audience(self) -> None:
         scope = self.tokens.mint_scope(
@@ -134,8 +133,7 @@ class M0SpineIntegrationSliceTests(unittest.TestCase):
         )
 
         with self.assertRaises(ScopeDeniedError):
-            broker.put_artifact(
-                scope_token=scope,
+            broker.client_for(scope).put_artifact(
                 kind="model",
                 payload={"weights": [1]},
                 producer=Producer(subsystem="S2", version="0.0.0"),
@@ -143,7 +141,7 @@ class M0SpineIntegrationSliceTests(unittest.TestCase):
             )
 
         self.assertEqual(self.artifacts.record_count, 0)
-        self.assertEqual(self.audit.events()[-1].event_type, "secret.denied")
+        self.assertEqual(self.audit.events()[-1].event_type, "store.denied")
 
 
 if __name__ == "__main__":

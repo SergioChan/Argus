@@ -189,6 +189,7 @@ from .s7 import (
 )
 from .s10 import (
     AuditEvent,
+    BrokeredStoreClient,
     BudgetCaps,
     BudgetExceededError,
     BudgetToken,
@@ -367,6 +368,7 @@ from .s9 import (
 
 __all__ = [
     "AuditEvent",
+    "BrokeredStoreClient",
     "ADDITIVE_MINOR",
     "BLAKE3_PREFIX",
     "BREAKING_MAJOR",

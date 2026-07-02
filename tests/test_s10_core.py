@@ -14,22 +14,28 @@ from argus_core import (
     DockerSandboxSupervisor,
     EgressProxy,
     EgressRule,
+    InMemoryArtifactStore,
     InMemoryAuditLedger,
     InMemoryQuotaLedger,
     InMemorySandboxOrchestrator,
     InMemoryTokenService,
     LaunchEnvelope,
     LaunchRequest,
+    Lineage,
     PolicyBundle,
     PolicyDeniedError,
+    Producer,
     ResourceCeilings,
     SandboxExecutionResult,
     SandboxHandle,
+    ScopeDeniedError,
     ScopeGrant,
     ScopeWideningError,
+    StoreWriterBroker,
     TokenInvalidError,
     canonical_json_bytes,
     decide_policy,
+    hash_bytes,
     materialize_sandbox_env,
 )
 
@@ -251,6 +257,65 @@ class S10PolicyAndEgressTests(unittest.TestCase):
                 estimated_cost_usd=1,
             ),
         )
+
+
+class S10StoreWriterBrokerTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.artifacts = InMemoryArtifactStore()
+        self.audit = InMemoryAuditLedger()
+        self.tokens = InMemoryTokenService(signing_key=b"test-key", now_fn=lambda: 1_000)
+        self.broker = StoreWriterBroker(
+            token_service=self.tokens,
+            artifact_store=self.artifacts,
+            audit_ledger=self.audit,
+        )
+
+    def test_sandbox_client_put_writes_artifact_and_matches_content_hash(self) -> None:
+        scope = self.tokens.mint_scope(job_id="job-1", scopes=ScopeGrant(broker_audiences=("store",)))
+        client = self.broker.client_for(scope)
+        payload = {"weights": [1, 2, 3]}
+
+        record = client.put_artifact(
+            kind="model",
+            payload=payload,
+            producer=Producer(subsystem="S2", version="0.0.0"),
+            lineage=Lineage(input_refs=(), code_ref="git:model", environment_digest="oci:model"),
+        )
+
+        payload_bytes = canonical_json_bytes(payload)
+        self.assertEqual(record.content_hash, hash_bytes(payload_bytes))
+        self.assertEqual(self.artifacts.get_artifact(record.artifact_ref), payload_bytes)
+        self.assertEqual(self.artifacts.record_count, 1)
+        self.assertEqual(self.audit.events()[-1].event_type, "store.put")
+
+    def test_sandbox_client_denies_direct_store_write_method(self) -> None:
+        scope = self.tokens.mint_scope(job_id="job-1", scopes=ScopeGrant(broker_audiences=("store",)))
+        client = self.broker.client_for(scope)
+
+        with self.assertRaises(ScopeDeniedError):
+            client.create_artifact(
+                kind="model",
+                payload={"weights": [1]},
+                producer=Producer(subsystem="S2", version="0.0.0"),
+                lineage=Lineage(input_refs=(), code_ref="git:model", environment_digest="oci:model"),
+            )
+
+        self.assertEqual(self.artifacts.record_count, 0)
+        self.assertEqual(self.audit.events()[-1].event_type, "store.direct_write_denied")
+
+    def test_store_broker_denies_scope_without_store_audience(self) -> None:
+        scope = self.tokens.mint_scope(job_id="job-1", scopes=ScopeGrant(broker_audiences=("adapter:a",)))
+
+        with self.assertRaises(ScopeDeniedError):
+            self.broker.client_for(scope).put_artifact(
+                kind="model",
+                payload={"weights": [1]},
+                producer=Producer(subsystem="S2", version="0.0.0"),
+                lineage=Lineage(input_refs=(), code_ref="git:model", environment_digest="oci:model"),
+            )
+
+        self.assertEqual(self.artifacts.record_count, 0)
+        self.assertEqual(self.audit.events()[-1].event_type, "store.denied")
 
 
 class S10OrchestratorAndAuditTests(unittest.TestCase):
