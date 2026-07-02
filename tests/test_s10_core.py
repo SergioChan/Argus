@@ -5,6 +5,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import unittest
 
 import argus_core.s10 as s10_module
@@ -18,6 +19,8 @@ from argus_core import (
     EgressRule,
     InMemoryArtifactStore,
     InMemoryAuditLedger,
+    InMemoryPolicyBundleTrustStore,
+    InMemoryPolicyService,
     InMemoryQuotaLedger,
     InMemorySandboxOrchestrator,
     InMemoryTokenService,
@@ -25,6 +28,8 @@ from argus_core import (
     LaunchRequest,
     Lineage,
     PolicyBundle,
+    PolicyBundleSignatureError,
+    PolicyBundleSigner,
     PolicyDeniedError,
     Producer,
     ResourceCeilings,
@@ -196,6 +201,146 @@ class S10PolicyAndEgressTests(unittest.TestCase):
         self.assertEqual(first.runtime_class, "gvisor")
         self.assertEqual(first.egress_acl, (EgressRule("store.local", 443, "https"),))
 
+    def test_policy_bundle_signature_verification_fails_closed_on_tamper(self) -> None:
+        signer = PolicyBundleSigner(key_id="policy-key", secret=b"policy-secret")
+        trust_store = InMemoryPolicyBundleTrustStore({"policy-key": b"policy-secret"})
+        signed = signer.sign(self.bundle)
+
+        self.assertTrue(trust_store.verify(signed).valid)
+
+        tampered = replace(
+            signed,
+            resource_ceilings=replace(signed.resource_ceilings, cpu_m=signed.resource_ceilings.cpu_m + 1),
+        )
+        self.assertEqual(trust_store.verify(tampered).reason, "signature_invalid")
+        self.assertEqual(trust_store.verify(replace(signed, signer_key_id="unknown")).reason, "unknown_signer")
+
+        with self.assertRaises(PolicyBundleSignatureError):
+            InMemoryPolicyService(initial_bundle=tampered, trust_store=trust_store)
+
+    def test_policy_decision_is_byte_identical_across_processes_for_signed_bundle(self) -> None:
+        expected = self._signed_policy_verdict_bytes()
+        script = """
+from dataclasses import asdict
+from argus_core import (
+    BudgetCaps,
+    EgressRule,
+    InMemoryPolicyBundleTrustStore,
+    InMemoryPolicyService,
+    InMemoryTokenService,
+    LaunchEnvelope,
+    LaunchRequest,
+    PolicyBundle,
+    PolicyBundleSigner,
+    ResourceCeilings,
+    ScopeGrant,
+    canonical_json_bytes,
+)
+
+tokens = InMemoryTokenService(signing_key=b"test-key", now_fn=lambda: 1_000)
+bundle = PolicyBundle(
+    bundle_version="1.0.0",
+    egress_allowlist=(EgressRule("store.local", 443, "https"),),
+    resource_ceilings=ResourceCeilings(
+        cpu_m=2_000,
+        mem_bytes=4_000_000_000,
+        gpu_count=1,
+        wallclock_s=120,
+        max_cost_usd=20,
+    ),
+    risk_to_runtime={"standard": "gvisor", "federated": "firecracker", "high": "firecracker"},
+    seccomp_profile_hash="blake3:" + "a" * 64,
+    signer_key_id="security",
+    signature="test-signature",
+)
+signed = PolicyBundleSigner(key_id="policy-key", secret=b"policy-secret").sign(bundle)
+service = InMemoryPolicyService(
+    initial_bundle=signed,
+    trust_store=InMemoryPolicyBundleTrustStore({"policy-key": b"policy-secret"}),
+)
+budget = tokens.mint_budget(
+    caps=BudgetCaps(max_compute_units=1_000, max_gpu_seconds=120, max_wallclock_s=120, max_cost_usd=20),
+    job_id="job-1",
+    root_request_id="root-1",
+)
+scope = tokens.mint_scope(
+    job_id="job-1",
+    scopes=ScopeGrant(
+        egress_allowlist=(EgressRule("store.local", 443, "https"),),
+        broker_audiences=("store",),
+    ),
+)
+request = LaunchRequest(
+    job_id="job-1",
+    subagent_id="subagent-1",
+    trace_id="trace-1",
+    budget_token=budget,
+    scope_token=scope,
+    image="registry.local/argus@sha256:" + "b" * 64,
+    entrypoint=("python",),
+    args=("train.py",),
+    env={},
+    env_allowlist=(),
+    requested_envelope=LaunchEnvelope(
+        cpu_m=1_000,
+        mem_bytes=1_000_000,
+        gpu_count=0,
+        wallclock_s=10,
+        scratch_bytes=1_000,
+        pids=10,
+        estimated_cost_usd=1,
+    ),
+)
+print(canonical_json_bytes(asdict(service.decide(request))).decode("utf-8"))
+"""
+        env = os.environ.copy()
+        env["PYTHONPATH"] = os.pathsep.join(filter(None, (os.getcwd(), env.get("PYTHONPATH", ""))))
+
+        outputs = [
+            subprocess.check_output([sys.executable, "-c", script], text=True, env=env).strip().encode("utf-8")
+            for _ in range(2)
+        ]
+
+        self.assertEqual(outputs, [expected, expected])
+        self.assertEqual(
+            expected.decode("utf-8"),
+            '{"allowed":true,"deny_reason":null,"egress_acl":[{"host":"store.local","port":443,"proto":"https"}],"runtime_class":"gvisor"}',
+        )
+
+    def test_policy_rollout_pins_in_flight_and_affects_new_launches(self) -> None:
+        audit = InMemoryAuditLedger()
+        signer = PolicyBundleSigner(key_id="policy-key", secret=b"policy-secret")
+        trust_store = InMemoryPolicyBundleTrustStore({"policy-key": b"policy-secret"})
+        v1 = signer.sign(self.bundle)
+        v2 = signer.sign(
+            replace(
+                self.bundle,
+                bundle_version="2.0.0",
+                risk_to_runtime={**self.bundle.risk_to_runtime, "standard": "docker"},
+            )
+        )
+        service = InMemoryPolicyService(initial_bundle=v1, trust_store=trust_store, audit_ledger=audit)
+        orchestrator = InMemorySandboxOrchestrator(
+            token_service=self.tokens,
+            quota_ledger=InMemoryQuotaLedger(),
+            audit_ledger=audit,
+            policy_service=service,
+        )
+
+        first = orchestrator.launch(self._launch_request())
+        service.publish(v2)
+        second = orchestrator.launch(self._launch_request())
+
+        self.assertEqual(first.policy_bundle_version, "1.0.0")
+        self.assertEqual(first.runtime_class, "gvisor")
+        self.assertEqual(orchestrator.get(first.sandbox_id).policy_bundle_version, "1.0.0")
+        self.assertEqual(second.policy_bundle_version, "2.0.0")
+        self.assertEqual(second.runtime_class, "docker")
+        rollout_events = [event for event in audit.events() if event.event_type == "policy.rollout"]
+        self.assertEqual(rollout_events[-1].payload["bundle_version"], "2.0.0")
+        self.assertEqual(rollout_events[-1].payload["previous_bundle_version"], "1.0.0")
+        self.assertFalse(rollout_events[-1].payload["initial"])
+
     def test_policy_denies_resource_ceiling(self) -> None:
         request = self._launch_request(
             envelope=LaunchEnvelope(
@@ -236,6 +381,14 @@ class S10PolicyAndEgressTests(unittest.TestCase):
 
         with self.assertRaises(PolicyDeniedError):
             materialize_sandbox_env({"SAFE": "api_key=sk-abcdefghijklmnop"}, ("SAFE",))
+
+    def _signed_policy_verdict_bytes(self) -> bytes:
+        signed = PolicyBundleSigner(key_id="policy-key", secret=b"policy-secret").sign(self.bundle)
+        service = InMemoryPolicyService(
+            initial_bundle=signed,
+            trust_store=InMemoryPolicyBundleTrustStore({"policy-key": b"policy-secret"}),
+        )
+        return canonical_json_bytes(asdict(service.decide(self._launch_request())))
 
     def _launch_request(self, envelope: LaunchEnvelope | None = None) -> LaunchRequest:
         budget = self.tokens.mint_budget(

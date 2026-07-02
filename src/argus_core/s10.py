@@ -58,6 +58,10 @@ class PolicyDeniedError(S10Error):
     """Raised when policy or admission denies a sandbox launch."""
 
 
+class PolicyBundleSignatureError(S10Error):
+    """Raised when a policy bundle signature cannot be trusted."""
+
+
 class SandboxRuntimeUnavailableError(S10Error):
     """Raised when the configured sandbox runtime cannot be invoked."""
 
@@ -129,6 +133,12 @@ class ScopeToken:
 
 @dataclass(frozen=True)
 class TokenVerification:
+    valid: bool
+    reason: str | None = None
+
+
+@dataclass(frozen=True)
+class PolicyBundleVerification:
     valid: bool
     reason: str | None = None
 
@@ -766,6 +776,99 @@ class InMemoryAuditLedger:
         return f"{BLAKE3_PREFIX}{'0' * 64}"
 
 
+class PolicyBundleSigner:
+    """Signs S10 policy bundles for deterministic admission decisions."""
+
+    def __init__(self, *, key_id: str, secret: bytes) -> None:
+        self.key_id = key_id
+        self._secret = bytes(secret)
+
+    def sign(self, bundle: PolicyBundle) -> PolicyBundle:
+        unsigned = replace(bundle, signer_key_id=self.key_id, signature="")
+        return replace(unsigned, signature=self._signature_value(unsigned))
+
+    def _signature_value(self, bundle: PolicyBundle) -> str:
+        digest = hmac.new(self._secret, _policy_bundle_signature_payload(bundle), sha256).hexdigest()
+        return f"{SIGNATURE_PREFIX}{digest}"
+
+
+class InMemoryPolicyBundleTrustStore:
+    """Fail-closed verifier for signed S10 policy bundles."""
+
+    def __init__(self, keys: dict[str, bytes]) -> None:
+        self._keys = {key_id: bytes(secret) for key_id, secret in keys.items()}
+
+    def verify(self, bundle: PolicyBundle) -> PolicyBundleVerification:
+        secret = self._keys.get(bundle.signer_key_id)
+        if secret is None:
+            return PolicyBundleVerification(False, "unknown_signer")
+        if not bundle.signature.startswith(SIGNATURE_PREFIX):
+            return PolicyBundleVerification(False, "signature_invalid")
+        digest = hmac.new(secret, _policy_bundle_signature_payload(bundle), sha256).hexdigest()
+        expected = f"{SIGNATURE_PREFIX}{digest}"
+        if not hmac.compare_digest(bundle.signature, expected):
+            return PolicyBundleVerification(False, "signature_invalid")
+        return PolicyBundleVerification(True)
+
+
+class InMemoryPolicyService:
+    """Verified in-memory S10 policy bundle service with atomic rollout semantics."""
+
+    def __init__(
+        self,
+        *,
+        initial_bundle: PolicyBundle,
+        trust_store: InMemoryPolicyBundleTrustStore,
+        audit_ledger: InMemoryAuditLedger | None = None,
+    ) -> None:
+        self._trust_store = trust_store
+        self._audit_ledger = audit_ledger
+        self._bundles: dict[str, PolicyBundle] = {}
+        self._active_version = ""
+        self.publish(initial_bundle, initial=True)
+
+    @property
+    def active_bundle(self) -> PolicyBundle:
+        return self._bundles[self._active_version]
+
+    def publish(self, bundle: PolicyBundle, *, initial: bool = False) -> None:
+        verification = self._trust_store.verify(bundle)
+        if not verification.valid:
+            raise PolicyBundleSignatureError(verification.reason or "invalid policy bundle signature")
+        previous_version = self._active_version or None
+        self._bundles[bundle.bundle_version] = bundle
+        self._active_version = bundle.bundle_version
+        if self._audit_ledger is not None:
+            self._audit_ledger.append(
+                "policy.rollout",
+                {
+                    "bundle_version": bundle.bundle_version,
+                    "previous_bundle_version": previous_version,
+                    "initial": initial,
+                    "signer_key_id": bundle.signer_key_id,
+                },
+            )
+
+    def decide(self, request: LaunchRequest) -> PolicyVerdict:
+        return decide_policy(self.active_bundle, request)
+
+
+class _StaticPolicyService:
+    def __init__(self, bundle: PolicyBundle) -> None:
+        self._bundle = bundle
+
+    @property
+    def active_bundle(self) -> PolicyBundle:
+        return self._bundle
+
+    def decide(self, request: LaunchRequest) -> PolicyVerdict:
+        return decide_policy(self._bundle, request)
+
+
+def _policy_bundle_signature_payload(bundle: PolicyBundle) -> bytes:
+    return canonical_json_bytes({**asdict(bundle), "signature": ""})
+
+
 class StoreWriterBroker:
     """Brokered S8 write path for sandbox-origin artifacts."""
 
@@ -1116,19 +1219,28 @@ class InMemorySandboxOrchestrator:
         token_service: InMemoryTokenService,
         quota_ledger: InMemoryQuotaLedger,
         audit_ledger: InMemoryAuditLedger,
-        policy_bundle: PolicyBundle,
+        policy_bundle: PolicyBundle | None = None,
+        policy_service: InMemoryPolicyService | None = None,
         artifact_store: InMemoryArtifactStore | None = None,
     ) -> None:
+        if policy_service is None and policy_bundle is None:
+            raise PolicyDeniedError("policy_bundle or policy_service is required")
+        if policy_service is not None and policy_bundle is not None:
+            raise PolicyDeniedError("policy_bundle and policy_service are mutually exclusive")
+        if policy_service is None:
+            assert policy_bundle is not None
+            policy_service = _StaticPolicyService(policy_bundle)
         self._token_service = token_service
         self._quota_ledger = quota_ledger
         self._audit_ledger = audit_ledger
-        self._policy_bundle = policy_bundle
+        self._policy_service = policy_service
         self._artifact_store = artifact_store
         self._handles: dict[str, SandboxHandle] = {}
 
     def launch(self, request: LaunchRequest) -> SandboxHandle:
         self._verify_tokens_for_launch(request)
-        verdict = decide_policy(self._policy_bundle, request)
+        policy_bundle = self._policy_service.active_bundle
+        verdict = self._policy_service.decide(request)
         if not verdict.allowed:
             self._audit_ledger.append("sandbox.denied", {"reason": verdict.deny_reason, "job_id": request.job_id})
             raise PolicyDeniedError(verdict.deny_reason or "policy denied")
@@ -1151,13 +1263,13 @@ class InMemorySandboxOrchestrator:
             self._audit_ledger.append("budget.reject", {"budget_id": request.budget_token.budget_id})
             raise
 
-        launch_provenance_ref = self._emit_launch_provenance(request, verdict)
+        launch_provenance_ref = self._emit_launch_provenance(request, verdict, policy_bundle)
         handle = SandboxHandle(
             sandbox_id=str(uuid4()),
             job_id=request.job_id,
             runtime_class=verdict.runtime_class or "gvisor",
             budget_epoch=request.budget_token.budget_epoch,
-            policy_bundle_version=self._policy_bundle.bundle_version,
+            policy_bundle_version=policy_bundle.bundle_version,
             state="ADMITTED",
             launch_provenance_ref=launch_provenance_ref,
         )
@@ -1187,10 +1299,15 @@ class InMemorySandboxOrchestrator:
             )
             raise TokenInvalidError(scope_verification.reason or "invalid scope token")
 
-    def _emit_launch_provenance(self, request: LaunchRequest, verdict: PolicyVerdict) -> str | None:
+    def _emit_launch_provenance(
+        self,
+        request: LaunchRequest,
+        verdict: PolicyVerdict,
+        policy_bundle: PolicyBundle,
+    ) -> str | None:
         if self._artifact_store is None:
             return None
-        exec_environment = _launch_exec_environment(request, verdict, self._policy_bundle)
+        exec_environment = _launch_exec_environment(request, verdict, policy_bundle)
         exec_environment_digest = hash_json(exec_environment)
         payload = {
             "exec_environment_digest": exec_environment_digest,
@@ -1208,7 +1325,7 @@ class InMemorySandboxOrchestrator:
         record = self._artifact_store.create_artifact(
             kind="container",
             payload=payload,
-            producer=Producer(subsystem="S10", version=self._policy_bundle.bundle_version),
+            producer=Producer(subsystem="S10", version=policy_bundle.bundle_version),
             lineage=Lineage(
                 input_refs=(),
                 code_ref=request.image,
