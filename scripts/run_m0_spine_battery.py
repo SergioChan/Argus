@@ -82,6 +82,7 @@ def main() -> int:
         **ports,
         "ARGUS_RUNTIME_BOOTSTRAP_TOKEN": runtime_secrets["bootstrap_token"],
         "ARGUS_RUNTIME_IDENTITY_SIGNING_KEY": runtime_secrets["identity_signing_key"],
+        "ARGUS_RUNTIME_IDENTITY_MINT_POLICY_JSON": _m0_identity_mint_policy_json(),
         "ARGUS_S10_SIGNING_KEY": runtime_secrets["s10_signing_key"],
         "ARGUS_S8_BROKER_WRITE_KEY": runtime_secrets["s8_broker_write_key"],
     }
@@ -102,6 +103,7 @@ def main() -> int:
             _run([docker, "compose", "-f", args.compose_file, "up", "-d", "--build", "--wait"], env=env, timeout=240)
         _wait_health(f"{s8_url}/healthz", token=runtime_secrets["bootstrap_token"])
         _wait_health(f"{s10_url}/healthz", token=runtime_secrets["bootstrap_token"])
+        _battery_runtime_identity_mint_policy(evidence, s10_url, bootstrap_token=runtime_secrets["bootstrap_token"])
         auth_tokens = _mint_m0_runtime_identities(s10_url=s10_url, bootstrap_token=runtime_secrets["bootstrap_token"])
         _ensure_image(docker, args.image)
 
@@ -262,12 +264,61 @@ def _m0_identity_requests() -> dict[str, dict[str, Any]]:
     }
 
 
+def _m0_identity_mint_policy_json() -> str:
+    policy: dict[str, dict[str, Any]] = {}
+    for body in _m0_identity_requests().values():
+        caller_id = body["caller_id"]
+        policy[caller_id] = {
+            "job_id": body["job_id"],
+            "root_request_id": body["root_request_id"],
+            "scopes": body.get("scopes", {}),
+            "budget_caps": body.get("budget_caps", {}),
+            "max_ttl_s": 900,
+        }
+    return json.dumps(policy, separators=(",", ":"), sort_keys=True)
+
+
+def _battery_runtime_identity_mint_policy(evidence: dict[str, Any], s10_url: str, *, bootstrap_token: str) -> None:
+    override = _post_json(
+        f"{s10_url}/v1/runtime-identities",
+        {"caller_id": "m0-spine-launch", "job_id": "attacker-selected-job"},
+        expected_status=403,
+        token=bootstrap_token,
+    )
+    unknown = _post_json(
+        f"{s10_url}/v1/runtime-identities",
+        {"caller_id": "unknown-launcher"},
+        expected_status=403,
+        token=bootstrap_token,
+    )
+    ttl = _post_json(
+        f"{s10_url}/v1/runtime-identities",
+        {"caller_id": "m0-spine-launch", "ttl_s": 901},
+        expected_status=403,
+        token=bootstrap_token,
+    )
+    if override["error"] != "IdentityOverrideError":
+        raise AssertionError(f"unexpected runtime identity override error: {override}")
+    if unknown["error"] != "PermissionError" or ttl["error"] != "PermissionError":
+        raise AssertionError(f"unexpected runtime identity policy errors: unknown={unknown}, ttl={ttl}")
+    _record(
+        evidence,
+        "identity-policy",
+        "bootstrap runtime identity mint is constrained by server-side caller policy",
+        {
+            "override": override["error"],
+            "unknown_caller": unknown["error"],
+            "ttl_ceiling": ttl["error"],
+        },
+    )
+
+
 def _mint_m0_runtime_identities(*, s10_url: str, bootstrap_token: str) -> dict[str, str]:
     minted: dict[str, str] = {}
     for name, body in _m0_identity_requests().items():
         response = _post_json(
             f"{s10_url}/v1/runtime-identities",
-            {**body, "ttl_s": 900},
+            {"caller_id": body["caller_id"], "ttl_s": 900},
             expected_status=201,
             token=bootstrap_token,
         )

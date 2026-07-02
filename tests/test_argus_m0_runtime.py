@@ -16,7 +16,11 @@ from argus_core import BudgetCaps, BudgetToken, FileSystemArtifactStore, Lineage
 from argus_core import canonical_json_bytes
 from argus_runtime.auth import RuntimeAuth, RuntimeIdentity
 from argus_runtime.http_json import JsonRequest
-from argus_runtime.s10_supervisor_service import S10SupervisorApp, build_app_from_env as build_s10_app_from_env
+from argus_runtime.s10_supervisor_service import (
+    RuntimeIdentityMintPolicy,
+    S10SupervisorApp,
+    build_app_from_env as build_s10_app_from_env,
+)
 from argus_runtime.s8_writer_service import S8WriterApp
 
 
@@ -280,7 +284,11 @@ class ArgusM0RuntimeServiceTests(unittest.TestCase):
         self.assertEqual(override_payload["error"], "IdentityOverrideError")
 
     def test_s10_http_mints_runtime_identity_before_budget_scope_tokens(self) -> None:
-        app = S10SupervisorApp(signing_key=b"test-key", auth=_signed_runtime_auth())
+        app = S10SupervisorApp(
+            signing_key=b"test-key",
+            auth=_signed_runtime_auth(),
+            runtime_identity_mint_policy=_runtime_identity_mint_policy(),
+        )
 
         identity_status, identity_payload = app.http.handle(
             JsonRequest(
@@ -289,10 +297,6 @@ class ArgusM0RuntimeServiceTests(unittest.TestCase):
                 query={},
                 body={
                     "caller_id": "sandbox-1",
-                    "job_id": "job-launch",
-                    "root_request_id": "root-launch",
-                    "budget_caps": {"max_compute_units": 10, "max_wallclock_s": 30, "max_cost_usd": 5},
-                    "scopes": {"broker_audiences": ["store"], "producer_subsystems": ["S2"]},
                     "ttl_s": 120,
                 },
                 headers=_auth_headers(BOOTSTRAP_TOKEN),
@@ -326,6 +330,75 @@ class ArgusM0RuntimeServiceTests(unittest.TestCase):
         self.assertEqual(scope_status, 201)
         self.assertEqual(scope["job_id"], "job-launch")
         self.assertEqual(scope["scopes"]["producer_subsystems"], ("S2",))
+
+    def test_s10_runtime_identity_mint_policy_rejects_overrides_unknown_callers_and_ttl_widening(self) -> None:
+        app = S10SupervisorApp(
+            signing_key=b"test-key",
+            auth=_signed_runtime_auth(),
+            runtime_identity_mint_policy=_runtime_identity_mint_policy(),
+        )
+
+        override_status, override_payload = app.http.handle(
+            JsonRequest(
+                method="POST",
+                path="/v1/runtime-identities",
+                query={},
+                body={"caller_id": "sandbox-1", "job_id": "attacker-selected-job"},
+                headers=_auth_headers(BOOTSTRAP_TOKEN),
+            )
+        )
+        unknown_status, unknown_payload = app.http.handle(
+            JsonRequest(
+                method="POST",
+                path="/v1/runtime-identities",
+                query={},
+                body={"caller_id": "unknown"},
+                headers=_auth_headers(BOOTSTRAP_TOKEN),
+            )
+        )
+        ttl_status, ttl_payload = app.http.handle(
+            JsonRequest(
+                method="POST",
+                path="/v1/runtime-identities",
+                query={},
+                body={"caller_id": "sandbox-1", "ttl_s": 301},
+                headers=_auth_headers(BOOTSTRAP_TOKEN),
+            )
+        )
+        no_policy = S10SupervisorApp(signing_key=b"test-key", auth=_signed_runtime_auth())
+        no_policy_status, no_policy_payload = no_policy.http.handle(
+            JsonRequest(
+                method="POST",
+                path="/v1/runtime-identities",
+                query={},
+                body={"caller_id": "sandbox-1"},
+                headers=_auth_headers(BOOTSTRAP_TOKEN),
+            )
+        )
+
+        self.assertEqual(override_status, 403)
+        self.assertEqual(override_payload["error"], "IdentityOverrideError")
+        self.assertEqual(unknown_status, 403)
+        self.assertEqual(unknown_payload["error"], "PermissionError")
+        self.assertEqual(ttl_status, 403)
+        self.assertEqual(ttl_payload["error"], "PermissionError")
+        self.assertEqual(no_policy_status, 403)
+        self.assertEqual(no_policy_payload["error"], "PermissionError")
+        caller_key_policy = RuntimeIdentityMintPolicy.from_json(
+            json.dumps(
+                {
+                    "sandbox-1": {
+                        "caller_id": "attacker-caller",
+                        "job_id": "job-launch",
+                        "root_request_id": "root-launch",
+                        "budget_caps": {"max_compute_units": 10, "max_wallclock_s": 30, "max_cost_usd": 5},
+                        "scopes": {"broker_audiences": ["store"], "producer_subsystems": ["S2"]},
+                        "max_ttl_s": 300,
+                    }
+                }
+            )
+        )
+        self.assertEqual(caller_key_policy.identity_for_request({"caller_id": "sandbox-1"}).caller_id, "sandbox-1")
 
     def test_s10_env_build_fails_closed_without_signing_key(self) -> None:
         with patch.dict(
@@ -476,6 +549,7 @@ class ArgusM0ComposeTests(unittest.TestCase):
                 **os.environ,
                 "ARGUS_RUNTIME_BOOTSTRAP_TOKEN": BOOTSTRAP_TOKEN,
                 "ARGUS_RUNTIME_IDENTITY_SIGNING_KEY": IDENTITY_SIGNING_KEY.decode("utf-8"),
+                "ARGUS_RUNTIME_IDENTITY_MINT_POLICY_JSON": _runtime_identity_mint_policy_json(),
                 "ARGUS_S10_SIGNING_KEY": "test-s10-signing-key",
                 "ARGUS_S8_BROKER_WRITE_KEY": BROKER_WRITE_KEY.decode("utf-8"),
             },
@@ -506,6 +580,7 @@ class ArgusM0ComposeTests(unittest.TestCase):
         self.assertIn("ARGUS_RUNTIME_IDENTITY_SIGNING_KEY", services["s8-writer"]["environment"])
         self.assertIn("ARGUS_RUNTIME_BOOTSTRAP_TOKEN", services["s10-supervisor"]["environment"])
         self.assertIn("ARGUS_RUNTIME_IDENTITY_SIGNING_KEY", services["s10-supervisor"]["environment"])
+        self.assertIn("ARGUS_RUNTIME_IDENTITY_MINT_POLICY_JSON", services["s10-supervisor"]["environment"])
         self.assertIn("ARGUS_S8_BROKER_WRITE_KEY", services["s8-writer"]["environment"])
         self.assertEqual(
             services["s10-supervisor"]["environment"]["ARGUS_S8_BROKER_URL"],
@@ -543,6 +618,26 @@ def _signed_runtime_auth() -> RuntimeAuth:
     return RuntimeAuth.with_signed_identities(
         bootstrap_token=BOOTSTRAP_TOKEN,
         identity_signing_key=IDENTITY_SIGNING_KEY,
+    )
+
+
+def _runtime_identity_mint_policy() -> RuntimeIdentityMintPolicy:
+    return RuntimeIdentityMintPolicy.from_json(_runtime_identity_mint_policy_json())
+
+
+def _runtime_identity_mint_policy_json() -> str:
+    return json.dumps(
+        {
+            "sandbox-1": {
+                "job_id": "job-launch",
+                "root_request_id": "root-launch",
+                "budget_caps": {"max_compute_units": 10, "max_wallclock_s": 30, "max_cost_usd": 5},
+                "scopes": {"broker_audiences": ["store"], "producer_subsystems": ["S2"]},
+                "max_ttl_s": 300,
+            }
+        },
+        separators=(",", ":"),
+        sort_keys=True,
     )
 
 

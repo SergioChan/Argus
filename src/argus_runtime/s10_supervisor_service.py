@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from hashlib import sha256
 import hmac
 import json
@@ -46,6 +46,45 @@ from .auth import (
 from .http_json import JsonHttpApp, JsonRequest, serve_json_app
 
 
+@dataclass(frozen=True)
+class RuntimeIdentityMintPolicy:
+    identities_by_caller: dict[str, RuntimeIdentity]
+
+    @classmethod
+    def from_json(cls, raw: str) -> "RuntimeIdentityMintPolicy":
+        parsed = json.loads(raw)
+        if not isinstance(parsed, dict):
+            raise ValueError("runtime identity mint policy must be a JSON object")
+        identities: dict[str, RuntimeIdentity] = {}
+        for caller_id, identity_body in parsed.items():
+            if not isinstance(caller_id, str) or not caller_id:
+                raise ValueError("runtime identity mint policy caller ids must be non-empty strings")
+            if not isinstance(identity_body, dict):
+                raise ValueError("runtime identity mint policy entries must be objects")
+            identity = runtime_identity_from_dict({**identity_body, "caller_id": caller_id})
+            identities[caller_id] = RuntimeIdentity(
+                caller_id=identity.caller_id,
+                job_id=identity.job_id,
+                root_request_id=identity.root_request_id,
+                scopes=identity.scopes,
+                budget_caps=identity.budget_caps,
+                max_ttl_s=identity.max_ttl_s,
+            )
+        return cls(identities)
+
+    def identity_for_request(self, body: dict[str, Any]) -> RuntimeIdentity:
+        override_fields = sorted(set(body) - {"caller_id", "ttl_s"})
+        if override_fields:
+            raise IdentityOverrideError(
+                "runtime identity fields are bound to the server mint policy: " + ", ".join(override_fields)
+            )
+        caller_id = _required_str(body, "caller_id")
+        identity = self.identities_by_caller.get(caller_id)
+        if identity is None:
+            raise PermissionError("runtime identity caller is not allowed by mint policy")
+        return identity
+
+
 class S10SupervisorApp:
     def __init__(
         self,
@@ -54,6 +93,7 @@ class S10SupervisorApp:
         artifact_store: InMemoryArtifactStore | None = None,
         artifact_store_path: str | os.PathLike[str] | None = None,
         auth: RuntimeAuth | None = None,
+        runtime_identity_mint_policy: RuntimeIdentityMintPolicy | None = None,
     ) -> None:
         self.tokens = InMemoryTokenService(signing_key=signing_key)
         self.quota = InMemoryQuotaLedger()
@@ -61,6 +101,7 @@ class S10SupervisorApp:
         self.artifacts = artifact_store or InMemoryArtifactStore()
         self._artifact_store_path = Path(artifact_store_path) if artifact_store_path is not None else None
         self.auth = auth
+        self.runtime_identity_mint_policy = runtime_identity_mint_policy
         self.policy = _default_policy_bundle()
         self.broker = StoreWriterBroker(
             token_service=self.tokens,
@@ -154,8 +195,11 @@ class S10SupervisorApp:
             raise PermissionError("runtime identity minting requires bootstrap authentication")
         if self.auth is None:
             raise RuntimeError("runtime auth is not configured")
-        identity = runtime_identity_from_dict(body)
-        return self.auth.mint_identity_token(identity, ttl_s=int(body.get("ttl_s", identity.max_ttl_s)))
+        if self.runtime_identity_mint_policy is None:
+            raise PermissionError("runtime identity mint policy is not configured")
+        identity = self.runtime_identity_mint_policy.identity_for_request(body)
+        ttl_s = _identity_mint_ttl(body, identity.max_ttl_s)
+        return self.auth.mint_identity_token(identity, ttl_s=ttl_s)
 
     def _refresh_artifacts(self) -> None:
         if self._artifact_store_path is not None:
@@ -194,6 +238,8 @@ class S10SupervisorApp:
                 return 201, self.mint_runtime_identity_for_launcher(launcher, request.body)
             except UnauthorizedError as exc:
                 return 401, {"error": "Unauthorized", "message": str(exc)}
+            except IdentityOverrideError as exc:
+                return 403, {"error": type(exc).__name__, "message": str(exc)}
             except PermissionError as exc:
                 return 403, {"error": type(exc).__name__, "message": str(exc)}
             except Exception as exc:
@@ -261,6 +307,7 @@ def build_app_from_env() -> S10SupervisorApp:
         signing_key = signing_key_value.encode("utf-8")
     s8_broker_url = os.environ.get("ARGUS_S8_BROKER_URL")
     s8_broker_key = os.environ.get("ARGUS_S8_BROKER_WRITE_KEY")
+    mint_policy = _runtime_identity_mint_policy_from_env()
     if s8_broker_url:
         if not s8_broker_key:
             raise RuntimeError("ARGUS_S8_BROKER_WRITE_KEY is required when ARGUS_S8_BROKER_URL is configured")
@@ -271,6 +318,7 @@ def build_app_from_env() -> S10SupervisorApp:
                 broker_write_key=s8_broker_key.encode("utf-8"),
             ),
             auth=runtime_auth_from_env(),
+            runtime_identity_mint_policy=mint_policy,
         )
     data_dir = os.environ.get("ARGUS_S8_DATA_DIR")
     if data_dir:
@@ -279,8 +327,13 @@ def build_app_from_env() -> S10SupervisorApp:
             artifact_store=FileSystemArtifactStore(data_dir),
             artifact_store_path=data_dir,
             auth=runtime_auth_from_env(),
+            runtime_identity_mint_policy=mint_policy,
         )
-    return S10SupervisorApp(signing_key=signing_key, auth=runtime_auth_from_env())
+    return S10SupervisorApp(
+        signing_key=signing_key,
+        auth=runtime_auth_from_env(),
+        runtime_identity_mint_policy=mint_policy,
+    )
 
 
 def main() -> None:
@@ -394,9 +447,25 @@ def _bounded_ttl(body: dict[str, Any], max_ttl_s: int) -> int:
     return min(requested, max_ttl_s)
 
 
+def _identity_mint_ttl(body: dict[str, Any], max_ttl_s: int) -> int:
+    requested = int(body.get("ttl_s", max_ttl_s))
+    if requested <= 0:
+        raise ValueError("ttl_s must be positive")
+    if requested > max_ttl_s:
+        raise PermissionError("ttl_s exceeds runtime identity mint policy")
+    return requested
+
+
 def _require_runtime_identity(identity: RuntimeIdentity) -> None:
     if identity.can_mint_runtime_identity:
         raise PermissionError("runtime identity token required")
+
+
+def _runtime_identity_mint_policy_from_env() -> RuntimeIdentityMintPolicy | None:
+    raw = os.environ.get("ARGUS_RUNTIME_IDENTITY_MINT_POLICY_JSON")
+    if not raw:
+        return None
+    return RuntimeIdentityMintPolicy.from_json(raw)
 
 
 def _scope_grant_from_dict(value: dict[str, Any]) -> ScopeGrant:
