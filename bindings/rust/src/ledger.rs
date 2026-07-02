@@ -6,6 +6,8 @@ use postgres::{Client, GenericClient, NoTls};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::Sha256;
+use std::error::Error;
+use std::fmt;
 
 const CHECKPOINT_SIGNATURE_ALGORITHM: &str = "hmac-sha256";
 const CHECKPOINT_SIGNATURE_PREFIX: &str = "hmac-sha256:";
@@ -105,6 +107,40 @@ pub struct MerkleCheckpoint {
     pub signer_key_id: String,
 }
 
+#[derive(Debug)]
+pub enum LedgerCommitError {
+    Postgres(postgres::Error),
+    CheckpointSigner(String),
+    CheckpointMismatch(&'static str),
+}
+
+impl fmt::Display for LedgerCommitError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Postgres(error) => write!(formatter, "{error}"),
+            Self::CheckpointSigner(error) => write!(formatter, "checkpoint signer failed: {error}"),
+            Self::CheckpointMismatch(reason) => {
+                write!(formatter, "checkpoint signer mismatch: {reason}")
+            }
+        }
+    }
+}
+
+impl Error for LedgerCommitError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Postgres(error) => Some(error),
+            Self::CheckpointSigner(_) | Self::CheckpointMismatch(_) => None,
+        }
+    }
+}
+
+impl From<postgres::Error> for LedgerCommitError {
+    fn from(error: postgres::Error) -> Self {
+        Self::Postgres(error)
+    }
+}
+
 impl PostgresLedgerWriter {
     pub fn connect(params: &str) -> Result<Self, postgres::Error> {
         Ok(Self {
@@ -145,6 +181,59 @@ impl PostgresLedgerWriter {
         }
         transaction.commit()?;
         Ok(())
+    }
+
+    pub fn commit_artifact_record_with_checkpoint<F>(
+        &mut self,
+        draft: &ArtifactRecordDraft,
+        sign_checkpoint: F,
+    ) -> Result<Option<MerkleCheckpoint>, LedgerCommitError>
+    where
+        F: FnOnce(i64, &str) -> Result<MerkleCheckpoint, String>,
+    {
+        let mut transaction = self.client.transaction()?;
+        let existing_sequence = existing_merkle_sequence(&mut transaction, &draft.artifact_id)?;
+        let (sequence, previous_root) = if let Some(sequence) = existing_sequence {
+            (sequence, String::new())
+        } else {
+            next_ledger_position(&mut transaction)?
+        };
+        let inserted = commit_artifact_record(&mut transaction, draft, sequence)?;
+        if !inserted {
+            let checkpoint = checkpoint_for_sequence(&mut transaction, sequence)?;
+            transaction.commit()?;
+            return Ok(checkpoint);
+        }
+
+        let root = next_ledger_root(&previous_root, &draft.record_hash, sequence);
+        transaction.execute(
+            "
+            SELECT s8.append_ledger_leaf($1, $2, $3, $4, $5);
+            ",
+            &[
+                &draft.artifact_id,
+                &draft.record_hash,
+                &sequence,
+                &previous_root,
+                &root,
+            ],
+        )?;
+        let checkpoint =
+            sign_checkpoint(sequence, &root).map_err(LedgerCommitError::CheckpointSigner)?;
+        validate_checkpoint_for_tip(&checkpoint, sequence, &root)?;
+        transaction.execute(
+            "
+            SELECT s8.append_merkle_checkpoint($1, $2, $3, $4);
+            ",
+            &[
+                &checkpoint.sequence,
+                &checkpoint.root,
+                &checkpoint.signature,
+                &checkpoint.signer_key_id,
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(Some(checkpoint))
     }
 
     pub fn append_latest_checkpoint(
@@ -281,6 +370,49 @@ fn latest_ledger_leaf<C: GenericClient>(
     } else {
         Ok(None)
     }
+}
+
+fn checkpoint_for_sequence<C: GenericClient>(
+    client: &mut C,
+    sequence: i64,
+) -> Result<Option<MerkleCheckpoint>, postgres::Error> {
+    let checkpoint = client.query_opt(
+        "
+        SELECT seq, root, signature, signer_key_id
+        FROM s8.merkle_checkpoint
+        WHERE seq = $1;
+        ",
+        &[&sequence],
+    )?;
+    Ok(checkpoint.map(|row| MerkleCheckpoint {
+        sequence: row.get(0),
+        root: row.get(1),
+        signature: row.get(2),
+        signer_key_id: row.get(3),
+    }))
+}
+
+fn validate_checkpoint_for_tip(
+    checkpoint: &MerkleCheckpoint,
+    sequence: i64,
+    root: &str,
+) -> Result<(), LedgerCommitError> {
+    if checkpoint.sequence != sequence {
+        return Err(LedgerCommitError::CheckpointMismatch("sequence"));
+    }
+    if checkpoint.root != root {
+        return Err(LedgerCommitError::CheckpointMismatch("root"));
+    }
+    if !checkpoint
+        .signature
+        .starts_with(CHECKPOINT_SIGNATURE_PREFIX)
+    {
+        return Err(LedgerCommitError::CheckpointMismatch("signature_algorithm"));
+    }
+    if checkpoint.signer_key_id.is_empty() {
+        return Err(LedgerCommitError::CheckpointMismatch("signer_key_id"));
+    }
+    Ok(())
 }
 
 fn next_ledger_root(previous_root: &str, record_hash: &str, sequence: i64) -> String {
@@ -559,6 +691,78 @@ mod tests {
             Some("42501"),
             "{direct_checkpoint_insert_error:?}"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn writer_rolls_back_record_and_leaf_when_checkpoint_signer_is_unavailable(
+    ) -> Result<(), Box<dyn Error>> {
+        let Some(postgres) = TestPostgres::start()? else {
+            return Ok(());
+        };
+        let mut writer = postgres.ledger_writer()?;
+        let record = draft("c4://artifact/s10-down-model", 6, "model", &[], None);
+
+        let error = writer
+            .commit_artifact_record_with_checkpoint(&record, |_sequence, _root| {
+                Err("s10 checkpoint signer unavailable".to_string())
+            })
+            .expect_err("S10 signer outage must reject the whole ledger commit");
+
+        match error {
+            LedgerCommitError::CheckpointSigner(reason) => {
+                assert!(reason.contains("s10 checkpoint signer unavailable"));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+
+        let mut admin = postgres.admin_client()?;
+        assert_eq!(
+            scalar_i64(
+                &mut admin,
+                "SELECT count(*) FROM s8.artifact_record WHERE artifact_id = 'c4://artifact/s10-down-model';",
+            )?,
+            0
+        );
+        assert_eq!(
+            scalar_i64(&mut admin, "SELECT count(*) FROM s8.ledger_leaf;")?,
+            0
+        );
+        assert_eq!(
+            scalar_i64(&mut admin, "SELECT count(*) FROM s8.merkle_checkpoint;")?,
+            0
+        );
+        drop(admin);
+
+        let signer = CheckpointSigner::new("s8-ledger-key", b"s8-ledger-secret".to_vec());
+        let checkpoint = writer
+            .commit_artifact_record_with_checkpoint(&record, |sequence, root| {
+                Ok(MerkleCheckpoint {
+                    sequence,
+                    root: root.to_string(),
+                    signature: signer.sign(sequence, root),
+                    signer_key_id: signer.key_id().to_string(),
+                })
+            })?
+            .expect("successful commit returns checkpoint");
+
+        let mut admin = postgres.admin_client()?;
+        assert_eq!(
+            scalar_i64(
+                &mut admin,
+                "SELECT count(*) FROM s8.artifact_record WHERE artifact_id = 'c4://artifact/s10-down-model';",
+            )?,
+            1
+        );
+        assert_eq!(
+            scalar_i64(&mut admin, "SELECT count(*) FROM s8.ledger_leaf;")?,
+            1
+        );
+        assert_eq!(
+            scalar_i64(&mut admin, "SELECT count(*) FROM s8.merkle_checkpoint;")?,
+            1
+        );
+        assert!(signer.verify(&checkpoint));
         Ok(())
     }
 

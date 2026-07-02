@@ -32,14 +32,11 @@ fn run() -> Result<(), Box<dyn Error>> {
     }
 
     let mut writer = PostgresLedgerWriter::from_client(client);
-    writer.commit_artifact_record(&draft)?;
-    let checkpoint = if let Some((sequence, root)) = writer.latest_ledger_tip()? {
-        let checkpoint = signer.sign(sequence, &root)?;
-        writer.append_checkpoint(&checkpoint)?;
-        Some(checkpoint)
-    } else {
-        None
-    };
+    let checkpoint = writer.commit_artifact_record_with_checkpoint(&draft, |sequence, root| {
+        signer
+            .sign(sequence, root)
+            .map_err(|error| error.to_string())
+    })?;
     println!(
         "{}",
         serde_json::to_string(&json!({
@@ -240,7 +237,9 @@ mod tests {
                 body.as_bytes().len(),
                 body
             );
-            stream.write_all(response.as_bytes()).expect("write response");
+            stream
+                .write_all(response.as_bytes())
+                .expect("write response");
         });
         let signer = HttpCheckpointSigner {
             endpoint: HttpEndpoint::parse(&format!("http://127.0.0.1:{port}/sign"))?,
