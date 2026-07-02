@@ -1,6 +1,6 @@
-.PHONY: check docs roadmap-audit schemas schema-compat bindings rust-bindings rust-test test lint
+.PHONY: check docs roadmap-audit schemas schema-compat bindings typescript-install typescript-bindings rust-bindings rust-test test lint
 
-check: docs roadmap-audit schemas schema-compat bindings rust-bindings rust-test test lint
+check: docs roadmap-audit schemas schema-compat bindings typescript-install typescript-bindings rust-bindings rust-test test lint
 
 docs:
 	python3 scripts/validate_docs.py
@@ -16,6 +16,12 @@ schema-compat:
 
 bindings:
 	python3 scripts/generate_bindings.py --check
+
+typescript-install:
+	npm ci --prefix bindings/typescript
+
+typescript-bindings:
+	npm test --prefix bindings/typescript
 
 rust-bindings:
 	cargo check --manifest-path bindings/rust/Cargo.toml

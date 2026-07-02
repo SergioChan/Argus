@@ -13,6 +13,8 @@ CHECKS = (
     ("schemas", ("python3", "scripts/validate_schemas.py")),
     ("schema-compat", ("python3", "scripts/schema_compatibility.py", "--check-manifest")),
     ("bindings", ("python3", "scripts/generate_bindings.py", "--check")),
+    ("typescript-install", ("npm", "ci", "--prefix", "bindings/typescript")),
+    ("typescript-bindings", ("npm", "test", "--prefix", "bindings/typescript")),
     ("rust-bindings", ("cargo", "check", "--manifest-path", "bindings/rust/Cargo.toml")),
     ("rust-tests", ("cargo", "test", "--manifest-path", "bindings/rust/Cargo.toml")),
     ("unit-tests", ("python3", "-m", "unittest", "discover", "-s", "tests")),

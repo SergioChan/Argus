@@ -127,6 +127,11 @@ export const contracts = [
   }
 ] as const satisfies readonly Contract[];
 
-export const contractById = Object.fromEntries(
-  contracts.map((contract) => [contract.id, contract]),
-) as Record<ContractId, Contract>;
+export const contractById = {
+  "C1": contracts[0],
+  "C2": contracts[1],
+  "C3": contracts[2],
+  "C4": contracts[3],
+  "C5": contracts[4],
+  "C6": contracts[5],
+} satisfies Record<ContractId, Contract>;
