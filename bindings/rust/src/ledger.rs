@@ -14,6 +14,10 @@ use std::fmt;
 #[cfg(test)]
 const CHECKPOINT_SIGNATURE_ALGORITHM: &str = "hmac-sha256";
 const CHECKPOINT_SIGNATURE_PREFIX: &str = "hmac-sha256:";
+const LEDGER_TRANSACTION_TIMEOUT_SQL: &str = "
+SET LOCAL statement_timeout = '15s';
+SET LOCAL idle_in_transaction_session_timeout = '15s';
+";
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct ArtifactRecordDraft {
@@ -162,6 +166,7 @@ impl PostgresLedgerWriter {
         draft: &ArtifactRecordDraft,
     ) -> Result<(), postgres::Error> {
         let mut transaction = self.client.transaction()?;
+        apply_ledger_transaction_timeouts(&mut transaction)?;
         let existing_sequence = existing_merkle_sequence(&mut transaction, &draft.artifact_id)?;
         let (sequence, previous_root) = if let Some(sequence) = existing_sequence {
             (sequence, String::new())
@@ -197,6 +202,7 @@ impl PostgresLedgerWriter {
         F: FnOnce(i64, &str) -> Result<MerkleCheckpoint, String>,
     {
         let mut transaction = self.client.transaction()?;
+        apply_ledger_transaction_timeouts(&mut transaction)?;
         let existing_sequence = existing_merkle_sequence(&mut transaction, &draft.artifact_id)?;
         let (sequence, previous_root) = if let Some(sequence) = existing_sequence {
             (sequence, String::new())
@@ -247,6 +253,7 @@ impl PostgresLedgerWriter {
         signer: &CheckpointSigner,
     ) -> Result<Option<MerkleCheckpoint>, postgres::Error> {
         let mut transaction = self.client.transaction()?;
+        apply_ledger_transaction_timeouts(&mut transaction)?;
         let Some((sequence, root)) = latest_ledger_leaf(&mut transaction)? else {
             transaction.commit()?;
             return Ok(None);
@@ -281,6 +288,7 @@ impl PostgresLedgerWriter {
         checkpoint: &MerkleCheckpoint,
     ) -> Result<(), postgres::Error> {
         let mut transaction = self.client.transaction()?;
+        apply_ledger_transaction_timeouts(&mut transaction)?;
         transaction.execute(
             "
             SELECT s8.append_merkle_checkpoint($1, $2, $3, $4);
@@ -299,6 +307,12 @@ impl PostgresLedgerWriter {
     pub fn into_client(self) -> Client {
         self.client
     }
+}
+
+fn apply_ledger_transaction_timeouts<C: GenericClient>(
+    client: &mut C,
+) -> Result<(), postgres::Error> {
+    client.batch_execute(LEDGER_TRANSACTION_TIMEOUT_SQL)
 }
 
 fn commit_artifact_record<C: GenericClient>(
@@ -775,6 +789,41 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn writer_sets_transaction_timeouts_with_local_scope() -> Result<(), Box<dyn Error>> {
+        let Some(postgres) = TestPostgres::start()? else {
+            return Ok(());
+        };
+        let mut client = postgres.ledger_client()?;
+        let baseline_statement_timeout = scalar_string(&mut client, "SHOW statement_timeout;")?;
+        let baseline_idle_timeout =
+            scalar_string(&mut client, "SHOW idle_in_transaction_session_timeout;")?;
+
+        {
+            let mut transaction = client.transaction()?;
+            apply_ledger_transaction_timeouts(&mut transaction)?;
+            assert_eq!(
+                scalar_string(&mut transaction, "SHOW statement_timeout;")?,
+                "15s"
+            );
+            assert_eq!(
+                scalar_string(&mut transaction, "SHOW idle_in_transaction_session_timeout;")?,
+                "15s"
+            );
+            transaction.commit()?;
+        }
+
+        assert_eq!(
+            scalar_string(&mut client, "SHOW statement_timeout;")?,
+            baseline_statement_timeout
+        );
+        assert_eq!(
+            scalar_string(&mut client, "SHOW idle_in_transaction_session_timeout;")?,
+            baseline_idle_timeout
+        );
+        Ok(())
+    }
+
     struct TestPostgres {
         root: Option<PathBuf>,
         data_dir: Option<PathBuf>,
@@ -1001,6 +1050,13 @@ mod tests {
     }
 
     fn scalar_i64(client: &mut Client, sql: &str) -> Result<i64, postgres::Error> {
+        Ok(client.query_one(sql, &[])?.get(0))
+    }
+
+    fn scalar_string<C: postgres::GenericClient>(
+        client: &mut C,
+        sql: &str,
+    ) -> Result<String, postgres::Error> {
         Ok(client.query_one(sql, &[])?.get(0))
     }
 

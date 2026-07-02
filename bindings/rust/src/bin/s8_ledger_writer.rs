@@ -4,9 +4,12 @@ use serde_json::json;
 use std::env;
 use std::error::Error;
 use std::io::{self, Read, Write};
-use std::net::TcpStream;
+use std::net::{TcpStream, ToSocketAddrs};
 use std::process;
 use std::time::Duration;
+
+const CHECKPOINT_SIGNER_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+const CHECKPOINT_SIGNER_IO_TIMEOUT: Duration = Duration::from_secs(10);
 
 fn main() {
     if let Err(error) = run() {
@@ -154,9 +157,9 @@ fn http_post_json(
     auth_token: &str,
     body: &str,
 ) -> Result<HttpResponse, Box<dyn Error>> {
-    let mut stream = TcpStream::connect((endpoint.host.as_str(), endpoint.port))?;
-    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(10)))?;
+    let mut stream = connect_checkpoint_signer(endpoint)?;
+    stream.set_read_timeout(Some(CHECKPOINT_SIGNER_IO_TIMEOUT))?;
+    stream.set_write_timeout(Some(CHECKPOINT_SIGNER_IO_TIMEOUT))?;
     let request = format!(
         "POST {} HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
         endpoint.path,
@@ -176,6 +179,21 @@ fn http_post_json(
         status,
         body: body.to_string(),
     })
+}
+
+fn connect_checkpoint_signer(endpoint: &HttpEndpoint) -> Result<TcpStream, Box<dyn Error>> {
+    let addresses = (endpoint.host.as_str(), endpoint.port).to_socket_addrs()?;
+    let mut last_error = None;
+    for address in addresses {
+        match TcpStream::connect_timeout(&address, CHECKPOINT_SIGNER_CONNECT_TIMEOUT) {
+            Ok(stream) => return Ok(stream),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    match last_error {
+        Some(error) => Err(error.into()),
+        None => Err("checkpoint signer host resolved to no socket addresses".into()),
+    }
 }
 
 fn parse_http_status(head: &str) -> Result<u16, Box<dyn Error>> {
