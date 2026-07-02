@@ -135,7 +135,12 @@ class S8WriterApp:
             if not authenticated:
                 return 401, error_response
             self._refresh_store()
-            return 200, {"service": "s8-writer", "status": "ok", "record_count": self.store.record_count}
+            return 200, {
+                "service": "s8-writer",
+                "status": "ok",
+                "record_count": self.store.record_count,
+                "ledger_writer": getattr(self.store, "ledger_writer_kind", "filesystem"),
+            }
 
         @self.http.route("POST", "/v1/artifacts")
         def create(request: JsonRequest) -> tuple[int, Any]:

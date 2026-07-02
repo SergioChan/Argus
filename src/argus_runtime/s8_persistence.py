@@ -7,7 +7,10 @@ from datetime import UTC, datetime
 from io import BytesIO
 import hashlib
 import json
+import os
 from pathlib import Path
+import shlex
+import subprocess
 from typing import Any
 
 from argus_core import (
@@ -161,15 +164,67 @@ class MinioObjectStore:
             response.release_conn()
 
 
+class SubprocessRustLedgerWriter:
+    def __init__(
+        self,
+        *,
+        command: list[str],
+        dsn: str,
+        db_role: str | None,
+        checkpoint_signer_key_id: str,
+        checkpoint_signing_key: str,
+    ) -> None:
+        self._command = command
+        self._dsn = dsn
+        self._db_role = db_role
+        self._checkpoint_signer_key_id = checkpoint_signer_key_id
+        self._checkpoint_signing_key = checkpoint_signing_key
+
+    def commit_record(self, record: ArtifactRecord) -> dict[str, Any]:
+        env = {
+            **os.environ,
+            "ARGUS_S8_RUST_LEDGER_DSN": self._dsn,
+            "ARGUS_S8_CHECKPOINT_SIGNER_KEY_ID": self._checkpoint_signer_key_id,
+            "ARGUS_S8_CHECKPOINT_SIGNING_KEY": self._checkpoint_signing_key,
+        }
+        if self._db_role:
+            env["ARGUS_S8_RUST_LEDGER_ROLE"] = self._db_role
+        completed = subprocess.run(
+            self._command,
+            input=json.dumps(_rust_ledger_draft(record), separators=(",", ":"), sort_keys=True),
+            text=True,
+            capture_output=True,
+            check=False,
+            env=env,
+        )
+        if completed.returncode != 0:
+            raise RuntimeError(f"Rust S8 ledger writer failed: {completed.stderr.strip()}")
+        if not completed.stdout.strip():
+            return {"status": "ok", "checkpoint": None}
+        result = json.loads(completed.stdout)
+        if result.get("status") != "ok":
+            raise RuntimeError(f"Rust S8 ledger writer returned unexpected status: {result!r}")
+        return result
+
+
 class PostgresArtifactStore:
     """C4 store that writes payload bytes to MinIO and the append-only ledger to PostgreSQL."""
 
     requires_service_refresh = False
 
-    def __init__(self, *, dsn: str, object_store: MinioObjectStore, db_role: str | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        dsn: str,
+        object_store: MinioObjectStore,
+        db_role: str | None = None,
+        ledger_writer: SubprocessRustLedgerWriter | None = None,
+    ) -> None:
         self._dsn = dsn
         self._object_store = object_store
         self._db_role = db_role
+        self._ledger_writer = ledger_writer
+        self.ledger_writer_kind = "rust-subprocess" if ledger_writer is not None else "python-sql"
         self._snapshot = InMemoryArtifactStore(object_store=object_store)
         self.refresh()
 
@@ -353,6 +408,12 @@ class PostgresArtifactStore:
                 return list(cur.fetchall())
 
     def _commit_record(self, record: ArtifactRecord) -> None:
+        if self._ledger_writer is not None:
+            self._ledger_writer.commit_record(record)
+            return
+        self._commit_record_sql(record)
+
+    def _commit_record_sql(self, record: ArtifactRecord) -> None:
         import psycopg
         from psycopg.types.json import Jsonb
 
@@ -429,11 +490,51 @@ def build_postgres_minio_store_from_env(env: dict[str, str]) -> PostgresArtifact
         bucket=env.get("ARGUS_S8_MINIO_BUCKET", "argus-s8-objects"),
         secure=env.get("ARGUS_S8_MINIO_SECURE", "0") == "1",
     )
+    ledger_writer = _rust_ledger_writer_from_env(env, dsn=dsn, db_role=env.get("ARGUS_S8_POSTGRES_ROLE") or None)
     return PostgresArtifactStore(
         dsn=dsn,
         object_store=object_store,
         db_role=env.get("ARGUS_S8_POSTGRES_ROLE") or None,
+        ledger_writer=ledger_writer,
     )
+
+
+def _rust_ledger_writer_from_env(
+    env: dict[str, str],
+    *,
+    dsn: str,
+    db_role: str | None,
+) -> SubprocessRustLedgerWriter | None:
+    command_text = env.get("ARGUS_S8_RUST_LEDGER_WRITER_CMD")
+    if not command_text:
+        return None
+    command = shlex.split(command_text)
+    if not command:
+        raise RuntimeError("ARGUS_S8_RUST_LEDGER_WRITER_CMD is empty")
+    return SubprocessRustLedgerWriter(
+        command=command,
+        dsn=dsn,
+        db_role=db_role,
+        checkpoint_signer_key_id=_required_env(env, "ARGUS_S8_CHECKPOINT_SIGNER_KEY_ID"),
+        checkpoint_signing_key=_required_env(env, "ARGUS_S8_CHECKPOINT_SIGNING_KEY"),
+    )
+
+
+def _rust_ledger_draft(record: ArtifactRecord) -> dict[str, Any]:
+    return {
+        "artifact_id": record.artifact_ref,
+        "content_hash": record.content_hash,
+        "kind": record.kind,
+        "producer": asdict(record.producer),
+        "lineage": asdict(record.lineage),
+        "record_hash": hash_json(asdict(record)),
+        "merkle_seq": 0,
+        "claim_tier": record.claim_tier,
+        "validation_report_ref": record.validation_report_ref,
+        "input_refs": list(record.lineage.input_refs),
+        "created_at": record.created_at,
+        "size_bytes": record.size_bytes,
+    }
 
 
 def _set_role(conn: Any, db_role: str | None) -> None:

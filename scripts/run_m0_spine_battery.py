@@ -92,6 +92,7 @@ def main() -> int:
         "ARGUS_S10_SIGNING_KEY": runtime_secrets["s10_signing_key"],
         "ARGUS_S10_POLICY_SIGNING_KEY": runtime_secrets["s10_policy_signing_key"],
         "ARGUS_S8_BROKER_WRITE_KEY": runtime_secrets["s8_broker_write_key"],
+        "ARGUS_S8_CHECKPOINT_SIGNING_KEY": runtime_secrets["s8_checkpoint_signing_key"],
     }
     s8_url = f"http://127.0.0.1:{ports['ARGUS_M0_S8_PORT']}"
     s10_url = f"http://127.0.0.1:{ports['ARGUS_M0_S10_PORT']}"
@@ -209,7 +210,13 @@ def main() -> int:
             policy_signing_key=runtime_secrets["s10_policy_signing_key"].encode("utf-8"),
         )
         _battery_g_argusverify(evidence)
-        _battery_real_persistence(evidence, ports, s8_url=s8_url, token=auth_tokens["read"])
+        _battery_real_persistence(
+            evidence,
+            ports,
+            s8_url=s8_url,
+            token=auth_tokens["read"],
+            checkpoint_signing_key=runtime_secrets["s8_checkpoint_signing_key"].encode("utf-8"),
+        )
         _battery_d_tamper_detected(
             evidence,
             s8_url=s8_url,
@@ -251,6 +258,7 @@ def _m0_runtime_secrets() -> dict[str, str]:
         "s10_signing_key": f"argus-s10-key-{uuid4().hex}",
         "s10_policy_signing_key": f"argus-s10-policy-key-{uuid4().hex}",
         "s8_broker_write_key": f"argus-s8-broker-key-{uuid4().hex}",
+        "s8_checkpoint_signing_key": f"argus-s8-checkpoint-key-{uuid4().hex}",
     }
 
 
@@ -392,6 +400,8 @@ def _battery_runtime_auth_required(
         raise AssertionError(f"unexpected auth denial payloads: {errors}")
     if s8_health["status"] != "ok" or s10_health["status"] != "ok":
         raise AssertionError(f"unexpected health payloads: s8={s8_health}, s10={s10_health}")
+    if s8_health.get("ledger_writer") != "rust-subprocess":
+        raise AssertionError(f"S8 did not activate the Rust ledger writer boundary: {s8_health}")
     _record(
         evidence,
         "auth",
@@ -399,6 +409,7 @@ def _battery_runtime_auth_required(
         {
             **errors,
             "s8_health": s8_health["status"],
+            "s8_ledger_writer": s8_health["ledger_writer"],
             "s10_health": s10_health["status"],
         },
     )
@@ -567,6 +578,7 @@ def _battery_real_persistence(
     *,
     s8_url: str,
     token: str,
+    checkpoint_signing_key: bytes,
 ) -> None:
     import psycopg
     from minio import Minio
@@ -580,6 +592,17 @@ def _battery_real_persistence(
             record_count = int(cur.fetchone()[0])
             cur.execute("SELECT count(*) FROM s8.ledger_leaf;")
             leaf_count = int(cur.fetchone()[0])
+            cur.execute("SELECT count(*) FROM s8.merkle_checkpoint;")
+            checkpoint_count = int(cur.fetchone()[0])
+            cur.execute(
+                """
+                SELECT seq, root, signature, signer_key_id
+                FROM s8.merkle_checkpoint
+                ORDER BY seq DESC
+                LIMIT 1;
+                """
+            )
+            latest_checkpoint = cur.fetchone()
             cur.execute("SELECT artifact_id, record_hash FROM s8.artifact_record ORDER BY merkle_seq;")
             record_hash_rows = [(str(row[0]), str(row[1])) for row in cur.fetchall()]
     append_only_denials = _postgres_append_only_denials(dsn)
@@ -595,10 +618,31 @@ def _battery_real_persistence(
         secure=False,
     )
     object_count = sum(1 for _ in minio.list_objects("argus-s8-objects", recursive=True))
+    checkpoint_signature_valid = False
+    checkpoint_sequence = 0
+    checkpoint_signer_key_id = ""
+    if latest_checkpoint is not None:
+        checkpoint_sequence = int(latest_checkpoint[0])
+        checkpoint_root = str(latest_checkpoint[1])
+        checkpoint_signature = str(latest_checkpoint[2])
+        checkpoint_signer_key_id = str(latest_checkpoint[3])
+        checkpoint_signature_valid = hmac.compare_digest(
+            checkpoint_signature,
+            _s8_checkpoint_signature(
+                sequence=checkpoint_sequence,
+                root=checkpoint_root,
+                signer_key_id=checkpoint_signer_key_id,
+                signing_key=checkpoint_signing_key,
+            ),
+        )
     if (
         migration_count < 1
         or record_count < 2
         or leaf_count < 2
+        or checkpoint_count != leaf_count
+        or checkpoint_sequence != leaf_count
+        or checkpoint_signer_key_id != "argus-m0-s8-checkpoint"
+        or not checkpoint_signature_valid
         or object_count < 2
         or not all(append_only_denials.values())
         or not record_hashes_match
@@ -606,6 +650,8 @@ def _battery_real_persistence(
         raise AssertionError(
             "Postgres/MinIO persistence did not record expected deployed S8 artifacts: "
             f"migrations={migration_count} records={record_count} leaves={leaf_count} "
+            f"checkpoints={checkpoint_count} checkpoint_sequence={checkpoint_sequence} "
+            f"checkpoint_signer={checkpoint_signer_key_id} checkpoint_signature_valid={checkpoint_signature_valid} "
             f"objects={object_count} append_only_denials={append_only_denials} "
             f"record_hashes_match_refreshed_records={record_hashes_match}"
         )
@@ -617,11 +663,32 @@ def _battery_real_persistence(
             "schema_migrations": migration_count,
             "artifact_records": record_count,
             "ledger_leaves": leaf_count,
+            "merkle_checkpoints": checkpoint_count,
+            "latest_checkpoint_sequence": checkpoint_sequence,
+            "checkpoint_signer_key_id": checkpoint_signer_key_id,
+            "checkpoint_signature_valid": checkpoint_signature_valid,
             "minio_objects": object_count,
             "record_hashes_match_refreshed_records": record_hashes_match,
             **append_only_denials,
         },
     )
+
+
+def _s8_checkpoint_signature(
+    *,
+    sequence: int,
+    root: str,
+    signer_key_id: str,
+    signing_key: bytes,
+) -> str:
+    payload = (
+        "argus-s8-merkle-checkpoint-v1\n"
+        "algorithm:hmac-sha256\n"
+        f"seq:{sequence}\n"
+        f"root:{root}\n"
+        f"signer_key_id:{signer_key_id}\n"
+    )
+    return "hmac-sha256:" + hmac.new(signing_key, payload.encode("utf-8"), sha256).hexdigest()
 
 
 def _postgres_record_hashes_match_refreshed_records(

@@ -44,6 +44,9 @@ services:
       ARGUS_S8_PORT: "8080"
       ARGUS_S8_POSTGRES_DSN: postgresql://argus:argus-dev-password@postgres:5432/argus
       ARGUS_S8_POSTGRES_ROLE: argus_s8_ledger_writer
+      ARGUS_S8_RUST_LEDGER_WRITER_CMD: /usr/local/bin/argus-s8-ledger-writer
+      ARGUS_S8_CHECKPOINT_SIGNER_KEY_ID: argus-m0-s8-checkpoint
+      ARGUS_S8_CHECKPOINT_SIGNING_KEY: ${ARGUS_S8_CHECKPOINT_SIGNING_KEY:?ARGUS_S8_CHECKPOINT_SIGNING_KEY is required}
       ARGUS_S8_APPLY_MIGRATIONS: "1"
       ARGUS_S8_MIGRATIONS_DIR: /app/db/s8
       ARGUS_S8_MINIO_ENDPOINT: minio:9000

@@ -1,14 +1,16 @@
 use crate::hash::{hash_bytes, BLAKE3_PREFIX};
+use chrono::{DateTime, Utc};
 use hmac::{Hmac, KeyInit, Mac};
 use postgres::types::Json;
 use postgres::{Client, GenericClient, NoTls};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::Sha256;
 
 const CHECKPOINT_SIGNATURE_ALGORITHM: &str = "hmac-sha256";
 const CHECKPOINT_SIGNATURE_PREFIX: &str = "hmac-sha256:";
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct ArtifactRecordDraft {
     pub artifact_id: String,
     pub content_hash: String,
@@ -20,6 +22,8 @@ pub struct ArtifactRecordDraft {
     pub claim_tier: String,
     pub validation_report_ref: Option<String>,
     pub input_refs: Vec<String>,
+    pub created_at: Option<DateTime<Utc>>,
+    pub size_bytes: Option<i64>,
 }
 
 impl ArtifactRecordDraft {
@@ -43,6 +47,8 @@ impl ArtifactRecordDraft {
             claim_tier: "ran-toy".to_string(),
             validation_report_ref: None,
             input_refs: Vec::new(),
+            created_at: None,
+            size_bytes: None,
         }
     }
 }
@@ -91,7 +97,7 @@ impl CheckpointSigner {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct MerkleCheckpoint {
     pub sequence: i64,
     pub root: String,
@@ -115,9 +121,14 @@ impl PostgresLedgerWriter {
         draft: &ArtifactRecordDraft,
     ) -> Result<(), postgres::Error> {
         let mut transaction = self.client.transaction()?;
-        let inserted = commit_artifact_record(&mut transaction, draft)?;
+        let existing_sequence = existing_merkle_sequence(&mut transaction, &draft.artifact_id)?;
+        let (sequence, previous_root) = if let Some(sequence) = existing_sequence {
+            (sequence, String::new())
+        } else {
+            next_ledger_position(&mut transaction)?
+        };
+        let inserted = commit_artifact_record(&mut transaction, draft, sequence)?;
         if inserted {
-            let (sequence, previous_root) = next_ledger_position(&mut transaction)?;
             let root = next_ledger_root(&previous_root, &draft.record_hash, sequence);
             transaction.execute(
                 "
@@ -174,13 +185,14 @@ impl PostgresLedgerWriter {
 fn commit_artifact_record<C: GenericClient>(
     client: &mut C,
     draft: &ArtifactRecordDraft,
+    merkle_seq: i64,
 ) -> Result<bool, postgres::Error> {
     let producer = Json(&draft.producer);
     let lineage = Json(&draft.lineage);
     let row = client.query_one(
         "
             SELECT s8.commit_artifact_record(
-                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10
+                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12
             );
             ",
         &[
@@ -190,13 +202,30 @@ fn commit_artifact_record<C: GenericClient>(
             &producer,
             &lineage,
             &draft.record_hash,
-            &draft.merkle_seq,
+            &merkle_seq,
             &draft.claim_tier,
             &draft.validation_report_ref,
             &draft.input_refs,
+            &draft.created_at,
+            &draft.size_bytes,
         ],
     )?;
     Ok(row.get(0))
+}
+
+fn existing_merkle_sequence<C: GenericClient>(
+    client: &mut C,
+    artifact_id: &str,
+) -> Result<Option<i64>, postgres::Error> {
+    let row = client.query_opt(
+        "
+        SELECT merkle_seq
+        FROM s8.artifact_record
+        WHERE artifact_id = $1;
+        ",
+        &[&artifact_id],
+    )?;
+    Ok(row.map(|row| row.get(0)))
 }
 
 fn next_ledger_position<C: GenericClient>(
@@ -376,6 +405,17 @@ mod tests {
         )?;
         let latest_sequence: i64 = latest_leaf.get(0);
         let latest_root: String = latest_leaf.get(1);
+        let dataset_row = admin.query_one(
+            "
+            SELECT merkle_seq, size_bytes, created_at
+            FROM s8.artifact_record
+            WHERE artifact_id = $1;
+            ",
+            &[&dataset.artifact_id],
+        )?;
+        let dataset_merkle_seq: i64 = dataset_row.get(0);
+        let dataset_size_bytes: Option<i64> = dataset_row.get(1);
+        let dataset_created_at: DateTime<Utc> = dataset_row.get(2);
         let checkpoint_count =
             scalar_i64(&mut admin, "SELECT count(*) FROM s8.merkle_checkpoint;")?;
         let persisted_checkpoint = admin.query_one(
@@ -459,6 +499,12 @@ mod tests {
         assert_eq!(leaf_count, 4);
         assert_eq!(latest_sequence, 4);
         assert_eq!(latest_root, expected_root);
+        assert_eq!(dataset_merkle_seq, 1);
+        assert_eq!(dataset_size_bytes, Some(10));
+        assert_eq!(
+            dataset_created_at,
+            *dataset.created_at.as_ref().expect("draft has created_at")
+        );
         assert_eq!(checkpoint_count, 1);
         assert_eq!(checkpoint, repeated_checkpoint);
         assert_eq!(checkpoint, persisted_checkpoint);
@@ -615,9 +661,11 @@ mod tests {
         }
 
         fn apply_schema(&self) -> Result<(), Box<dyn Error>> {
-            let schema = fs::read_to_string(schema_path())?;
             let mut client = self.admin_client()?;
-            client.batch_execute(&schema)?;
+            for migration in migration_paths()? {
+                let schema = fs::read_to_string(migration)?;
+                client.batch_execute(&schema)?;
+            }
             Ok(())
         }
 
@@ -702,10 +750,16 @@ mod tests {
                 "seeds": []
             }),
             format!("blake3:{:064x}", sequence + 1000),
-            sequence,
+            sequence + 1000,
         );
         draft.input_refs = input_refs;
         draft.validation_report_ref = validation_report_ref.map(str::to_string);
+        draft.created_at = Some(
+            DateTime::parse_from_rfc3339("2026-07-02T00:00:00Z")
+                .expect("valid fixture instant")
+                .with_timezone(&Utc),
+        );
+        draft.size_bytes = Some(sequence * 10);
         draft
     }
 
@@ -790,14 +844,19 @@ mod tests {
         nanos
     }
 
-    fn schema_path() -> PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR"))
+    fn migration_paths() -> Result<Vec<PathBuf>, Box<dyn Error>> {
+        let migrations_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .expect("bindings directory exists")
             .parent()
             .expect("repository root exists")
             .join("db")
-            .join("s8")
-            .join("001_append_only_schema.sql")
+            .join("s8");
+        let mut migrations = fs::read_dir(migrations_dir)?
+            .map(|entry| entry.map(|entry| entry.path()))
+            .collect::<Result<Vec<_>, _>>()?;
+        migrations.retain(|path| path.extension().is_some_and(|extension| extension == "sql"));
+        migrations.sort();
+        Ok(migrations)
     }
 }

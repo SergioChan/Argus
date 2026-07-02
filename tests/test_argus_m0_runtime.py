@@ -327,6 +327,7 @@ class ArgusM0RuntimeServiceTests(unittest.TestCase):
             self.assertEqual(s8_bootstrap_payload["error"], "Unauthorized")
             self.assertEqual(s8_health_status, 200)
             self.assertEqual(s8_health_payload["status"], "ok")
+            self.assertEqual(s8_health_payload["ledger_writer"], "filesystem")
             self.assertEqual(s10_no_auth_status, 401)
             self.assertEqual(s10_no_auth_payload["error"], "Unauthorized")
             self.assertEqual(s10_bootstrap_status, 401)
@@ -679,6 +680,7 @@ class ArgusM0ComposeTests(unittest.TestCase):
                 "ARGUS_S10_SIGNING_KEY": "test-s10-signing-key",
                 "ARGUS_S10_POLICY_SIGNING_KEY": POLICY_SIGNING_KEY,
                 "ARGUS_S8_BROKER_WRITE_KEY": BROKER_WRITE_KEY.decode("utf-8"),
+                "ARGUS_S8_CHECKPOINT_SIGNING_KEY": "test-s8-checkpoint-signing-key",
             },
         )
         if config.returncode != 0:
@@ -697,6 +699,14 @@ class ArgusM0ComposeTests(unittest.TestCase):
             "postgresql://argus:argus-dev-password@postgres:5432/argus",
         )
         self.assertEqual(services["s8-writer"]["environment"]["ARGUS_S8_POSTGRES_ROLE"], "argus_s8_ledger_writer")
+        self.assertEqual(
+            services["s8-writer"]["environment"]["ARGUS_S8_RUST_LEDGER_WRITER_CMD"],
+            "/usr/local/bin/argus-s8-ledger-writer",
+        )
+        self.assertEqual(
+            services["s8-writer"]["environment"]["ARGUS_S8_CHECKPOINT_SIGNER_KEY_ID"],
+            "argus-m0-s8-checkpoint",
+        )
         self.assertEqual(services["s8-writer"]["environment"]["ARGUS_S8_MINIO_ENDPOINT"], "minio:9000")
         self.assertEqual(services["s8-writer"]["environment"]["ARGUS_S8_MINIO_BUCKET"], "argus-s8-objects")
         self.assertNotIn("ARGUS_S8_DATA_DIR", services["s8-writer"]["environment"])

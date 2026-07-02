@@ -12,6 +12,7 @@ from tempfile import TemporaryDirectory
 import unittest
 
 from argus_core import (
+    ArtifactRecord,
     DatasetRegistry,
     DatasetSplit,
     HashMismatchError,
@@ -19,6 +20,7 @@ from argus_core import (
     InMemoryObjectStore,
     Lineage,
     Producer,
+    hash_bytes,
     hash_json,
 )
 from argus_runtime.s8_persistence import PostgresArtifactStore
@@ -733,6 +735,41 @@ class S8PostgresSchemaTests(unittest.TestCase):
             store.get_artifact(tampered.artifact_ref)
         with self.assertRaises(HashMismatchError):
             store.get_record(tampered.artifact_ref)
+
+    def test_postgres_store_delegates_commit_to_configured_ledger_writer(self) -> None:
+        class RecordingLedgerWriter:
+            def __init__(self) -> None:
+                self.records: list[ArtifactRecord] = []
+
+            def commit_record(self, record: ArtifactRecord) -> dict[str, object]:
+                self.records.append(record)
+                return {"status": "ok", "checkpoint": None}
+
+        ledger_writer = RecordingLedgerWriter()
+        store = PostgresArtifactStore(
+            dsn=self._postgres_dsn(),
+            object_store=InMemoryObjectStore(),
+            db_role="argus_s8_ledger_writer",
+            ledger_writer=ledger_writer,
+        )
+        record = ArtifactRecord(
+            artifact_ref="c4://r8-s8t07/delegated",
+            kind="model",
+            content_hash=hash_bytes(b"{}"),
+            size_bytes=2,
+            producer=Producer(subsystem="S2", version="0.0.0"),
+            lineage=Lineage(input_refs=(), code_ref="git:r8-s8t07", environment_digest="oci:r8-s8t07"),
+            created_at="2026-07-02T00:00:00Z",
+        )
+
+        store._commit_record(record)
+        record_count = self._psql(
+            "SELECT count(*) FROM s8.artifact_record WHERE artifact_id = 'c4://r8-s8t07/delegated';"
+        )
+
+        self.assertEqual(store.ledger_writer_kind, "rust-subprocess")
+        self.assertEqual(ledger_writer.records, [record])
+        self.assertEqual(record_count.stdout.strip(), "0")
 
     def test_read_query_functions_resolve_refs_filter_page_and_grant_reader(self) -> None:
         self._commit_record(
