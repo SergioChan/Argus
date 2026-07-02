@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, replace
+import json
 import os
 import shutil
 import subprocess
@@ -36,6 +37,7 @@ from argus_core import (
     canonical_json_bytes,
     decide_policy,
     hash_bytes,
+    hash_json,
     materialize_sandbox_env,
 )
 
@@ -357,6 +359,46 @@ class S10OrchestratorAndAuditTests(unittest.TestCase):
         self.assertTrue(self.audit.verify_chain().valid)
         self.assertEqual(self.audit.events()[-1].event_type, "sandbox.launched")
 
+    def test_launch_emits_reproducible_c4_exec_environment_digest(self) -> None:
+        artifacts = InMemoryArtifactStore()
+        orchestrator = InMemorySandboxOrchestrator(
+            token_service=self.tokens,
+            quota_ledger=self.quota,
+            audit_ledger=self.audit,
+            policy_bundle=self.bundle,
+            artifact_store=artifacts,
+        )
+        request = self._launch_request(max_cost_usd=10, estimated_cost_usd=2)
+
+        handle = orchestrator.launch(request)
+        record = artifacts.get_record(handle.launch_provenance_ref or "")
+        payload = json.loads(artifacts.get_artifact(record.artifact_ref).decode("utf-8"))
+        exec_environment = payload["exec_environment"]
+        exec_environment_digest = hash_json(exec_environment)
+
+        self.assertEqual(record.kind, "container")
+        self.assertEqual(record.lineage.code_ref, request.image)
+        self.assertEqual(record.lineage.environment_digest, exec_environment_digest)
+        self.assertEqual(record.lineage.seeds, (request.trace_id,))
+        self.assertEqual(payload["exec_environment_digest"], exec_environment_digest)
+        self.assertEqual(exec_environment["image_digest"], request.image)
+        self.assertEqual(exec_environment["runtime_class"], "gvisor")
+        self.assertEqual(exec_environment["cgroup_limits"], asdict(request.requested_envelope))
+        self.assertEqual(exec_environment["egress_acl"], [asdict(EgressRule("store.local", 443, "https"))])
+        self.assertEqual(payload["launch"]["budget_id"], request.budget_token.budget_id)
+
+        replacement_budget = self.tokens.mint_budget(
+            caps=request.budget_token.caps,
+            job_id=request.job_id,
+            root_request_id=request.budget_token.root_request_id,
+        )
+        replacement_scope = self.tokens.mint_scope(job_id=request.job_id, scopes=request.scope_token.scopes)
+        second_handle = orchestrator.launch(
+            replace(request, budget_token=replacement_budget, scope_token=replacement_scope)
+        )
+        second_payload = json.loads(artifacts.get_artifact(second_handle.launch_provenance_ref or "").decode("utf-8"))
+        self.assertEqual(second_payload["exec_environment_digest"], exec_environment_digest)
+
     def test_launch_rejects_tag_only_image_before_reserving_budget(self) -> None:
         request = replace(self._launch_request(max_cost_usd=10, estimated_cost_usd=2), image="registry.local/argus:latest")
 
@@ -610,6 +652,7 @@ class S10DockerOrchestratorTests(unittest.TestCase):
         self.tokens = InMemoryTokenService(signing_key=b"test-key", now_fn=lambda: 1_000)
         self.quota = InMemoryQuotaLedger()
         self.audit = InMemoryAuditLedger()
+        self.artifacts = InMemoryArtifactStore()
         self.bundle = PolicyBundle(
             bundle_version="1.0.0",
             egress_allowlist=(),
@@ -630,6 +673,7 @@ class S10DockerOrchestratorTests(unittest.TestCase):
             quota_ledger=self.quota,
             audit_ledger=self.audit,
             policy_bundle=self.bundle,
+            artifact_store=self.artifacts,
             supervisor=DockerSandboxSupervisor(docker_bin=self.docker_bin),
         )
 
@@ -649,6 +693,15 @@ class S10DockerOrchestratorTests(unittest.TestCase):
         self.assertIn("ARGUS_SAFE=visible", result.stdout)
         self.assertNotIn("hidden", result.stdout)
         self.assertFalse(_has_default_route(result.stdout), result.stdout)
+        provenance_ref = result.handle.launch_provenance_ref or ""
+        provenance_record = self.artifacts.get_record(provenance_ref)
+        provenance_payload = json.loads(self.artifacts.get_artifact(provenance_ref).decode("utf-8"))
+        self.assertEqual(provenance_record.kind, "container")
+        self.assertEqual(provenance_payload["exec_environment"]["runtime_class"], "docker")
+        self.assertEqual(
+            provenance_payload["exec_environment_digest"],
+            provenance_record.lineage.environment_digest,
+        )
         quota_state = self.quota.state(request.budget_token.budget_id)
         self.assertEqual(quota_state.reserved, BudgetUsage())
         self.assertGreater(quota_state.actual.wallclock_s, 0)

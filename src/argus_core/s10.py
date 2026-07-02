@@ -1028,13 +1028,20 @@ class InMemorySandboxOrchestrator:
     def _emit_launch_provenance(self, request: LaunchRequest, verdict: PolicyVerdict) -> str | None:
         if self._artifact_store is None:
             return None
+        exec_environment = _launch_exec_environment(request, verdict, self._policy_bundle)
+        exec_environment_digest = hash_json(exec_environment)
         payload = {
-            "image_digest": request.image,
-            "runtime": verdict.runtime_class or "gvisor",
-            "seccomp_profile_hash": self._policy_bundle.seccomp_profile_hash,
-            "cgroup_limits": asdict(request.requested_envelope),
-            "policy_bundle_version": self._policy_bundle.bundle_version,
-            "node_kernel_caps_dropped": ["ALL"],
+            "exec_environment_digest": exec_environment_digest,
+            "exec_environment": exec_environment,
+            "launch": {
+                "job_id": request.job_id,
+                "subagent_id": request.subagent_id,
+                "trace_id": request.trace_id,
+                "budget_id": request.budget_token.budget_id,
+                "budget_epoch": request.budget_token.budget_epoch,
+                "scope_id": request.scope_token.scope_id,
+                "policy_pin": request.policy_pin,
+            },
         }
         record = self._artifact_store.create_artifact(
             kind="container",
@@ -1043,11 +1050,35 @@ class InMemorySandboxOrchestrator:
             lineage=Lineage(
                 input_refs=(),
                 code_ref=request.image,
-                environment_digest=hash_json(payload),
+                environment_digest=exec_environment_digest,
                 seeds=(request.trace_id,),
             ),
         )
         return record.artifact_ref
+
+
+def _launch_exec_environment(
+    request: LaunchRequest,
+    verdict: PolicyVerdict,
+    policy_bundle: PolicyBundle,
+) -> dict[str, Any]:
+    return {
+        "image_digest": request.image,
+        "runtime_class": verdict.runtime_class or "gvisor",
+        "entrypoint": list(request.entrypoint),
+        "args": list(request.args),
+        "env_allowlist": sorted(request.env_allowlist),
+        "egress_acl": [
+            asdict(rule)
+            for rule in sorted(verdict.egress_acl, key=lambda item: (item.host, item.port, item.proto))
+        ],
+        "cgroup_limits": asdict(request.requested_envelope),
+        "policy_bundle_version": policy_bundle.bundle_version,
+        "seccomp_profile_hash": policy_bundle.seccomp_profile_hash,
+        "risk_class": request.scope_token.scopes.sandbox_risk_class,
+        "seed_material": [request.trace_id],
+        "node_kernel_caps_dropped": ["ALL"],
+    }
 
 
 class DockerSandboxOrchestrator(InMemorySandboxOrchestrator):
