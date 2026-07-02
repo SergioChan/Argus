@@ -29,6 +29,7 @@ BOOTSTRAP_TOKEN = "test-bootstrap-token"
 IDENTITY_SIGNING_KEY = b"test-identity-signing-key"
 HEALTH_TOKEN = "test-health-token"
 BROKER_WRITE_KEY = b"test-s8-broker-write-key"
+POLICY_SIGNING_KEY = "test-s10-policy-signing-key"
 
 
 class ArgusM0RuntimeServiceTests(unittest.TestCase):
@@ -482,6 +483,29 @@ class ArgusM0RuntimeServiceTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 build_s10_app_from_env()
 
+    def test_s10_env_build_requires_signed_policy_service(self) -> None:
+        base_env = {
+            "ARGUS_S10_SIGNING_KEY": "test-s10-signing-key",
+            "ARGUS_RUNTIME_BOOTSTRAP_TOKEN": BOOTSTRAP_TOKEN,
+            "ARGUS_RUNTIME_IDENTITY_SIGNING_KEY": IDENTITY_SIGNING_KEY.decode("utf-8"),
+            "ARGUS_RUNTIME_IDENTITY_MINT_POLICY_JSON": _runtime_identity_mint_policy_json(),
+            "ARGUS_M0_HEALTH_TOKEN": HEALTH_TOKEN,
+        }
+        with patch.dict(os.environ, base_env, clear=True):
+            with self.assertRaisesRegex(RuntimeError, "ARGUS_S10_POLICY_SIGNING_KEY"):
+                build_s10_app_from_env()
+        with patch.dict(os.environ, {**base_env, "ARGUS_S10_POLICY_SIGNING_KEY": POLICY_SIGNING_KEY}, clear=True):
+            app = build_s10_app_from_env()
+            status, payload = app.http.handle(
+                JsonRequest(method="GET", path="/healthz", query={}, body=None, headers=_auth_headers(HEALTH_TOKEN))
+            )
+
+        self.assertTrue(app.policy.signature.startswith("hmac-sha256:"))
+        self.assertEqual(app.policy.signer_key_id, "argus-m0-policy")
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["policy_bundle_version"], "argus-m0-dev")
+        self.assertEqual(payload["policy_signer_key_id"], "argus-m0-policy")
+
     def test_s10_store_artifact_rejects_scope_token_from_other_identity(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             app = S10SupervisorApp(
@@ -622,6 +646,7 @@ class ArgusM0ComposeTests(unittest.TestCase):
                 "ARGUS_RUNTIME_IDENTITY_MINT_POLICY_JSON": _runtime_identity_mint_policy_json(),
                 "ARGUS_M0_HEALTH_TOKEN": HEALTH_TOKEN,
                 "ARGUS_S10_SIGNING_KEY": "test-s10-signing-key",
+                "ARGUS_S10_POLICY_SIGNING_KEY": POLICY_SIGNING_KEY,
                 "ARGUS_S8_BROKER_WRITE_KEY": BROKER_WRITE_KEY.decode("utf-8"),
             },
         )
@@ -664,6 +689,7 @@ class ArgusM0ComposeTests(unittest.TestCase):
         )
         self.assertIn("ARGUS_S8_BROKER_WRITE_KEY", services["s10-supervisor"]["environment"])
         self.assertEqual(services["s10-supervisor"]["environment"]["ARGUS_S10_SIGNING_KEY"], "test-s10-signing-key")
+        self.assertEqual(services["s10-supervisor"]["environment"]["ARGUS_S10_POLICY_SIGNING_KEY"], POLICY_SIGNING_KEY)
         self.assertNotIn("volumes", services["s10-supervisor"])
         self.assertNotIn("s8-data", rendered["volumes"])
         self.assertIn("postgres-data", rendered["volumes"])

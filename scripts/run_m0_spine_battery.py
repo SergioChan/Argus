@@ -32,12 +32,16 @@ from argus_core import (
     DockerSandboxOrchestrator,
     EgressRule,
     InMemoryAuditLedger,
+    InMemoryPolicyBundleTrustStore,
+    InMemoryPolicyService,
     InMemoryQuotaLedger,
     InMemoryTokenService,
     LaunchEnvelope,
     LaunchRequest,
     Lineage,
     PolicyBundle,
+    PolicyBundleSignatureError,
+    PolicyBundleSigner,
     Producer,
     ResourceCeilings,
     ScopeGrant,
@@ -86,6 +90,7 @@ def main() -> int:
         "ARGUS_RUNTIME_IDENTITY_MINT_POLICY_JSON": _m0_identity_mint_policy_json(),
         "ARGUS_M0_HEALTH_TOKEN": runtime_secrets["health_token"],
         "ARGUS_S10_SIGNING_KEY": runtime_secrets["s10_signing_key"],
+        "ARGUS_S10_POLICY_SIGNING_KEY": runtime_secrets["s10_policy_signing_key"],
         "ARGUS_S8_BROKER_WRITE_KEY": runtime_secrets["s8_broker_write_key"],
     }
     s8_url = f"http://127.0.0.1:{ports['ARGUS_M0_S8_PORT']}"
@@ -122,6 +127,10 @@ def main() -> int:
         _battery_forged_scope_token_denied(evidence, s10_url, write_scope_json, token=auth_tokens["write"])
         _battery_b_incomplete_lineage(evidence, s10_url, write_scope_json, token=auth_tokens["write"])
         _battery_c_write_once(evidence, s10_url, write_scope_json, token=auth_tokens["write"])
+        _battery_signed_policy_service(
+            evidence,
+            policy_signing_key=runtime_secrets["s10_policy_signing_key"].encode("utf-8"),
+        )
 
         budget_json = _post_json(
             f"{s10_url}/v1/budget-tokens",
@@ -143,6 +152,7 @@ def main() -> int:
             s8_broker_write_key=runtime_secrets["s8_broker_write_key"].encode("utf-8"),
             read_token=auth_tokens["read"],
             signing_key=runtime_secrets["s10_signing_key"].encode("utf-8"),
+            policy_signing_key=runtime_secrets["s10_policy_signing_key"].encode("utf-8"),
         )
         model_record = _post_json(
             f"{s10_url}/v1/store/artifacts",
@@ -191,6 +201,7 @@ def main() -> int:
             read_token=auth_tokens["read"],
             s8_broker_write_key=runtime_secrets["s8_broker_write_key"].encode("utf-8"),
             signing_key=runtime_secrets["s10_signing_key"].encode("utf-8"),
+            policy_signing_key=runtime_secrets["s10_policy_signing_key"].encode("utf-8"),
         )
         _battery_g_argusverify(evidence)
         _battery_real_persistence(evidence, ports, s8_url=s8_url, token=auth_tokens["read"])
@@ -231,6 +242,7 @@ def _m0_runtime_secrets() -> dict[str, str]:
         "health_token": f"argus-health-{uuid4().hex}",
         "identity_signing_key": f"argus-identity-key-{uuid4().hex}",
         "s10_signing_key": f"argus-s10-key-{uuid4().hex}",
+        "s10_policy_signing_key": f"argus-s10-policy-key-{uuid4().hex}",
         "s8_broker_write_key": f"argus-s8-broker-key-{uuid4().hex}",
     }
 
@@ -723,6 +735,7 @@ def _battery_e_budget_halt(
     read_token: str,
     s8_broker_write_key: bytes,
     signing_key: bytes,
+    policy_signing_key: bytes,
 ) -> None:
     budget_json = _post_json(
         f"{s10_url}/v1/budget-tokens",
@@ -743,7 +756,7 @@ def _battery_e_budget_halt(
         token_service=tokens,
         quota_ledger=quota,
         audit_ledger=audit,
-        policy_bundle=_policy_bundle(),
+        policy_service=_policy_service(policy_signing_key),
         artifact_store=S8InternalArtifactStoreClient(
             s8_url=s8_url,
             broker_write_key=s8_broker_write_key,
@@ -813,6 +826,46 @@ def _battery_g_argusverify(evidence: dict[str, Any]) -> None:
     )
 
 
+def _battery_signed_policy_service(evidence: dict[str, Any], *, policy_signing_key: bytes) -> None:
+    service = _policy_service(policy_signing_key)
+    signed = service.active_bundle
+    tampered = replace(
+        signed,
+        resource_ceilings=replace(signed.resource_ceilings, cpu_m=signed.resource_ceilings.cpu_m + 1),
+    )
+    unknown_signer = replace(signed, signer_key_id="unknown-policy-signer")
+
+    tamper_rejected = False
+    unknown_rejected = False
+    try:
+        InMemoryPolicyService(
+            initial_bundle=tampered,
+            trust_store=InMemoryPolicyBundleTrustStore({signed.signer_key_id: policy_signing_key}),
+        )
+    except PolicyBundleSignatureError:
+        tamper_rejected = True
+    try:
+        InMemoryPolicyService(
+            initial_bundle=unknown_signer,
+            trust_store=InMemoryPolicyBundleTrustStore({signed.signer_key_id: policy_signing_key}),
+        )
+    except PolicyBundleSignatureError:
+        unknown_rejected = True
+    if not signed.signature.startswith("hmac-sha256:") or not tamper_rejected or not unknown_rejected:
+        raise AssertionError("signed S10 policy service did not fail closed")
+    _record(
+        evidence,
+        "policy-signature",
+        "S10 Docker launch policy bundle is signed and verified before activation",
+        {
+            "bundle_version": signed.bundle_version,
+            "signer_key_id": signed.signer_key_id,
+            "tamper_rejected": tamper_rejected,
+            "unknown_signer_rejected": unknown_rejected,
+        },
+    )
+
+
 def _run_no_network_launch(
     *,
     image: str,
@@ -822,6 +875,7 @@ def _run_no_network_launch(
     s8_broker_write_key: bytes,
     read_token: str,
     signing_key: bytes,
+    policy_signing_key: bytes,
 ) -> dict[str, Any]:
     tokens = InMemoryTokenService(signing_key=signing_key)
     quota = InMemoryQuotaLedger()
@@ -830,7 +884,7 @@ def _run_no_network_launch(
         token_service=tokens,
         quota_ledger=quota,
         audit_ledger=audit,
-        policy_bundle=_policy_bundle(),
+        policy_service=_policy_service(policy_signing_key),
         artifact_store=S8InternalArtifactStoreClient(
             s8_url=s8_url,
             broker_write_key=s8_broker_write_key,
@@ -896,8 +950,17 @@ def _policy_bundle() -> PolicyBundle:
         ),
         risk_to_runtime={"standard": "docker"},
         seccomp_profile_hash="blake3:" + "0" * 64,
-        signer_key_id="argus-m0-battery",
-        signature="battery-policy-signature",
+        signer_key_id="",
+        signature="",
+    )
+
+
+def _policy_service(policy_signing_key: bytes) -> InMemoryPolicyService:
+    signer_key_id = "argus-m0-battery-policy"
+    signed = PolicyBundleSigner(key_id=signer_key_id, secret=policy_signing_key).sign(_policy_bundle())
+    return InMemoryPolicyService(
+        initial_bundle=signed,
+        trust_store=InMemoryPolicyBundleTrustStore({signer_key_id: policy_signing_key}),
     )
 
 

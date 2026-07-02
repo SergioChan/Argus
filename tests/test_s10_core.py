@@ -1165,6 +1165,42 @@ class S10DockerOrchestratorFailureTests(unittest.TestCase):
                 supervisor=_RaisingSupervisor(PermissionError("not reached")),
             )
 
+    def test_docker_orchestrator_uses_verified_policy_service(self) -> None:
+        signer = PolicyBundleSigner(key_id="policy-key", secret=b"policy-secret")
+        trust_store = InMemoryPolicyBundleTrustStore({"policy-key": b"policy-secret"})
+        signed = signer.sign(self.bundle)
+        policy_service = InMemoryPolicyService(initial_bundle=signed, trust_store=trust_store)
+        tampered = replace(
+            signed,
+            resource_ceilings=replace(signed.resource_ceilings, cpu_m=signed.resource_ceilings.cpu_m + 1),
+        )
+
+        with self.assertRaises(PolicyBundleSignatureError):
+            InMemoryPolicyService(initial_bundle=tampered, trust_store=trust_store)
+        with self.assertRaisesRegex(PolicyDeniedError, "mutually exclusive"):
+            DockerSandboxOrchestrator(
+                token_service=self.tokens,
+                quota_ledger=InMemoryQuotaLedger(),
+                audit_ledger=InMemoryAuditLedger(),
+                policy_bundle=self.bundle,
+                policy_service=policy_service,
+                artifact_store=InMemoryArtifactStore(),
+                supervisor=_FixedUsageSupervisor(BudgetUsage(wallclock_s=0.1)),
+            )
+
+        orchestrator = DockerSandboxOrchestrator(
+            token_service=self.tokens,
+            quota_ledger=InMemoryQuotaLedger(),
+            audit_ledger=InMemoryAuditLedger(),
+            policy_service=policy_service,
+            artifact_store=InMemoryArtifactStore(),
+            supervisor=_FixedUsageSupervisor(BudgetUsage(wallclock_s=0.1)),
+        )
+        result = orchestrator.launch_and_wait(self._launch_request())
+
+        self.assertEqual(result.handle.policy_bundle_version, "1.0.0")
+        self.assertEqual(result.handle.runtime_class, "docker")
+
     def test_supervisor_exceptions_release_reserved_quota_and_fail_handle(self) -> None:
         for exc in (
             SandboxRuntimeUnavailableError("docker runtime is unavailable"),

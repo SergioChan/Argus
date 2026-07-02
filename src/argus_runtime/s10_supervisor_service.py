@@ -18,10 +18,13 @@ from argus_core import (
     FileSystemArtifactStore,
     InMemoryArtifactStore,
     InMemoryAuditLedger,
+    InMemoryPolicyBundleTrustStore,
+    InMemoryPolicyService,
     InMemoryQuotaLedger,
     InMemoryTokenService,
     Lineage,
     PolicyBundle,
+    PolicyBundleSigner,
     Producer,
     ResourceCeilings,
     ScopeDeniedError,
@@ -97,6 +100,7 @@ class S10SupervisorApp:
         auth: RuntimeAuth | None = None,
         runtime_identity_mint_policy: RuntimeIdentityMintPolicy | None = None,
         health_token: str | None = None,
+        policy_service: InMemoryPolicyService | None = None,
     ) -> None:
         self.tokens = InMemoryTokenService(signing_key=signing_key)
         self.quota = InMemoryQuotaLedger()
@@ -106,7 +110,8 @@ class S10SupervisorApp:
         self.auth = auth
         self.runtime_identity_mint_policy = runtime_identity_mint_policy
         self._health_token = health_token
-        self.policy = _default_policy_bundle()
+        self.policy_service = policy_service or _default_policy_service()
+        self.policy = self.policy_service.active_bundle
         self.broker = StoreWriterBroker(
             token_service=self.tokens,
             artifact_store=self.artifacts,
@@ -233,6 +238,7 @@ class S10SupervisorApp:
                 "service": "s10-supervisor",
                 "status": "ok",
                 "policy_bundle_version": self.policy.bundle_version,
+                "policy_signer_key_id": self.policy.signer_key_id,
                 "audit_events": len(self.audit.events()),
             }
 
@@ -316,6 +322,7 @@ def build_app_from_env() -> S10SupervisorApp:
     s8_broker_key = os.environ.get("ARGUS_S8_BROKER_WRITE_KEY")
     mint_policy = _runtime_identity_mint_policy_from_env()
     health_token = health_token_from_env()
+    policy_service = _policy_service_from_env()
     if s8_broker_url:
         if not s8_broker_key:
             raise RuntimeError("ARGUS_S8_BROKER_WRITE_KEY is required when ARGUS_S8_BROKER_URL is configured")
@@ -328,6 +335,7 @@ def build_app_from_env() -> S10SupervisorApp:
             auth=runtime_auth_from_env(),
             runtime_identity_mint_policy=mint_policy,
             health_token=health_token,
+            policy_service=policy_service,
         )
     data_dir = os.environ.get("ARGUS_S8_DATA_DIR")
     if data_dir:
@@ -338,12 +346,14 @@ def build_app_from_env() -> S10SupervisorApp:
             auth=runtime_auth_from_env(),
             runtime_identity_mint_policy=mint_policy,
             health_token=health_token,
+            policy_service=policy_service,
         )
     return S10SupervisorApp(
         signing_key=signing_key,
         auth=runtime_auth_from_env(),
         runtime_identity_mint_policy=mint_policy,
         health_token=health_token,
+        policy_service=policy_service,
     )
 
 
@@ -366,8 +376,38 @@ def _default_policy_bundle() -> PolicyBundle:
         ),
         risk_to_runtime={"standard": "docker"},
         seccomp_profile_hash="blake3:" + "0" * 64,
-        signer_key_id="argus-m0-dev",
-        signature="dev-policy-signature",
+        signer_key_id="",
+        signature="",
+    )
+
+
+def _default_policy_service() -> InMemoryPolicyService:
+    return _policy_service_from_signing_key(
+        b"argus-m0-dev-policy-signing-key",
+        signer_key_id="argus-m0-dev-policy",
+    )
+
+
+def _policy_service_from_env() -> InMemoryPolicyService:
+    key_file = os.environ.get("ARGUS_S10_POLICY_SIGNING_KEY_FILE")
+    if key_file:
+        signing_key = Path(key_file).read_bytes()
+    else:
+        signing_key_value = os.environ.get("ARGUS_S10_POLICY_SIGNING_KEY")
+        if not signing_key_value:
+            raise RuntimeError("ARGUS_S10_POLICY_SIGNING_KEY or ARGUS_S10_POLICY_SIGNING_KEY_FILE is required")
+        signing_key = signing_key_value.encode("utf-8")
+    return _policy_service_from_signing_key(
+        signing_key,
+        signer_key_id=os.environ.get("ARGUS_S10_POLICY_SIGNER_KEY_ID", "argus-m0-policy"),
+    )
+
+
+def _policy_service_from_signing_key(signing_key: bytes, *, signer_key_id: str) -> InMemoryPolicyService:
+    signed_bundle = PolicyBundleSigner(key_id=signer_key_id, secret=signing_key).sign(_default_policy_bundle())
+    return InMemoryPolicyService(
+        initial_bundle=signed_bundle,
+        trust_store=InMemoryPolicyBundleTrustStore({signer_key_id: signing_key}),
     )
 
 

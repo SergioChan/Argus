@@ -1369,7 +1369,8 @@ class DockerSandboxOrchestrator(InMemorySandboxOrchestrator):
         token_service: InMemoryTokenService,
         quota_ledger: InMemoryQuotaLedger,
         audit_ledger: InMemoryAuditLedger,
-        policy_bundle: PolicyBundle,
+        policy_bundle: PolicyBundle | None = None,
+        policy_service: InMemoryPolicyService | None = None,
         artifact_store: InMemoryArtifactStore | None = None,
         supervisor: DockerSandboxSupervisor | None = None,
     ) -> None:
@@ -1380,6 +1381,7 @@ class DockerSandboxOrchestrator(InMemorySandboxOrchestrator):
             quota_ledger=quota_ledger,
             audit_ledger=audit_ledger,
             policy_bundle=policy_bundle,
+            policy_service=policy_service,
             artifact_store=artifact_store,
         )
         self._supervisor = supervisor or DockerSandboxSupervisor()
