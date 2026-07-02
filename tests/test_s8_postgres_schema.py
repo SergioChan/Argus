@@ -754,9 +754,9 @@ class S8PostgresSchemaTests(unittest.TestCase):
         )
         drift = self._apply_s8_migrations(check=False)
 
-        self.assertEqual(first_count.stdout.strip(), "10")
+        self.assertEqual(first_count.stdout.strip(), "11")
         self.assertIn("already applied with matching checksum", reapplied.stdout)
-        self.assertEqual(second_count.stdout.strip(), "10")
+        self.assertEqual(second_count.stdout.strip(), "11")
         self.assertNotEqual(drift.returncode, 0)
         self.assertIn("checksum drift", drift.stderr)
 
@@ -1736,7 +1736,7 @@ class S8PostgresSchemaTests(unittest.TestCase):
         self.assertNotEqual(update.returncode, 0)
         self.assertIn("append-only table dataset_resolve_audit", update.stderr)
 
-    def test_audit_export_proofs_verify_and_detect_record_tamper(self) -> None:
+    def test_audit_export_proofs_are_exported_and_weak_sql_verifiers_are_removed(self) -> None:
         zero_root = "blake3:" + ("0" * 64)
         first_root = "blake3:audit-root-1"
         second_root = "blake3:audit-root-2"
@@ -1795,25 +1795,24 @@ class S8PostgresSchemaTests(unittest.TestCase):
         )
         audit_slice = json.loads(export_result.stdout)
         proof = audit_slice["inclusion_proofs"][0]
-        chain_valid = self._psql("SELECT s8.verify_audit_chain()->>'valid';")
-        slice_valid = self._psql(
+        removed_verifiers = self._psql(
             """
-            WITH audit_slice AS (
-                SELECT s8.export_audit_slice(ARRAY['c4://artifact/dataset']::text[]) AS payload
-            )
-            SELECT s8.verify_audit_slice(payload)->>'valid'
-            FROM audit_slice;
+            SELECT (to_regprocedure('s8.verify_audit_chain()') IS NULL)::text
+                || '|'
+                || (to_regprocedure('s8.verify_audit_slice(jsonb)') IS NULL)::text;
             """
         )
-        reader_slice_valid = self._psql(
+        direct_chain_call = self._psql("SELECT s8.verify_audit_chain();", check=False)
+        reader_slice_call = self._psql(
             """
             SET ROLE argus_s8_reader;
             WITH audit_slice AS (
                 SELECT s8.export_audit_slice(ARRAY['c4://artifact/dataset']::text[]) AS payload
             )
-            SELECT s8.verify_audit_slice(payload)->>'valid'
+            SELECT s8.verify_audit_slice(payload)
             FROM audit_slice;
-            """
+            """,
+            check=False,
         )
         missing_ref = self._psql(
             """
@@ -1828,42 +1827,13 @@ class S8PostgresSchemaTests(unittest.TestCase):
         self.assertEqual(proof["sequence"], 2)
         self.assertEqual(proof["anchor_previous_root"], first_root)
         self.assertEqual([step["sequence"] for step in proof["steps"]], [3])
-        self.assertEqual(chain_valid.stdout.strip(), "true")
-        self.assertEqual(slice_valid.stdout.strip(), "true")
-        self.assertEqual(reader_slice_valid.stdout.strip(), "true")
+        self.assertEqual(removed_verifiers.stdout.strip(), "true|true")
+        self.assertNotEqual(direct_chain_call.returncode, 0)
+        self.assertIn("function s8.verify_audit_chain() does not exist", direct_chain_call.stderr)
+        self.assertNotEqual(reader_slice_call.returncode, 0)
+        self.assertIn("function s8.verify_audit_slice(jsonb) does not exist", reader_slice_call.stderr)
         self.assertNotEqual(missing_ref.returncode, 0)
         self.assertIn("audit export missing ledger leaves", missing_ref.stderr)
-
-        self._psql(
-            """
-            ALTER TABLE s8.artifact_record DISABLE TRIGGER artifact_record_append_only;
-            UPDATE s8.artifact_record
-            SET record_hash = 'blake3:tampered-record-2'
-            WHERE artifact_id = 'c4://artifact/dataset';
-            ALTER TABLE s8.artifact_record ENABLE TRIGGER artifact_record_append_only;
-            """
-        )
-        tampered_chain = self._psql(
-            """
-            SELECT (s8.verify_audit_chain()->>'valid')
-                || '|'
-                || (s8.verify_audit_chain()->>'break_sequence')
-                || '|'
-                || (s8.verify_audit_chain()->>'reason');
-            """
-        )
-        tampered_slice = self._psql(
-            f"""
-            SELECT (s8.verify_audit_slice({_jsonb_literal(audit_slice)})->>'valid')
-                || '|'
-                || (s8.verify_audit_slice({_jsonb_literal(audit_slice)})->>'break_sequence')
-                || '|'
-                || (s8.verify_audit_slice({_jsonb_literal(audit_slice)})->>'reason');
-            """
-        )
-
-        self.assertEqual(tampered_chain.stdout.strip(), "false|2|record_hash_mismatch")
-        self.assertEqual(tampered_slice.stdout.strip(), "false|2|record_hash_mismatch")
 
     def test_reproducibility_manifest_and_check_functions_are_append_only(self) -> None:
         self._commit_record("c4://artifact/model", sequence=1, kind="model")
