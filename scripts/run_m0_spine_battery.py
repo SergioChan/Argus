@@ -499,6 +499,9 @@ def _prepare_shared_data_dir(data_dir: Path) -> None:
     ):
         path.mkdir(parents=True, exist_ok=True)
         path.chmod(0o777)
+    ledger_path = data_dir / "artifact_ledger.jsonl"
+    ledger_path.touch(exist_ok=True)
+    ledger_path.chmod(0o666)
 
 
 def _run(
