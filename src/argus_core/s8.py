@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
+import hashlib
 import json
 from pathlib import Path
 from typing import Any, Callable, Mapping, Protocol
@@ -377,6 +378,18 @@ class DatasetSplitResolution:
     feature_blob_ref: str
     label_blob_ref: str | None
     audit_event: DatasetResolveAuditEvent
+
+
+@dataclass(frozen=True)
+class SchemaPublication:
+    contract_id: str
+    version: str
+    artifact_ref: str
+    content_hash: str
+    schema_sha256: str
+    manifest_sha256: str
+    compatibility_sha256: str
+    baseline_schema_sha256: str
 
 
 WRITE_ONCE_BUCKET = "write_once"
@@ -1244,7 +1257,7 @@ class InMemoryArtifactStore:
 
     @staticmethod
     def _bucket_class_for_record(*, kind: str, claim_tier: str) -> str:
-        if kind == "report" or claim_tier != "ran-toy":
+        if kind in {"report", "schema"} or claim_tier != "ran-toy":
             return WRITE_ONCE_BUCKET
         return SCRATCH_BUCKET
 
@@ -1253,6 +1266,79 @@ class InMemoryArtifactStore:
             return AuditCheckpoint(sequence=0, root=self._zero_root())
         latest_leaf = self._audit_leaves[-1]
         return AuditCheckpoint(sequence=latest_leaf.sequence, root=latest_leaf.root)
+
+
+def publish_c4_schema(
+    store: InMemoryArtifactStore,
+    *,
+    schema: Mapping[str, Any],
+    manifest: Mapping[str, Any],
+    compatibility: Mapping[str, Any],
+    baseline_schema: Mapping[str, Any],
+    created_at: str | None = None,
+) -> SchemaPublication:
+    """Publish frozen C4 v1 schema metadata through the S8 write-once facade."""
+    metadata = _contract_metadata(schema, contract_id="C4")
+    version = _required_string(metadata, "version", "C4 schema metadata")
+    manifest_entry = _contract_manifest_entry(manifest, contract_id="C4")
+    compatibility_entry = _contract_compatibility_entry(
+        compatibility,
+        contract_id="C4",
+        version=version,
+    )
+    baseline_metadata = _contract_metadata(baseline_schema, contract_id="C4")
+
+    if manifest_entry.get("version") != version:
+        raise ValueError("C4 manifest version must match schema metadata")
+    if compatibility_entry.get("baseline_version") != version:
+        raise ValueError("C4 compatibility baseline version must match schema metadata")
+    if baseline_metadata.get("version") != version:
+        raise ValueError("C4 baseline schema version must match schema metadata")
+
+    schema_sha256 = _canonical_sha256(schema)
+    baseline_schema_sha256 = _canonical_sha256(baseline_schema)
+    if schema_sha256 != baseline_schema_sha256:
+        raise ValueError("C4 schema bytes must match the frozen v1 compatibility baseline")
+
+    manifest_sha256 = _canonical_sha256(manifest)
+    compatibility_sha256 = _canonical_sha256(compatibility)
+    artifact_ref = f"c4://schema/C4/{version}"
+    payload = {
+        "publication_type": "contract_schema",
+        "contract_id": "C4",
+        "schema_ref": _required_string(schema, "$id", "C4 schema"),
+        "version": version,
+        "schema_sha256": schema_sha256,
+        "manifest_sha256": manifest_sha256,
+        "compatibility_sha256": compatibility_sha256,
+        "baseline_schema_sha256": baseline_schema_sha256,
+        "manifest_schema": manifest_entry.get("schema"),
+        "baseline_schema": compatibility_entry.get("baseline_schema"),
+        "schema": schema,
+    }
+    record = store.create_artifact(
+        artifact_ref=artifact_ref,
+        kind="schema",
+        payload=payload,
+        producer=Producer(subsystem="S8", version=version),
+        lineage=Lineage(
+            input_refs=(),
+            code_ref=f"schema:{_required_string(schema, '$id', 'C4 schema')}",
+            environment_digest=schema_sha256,
+            seeds=(),
+        ),
+        created_at=created_at,
+    )
+    return SchemaPublication(
+        contract_id="C4",
+        version=version,
+        artifact_ref=record.artifact_ref,
+        content_hash=record.content_hash,
+        schema_sha256=schema_sha256,
+        manifest_sha256=manifest_sha256,
+        compatibility_sha256=compatibility_sha256,
+        baseline_schema_sha256=baseline_schema_sha256,
+    )
 
 
 class FileSystemArtifactStore(InMemoryArtifactStore):
@@ -1625,6 +1711,55 @@ class DatasetRegistry:
 def _assert_known_bucket_class(bucket_class: str) -> None:
     if bucket_class not in {WRITE_ONCE_BUCKET, SCRATCH_BUCKET}:
         raise ValueError(f"unknown bucket_class: {bucket_class}")
+
+
+def _canonical_sha256(value: Mapping[str, Any]) -> str:
+    return "sha256:" + hashlib.sha256(canonical_json_bytes(value)).hexdigest()
+
+
+def _contract_metadata(schema: Mapping[str, Any], *, contract_id: str) -> Mapping[str, Any]:
+    metadata = schema.get("x-argus-contract")
+    if not isinstance(metadata, Mapping):
+        raise ValueError(f"{contract_id} schema missing x-argus-contract metadata")
+    if metadata.get("id") != contract_id:
+        raise ValueError(f"schema metadata id must be {contract_id}")
+    return metadata
+
+
+def _contract_manifest_entry(manifest: Mapping[str, Any], *, contract_id: str) -> Mapping[str, Any]:
+    contracts = manifest.get("contracts")
+    if not isinstance(contracts, list):
+        raise ValueError("manifest missing contracts list")
+    for entry in contracts:
+        if isinstance(entry, Mapping) and entry.get("id") == contract_id:
+            return entry
+    raise ValueError(f"manifest missing {contract_id} entry")
+
+
+def _contract_compatibility_entry(
+    compatibility: Mapping[str, Any],
+    *,
+    contract_id: str,
+    version: str,
+) -> Mapping[str, Any]:
+    contracts = compatibility.get("contracts")
+    if not isinstance(contracts, list):
+        raise ValueError("compatibility manifest missing contracts list")
+    for entry in contracts:
+        if (
+            isinstance(entry, Mapping)
+            and entry.get("id") == contract_id
+            and entry.get("baseline_version") == version
+        ):
+            return entry
+    raise ValueError(f"compatibility manifest missing {contract_id} {version} baseline")
+
+
+def _required_string(value: Mapping[str, Any], field_name: str, context: str) -> str:
+    field_value = value.get(field_name)
+    if not isinstance(field_value, str) or not field_value:
+        raise ValueError(f"{context} missing {field_name}")
+    return field_value
 
 
 def _assert_payload_matches_hash(content_hash: str, payload: bytes) -> None:

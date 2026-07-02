@@ -356,10 +356,12 @@ from .s8 import (
     ReproducibilityManifest,
     SCRATCH_BUCKET,
     S8ScopeDeniedError,
+    SchemaPublication,
     SignatureInvalidError,
     WRITE_ONCE_BUCKET,
     WriteOnceViolationError,
     assert_lineage_complete,
+    publish_c4_schema,
 )
 from .s9 import (
     EmissionAuthorization,
@@ -623,6 +625,7 @@ __all__ = [
     "ScopeWideningError",
     "ScrubbedTelemetry",
     "S8ScopeDeniedError",
+    "SchemaPublication",
     "SelfGradeError",
     "SemverCompatibilityError",
     "SignatureInvalidError",
@@ -665,6 +668,7 @@ __all__ = [
     "assert_declared_semver_bump",
     "assert_schema_version_declares_change",
     "assert_lineage_complete",
+    "publish_c4_schema",
     "attest_challenger_independence",
     "admit_signed_reward",
     "build_subagent_report",
