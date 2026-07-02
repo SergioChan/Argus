@@ -645,11 +645,107 @@ class S8PostgresSchemaTests(unittest.TestCase):
         )
         drift = self._apply_s8_migrations(check=False)
 
-        self.assertEqual(first_count.stdout.strip(), "6")
+        self.assertEqual(first_count.stdout.strip(), "7")
         self.assertIn("already applied with matching checksum", reapplied.stdout)
-        self.assertEqual(second_count.stdout.strip(), "6")
+        self.assertEqual(second_count.stdout.strip(), "7")
         self.assertNotEqual(drift.returncode, 0)
         self.assertIn("checksum drift", drift.stderr)
+
+    def test_read_query_functions_resolve_refs_filter_page_and_grant_reader(self) -> None:
+        self._commit_record(
+            "c4://artifact/dataset-a",
+            sequence=1,
+            kind="dataset",
+            producer={"subsystem": "S6", "version": "1", "actor_id": "ingest-agent"},
+            lineage_extra={"job_id": "job-42", "contamination_index_version": "contam-v1"},
+        )
+        self._commit_record(
+            "c4://artifact/report-a",
+            sequence=2,
+            kind="validation_report",
+            producer={"subsystem": "S3", "version": "1", "actor_id": "verifier-agent"},
+            lineage_extra={"job_id": "job-42"},
+        )
+        self._commit_record(
+            "c4://artifact/model-a",
+            sequence=3,
+            kind="model",
+            input_refs=["c4://artifact/dataset-a"],
+            validation_report_ref="c4://artifact/report-a",
+            claim_tier="recapitulated-known",
+            producer={"subsystem": "S2", "version": "1", "actor_id": "builder-a"},
+            lineage_extra={"job_id": "job-42", "contamination_index_version": "contam-v1"},
+        )
+        self._commit_record(
+            "c4://artifact/model-b",
+            sequence=4,
+            kind="model",
+            claim_tier="ran-toy",
+            producer={"subsystem": "S2", "version": "2", "actor_id": "builder-b"},
+            lineage_extra={"job_id": "job-99", "contamination_index_version": "contam-v2"},
+        )
+
+        by_artifact_id = self._psql("SELECT s8.get_artifact_record('c4://artifact/model-a')->>'content_hash';")
+        by_content_hash = self._psql("SELECT s8.get_artifact_record('blake3:3')->>'artifact_id';")
+        missing = self._psql("SELECT s8.get_artifact_record('c4://artifact/missing');", check=False)
+        models = self._psql(
+            f"""
+            SELECT string_agg(record->>'artifact_id', ',' ORDER BY record->>'artifact_id')
+            FROM s8.query_artifacts({_jsonb_literal({"kind": "model"})}, 10, 0) AS query(record);
+            """
+        )
+        actor = self._psql(
+            f"""
+            SELECT record->>'artifact_id'
+            FROM s8.query_artifacts({_jsonb_literal({"actor_id": "builder-a"})}, 10, 0) AS query(record);
+            """
+        )
+        job_contam = self._psql(
+            f"""
+            SELECT string_agg(record->>'artifact_id', ',' ORDER BY record->>'merkle_seq')
+            FROM s8.query_artifacts(
+                {_jsonb_literal({"job_id": "job-42", "contamination_index_version": "contam-v1"})},
+                10,
+                0
+            ) AS query(record);
+            """
+        )
+        second_model_page = self._psql(
+            f"""
+            SELECT record->>'artifact_id'
+            FROM s8.query_artifacts({_jsonb_literal({"kind": "model"})}, 1, 1) AS query(record);
+            """
+        )
+        old_range_count = self._psql(
+            f"""
+            SELECT count(*)
+            FROM s8.query_artifacts({_jsonb_literal({"created_after": "2000-01-01T00:00:00Z"})}, 100, 0);
+            """
+        )
+        reader_count = self._psql(
+            f"""
+            SET ROLE argus_s8_reader;
+            SELECT count(*)
+            FROM s8.query_artifacts({_jsonb_literal({"producer_subsystem": "S2"})}, 10, 0);
+            """
+        )
+        bad_limit = self._psql(
+            f"SELECT count(*) FROM s8.query_artifacts({_jsonb_literal({'kind': 'model'})}, 0, 0);",
+            check=False,
+        )
+
+        self.assertEqual(by_artifact_id.stdout.strip(), "blake3:3")
+        self.assertEqual(by_content_hash.stdout.strip(), "c4://artifact/model-a")
+        self.assertNotEqual(missing.returncode, 0)
+        self.assertIn("not found", missing.stderr)
+        self.assertEqual(models.stdout.strip(), "c4://artifact/model-a,c4://artifact/model-b")
+        self.assertEqual(actor.stdout.strip(), "c4://artifact/model-a")
+        self.assertEqual(job_contam.stdout.strip(), "c4://artifact/dataset-a,c4://artifact/model-a")
+        self.assertEqual(second_model_page.stdout.strip(), "c4://artifact/model-b")
+        self.assertEqual(old_range_count.stdout.strip(), "4")
+        self.assertEqual(reader_count.stdout.strip(), "2")
+        self.assertNotEqual(bad_limit.returncode, 0)
+        self.assertIn("limit must be between 1 and 1000", bad_limit.stderr)
 
     def test_dataset_registry_functions_are_versioned_typed_and_append_only(self) -> None:
         splits_v1 = [
@@ -1219,15 +1315,20 @@ class S8PostgresSchemaTests(unittest.TestCase):
         kind: str = "dataset",
         input_refs: list[str] | None = None,
         validation_report_ref: str | None = None,
+        claim_tier: str = "ran-toy",
+        producer: dict[str, object] | None = None,
+        lineage_extra: dict[str, object] | None = None,
         check: bool = True,
     ) -> subprocess.CompletedProcess[str]:
         input_refs = input_refs or []
-        producer = {"subsystem": "S6", "version": "1"}
+        producer = producer or {"subsystem": "S6", "version": "1"}
         lineage = {
             "input_refs": input_refs,
             "code_ref": f"git:{sequence}",
             "environment_digest": f"oci:{sequence}",
         }
+        if lineage_extra:
+            lineage.update(lineage_extra)
         validation_ref_sql = "NULL"
         if validation_report_ref is not None:
             validation_ref_sql = _sql_literal(validation_report_ref)
@@ -1243,7 +1344,7 @@ class S8PostgresSchemaTests(unittest.TestCase):
                 {_jsonb_literal(lineage)},
                 {_sql_literal(f"blake3:record-{sequence}")},
                 {sequence},
-                'ran-toy',
+                {_sql_literal(claim_tier)},
                 {validation_ref_sql},
                 {_text_array_literal(input_refs)}
             );

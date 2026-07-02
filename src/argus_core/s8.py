@@ -136,6 +136,28 @@ class ArtifactRecord:
 
 
 @dataclass(frozen=True)
+class ArtifactQueryFilter:
+    artifact_ref: str | None = None
+    content_hash: str | None = None
+    kind: str | None = None
+    actor_id: str | None = None
+    job_id: str | None = None
+    producer_subsystem: str | None = None
+    producer_version: str | None = None
+    claim_tier: str | None = None
+    validation_report_ref: str | None = None
+    contamination_index_version: str | None = None
+    created_after: str | None = None
+    created_before: str | None = None
+
+
+@dataclass(frozen=True)
+class ArtifactQueryPage:
+    records: tuple[ArtifactRecord, ...]
+    next_page_token: int | None = None
+
+
+@dataclass(frozen=True)
 class LineageEdge:
     source_ref: str
     target_ref: str
@@ -535,6 +557,71 @@ def _missing_lineage_fields(lineage: Lineage | Mapping[str, Any]) -> list[str]:
     return missing
 
 
+def _artifact_query_filter(query: ArtifactQueryFilter | Mapping[str, Any] | None) -> ArtifactQueryFilter:
+    if query is None:
+        return ArtifactQueryFilter()
+    if isinstance(query, ArtifactQueryFilter):
+        return query
+    allowed_fields = ArtifactQueryFilter.__dataclass_fields__
+    unknown_fields = sorted(set(query) - set(allowed_fields))
+    if unknown_fields:
+        raise ValueError("unsupported artifact query filters: " + ", ".join(unknown_fields))
+    return ArtifactQueryFilter(**dict(query))
+
+
+def _artifact_record_matches_filter(record: ArtifactRecord, query: ArtifactQueryFilter) -> bool:
+    expected_values = {
+        "artifact_ref": query.artifact_ref,
+        "content_hash": query.content_hash,
+        "kind": query.kind,
+        "actor_id": query.actor_id,
+        "job_id": query.job_id,
+        "producer_subsystem": query.producer_subsystem,
+        "producer_version": query.producer_version,
+        "claim_tier": query.claim_tier,
+        "validation_report_ref": query.validation_report_ref,
+        "contamination_index_version": query.contamination_index_version,
+    }
+    for field_name, expected in expected_values.items():
+        if expected is not None and _artifact_filter_value(record, field_name) != expected:
+            return False
+    created_at = _artifact_filter_value(record, "created_at")
+    if query.created_after is not None and (created_at is None or created_at < query.created_after):
+        return False
+    if query.created_before is not None and (created_at is None or created_at > query.created_before):
+        return False
+    return True
+
+
+def _artifact_filter_value(record: ArtifactRecord, field_name: str) -> str | None:
+    if field_name in {
+        "artifact_ref",
+        "content_hash",
+        "kind",
+        "claim_tier",
+        "validation_report_ref",
+        "created_at",
+    }:
+        value = getattr(record, field_name, None)
+    elif field_name == "producer_subsystem":
+        value = _object_field(record.producer, "subsystem")
+    elif field_name == "producer_version":
+        value = _object_field(record.producer, "version")
+    elif field_name in {"actor_id", "job_id"}:
+        value = _object_field(record.producer, field_name) or _object_field(record.lineage, field_name)
+    elif field_name == "contamination_index_version":
+        value = _object_field(record.lineage, field_name)
+    else:
+        value = None
+    return str(value) if value is not None else None
+
+
+def _object_field(value: object, field_name: str) -> Any | None:
+    if isinstance(value, Mapping):
+        return value.get(field_name)
+    return getattr(value, field_name, None)
+
+
 class InMemoryArtifactStore:
     """A small write-once C4 store for exercising S8 invariants."""
 
@@ -546,6 +633,7 @@ class InMemoryArtifactStore:
     ) -> None:
         self._object_store = object_store or InMemoryObjectStore()
         self._records: dict[str, ArtifactRecord] = {}
+        self._content_hash_index: dict[str, set[str]] = {}
         self._record_hashes: dict[str, str] = {}
         self._parents: dict[str, set[str]] = {}
         self._children: dict[str, set[str]] = {}
@@ -615,19 +703,57 @@ class InMemoryArtifactStore:
             bucket_class=self._bucket_class_for_record(kind=kind, claim_tier=claim_tier),
         )
         self._records[artifact_ref] = record
+        self._content_hash_index.setdefault(content_hash, set()).add(artifact_ref)
         self._record_hashes[artifact_ref] = record_hash
         self._insert_lineage(record)
         self._promote_referenced_inputs(record)
         self._append_audit_leaf(record)
         return record
 
-    def get_artifact(self, artifact_ref: str) -> bytes:
-        record = self._records[artifact_ref]
+    def get_artifact(self, ref: str) -> bytes:
+        record = self._record_by_ref(ref, require_unique_record=False)
         return self._object_store.get(record.content_hash)
 
     def get_record(self, artifact_ref: str) -> ArtifactRecord:
-        self.get_artifact(artifact_ref)
-        return self._records[artifact_ref]
+        record = self._record_by_ref(artifact_ref, require_unique_record=True)
+        self._object_store.get(record.content_hash)
+        return record
+
+    def get_artifact_record(self, ref: str) -> ArtifactRecord:
+        return self._record_by_ref(ref, require_unique_record=True)
+
+    def query_artifacts(
+        self,
+        query: ArtifactQueryFilter | Mapping[str, Any] | None = None,
+        *,
+        page_size: int | None = None,
+        page_token: int | None = None,
+    ) -> tuple[ArtifactRecord, ...]:
+        return self.query_artifacts_page(query, page_size=page_size, page_token=page_token).records
+
+    def query_artifacts_page(
+        self,
+        query: ArtifactQueryFilter | Mapping[str, Any] | None = None,
+        *,
+        page_size: int | None = None,
+        page_token: int | None = None,
+    ) -> ArtifactQueryPage:
+        parsed_query = _artifact_query_filter(query)
+        matched_records = tuple(
+            record for record in sorted(self._records.values(), key=lambda item: item.artifact_ref)
+            if _artifact_record_matches_filter(record, parsed_query)
+        )
+        offset = page_token or 0
+        if offset < 0:
+            raise ValueError("page_token must be non-negative")
+        if page_size is None:
+            return ArtifactQueryPage(records=matched_records[offset:], next_page_token=None)
+        if page_size <= 0:
+            raise ValueError("page_size must be positive")
+        page = matched_records[offset : offset + page_size]
+        next_offset = offset + page_size
+        next_page_token = next_offset if next_offset < len(matched_records) else None
+        return ArtifactQueryPage(records=page, next_page_token=next_page_token)
 
     def get_lineage(
         self,
@@ -828,6 +954,18 @@ class InMemoryArtifactStore:
 
     def __len__(self) -> int:
         return len(self._records)
+
+    def _record_by_ref(self, ref: str, *, require_unique_record: bool) -> ArtifactRecord:
+        record = self._records.get(ref)
+        if record is not None:
+            return record
+
+        artifact_refs = sorted(self._content_hash_index.get(ref, set()))
+        if not artifact_refs:
+            raise KeyError(ref)
+        if require_unique_record and len(artifact_refs) > 1:
+            raise KeyError(f"ambiguous content_hash: {ref}")
+        return self._records[artifact_refs[0]]
 
     @staticmethod
     def _assert_lineage_complete(

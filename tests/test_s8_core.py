@@ -4,9 +4,11 @@ from copy import deepcopy
 from dataclasses import replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
+import time
 import unittest
 
 from argus_core import (
+    ArtifactQueryFilter,
     BLAKE3_PREFIX,
     C3ReportSigner,
     C3ReportVerifier,
@@ -123,6 +125,10 @@ class InMemoryArtifactStoreTests(unittest.TestCase):
         self.assertEqual(dataset.content_hash, model.content_hash)
         self.assertEqual(self.store.object_count, 1)
         self.assertEqual(self.store.record_count, 2)
+        self.assertEqual(self.store.get_artifact(dataset.content_hash), b'{"same":true}')
+        with self.assertRaises(KeyError) as raised:
+            self.store.get_artifact_record(dataset.content_hash)
+        self.assertIn("ambiguous content_hash", str(raised.exception))
 
     def test_explicit_ref_is_write_once(self) -> None:
         artifact_ref = "c4://artifact/fixed-ref"
@@ -215,6 +221,90 @@ class InMemoryArtifactStoreTests(unittest.TestCase):
             self.store.get_artifact(record.artifact_ref)
 
         self.assertEqual(raised.exception.category, "HASH_MISMATCH")
+
+    def test_get_artifact_by_content_hash_detects_tamper_but_record_read_is_metadata_only(self) -> None:
+        record = self.store.create_artifact(
+            kind="model",
+            payload={"weights": [1]},
+            producer=self.producer,
+            lineage=self.lineage,
+        )
+
+        self.assertEqual(self.store.get_artifact(record.content_hash), b'{"weights":[1]}')
+        self.object_store._objects[record.content_hash] = b'{"weights":[2]}'
+
+        self.assertEqual(self.store.get_artifact_record(record.artifact_ref), record)
+        with self.assertRaises(HashMismatchError) as raised:
+            self.store.get_artifact(record.content_hash)
+        self.assertEqual(raised.exception.category, "HASH_MISMATCH")
+        with self.assertRaises(HashMismatchError):
+            self.store.get_record(record.artifact_ref)
+
+    def test_query_artifacts_filters_and_paginates_metadata(self) -> None:
+        dataset = self.store.create_artifact(
+            kind="dataset",
+            payload={"rows": [1]},
+            producer=Producer(subsystem="S6", version="0.0.0"),
+            lineage=Lineage(input_refs=(), code_ref="git:data", environment_digest="oci:data"),
+        )
+        report = self.store.create_artifact(
+            kind="report",
+            payload={"report": "unsigned-test-report"},
+            producer=Producer(subsystem="S3", version="0.0.0"),
+            lineage=Lineage(input_refs=(), code_ref="git:verify", environment_digest="oci:verify"),
+        )
+        model = self.store.create_artifact(
+            kind="model",
+            payload={"weights": [1]},
+            producer=self.producer,
+            lineage=Lineage(
+                input_refs=(dataset.artifact_ref,),
+                code_ref="git:model",
+                environment_digest="oci:model",
+            ),
+            validation_report_ref=report.artifact_ref,
+        )
+
+        self.assertEqual(self.store.query_artifacts({"kind": "model"}), (model,))
+        self.assertEqual(self.store.query_artifacts({"content_hash": dataset.content_hash}), (dataset,))
+        self.assertEqual(self.store.query_artifacts(ArtifactQueryFilter(producer_subsystem="S6")), (dataset,))
+        self.assertEqual(self.store.query_artifacts({"validation_report_ref": report.artifact_ref}), (model,))
+        with self.assertRaises(ValueError):
+            self.store.query_artifacts({"unsupported": "filter"})
+
+        all_ran_toy = self.store.query_artifacts_page({"claim_tier": "ran-toy"}, page_size=2)
+        second_page = self.store.query_artifacts_page(
+            {"claim_tier": "ran-toy"},
+            page_size=2,
+            page_token=all_ran_toy.next_page_token,
+        )
+        expected_refs = tuple(sorted(record.artifact_ref for record in (dataset, model, report)))
+
+        self.assertEqual(tuple(record.artifact_ref for record in all_ran_toy.records), expected_refs[:2])
+        self.assertEqual(all_ran_toy.next_page_token, 2)
+        self.assertEqual(tuple(record.artifact_ref for record in second_page.records), expected_refs[2:])
+        self.assertIsNone(second_page.next_page_token)
+
+    def test_get_artifact_record_metadata_lookup_unit_p95_stays_under_slo(self) -> None:
+        records = [
+            self.store.create_artifact(
+                artifact_ref=f"c4://artifact/unit-scale-{index}",
+                kind="dataset",
+                payload={"row": index},
+                producer=self.producer,
+                lineage=Lineage(input_refs=(), code_ref=f"git:data:{index}", environment_digest=f"oci:data:{index}"),
+            )
+            for index in range(2500)
+        ]
+        samples: list[float] = []
+
+        for record in records[-1000:]:
+            started = time.perf_counter()
+            self.store.get_artifact_record(record.content_hash)
+            samples.append(time.perf_counter() - started)
+
+        p95 = sorted(samples)[int(len(samples) * 0.95) - 1]
+        self.assertLess(p95, 0.050)
 
     def test_self_cycle_is_rejected(self) -> None:
         artifact_ref = "c4://artifact/self-cycle"
