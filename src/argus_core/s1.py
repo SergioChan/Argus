@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Mapping
 
-from .c3 import C3ReportVerifier
+from argusverify import C3ReportVerifier
 from .hashing import hash_json
 
 

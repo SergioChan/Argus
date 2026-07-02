@@ -8,7 +8,7 @@ from hashlib import sha256
 from typing import Any
 import hmac
 
-from .c3 import C3ReportVerifier
+from argusverify import C3ReportVerifier
 from .canonical import canonical_json_bytes
 from .hashing import hash_json
 from .s8 import HashMismatchError, InMemoryArtifactStore

@@ -6,7 +6,7 @@ from dataclasses import asdict, dataclass, replace
 from decimal import Decimal
 from typing import Any
 
-from .c3 import C3ReportVerifier
+from argusverify import C3ReportVerifier
 from .hashing import hash_json
 from .s8 import ArtifactRecord, InMemoryArtifactStore, Lineage, Producer
 

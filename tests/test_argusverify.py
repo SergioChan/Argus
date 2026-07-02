@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from pathlib import Path
+import tomllib
 import unittest
 
 import argusverify
@@ -14,8 +16,10 @@ from argusverify import (
     sign_report,
     verify_report,
 )
+from setuptools import find_packages
 
 
+ROOT = Path(__file__).resolve().parents[1]
 VECTOR_REPORT = {
     "report_id": "33333333-3333-4333-8333-333333333333",
     "profile_ref": "c4://profile/ewpt-toy/v1",
@@ -200,6 +204,26 @@ class ArgusVerifyTests(unittest.TestCase):
         )
         with self.assertRaises(ValueError):
             argusverify._canonical_json_text({"bad": float("nan")})
+
+    def test_argusverify_is_packaged_and_production_consumers_import_it_directly(self) -> None:
+        config = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+        package_roots = config["tool"]["setuptools"]["packages"]["find"]["where"]
+
+        self.assertEqual(package_roots, ["src"])
+        self.assertIn("argusverify", find_packages(where=str(ROOT / "src")))
+        self.assertTrue((ROOT / "src" / "argusverify" / "__init__.py").is_file())
+
+        for consumer in (
+            ROOT / "src" / "argus_core" / "s1.py",
+            ROOT / "src" / "argus_core" / "s4.py",
+            ROOT / "src" / "argus_core" / "s9.py",
+            ROOT / "src" / "argus_core" / "s11.py",
+        ):
+            with self.subTest(consumer=consumer.name):
+                source = consumer.read_text(encoding="utf-8")
+                self.assertIn("from argusverify import ", source)
+                self.assertNotIn("from .c3 import", source)
+                self.assertNotIn("argus_core.c3", source)
 
 
 if __name__ == "__main__":

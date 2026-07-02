@@ -6,7 +6,7 @@ from dataclasses import asdict, dataclass
 from decimal import Decimal
 from typing import Any
 
-from .c3 import C3SignatureVerification
+from argusverify import C3SignatureVerification
 from .s3 import attest_challenger_independence
 from .s6 import CapabilityDescriptor, IndependenceAttestation
 from .s8 import ArtifactRecord, InMemoryArtifactStore, Lineage, Producer
