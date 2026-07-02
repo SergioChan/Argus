@@ -303,7 +303,7 @@ class InMemoryArtifactStoreTests(unittest.TestCase):
         self.assertEqual(impact_refs, {dataset.artifact_ref, model.artifact_ref})
         self.assertEqual(len(lineage_graph.edges), 2)
 
-    def test_audit_slice_and_chain_detect_record_tampering(self) -> None:
+    def test_audit_slice_proofs_and_chain_detect_tampering(self) -> None:
         source = self.store.create_artifact(
             kind="external_source",
             payload={"source": "paper"},
@@ -320,11 +320,34 @@ class InMemoryArtifactStoreTests(unittest.TestCase):
                 environment_digest="oci:normalize",
             ),
         )
+        model = self.store.create_artifact(
+            kind="model",
+            payload={"weights": [1]},
+            producer=self.producer,
+            lineage=Lineage(
+                input_refs=(dataset.artifact_ref,),
+                code_ref="git:train",
+                environment_digest="oci:train",
+            ),
+        )
 
         audit_slice = self.store.export_audit_slice((dataset.artifact_ref,))
 
+        self.assertEqual(audit_slice.checkpoint.sequence, 3)
+        self.assertEqual(tuple(leaf.artifact_ref for leaf in audit_slice.leaves), (dataset.artifact_ref,))
+        self.assertEqual(len(audit_slice.inclusion_proofs), 1)
+        self.assertEqual(audit_slice.inclusion_proofs[0].sequence, 2)
+        self.assertEqual(tuple(step.artifact_ref for step in audit_slice.inclusion_proofs[0].steps), (model.artifact_ref,))
         self.assertTrue(self.store.verify_audit_slice(audit_slice).valid)
         self.assertTrue(self.store.verify_audit_chain().valid)
+
+        tampered_step = replace(audit_slice.inclusion_proofs[0].steps[0], record_hash="blake3:" + ("f" * 64))
+        tampered_proof = replace(audit_slice.inclusion_proofs[0], steps=(tampered_step,))
+        tampered_slice = replace(audit_slice, inclusion_proofs=(tampered_proof,))
+
+        proof_verification = self.store.verify_audit_slice(tampered_slice)
+        self.assertFalse(proof_verification.valid)
+        self.assertEqual(proof_verification.break_sequence, 3)
 
         self.store._records[dataset.artifact_ref] = replace(dataset, kind="tampered")
 

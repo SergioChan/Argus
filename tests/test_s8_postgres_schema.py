@@ -645,11 +645,140 @@ class S8PostgresSchemaTests(unittest.TestCase):
         )
         drift = self._apply_s8_migrations(check=False)
 
-        self.assertEqual(first_count.stdout.strip(), "3")
+        self.assertEqual(first_count.stdout.strip(), "4")
         self.assertIn("already applied with matching checksum", reapplied.stdout)
-        self.assertEqual(second_count.stdout.strip(), "3")
+        self.assertEqual(second_count.stdout.strip(), "4")
         self.assertNotEqual(drift.returncode, 0)
         self.assertIn("checksum drift", drift.stderr)
+
+    def test_audit_export_proofs_verify_and_detect_record_tamper(self) -> None:
+        zero_root = "blake3:" + ("0" * 64)
+        first_root = "blake3:audit-root-1"
+        second_root = "blake3:audit-root-2"
+        third_root = "blake3:audit-root-3"
+        self._commit_record("c4://artifact/source", sequence=1, kind="external_source")
+        self._commit_record(
+            "c4://artifact/dataset",
+            sequence=2,
+            kind="dataset",
+            input_refs=["c4://artifact/source"],
+        )
+        self._commit_record(
+            "c4://artifact/model",
+            sequence=3,
+            kind="model",
+            input_refs=["c4://artifact/dataset"],
+        )
+        self._psql(
+            f"""
+            SET ROLE argus_s8_ledger_writer;
+            SELECT s8.append_ledger_leaf(
+                'c4://artifact/source',
+                'blake3:record-1',
+                1,
+                '{zero_root}',
+                '{first_root}'
+            );
+            SELECT s8.append_ledger_leaf(
+                'c4://artifact/dataset',
+                'blake3:record-2',
+                2,
+                '{first_root}',
+                '{second_root}'
+            );
+            SELECT s8.append_ledger_leaf(
+                'c4://artifact/model',
+                'blake3:record-3',
+                3,
+                '{second_root}',
+                '{third_root}'
+            );
+            SELECT s8.append_merkle_checkpoint(
+                3,
+                '{third_root}',
+                'hmac-sha256:audit-signature',
+                's8-ledger-key'
+            );
+            RESET ROLE;
+            """
+        )
+
+        export_result = self._psql(
+            """
+            SELECT s8.export_audit_slice(ARRAY['c4://artifact/dataset']::text[]);
+            """
+        )
+        audit_slice = json.loads(export_result.stdout)
+        proof = audit_slice["inclusion_proofs"][0]
+        chain_valid = self._psql("SELECT s8.verify_audit_chain()->>'valid';")
+        slice_valid = self._psql(
+            """
+            WITH audit_slice AS (
+                SELECT s8.export_audit_slice(ARRAY['c4://artifact/dataset']::text[]) AS payload
+            )
+            SELECT s8.verify_audit_slice(payload)->>'valid'
+            FROM audit_slice;
+            """
+        )
+        reader_slice_valid = self._psql(
+            """
+            SET ROLE argus_s8_reader;
+            WITH audit_slice AS (
+                SELECT s8.export_audit_slice(ARRAY['c4://artifact/dataset']::text[]) AS payload
+            )
+            SELECT s8.verify_audit_slice(payload)->>'valid'
+            FROM audit_slice;
+            """
+        )
+        missing_ref = self._psql(
+            """
+            SELECT s8.export_audit_slice(ARRAY['c4://artifact/missing']::text[]);
+            """,
+            check=False,
+        )
+
+        self.assertEqual(audit_slice["records"][0]["artifact_id"], "c4://artifact/dataset")
+        self.assertEqual(audit_slice["leaves"][0]["sequence"], 2)
+        self.assertEqual(audit_slice["merkle_checkpoints"][0]["sequence"], 3)
+        self.assertEqual(proof["sequence"], 2)
+        self.assertEqual(proof["anchor_previous_root"], first_root)
+        self.assertEqual([step["sequence"] for step in proof["steps"]], [3])
+        self.assertEqual(chain_valid.stdout.strip(), "true")
+        self.assertEqual(slice_valid.stdout.strip(), "true")
+        self.assertEqual(reader_slice_valid.stdout.strip(), "true")
+        self.assertNotEqual(missing_ref.returncode, 0)
+        self.assertIn("audit export missing ledger leaves", missing_ref.stderr)
+
+        self._psql(
+            """
+            ALTER TABLE s8.artifact_record DISABLE TRIGGER artifact_record_append_only;
+            UPDATE s8.artifact_record
+            SET record_hash = 'blake3:tampered-record-2'
+            WHERE artifact_id = 'c4://artifact/dataset';
+            ALTER TABLE s8.artifact_record ENABLE TRIGGER artifact_record_append_only;
+            """
+        )
+        tampered_chain = self._psql(
+            """
+            SELECT (s8.verify_audit_chain()->>'valid')
+                || '|'
+                || (s8.verify_audit_chain()->>'break_sequence')
+                || '|'
+                || (s8.verify_audit_chain()->>'reason');
+            """
+        )
+        tampered_slice = self._psql(
+            f"""
+            SELECT (s8.verify_audit_slice({_jsonb_literal(audit_slice)})->>'valid')
+                || '|'
+                || (s8.verify_audit_slice({_jsonb_literal(audit_slice)})->>'break_sequence')
+                || '|'
+                || (s8.verify_audit_slice({_jsonb_literal(audit_slice)})->>'reason');
+            """
+        )
+
+        self.assertEqual(tampered_chain.stdout.strip(), "false|2|record_hash_mismatch")
+        self.assertEqual(tampered_slice.stdout.strip(), "false|2|record_hash_mismatch")
 
     def test_reproducibility_manifest_and_check_functions_are_append_only(self) -> None:
         self._commit_record("c4://artifact/model", sequence=1, kind="model")

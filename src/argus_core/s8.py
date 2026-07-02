@@ -143,12 +143,33 @@ class AuditLeaf:
 class AuditCheckpoint:
     sequence: int
     root: str
+    signature: str | None = None
+    signer_key_id: str | None = None
+
+
+@dataclass(frozen=True)
+class AuditProofStep:
+    sequence: int
+    artifact_ref: str
+    record_hash: str
+    previous_root: str
+    root: str
+
+
+@dataclass(frozen=True)
+class AuditInclusionProof:
+    artifact_ref: str
+    sequence: int
+    record_hash: str
+    anchor_previous_root: str
+    steps: tuple[AuditProofStep, ...]
 
 
 @dataclass(frozen=True)
 class AuditSlice:
     leaves: tuple[AuditLeaf, ...]
     checkpoint: AuditCheckpoint
+    inclusion_proofs: tuple[AuditInclusionProof, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -681,10 +702,15 @@ class InMemoryArtifactStore:
     def export_audit_slice(self, artifact_refs: tuple[str, ...]) -> AuditSlice:
         wanted = set(artifact_refs)
         leaves = tuple(leaf for leaf in self._audit_leaves if leaf.artifact_ref in wanted)
-        return AuditSlice(leaves=leaves, checkpoint=self._latest_checkpoint())
+        return AuditSlice(
+            leaves=leaves,
+            checkpoint=self._latest_checkpoint(),
+            inclusion_proofs=tuple(self._audit_inclusion_proof(leaf) for leaf in leaves),
+        )
 
     def verify_audit_slice(self, audit_slice: AuditSlice) -> AuditVerification:
         leaves_by_sequence = {leaf.sequence: leaf for leaf in self._audit_leaves}
+        proofs_by_sequence = {proof.sequence: proof for proof in audit_slice.inclusion_proofs}
         for leaf in audit_slice.leaves:
             ledger_leaf = leaves_by_sequence.get(leaf.sequence)
             if ledger_leaf != leaf:
@@ -692,6 +718,12 @@ class InMemoryArtifactStore:
             record = self._records.get(leaf.artifact_ref)
             if record is None or self._record_hash(record) != leaf.record_hash:
                 return AuditVerification(valid=False, break_sequence=leaf.sequence)
+            proof = proofs_by_sequence.get(leaf.sequence)
+            if proof is None:
+                return AuditVerification(valid=False, break_sequence=leaf.sequence)
+            proof_verification = self._verify_audit_inclusion_proof(leaf, proof, audit_slice.checkpoint)
+            if not proof_verification.valid:
+                return proof_verification
         if self._latest_checkpoint() != audit_slice.checkpoint:
             return AuditVerification(valid=False, break_sequence=audit_slice.checkpoint.sequence)
         return AuditVerification(valid=True)
@@ -915,6 +947,55 @@ class InMemoryArtifactStore:
                 root=root,
             )
         )
+
+    def _audit_inclusion_proof(self, leaf: AuditLeaf) -> AuditInclusionProof:
+        steps = tuple(
+            AuditProofStep(
+                sequence=suffix.sequence,
+                artifact_ref=suffix.artifact_ref,
+                record_hash=suffix.record_hash,
+                previous_root=suffix.previous_root,
+                root=suffix.root,
+            )
+            for suffix in self._audit_leaves
+            if suffix.sequence > leaf.sequence
+        )
+        return AuditInclusionProof(
+            artifact_ref=leaf.artifact_ref,
+            sequence=leaf.sequence,
+            record_hash=leaf.record_hash,
+            anchor_previous_root=leaf.previous_root,
+            steps=steps,
+        )
+
+    def _verify_audit_inclusion_proof(
+        self,
+        leaf: AuditLeaf,
+        proof: AuditInclusionProof,
+        checkpoint: AuditCheckpoint,
+    ) -> AuditVerification:
+        if proof.artifact_ref != leaf.artifact_ref or proof.sequence != leaf.sequence:
+            return AuditVerification(valid=False, break_sequence=leaf.sequence)
+        if proof.record_hash != leaf.record_hash or proof.anchor_previous_root != leaf.previous_root:
+            return AuditVerification(valid=False, break_sequence=leaf.sequence)
+        expected_root = self._next_audit_root(proof.anchor_previous_root, proof.record_hash, proof.sequence)
+        if leaf.root != expected_root:
+            return AuditVerification(valid=False, break_sequence=leaf.sequence)
+
+        current_sequence = leaf.sequence
+        current_root = leaf.root
+        for step in proof.steps:
+            if step.sequence != current_sequence + 1 or step.previous_root != current_root:
+                return AuditVerification(valid=False, break_sequence=step.sequence)
+            expected_step_root = self._next_audit_root(step.previous_root, step.record_hash, step.sequence)
+            if step.root != expected_step_root:
+                return AuditVerification(valid=False, break_sequence=step.sequence)
+            current_sequence = step.sequence
+            current_root = step.root
+
+        if current_sequence != checkpoint.sequence or current_root != checkpoint.root:
+            return AuditVerification(valid=False, break_sequence=checkpoint.sequence)
+        return AuditVerification(valid=True)
 
     @staticmethod
     def _record_hash(record: ArtifactRecord) -> str:

@@ -303,7 +303,9 @@ from .schema_compat import (
 )
 from .s8 import (
     AuditCheckpoint,
+    AuditInclusionProof,
     AuditLeaf,
+    AuditProofStep,
     AuditSlice,
     AuditVerification,
     ArtifactRecord,
@@ -387,7 +389,9 @@ __all__ = [
     "ERROR_BEHAVIORS",
     "ERROR_CATEGORIES",
     "AuditCheckpoint",
+    "AuditInclusionProof",
     "AuditLeaf",
+    "AuditProofStep",
     "AuditSlice",
     "AuditVerification",
     "ArtifactRecord",
