@@ -175,7 +175,13 @@ class ArgusM0RuntimeServiceTests(unittest.TestCase):
         self.assertEqual(writer.checkpoint_signer_kind, "s10-http")
         self.assertEqual(result, {"status": "ok", "checkpoint": None})
 
-    def test_s8_postgres_env_requires_rust_ledger_writer_when_configured(self) -> None:
+    def test_s8_postgres_env_requires_rust_ledger_writer(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "ARGUS_S8_RUST_LEDGER_WRITER_CMD"):
+            _rust_ledger_writer_from_env(
+                {},
+                dsn="postgresql://argus@example/argus",
+                db_role=None,
+            )
         with self.assertRaisesRegex(RuntimeError, "ARGUS_S8_RUST_LEDGER_WRITER_CMD"):
             _rust_ledger_writer_from_env(
                 {"ARGUS_S8_REQUIRE_RUST_LEDGER_WRITER": "1"},

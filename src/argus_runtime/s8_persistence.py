@@ -26,7 +26,6 @@ from argus_core import (
     Producer,
     SCRATCH_BUCKET,
     WRITE_ONCE_BUCKET,
-    hash_bytes,
     hash_json,
 )
 from argus_core.s8 import _assert_known_bucket_class, _assert_payload_matches_hash, _object_name
@@ -225,17 +224,15 @@ class PostgresArtifactStore:
         db_role: str | None = None,
         ledger_writer: SubprocessRustLedgerWriter | None = None,
         report_verifier: C3ReportVerifier | None = None,
-        require_ledger_writer: bool = False,
     ) -> None:
-        if require_ledger_writer and ledger_writer is None:
+        if ledger_writer is None:
             raise RuntimeError("S8 Rust ledger writer is required")
         self._dsn = dsn
         self._object_store = object_store
         self._db_role = db_role
         self._ledger_writer = ledger_writer
         self._report_verifier = report_verifier
-        self._require_ledger_writer = require_ledger_writer
-        self.ledger_writer_kind = "rust-subprocess" if ledger_writer is not None else "python-sql"
+        self.ledger_writer_kind = getattr(ledger_writer, "ledger_writer_kind", "rust-subprocess")
         self.checkpoint_signer_kind = getattr(ledger_writer, "checkpoint_signer_kind", "unconfigured")
         self.report_verifier_kind = "argusverify" if report_verifier is not None else "unconfigured"
         self._snapshot = self._snapshot_store()
@@ -427,65 +424,7 @@ class PostgresArtifactStore:
                 return list(cur.fetchall())
 
     def _commit_record(self, record: ArtifactRecord) -> None:
-        if self._ledger_writer is not None:
-            self._ledger_writer.commit_record(record)
-            return
-        self._commit_record_sql(record)
-
-    def _commit_record_sql(self, record: ArtifactRecord) -> None:
-        import psycopg
-        from psycopg.types.json import Jsonb
-
-        record_hash = hash_json(asdict(record))
-        with psycopg.connect(self._dsn) as conn:
-            with conn.transaction():
-                _set_role(conn, self._db_role)
-                with conn.cursor() as cur:
-                    cur.execute(
-                        """
-                        SELECT sequence, root
-                        FROM s8.ledger_leaf
-                        ORDER BY sequence DESC
-                        LIMIT 1;
-                        """
-                    )
-                    latest = cur.fetchone()
-                    if latest is None:
-                        sequence = 1
-                        previous_root = _zero_root()
-                    else:
-                        sequence = int(latest[0]) + 1
-                        previous_root = str(latest[1])
-                    root = hash_bytes(f"{previous_root}|{record_hash}|{sequence}".encode("utf-8"))
-                    cur.execute(
-                        """
-                        SELECT s8.commit_artifact_record(
-                            %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
-                        );
-                        """,
-                        (
-                            record.artifact_ref,
-                            record.content_hash,
-                            record.kind,
-                            Jsonb(asdict(record.producer)),
-                            Jsonb(asdict(record.lineage)),
-                            record_hash,
-                            sequence,
-                            record.claim_tier,
-                            record.validation_report_ref,
-                            list(record.lineage.input_refs),
-                            record.created_at,
-                            record.size_bytes,
-                        ),
-                    )
-                    inserted = bool(cur.fetchone()[0])
-                    if inserted:
-                        cur.execute(
-                            """
-                            SELECT s8.append_ledger_leaf(%s, %s, %s, %s, %s);
-                            """,
-                            (record.artifact_ref, record_hash, sequence, previous_root, root),
-                        )
+        self._ledger_writer.commit_record(record)
 
     def _record_from_row_with_metadata_size(self, row: dict[str, Any]) -> ArtifactRecord:
         size_bytes = row.get("size_bytes")
@@ -516,7 +455,6 @@ def build_postgres_minio_store_from_env(env: dict[str, str]) -> PostgresArtifact
         db_role=env.get("ARGUS_S8_POSTGRES_ROLE") or None,
         ledger_writer=ledger_writer,
         report_verifier=report_verifier_from_env(env),
-        require_ledger_writer=env.get("ARGUS_S8_REQUIRE_RUST_LEDGER_WRITER", "0") == "1",
     )
 
 
@@ -570,12 +508,10 @@ def _rust_ledger_writer_from_env(
     *,
     dsn: str,
     db_role: str | None,
-) -> SubprocessRustLedgerWriter | None:
+) -> SubprocessRustLedgerWriter:
     command_text = env.get("ARGUS_S8_RUST_LEDGER_WRITER_CMD")
     if not command_text:
-        if env.get("ARGUS_S8_REQUIRE_RUST_LEDGER_WRITER", "0") == "1":
-            raise RuntimeError("ARGUS_S8_RUST_LEDGER_WRITER_CMD is required")
-        return None
+        raise RuntimeError("ARGUS_S8_RUST_LEDGER_WRITER_CMD is required")
     command = shlex.split(command_text)
     if not command:
         raise RuntimeError("ARGUS_S8_RUST_LEDGER_WRITER_CMD is empty")
@@ -690,7 +626,3 @@ def _required_env(env: dict[str, str], name: str) -> str:
 
 def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
-
-
-def _zero_root() -> str:
-    return "blake3:" + "0" * 64

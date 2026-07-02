@@ -34,6 +34,71 @@ MIGRATIONS_DIR = ROOT / "db" / "s8"
 MIGRATION_SCRIPT = ROOT / "scripts" / "apply_s8_migrations.py"
 
 
+class _TestPostgresLedgerWriter:
+    ledger_writer_kind = "test-postgres"
+    checkpoint_signer_kind = "test-only"
+
+    def __init__(self, test_case: "S8PostgresSchemaTests") -> None:
+        self._test_case = test_case
+
+    def commit_record(self, record: ArtifactRecord) -> dict[str, object]:
+        import psycopg
+        from psycopg import sql
+        from psycopg.types.json import Jsonb
+
+        record_hash = hash_json(asdict(record))
+        with psycopg.connect(self._test_case._postgres_dsn()) as conn:
+            with conn.transaction():
+                with conn.cursor() as cur:
+                    cur.execute(sql.SQL("SET ROLE {};").format(sql.Identifier("argus_s8_ledger_writer")))
+                    cur.execute(
+                        """
+                        SELECT sequence, root
+                        FROM s8.ledger_leaf
+                        ORDER BY sequence DESC
+                        LIMIT 1;
+                        """
+                    )
+                    latest = cur.fetchone()
+                    if latest is None:
+                        sequence = 1
+                        previous_root = "blake3:" + "0" * 64
+                    else:
+                        sequence = int(latest[0]) + 1
+                        previous_root = str(latest[1])
+                    root = hash_bytes(f"{previous_root}|{record_hash}|{sequence}".encode("utf-8"))
+                    cur.execute(
+                        """
+                        SELECT s8.commit_artifact_record(
+                            %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+                        );
+                        """,
+                        (
+                            record.artifact_ref,
+                            record.content_hash,
+                            record.kind,
+                            Jsonb(asdict(record.producer)),
+                            Jsonb(asdict(record.lineage)),
+                            record_hash,
+                            sequence,
+                            record.claim_tier,
+                            record.validation_report_ref,
+                            list(record.lineage.input_refs),
+                            record.created_at,
+                            record.size_bytes,
+                        ),
+                    )
+                    inserted = bool(cur.fetchone()[0])
+                    if inserted:
+                        cur.execute(
+                            """
+                            SELECT s8.append_ledger_leaf(%s, %s, %s, %s, %s);
+                            """,
+                            (record.artifact_ref, record_hash, sequence, previous_root, root),
+                        )
+        return {"status": "ok", "checkpoint": None}
+
+
 def _free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("127.0.0.1", 0))
@@ -163,6 +228,20 @@ class S8PostgresSchemaTests(unittest.TestCase):
     def setUp(self) -> None:
         self._psql("DROP SCHEMA IF EXISTS s8 CASCADE;")
         self._apply_s8_migrations()
+
+    def _postgres_store(
+        self,
+        *,
+        object_store: InMemoryObjectStore | None = None,
+        report_verifier: C3ReportVerifier | None = None,
+    ) -> PostgresArtifactStore:
+        return PostgresArtifactStore(
+            dsn=self._postgres_dsn(),
+            object_store=object_store or InMemoryObjectStore(),
+            db_role="argus_s8_ledger_writer",
+            ledger_writer=_TestPostgresLedgerWriter(self),
+            report_verifier=report_verifier,
+        )
 
     def test_ledger_writer_commits_records_and_lineage_through_function(self) -> None:
         self._commit_record("c4://artifact/a", sequence=1, kind="dataset")
@@ -682,11 +761,7 @@ class S8PostgresSchemaTests(unittest.TestCase):
         self.assertIn("checksum drift", drift.stderr)
 
     def test_postgres_store_record_hash_matches_refreshed_created_at(self) -> None:
-        store = PostgresArtifactStore(
-            dsn=self._postgres_dsn(),
-            object_store=InMemoryObjectStore(),
-            db_role="argus_s8_ledger_writer",
-        )
+        store = self._postgres_store()
 
         record = store.create_artifact(
             kind="model",
@@ -709,11 +784,7 @@ class S8PostgresSchemaTests(unittest.TestCase):
 
     def test_postgres_store_targeted_reads_ignore_unrelated_tampered_object(self) -> None:
         object_store = InMemoryObjectStore()
-        store = PostgresArtifactStore(
-            dsn=self._postgres_dsn(),
-            object_store=object_store,
-            db_role="argus_s8_ledger_writer",
-        )
+        store = self._postgres_store(object_store=object_store)
         good = store.create_artifact(
             artifact_ref="c4://r8-m6/good",
             kind="model",
@@ -774,13 +845,12 @@ class S8PostgresSchemaTests(unittest.TestCase):
         self.assertEqual(ledger_writer.records, [record])
         self.assertEqual(record_count.stdout.strip(), "0")
 
-    def test_postgres_store_requires_ledger_writer_when_flag_set(self) -> None:
+    def test_postgres_store_requires_ledger_writer(self) -> None:
         with self.assertRaisesRegex(RuntimeError, "S8 Rust ledger writer is required"):
             PostgresArtifactStore(
                 dsn=self._postgres_dsn(),
                 object_store=InMemoryObjectStore(),
                 db_role="argus_s8_ledger_writer",
-                require_ledger_writer=True,
             )
 
     def test_postgres_store_uses_report_verifier_for_tier_coupling(self) -> None:
@@ -788,12 +858,7 @@ class S8PostgresSchemaTests(unittest.TestCase):
         trust_store.register_key("s3-key", b"s3-secret")
         signer = C3ReportSigner(key_id="s3-key", secret=b"s3-secret")
         object_store = InMemoryObjectStore()
-        store = PostgresArtifactStore(
-            dsn=self._postgres_dsn(),
-            object_store=object_store,
-            db_role="argus_s8_ledger_writer",
-            report_verifier=C3ReportVerifier(trust_store),
-        )
+        store = self._postgres_store(object_store=object_store, report_verifier=C3ReportVerifier(trust_store))
         report = store.create_artifact(
             kind="report",
             payload=signer.sign(self._validation_report(claim_tier="recapitulated-known")),
@@ -829,12 +894,7 @@ class S8PostgresSchemaTests(unittest.TestCase):
                 validation_report_ref=report.artifact_ref,
             )
 
-        refreshed = PostgresArtifactStore(
-            dsn=self._postgres_dsn(),
-            object_store=object_store,
-            db_role="argus_s8_ledger_writer",
-            report_verifier=C3ReportVerifier(trust_store),
-        )
+        refreshed = self._postgres_store(object_store=object_store, report_verifier=C3ReportVerifier(trust_store))
         self.assertEqual(store.report_verifier_kind, "argusverify")
         self.assertEqual(model.validation_report_ref, report.artifact_ref)
         self.assertEqual(refreshed.get_artifact_record(model.artifact_ref).claim_tier, "recapitulated-known")
