@@ -43,6 +43,7 @@ from argus_core import (
     ScopeGrant,
     ScopeToken,
     canonical_json_bytes,
+    hash_json,
 )
 from argusverify import C3ReportSigner, InMemoryVerifierTrustStore, verify_report
 
@@ -192,7 +193,7 @@ def main() -> int:
             signing_key=runtime_secrets["s10_signing_key"].encode("utf-8"),
         )
         _battery_g_argusverify(evidence)
-        _battery_real_persistence(evidence, ports)
+        _battery_real_persistence(evidence, ports, s8_url=s8_url, token=auth_tokens["read"])
         _battery_d_tamper_detected(
             evidence,
             s8_url=s8_url,
@@ -541,7 +542,13 @@ class S8InternalArtifactStoreClient:
         return _artifact_record_from_json(response)
 
 
-def _battery_real_persistence(evidence: dict[str, Any], ports: dict[str, str]) -> None:
+def _battery_real_persistence(
+    evidence: dict[str, Any],
+    ports: dict[str, str],
+    *,
+    s8_url: str,
+    token: str,
+) -> None:
     import psycopg
     from minio import Minio
 
@@ -554,7 +561,14 @@ def _battery_real_persistence(evidence: dict[str, Any], ports: dict[str, str]) -
             record_count = int(cur.fetchone()[0])
             cur.execute("SELECT count(*) FROM s8.ledger_leaf;")
             leaf_count = int(cur.fetchone()[0])
+            cur.execute("SELECT artifact_id, record_hash FROM s8.artifact_record ORDER BY merkle_seq;")
+            record_hash_rows = [(str(row[0]), str(row[1])) for row in cur.fetchall()]
     append_only_denials = _postgres_append_only_denials(dsn)
+    record_hashes_match = _postgres_record_hashes_match_refreshed_records(
+        record_hash_rows,
+        s8_url=s8_url,
+        token=token,
+    )
     minio = Minio(
         f"127.0.0.1:{ports['ARGUS_M0_MINIO_PORT']}",
         access_key="argus",
@@ -568,24 +582,41 @@ def _battery_real_persistence(evidence: dict[str, Any], ports: dict[str, str]) -
         or leaf_count < 2
         or object_count < 2
         or not all(append_only_denials.values())
+        or not record_hashes_match
     ):
         raise AssertionError(
             "Postgres/MinIO persistence did not record expected deployed S8 artifacts: "
             f"migrations={migration_count} records={record_count} leaves={leaf_count} "
-            f"objects={object_count} append_only_denials={append_only_denials}"
+            f"objects={object_count} append_only_denials={append_only_denials} "
+            f"record_hashes_match_refreshed_records={record_hashes_match}"
         )
     _record(
         evidence,
         "persist",
-        "deployed S8 wrote C4 metadata to Postgres append-only ledger and payloads to MinIO",
+        "deployed S8 wrote C4 metadata to Postgres append-only ledger and payloads to MinIO with recomputable record hashes",
         {
             "schema_migrations": migration_count,
             "artifact_records": record_count,
             "ledger_leaves": leaf_count,
             "minio_objects": object_count,
+            "record_hashes_match_refreshed_records": record_hashes_match,
             **append_only_denials,
         },
     )
+
+
+def _postgres_record_hashes_match_refreshed_records(
+    rows: list[tuple[str, str]],
+    *,
+    s8_url: str,
+    token: str,
+) -> bool:
+    for artifact_id, record_hash in rows:
+        record_json = _get_json(f"{s8_url}/v1/artifacts/{artifact_id}/record", token=token)
+        record = _artifact_record_from_json(record_json)
+        if hash_json(asdict(record)) != record_hash:
+            return False
+    return True
 
 
 def _postgres_append_only_denials(dsn: str) -> dict[str, bool]:

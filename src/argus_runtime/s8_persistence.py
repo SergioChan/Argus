@@ -332,7 +332,7 @@ class PostgresArtifactStore:
                     cur.execute(
                         """
                         SELECT s8.commit_artifact_record(
-                            %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+                            %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
                         );
                         """,
                         (
@@ -346,6 +346,7 @@ class PostgresArtifactStore:
                             record.claim_tier,
                             record.validation_report_ref,
                             list(record.lineage.input_refs),
+                            record.created_at,
                         ),
                     )
                     inserted = bool(cur.fetchone()[0])

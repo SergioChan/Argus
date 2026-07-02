@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import asdict
 import json
 import os
 from pathlib import Path
@@ -10,7 +11,16 @@ import subprocess
 from tempfile import TemporaryDirectory
 import unittest
 
-from argus_core import DatasetRegistry, DatasetSplit, InMemoryArtifactStore, Lineage, Producer
+from argus_core import (
+    DatasetRegistry,
+    DatasetSplit,
+    InMemoryArtifactStore,
+    InMemoryObjectStore,
+    Lineage,
+    Producer,
+    hash_json,
+)
+from argus_runtime.s8_persistence import PostgresArtifactStore
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -659,11 +669,37 @@ class S8PostgresSchemaTests(unittest.TestCase):
         )
         drift = self._apply_s8_migrations(check=False)
 
-        self.assertEqual(first_count.stdout.strip(), "8")
+        self.assertEqual(first_count.stdout.strip(), "9")
         self.assertIn("already applied with matching checksum", reapplied.stdout)
-        self.assertEqual(second_count.stdout.strip(), "8")
+        self.assertEqual(second_count.stdout.strip(), "9")
         self.assertNotEqual(drift.returncode, 0)
         self.assertIn("checksum drift", drift.stderr)
+
+    def test_postgres_store_record_hash_matches_refreshed_created_at(self) -> None:
+        store = PostgresArtifactStore(
+            dsn=self._postgres_dsn(),
+            object_store=InMemoryObjectStore(),
+            db_role="argus_s8_ledger_writer",
+        )
+
+        record = store.create_artifact(
+            kind="model",
+            payload={"weights": [1, 2, 3]},
+            producer=Producer(subsystem="S2", version="0.0.0"),
+            lineage=Lineage(input_refs=(), code_ref="git:r8-m4", environment_digest="oci:r8-m4"),
+        )
+
+        refreshed = store.get_artifact_record(record.artifact_ref)
+        stored_hash = self._psql(
+            f"""
+            SELECT record_hash
+            FROM s8.artifact_record
+            WHERE artifact_id = {_sql_literal(record.artifact_ref)};
+            """
+        ).stdout.strip()
+
+        self.assertEqual(refreshed.created_at, record.created_at)
+        self.assertEqual(hash_json(asdict(refreshed)), stored_hash)
 
     def test_read_query_functions_resolve_refs_filter_page_and_grant_reader(self) -> None:
         self._commit_record(
@@ -1635,7 +1671,8 @@ class S8PostgresSchemaTests(unittest.TestCase):
         validation_ref_sql = "NULL"
         if validation_report_ref is not None:
             validation_ref_sql = _sql_literal(validation_report_ref)
-        commit_result = self._psql(
+        created_at_sql = "NULL" if created_at is None else f"{_sql_literal(created_at)}::timestamptz"
+        return self._psql(
             f"""
             SET ROLE argus_s8_ledger_writer;
             SELECT s8.commit_artifact_record(
@@ -1648,22 +1685,12 @@ class S8PostgresSchemaTests(unittest.TestCase):
                 {sequence},
                 {_sql_literal(claim_tier)},
                 {validation_ref_sql},
-                {_text_array_literal(input_refs)}
+                {_text_array_literal(input_refs)},
+                {created_at_sql}
             );
             """,
             check=check,
         )
-        if created_at is not None and commit_result.returncode == 0:
-            self._psql(
-                f"""
-                ALTER TABLE s8.artifact_record DISABLE TRIGGER artifact_record_append_only;
-                UPDATE s8.artifact_record
-                SET created_at = {_sql_literal(created_at)}::timestamptz
-                WHERE artifact_id = {_sql_literal(artifact_ref)};
-                ALTER TABLE s8.artifact_record ENABLE TRIGGER artifact_record_append_only;
-                """
-            )
-        return commit_result
 
     def _postgres_query_refs(self, query_filter: dict[str, object]) -> tuple[str, ...]:
         result = self._psql(
@@ -1729,6 +1756,14 @@ class S8PostgresSchemaTests(unittest.TestCase):
             ]
         )
         return command
+
+    def _postgres_dsn(self) -> str:
+        from psycopg.conninfo import make_conninfo
+
+        kwargs = {"host": str(self.pg_host), "dbname": self.pg_database}
+        if self.pg_port is not None:
+            kwargs["port"] = str(self.pg_port)
+        return make_conninfo("", **kwargs)
 
 
 def _sql_literal(value: str) -> str:
