@@ -358,6 +358,24 @@ print(canonical_json_bytes(asdict(service.decide(request))).decode("utf-8"))
         self.assertFalse(verdict.allowed)
         self.assertEqual(verdict.deny_reason, "cpu_ceiling")
 
+    def test_runtime_class_hint_cannot_override_policy_mapping(self) -> None:
+        matching_hint = decide_policy(self.bundle, self._launch_request(runtime_class_hint="gvisor"))
+        mismatched_hint = decide_policy(self.bundle, self._launch_request(runtime_class_hint="firecracker"))
+        high_auto = decide_policy(self.bundle, self._launch_request(risk_class="high"))
+        high_downgrade = decide_policy(
+            self.bundle,
+            self._launch_request(risk_class="high", runtime_class_hint="gvisor"),
+        )
+
+        self.assertTrue(matching_hint.allowed)
+        self.assertEqual(matching_hint.runtime_class, "gvisor")
+        self.assertFalse(mismatched_hint.allowed)
+        self.assertEqual(mismatched_hint.deny_reason, "runtime_class_hint_mismatch")
+        self.assertTrue(high_auto.allowed)
+        self.assertEqual(high_auto.runtime_class, "firecracker")
+        self.assertFalse(high_downgrade.allowed)
+        self.assertEqual(high_downgrade.deny_reason, "runtime_class_hint_mismatch")
+
     def test_egress_proxy_is_default_deny_with_sni_check(self) -> None:
         scope = self.tokens.mint_scope(
             job_id="job-1",
@@ -390,7 +408,13 @@ print(canonical_json_bytes(asdict(service.decide(request))).decode("utf-8"))
         )
         return canonical_json_bytes(asdict(service.decide(self._launch_request())))
 
-    def _launch_request(self, envelope: LaunchEnvelope | None = None) -> LaunchRequest:
+    def _launch_request(
+        self,
+        envelope: LaunchEnvelope | None = None,
+        *,
+        risk_class: str = "standard",
+        runtime_class_hint: str = "auto",
+    ) -> LaunchRequest:
         budget = self.tokens.mint_budget(
             caps=BudgetCaps(
                 max_compute_units=1_000,
@@ -400,12 +424,14 @@ print(canonical_json_bytes(asdict(service.decide(request))).decode("utf-8"))
             ),
             job_id="job-1",
             root_request_id="root-1",
+            risk_class=risk_class,
         )
         scope = self.tokens.mint_scope(
             job_id="job-1",
             scopes=ScopeGrant(
                 egress_allowlist=(EgressRule("store.local", 443, "https"),),
                 broker_audiences=("store",),
+                sandbox_risk_class=risk_class,
             ),
         )
         return LaunchRequest(
@@ -429,6 +455,7 @@ print(canonical_json_bytes(asdict(service.decide(request))).decode("utf-8"))
                 pids=10,
                 estimated_cost_usd=1,
             ),
+            runtime_class_hint=runtime_class_hint,
         )
 
 

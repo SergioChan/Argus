@@ -661,7 +661,8 @@ def decide_policy(bundle: PolicyBundle, request: LaunchRequest) -> PolicyVerdict
     if runtime_class is None:
         return PolicyVerdict(False, None, (), "risk_class_unsupported")
     if request.runtime_class_hint != "auto":
-        runtime_class = request.runtime_class_hint
+        if request.runtime_class_hint != runtime_class:
+            return PolicyVerdict(False, None, (), "runtime_class_hint_mismatch")
 
     egress_acl = tuple(
         sorted(

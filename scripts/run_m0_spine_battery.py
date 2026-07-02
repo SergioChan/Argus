@@ -131,6 +131,11 @@ def main() -> int:
             evidence,
             policy_signing_key=runtime_secrets["s10_policy_signing_key"].encode("utf-8"),
         )
+        _battery_runtime_class_hint_policy(
+            evidence,
+            signing_key=runtime_secrets["s10_signing_key"].encode("utf-8"),
+            policy_signing_key=runtime_secrets["s10_policy_signing_key"].encode("utf-8"),
+        )
 
         budget_json = _post_json(
             f"{s10_url}/v1/budget-tokens",
@@ -866,6 +871,82 @@ def _battery_signed_policy_service(evidence: dict[str, Any], *, policy_signing_k
     )
 
 
+def _battery_runtime_class_hint_policy(
+    evidence: dict[str, Any],
+    *,
+    signing_key: bytes,
+    policy_signing_key: bytes,
+) -> None:
+    tokens = InMemoryTokenService(signing_key=signing_key)
+    service = _policy_service(
+        policy_signing_key,
+        risk_to_runtime={"standard": "docker", "high": "firecracker"},
+    )
+    matching = service.decide(
+        _policy_hint_request(tokens, risk_class="standard", runtime_class_hint="docker")
+    )
+    unknown = service.decide(
+        _policy_hint_request(tokens, risk_class="standard", runtime_class_hint="runc")
+    )
+    downgrade = service.decide(
+        _policy_hint_request(tokens, risk_class="high", runtime_class_hint="docker")
+    )
+    if not matching.allowed or unknown.deny_reason != "runtime_class_hint_mismatch":
+        raise AssertionError(f"runtime_class_hint unknown-value guard failed: {matching=}, {unknown=}")
+    if downgrade.deny_reason != "runtime_class_hint_mismatch":
+        raise AssertionError(f"runtime_class_hint downgrade guard failed: {downgrade=}")
+    _record(
+        evidence,
+        "policy-hint",
+        "runtime_class_hint cannot override the signed policy risk-to-runtime mapping",
+        {
+            "matching_hint_runtime": matching.runtime_class,
+            "unknown_hint_deny_reason": unknown.deny_reason,
+            "high_risk_downgrade_deny_reason": downgrade.deny_reason,
+        },
+    )
+
+
+def _policy_hint_request(
+    tokens: InMemoryTokenService,
+    *,
+    risk_class: str,
+    runtime_class_hint: str,
+) -> LaunchRequest:
+    budget = tokens.mint_budget(
+        caps=BudgetCaps(max_compute_units=10, max_wallclock_s=10, max_cost_usd=1),
+        job_id=f"m0-policy-hint-{risk_class}",
+        root_request_id=f"m0-policy-hint-{risk_class}-root",
+        risk_class=risk_class,
+    )
+    scope = tokens.mint_scope(
+        job_id=f"m0-policy-hint-{risk_class}",
+        scopes=ScopeGrant(sandbox_risk_class=risk_class),
+    )
+    return LaunchRequest(
+        job_id=f"m0-policy-hint-{risk_class}",
+        subagent_id="m0-policy-hint",
+        trace_id=f"trace-policy-hint-{risk_class}",
+        budget_token=budget,
+        scope_token=scope,
+        image=DEFAULT_IMAGE,
+        entrypoint=("sh",),
+        args=("-c", "true"),
+        env={},
+        env_allowlist=(),
+        requested_envelope=LaunchEnvelope(
+            cpu_m=100,
+            mem_bytes=16 * 1024 * 1024,
+            gpu_count=0,
+            wallclock_s=1,
+            scratch_bytes=1024 * 1024,
+            pids=16,
+            estimated_cost_usd=0,
+        ),
+        runtime_class_hint=runtime_class_hint,
+    )
+
+
 def _run_no_network_launch(
     *,
     image: str,
@@ -955,9 +1036,16 @@ def _policy_bundle() -> PolicyBundle:
     )
 
 
-def _policy_service(policy_signing_key: bytes) -> InMemoryPolicyService:
+def _policy_service(
+    policy_signing_key: bytes,
+    *,
+    risk_to_runtime: dict[str, str] | None = None,
+) -> InMemoryPolicyService:
     signer_key_id = "argus-m0-battery-policy"
-    signed = PolicyBundleSigner(key_id=signer_key_id, secret=policy_signing_key).sign(_policy_bundle())
+    bundle = _policy_bundle()
+    if risk_to_runtime is not None:
+        bundle = replace(bundle, risk_to_runtime=risk_to_runtime)
+    signed = PolicyBundleSigner(key_id=signer_key_id, secret=policy_signing_key).sign(bundle)
     return InMemoryPolicyService(
         initial_bundle=signed,
         trust_store=InMemoryPolicyBundleTrustStore({signer_key_id: policy_signing_key}),
