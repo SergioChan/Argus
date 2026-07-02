@@ -41,6 +41,11 @@ class HashMismatchError(S8Error):
 class WriteOnceViolationError(S8Error):
     """Raised when an existing artifact ref would be overwritten."""
 
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.category = "IMMUTABLE_VIOLATION"
+        self.reason = reason
+
 
 class SignatureInvalidError(S8Error):
     """Raised when a C3 report signature is missing, unknown, revoked, or invalid."""
@@ -135,6 +140,20 @@ class AuditSlice:
 class AuditVerification:
     valid: bool
     break_sequence: int | None = None
+
+
+@dataclass(frozen=True)
+class ExternalSourceRef:
+    source: str
+    external_id: str
+    url: str
+    snapshot_hash: str
+    ingested_at: str
+    license: str
+
+    @property
+    def source_id(self) -> str:
+        return f"{self.source}:{self.external_id}"
 
 
 def assert_lineage_complete(
@@ -556,3 +575,27 @@ class InMemoryArtifactStore:
             return AuditCheckpoint(sequence=0, root=self._zero_root())
         latest_leaf = self._audit_leaves[-1]
         return AuditCheckpoint(sequence=latest_leaf.sequence, root=latest_leaf.root)
+
+
+class ExternalSourceRegistry:
+    """Immutable C4-backed registry for external-source ingestion records."""
+
+    def __init__(self, *, artifact_store: InMemoryArtifactStore) -> None:
+        self._artifact_store = artifact_store
+
+    def register(self, source_ref: ExternalSourceRef) -> ArtifactRecord:
+        return self._artifact_store.create_artifact(
+            artifact_ref=self._artifact_ref(source_ref.source_id),
+            kind="external_source",
+            payload=asdict(source_ref),
+            producer=Producer(subsystem="S8", version="0.0.0"),
+            lineage=Lineage(input_refs=(), code_ref="git:s8-external-source", environment_digest="oci:s8"),
+        )
+
+    def get(self, source_id: str) -> ExternalSourceRef:
+        payload = json.loads(self._artifact_store.get_artifact(self._artifact_ref(source_id)).decode("utf-8"))
+        return ExternalSourceRef(**payload)
+
+    @staticmethod
+    def _artifact_ref(source_id: str) -> str:
+        return f"c4://external_source/{source_id}"
