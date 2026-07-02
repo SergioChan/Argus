@@ -92,6 +92,7 @@ class ScopeGrant:
     allowed_datasets: tuple[str, ...] = ()
     egress_allowlist: tuple[EgressRule, ...] = ()
     broker_audiences: tuple[str, ...] = ()
+    producer_subsystems: tuple[str, ...] = ()
     sandbox_risk_class: str = "standard"
     disallowed_actions: tuple[str, ...] = ()
 
@@ -508,6 +509,8 @@ class InMemoryTokenService:
             raise ScopeWideningError("attenuated scope cannot add egress")
         if set(child.broker_audiences) - set(parent.broker_audiences):
             raise ScopeWideningError("attenuated scope cannot add broker audiences")
+        if set(child.producer_subsystems) - set(parent.producer_subsystems):
+            raise ScopeWideningError("attenuated scope cannot add producer subsystems")
         if child.sandbox_risk_class != parent.sandbox_risk_class:
             raise ScopeWideningError("attenuated scope cannot change risk class")
         if set(parent.disallowed_actions) - set(child.disallowed_actions):
@@ -791,8 +794,12 @@ class StoreWriterBroker:
             )
             raise TokenInvalidError(verification.reason or "invalid scope token")
         if "store" not in scope_token.scopes.broker_audiences:
-            self._audit_ledger.append("store.denied", {"audience": "store", "reason": "scope_denied"})
-            raise ScopeDeniedError("scope does not allow store broker audience")
+            self._deny_store(scope_token=scope_token, reason="scope_denied")
+        producer, lineage = self._seal_store_identity(
+            scope_token=scope_token,
+            producer=producer,
+            lineage=lineage,
+        )
         record = self._artifact_store.create_artifact(
             kind=kind,
             payload=payload,
@@ -803,7 +810,14 @@ class StoreWriterBroker:
         )
         self._audit_ledger.append(
             "store.put",
-            {"audience": "store", "op": "put_artifact", "artifact_ref": record.artifact_ref},
+            {
+                "audience": "store",
+                "op": "put_artifact",
+                "artifact_ref": record.artifact_ref,
+                "scope_id": scope_token.scope_id,
+                "job_id": scope_token.job_id,
+                "producer_subsystem": producer.subsystem,
+            },
         )
         return record
 
@@ -813,6 +827,41 @@ class StoreWriterBroker:
             {"audience": "store", "op": op, "scope_id": scope_token.scope_id},
         )
         raise ScopeDeniedError("direct S8 writes are denied; use StoreWriterBroker.put_artifact")
+
+    def _seal_store_identity(
+        self,
+        *,
+        scope_token: ScopeToken,
+        producer: Producer,
+        lineage: Lineage,
+    ) -> tuple[Producer, Lineage]:
+        allowed_producers = scope_token.scopes.producer_subsystems
+        if not allowed_producers:
+            self._deny_store(scope_token=scope_token, reason="producer_scope_missing")
+        if producer.subsystem not in allowed_producers:
+            self._deny_store(
+                scope_token=scope_token,
+                reason="producer_scope_denied",
+                producer_subsystem=producer.subsystem,
+            )
+        if producer.job_id is not None and producer.job_id != scope_token.job_id:
+            self._deny_store(scope_token=scope_token, reason="producer_job_mismatch")
+        if lineage.job_id is not None and lineage.job_id != scope_token.job_id:
+            self._deny_store(scope_token=scope_token, reason="lineage_job_mismatch")
+        return replace(producer, job_id=scope_token.job_id), replace(lineage, job_id=scope_token.job_id)
+
+    def _deny_store(self, *, scope_token: ScopeToken, reason: str, **payload: Any) -> None:
+        self._audit_ledger.append(
+            "store.denied",
+            {
+                "audience": "store",
+                "reason": reason,
+                "scope_id": scope_token.scope_id,
+                "job_id": scope_token.job_id,
+                **payload,
+            },
+        )
+        raise ScopeDeniedError(reason)
 
 
 class BrokeredStoreClient:

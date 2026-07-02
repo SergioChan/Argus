@@ -53,7 +53,11 @@ class ArgusM0RuntimeServiceTests(unittest.TestCase):
         scope = app.mint_scope(
             {
                 "job_id": "job-1",
-                "scopes": {"broker_audiences": ["store"], "sandbox_risk_class": "standard"},
+                "scopes": {
+                    "broker_audiences": ["store"],
+                    "producer_subsystems": ["S2"],
+                    "sandbox_risk_class": "standard",
+                },
             }
         )
 
@@ -71,6 +75,7 @@ class ArgusM0RuntimeServiceTests(unittest.TestCase):
                     allowed_datasets=tuple(scope["scopes"]["allowed_datasets"]),
                     egress_allowlist=(),
                     broker_audiences=tuple(scope["scopes"]["broker_audiences"]),
+                    producer_subsystems=tuple(scope["scopes"]["producer_subsystems"]),
                     disallowed_actions=tuple(scope["scopes"]["disallowed_actions"]),
                     sandbox_risk_class=scope["scopes"]["sandbox_risk_class"],
                 ),

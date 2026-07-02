@@ -55,6 +55,7 @@ class M0SpineIntegrationSliceTests(unittest.TestCase):
             scopes=ScopeGrant(
                 egress_allowlist=(EgressRule("store.local", 443, "https"),),
                 broker_audiences=("store",),
+                producer_subsystems=("S2",),
             ),
         )
         orchestrator = InMemorySandboxOrchestrator(
@@ -113,6 +114,8 @@ class M0SpineIntegrationSliceTests(unittest.TestCase):
         lineage_refs = {node.artifact_ref for node in lineage.nodes}
 
         self.assertIn(handle.launch_provenance_ref, lineage_refs)
+        self.assertEqual(model.producer.job_id, "job-1")
+        self.assertEqual(model.lineage.job_id, "job-1")
         self.assertEqual(self.artifacts.record_count, 2)
         self.assertTrue(self.artifacts.verify_audit_chain().valid)
         self.assertTrue(self.audit.verify_chain().valid)

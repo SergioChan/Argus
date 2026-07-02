@@ -95,6 +95,7 @@ class S10TokenServiceTests(unittest.TestCase):
                 allowed_adapters=("adapter:a",),
                 egress_allowlist=(EgressRule("store.local", 443, "https"),),
                 broker_audiences=("store", "adapter:a"),
+                producer_subsystems=("S2", "S3"),
                 disallowed_actions=("direct_ledger_write",),
             ),
         )
@@ -104,6 +105,7 @@ class S10TokenServiceTests(unittest.TestCase):
                 allowed_adapters=("adapter:a",),
                 egress_allowlist=(EgressRule("store.local", 443, "https"),),
                 broker_audiences=("store",),
+                producer_subsystems=("S2",),
                 disallowed_actions=("direct_ledger_write", "direct_egress"),
             ),
         )
@@ -116,6 +118,19 @@ class S10TokenServiceTests(unittest.TestCase):
                     allowed_adapters=("adapter:a", "adapter:b"),
                     egress_allowlist=(EgressRule("store.local", 443, "https"),),
                     broker_audiences=("store",),
+                    producer_subsystems=("S2",),
+                    disallowed_actions=("direct_ledger_write",),
+                ),
+            )
+
+        with self.assertRaises(ScopeWideningError):
+            self.tokens.attenuate_scope(
+                parent_scope,
+                ScopeGrant(
+                    allowed_adapters=("adapter:a",),
+                    egress_allowlist=(EgressRule("store.local", 443, "https"),),
+                    broker_audiences=("store",),
+                    producer_subsystems=("S4",),
                     disallowed_actions=("direct_ledger_write",),
                 ),
             )
@@ -274,7 +289,10 @@ class S10StoreWriterBrokerTests(unittest.TestCase):
         )
 
     def test_sandbox_client_put_writes_artifact_and_matches_content_hash(self) -> None:
-        scope = self.tokens.mint_scope(job_id="job-1", scopes=ScopeGrant(broker_audiences=("store",)))
+        scope = self.tokens.mint_scope(
+            job_id="job-1",
+            scopes=ScopeGrant(broker_audiences=("store",), producer_subsystems=("S2",)),
+        )
         client = self.broker.client_for(scope)
         payload = {"weights": [1, 2, 3]}
 
@@ -287,12 +305,17 @@ class S10StoreWriterBrokerTests(unittest.TestCase):
 
         payload_bytes = canonical_json_bytes(payload)
         self.assertEqual(record.content_hash, hash_bytes(payload_bytes))
+        self.assertEqual(record.producer.job_id, "job-1")
+        self.assertEqual(record.lineage.job_id, "job-1")
         self.assertEqual(self.artifacts.get_artifact(record.artifact_ref), payload_bytes)
         self.assertEqual(self.artifacts.record_count, 1)
         self.assertEqual(self.audit.events()[-1].event_type, "store.put")
 
     def test_sandbox_client_denies_direct_store_write_method(self) -> None:
-        scope = self.tokens.mint_scope(job_id="job-1", scopes=ScopeGrant(broker_audiences=("store",)))
+        scope = self.tokens.mint_scope(
+            job_id="job-1",
+            scopes=ScopeGrant(broker_audiences=("store",), producer_subsystems=("S2",)),
+        )
         client = self.broker.client_for(scope)
 
         with self.assertRaises(ScopeDeniedError):
@@ -307,7 +330,10 @@ class S10StoreWriterBrokerTests(unittest.TestCase):
         self.assertEqual(self.audit.events()[-1].event_type, "store.direct_write_denied")
 
     def test_store_broker_denies_scope_without_store_audience(self) -> None:
-        scope = self.tokens.mint_scope(job_id="job-1", scopes=ScopeGrant(broker_audiences=("adapter:a",)))
+        scope = self.tokens.mint_scope(
+            job_id="job-1",
+            scopes=ScopeGrant(broker_audiences=("adapter:a",), producer_subsystems=("S2",)),
+        )
 
         with self.assertRaises(ScopeDeniedError):
             self.broker.client_for(scope).put_artifact(
@@ -319,6 +345,65 @@ class S10StoreWriterBrokerTests(unittest.TestCase):
 
         self.assertEqual(self.artifacts.record_count, 0)
         self.assertEqual(self.audit.events()[-1].event_type, "store.denied")
+
+    def test_store_broker_requires_producer_scope_and_denies_wrong_subsystem(self) -> None:
+        unbound_scope = self.tokens.mint_scope(
+            job_id="job-1",
+            scopes=ScopeGrant(broker_audiences=("store",)),
+        )
+
+        with self.assertRaisesRegex(ScopeDeniedError, "producer_scope_missing"):
+            self.broker.client_for(unbound_scope).put_artifact(
+                kind="model",
+                payload={"weights": [1]},
+                producer=Producer(subsystem="S2", version="0.0.0"),
+                lineage=Lineage(input_refs=(), code_ref="git:model", environment_digest="oci:model"),
+            )
+
+        scoped = self.tokens.mint_scope(
+            job_id="job-1",
+            scopes=ScopeGrant(broker_audiences=("store",), producer_subsystems=("S2",)),
+        )
+        with self.assertRaisesRegex(ScopeDeniedError, "producer_scope_denied"):
+            self.broker.client_for(scoped).put_artifact(
+                kind="model",
+                payload={"weights": [1]},
+                producer=Producer(subsystem="S3", version="0.0.0"),
+                lineage=Lineage(input_refs=(), code_ref="git:model", environment_digest="oci:model"),
+            )
+
+        self.assertEqual(self.artifacts.record_count, 0)
+        self.assertEqual(self.audit.events()[-1].event_type, "store.denied")
+        self.assertEqual(self.audit.events()[-1].payload["reason"], "producer_scope_denied")
+
+    def test_store_broker_denies_cross_job_producer_or_lineage(self) -> None:
+        scope = self.tokens.mint_scope(
+            job_id="job-1",
+            scopes=ScopeGrant(broker_audiences=("store",), producer_subsystems=("S2",)),
+        )
+
+        with self.assertRaisesRegex(ScopeDeniedError, "producer_job_mismatch"):
+            self.broker.client_for(scope).put_artifact(
+                kind="model",
+                payload={"weights": [1]},
+                producer=Producer(subsystem="S2", version="0.0.0", job_id="job-2"),
+                lineage=Lineage(input_refs=(), code_ref="git:model", environment_digest="oci:model"),
+            )
+
+        with self.assertRaisesRegex(ScopeDeniedError, "lineage_job_mismatch"):
+            self.broker.client_for(scope).put_artifact(
+                kind="model",
+                payload={"weights": [1]},
+                producer=Producer(subsystem="S2", version="0.0.0"),
+                lineage=Lineage(
+                    input_refs=(),
+                    code_ref="git:model",
+                    environment_digest="oci:model",
+                    job_id="job-2",
+                ),
+            )
+
+        self.assertEqual(self.artifacts.record_count, 0)
 
 
 class S10OrchestratorAndAuditTests(unittest.TestCase):

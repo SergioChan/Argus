@@ -52,8 +52,10 @@ class S10SupervisorApp:
         scopes_body = dict(body.get("scopes") or {})
         scopes = ScopeGrant(
             allowed_adapters=tuple(scopes_body.get("allowed_adapters") or ()),
+            allowed_datasets=tuple(scopes_body.get("allowed_datasets") or ()),
             egress_allowlist=tuple(EgressRule(**rule) for rule in scopes_body.get("egress_allowlist") or ()),
             broker_audiences=tuple(scopes_body.get("broker_audiences") or ()),
+            producer_subsystems=tuple(scopes_body.get("producer_subsystems") or ()),
             disallowed_actions=tuple(scopes_body.get("disallowed_actions") or ()),
             sandbox_risk_class=str(scopes_body.get("sandbox_risk_class", "standard")),
         )
@@ -135,4 +137,3 @@ def _required_str(body: dict[str, Any], field: str) -> str:
 
 if __name__ == "__main__":
     main()
-

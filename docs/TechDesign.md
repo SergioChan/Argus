@@ -3111,6 +3111,7 @@ on connect(sandbox, dst_host, port, sni):
   "allowed_adapters":["adapter_ref(C6)"], "allowed_datasets":["dataset_ref(C4)"],
   "egress_allowlist":[{"host":"string","port":"int","proto":"https|grpc"}],
   "broker_audiences":["store|adapter:<id>|model"],
+  "producer_subsystems":["S2|S3|..."],
   "sandbox_risk_class":"standard|federated|high",
   "disallowed_actions":["string"], "expires_at":"rfc3339","parent_scope_id":"uuid|null",
   "signer_key_id":"string","signature":"bytes"
