@@ -89,6 +89,15 @@ class DatasetRegistryError(S8Error):
         self.reason = reason
 
 
+class S8ScopeDeniedError(S8Error):
+    """Raised when an S8 read or materialization request is outside its scope."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.category = "SCOPE_DENIED"
+        self.reason = reason
+
+
 @dataclass(frozen=True)
 class Producer:
     subsystem: str
@@ -316,6 +325,29 @@ class DatasetRecord:
     splits: tuple[DatasetSplit, ...]
     contamination_index_version: str
     provenance_ref: DatasetProvenanceRef
+
+
+@dataclass(frozen=True)
+class DatasetResolveAuditEvent:
+    sequence: int
+    event_type: str
+    dataset_id: str
+    version: str
+    split_id: str
+    requester_audiences: tuple[str, ...]
+    verdict: str
+    label_seal_ref: str | None = None
+
+
+@dataclass(frozen=True)
+class DatasetSplitResolution:
+    dataset_id: str
+    version: str
+    split_id: str
+    role: str
+    feature_blob_ref: str
+    label_blob_ref: str | None
+    audit_event: DatasetResolveAuditEvent
 
 
 WRITE_ONCE_BUCKET = "write_once"
@@ -1180,6 +1212,7 @@ class DatasetRegistry:
     def __init__(self, *, artifact_store: InMemoryArtifactStore) -> None:
         self._artifact_store = artifact_store
         self._records: dict[tuple[str, str], DatasetRecord] = {}
+        self._resolve_events: list[DatasetResolveAuditEvent] = []
         self._rebuild_index()
 
     def register(
@@ -1241,6 +1274,59 @@ class DatasetRegistry:
             version
             for stored_dataset_id, version in sorted(self._records, key=lambda item: _dataset_version_key(item[1]))
             if stored_dataset_id == dataset_id
+        )
+
+    @property
+    def resolve_events(self) -> tuple[DatasetResolveAuditEvent, ...]:
+        return tuple(self._resolve_events)
+
+    def resolve_split(
+        self,
+        *,
+        dataset_id: str,
+        version: str | None,
+        split_id: str,
+        scope_token: Any,
+    ) -> DatasetSplitResolution:
+        record = self.get(dataset_id, version)
+        split = self._split(record, split_id)
+        requester_audiences = _scope_broker_audiences(scope_token)
+        _assert_dataset_scope_allows(record, scope_token)
+
+        if split.access_scope == "verifier-only":
+            if not _scope_has_verifier_audience(scope_token):
+                event = self._append_resolve_event(
+                    dataset_id=record.dataset_id,
+                    version=record.version,
+                    split_id=split.split_id,
+                    requester_audiences=requester_audiences,
+                    verdict="DENIED",
+                    label_seal_ref=None,
+                )
+                raise S8ScopeDeniedError(
+                    f"scope denied for verifier-only split {record.dataset_id}@{record.version}/{split.split_id}; "
+                    f"audit_event={event.sequence}"
+                )
+            if not split.label_seal_ref:
+                raise DatasetRegistryError(f"{split.role} split requires label_seal_ref")
+
+        label_blob_ref = split.label_seal_ref if split.access_scope == "verifier-only" else None
+        event = self._append_resolve_event(
+            dataset_id=record.dataset_id,
+            version=record.version,
+            split_id=split.split_id,
+            requester_audiences=requester_audiences,
+            verdict="ALLOWED",
+            label_seal_ref=label_blob_ref,
+        )
+        return DatasetSplitResolution(
+            dataset_id=record.dataset_id,
+            version=record.version,
+            split_id=split.split_id,
+            role=split.role,
+            feature_blob_ref=split.content_hash,
+            label_blob_ref=label_blob_ref,
+            audit_event=event,
         )
 
     def _latest_version(self, dataset_id: str) -> str:
@@ -1315,6 +1401,8 @@ class DatasetRegistry:
                 raise DatasetRegistryError(f"unsupported access_scope: {split.access_scope}")
             if split.role in DATASET_VERIFIER_ONLY_ROLES and split.access_scope != "verifier-only":
                 raise DatasetRegistryError(f"{split.role} split must use verifier-only access_scope")
+            if split.access_scope == "verifier-only" and not split.label_seal_ref:
+                raise DatasetRegistryError(f"{split.role} split requires label_seal_ref")
             if split.row_count < 0:
                 raise DatasetRegistryError("split row_count must be non-negative")
             if not split.content_hash:
@@ -1327,6 +1415,36 @@ class DatasetRegistry:
     @staticmethod
     def _artifact_ref(dataset_id: str, version: str) -> str:
         return "c4://dataset/" + dataset_id.replace("/", "_") + "/" + version.replace("/", "_")
+
+    @staticmethod
+    def _split(record: DatasetRecord, split_id: str) -> DatasetSplit:
+        for split in record.splits:
+            if split.split_id == split_id:
+                return split
+        raise DatasetRegistryError(f"dataset split not found: {record.dataset_id}@{record.version}/{split_id}")
+
+    def _append_resolve_event(
+        self,
+        *,
+        dataset_id: str,
+        version: str,
+        split_id: str,
+        requester_audiences: tuple[str, ...],
+        verdict: str,
+        label_seal_ref: str | None,
+    ) -> DatasetResolveAuditEvent:
+        event = DatasetResolveAuditEvent(
+            sequence=len(self._resolve_events) + 1,
+            event_type="dataset.split_resolved",
+            dataset_id=dataset_id,
+            version=version,
+            split_id=split_id,
+            requester_audiences=requester_audiences,
+            verdict=verdict,
+            label_seal_ref=label_seal_ref,
+        )
+        self._resolve_events.append(event)
+        return event
 
 
 def _assert_known_bucket_class(bucket_class: str) -> None:
@@ -1382,6 +1500,53 @@ def _dataset_version_key(version: str) -> tuple[Any, ...]:
     if all(part.isdigit() for part in parts):
         return (0, *(int(part) for part in parts))
     return (1, version)
+
+
+def _scope_broker_audiences(scope_token: Any) -> tuple[str, ...]:
+    scopes = _scope_grant(scope_token)
+    return _tuple_field(scopes, "broker_audiences")
+
+
+def _scope_allowed_datasets(scope_token: Any) -> tuple[str, ...]:
+    scopes = _scope_grant(scope_token)
+    return _tuple_field(scopes, "allowed_datasets")
+
+
+def _scope_has_verifier_audience(scope_token: Any) -> bool:
+    audiences = set(_scope_broker_audiences(scope_token))
+    return "verifier" in audiences or "s8:verifier" in audiences
+
+
+def _assert_dataset_scope_allows(record: DatasetRecord, scope_token: Any) -> None:
+    allowed = set(_scope_allowed_datasets(scope_token))
+    if not allowed:
+        return
+    accepted_refs = {
+        record.dataset_id,
+        f"{record.dataset_id}@{record.version}",
+        f"{record.dataset_id}:{record.version}",
+        record.provenance_ref.artifact_ref,
+    }
+    if allowed.isdisjoint(accepted_refs):
+        raise S8ScopeDeniedError(f"scope does not allow dataset {record.dataset_id}@{record.version}")
+
+
+def _scope_grant(scope_token: Any) -> Any:
+    if isinstance(scope_token, Mapping):
+        return scope_token.get("scopes", scope_token)
+    return getattr(scope_token, "scopes", scope_token)
+
+
+def _tuple_field(value: Any, field_name: str) -> tuple[str, ...]:
+    if isinstance(value, Mapping):
+        raw = value.get(field_name, ())
+    else:
+        raw = getattr(value, field_name, ())
+    if raw is None:
+        return ()
+    if isinstance(raw, str):
+        return (raw,)
+    return tuple(str(item) for item in raw)
 
 
 def _record_from_ledger_event(event: Mapping[str, Any]) -> ArtifactRecord:

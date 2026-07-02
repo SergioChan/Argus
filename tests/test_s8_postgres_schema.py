@@ -645,9 +645,9 @@ class S8PostgresSchemaTests(unittest.TestCase):
         )
         drift = self._apply_s8_migrations(check=False)
 
-        self.assertEqual(first_count.stdout.strip(), "5")
+        self.assertEqual(first_count.stdout.strip(), "6")
         self.assertIn("already applied with matching checksum", reapplied.stdout)
-        self.assertEqual(second_count.stdout.strip(), "5")
+        self.assertEqual(second_count.stdout.strip(), "6")
         self.assertNotEqual(drift.returncode, 0)
         self.assertIn("checksum drift", drift.stderr)
 
@@ -835,6 +835,137 @@ class S8PostgresSchemaTests(unittest.TestCase):
         self.assertNotEqual(update.returncode, 0)
         self.assertIn("append-only table dataset_registry", update.stderr)
         self.assertEqual(row_count.stdout.strip(), "2")
+
+    def test_resolve_split_denies_non_verifier_labels_and_audits_verifier_resolution(self) -> None:
+        splits = [
+            {
+                "split_id": "train",
+                "role": "train",
+                "content_hash": "blake3:train",
+                "row_count": 10,
+                "schema_ref": "c4://schema/ewpt/v1",
+                "access_scope": "agent-readable",
+            },
+            {
+                "split_id": "blind",
+                "role": "blind",
+                "content_hash": "blake3:blind-features",
+                "row_count": 3,
+                "schema_ref": "c4://schema/ewpt/v1",
+                "access_scope": "verifier-only",
+                "label_seal_ref": "c4://labels/blind-sealed",
+            },
+        ]
+        missing_label_splits = [
+            {
+                "split_id": "blind",
+                "role": "blind",
+                "content_hash": "blake3:blind-features",
+                "row_count": 3,
+                "schema_ref": "c4://schema/ewpt/v1",
+                "access_scope": "verifier-only",
+            },
+        ]
+        self._commit_record("c4://dataset/ewpt/1.0.0", sequence=1, kind="dataset")
+
+        self._psql(
+            f"""
+            SET ROLE argus_s8_ledger_writer;
+            SELECT s8.register_dataset(
+                'ewpt-corpus',
+                '1.0.0',
+                'c4://dataset/ewpt/1.0.0',
+                {_jsonb_literal(splits)},
+                'contam-2026-07-01'
+            );
+            """
+        )
+        missing_label = self._psql(
+            f"""
+            SET ROLE argus_s8_ledger_writer;
+            SELECT s8.register_dataset(
+                'ewpt-missing-label',
+                '1.0.0',
+                'c4://dataset/ewpt/1.0.0',
+                {_jsonb_literal(missing_label_splits)},
+                'contam-2026-07-01'
+            );
+            """,
+            check=False,
+        )
+        agent_train = self._psql(
+            """
+            SET ROLE argus_s8_reader;
+            WITH resolved AS (
+                SELECT s8.resolve_split('ewpt-corpus', '1.0.0', 'train', 'agent') AS payload
+            )
+            SELECT (payload->>'feature_blob_ref') || '|' || COALESCE(payload->>'label_blob_ref', '<null>')
+            FROM resolved;
+            """
+        )
+        agent_blind = self._psql(
+            """
+            SET ROLE argus_s8_reader;
+            SELECT s8.resolve_split('ewpt-corpus', '1.0.0', 'blind', 'agent');
+            """,
+            check=False,
+        )
+        verifier_blind = self._psql(
+            """
+            SET ROLE argus_s8_reader;
+            WITH resolved AS (
+                SELECT s8.resolve_split('ewpt-corpus', '1.0.0', 'blind', 'verifier') AS payload
+            )
+            SELECT (payload->>'feature_blob_ref') || '|' || (payload->>'label_blob_ref')
+            FROM resolved;
+            """
+        )
+        audit = self._psql(
+            """
+            SELECT count(*) || '|' || string_agg(split_id || ':' || COALESCE(label_seal_ref, '<null>'), ',' ORDER BY resolve_id)
+            FROM s8.dataset_resolve_audit;
+            """
+        )
+        direct_insert = self._psql(
+            """
+            SET ROLE argus_s8_ledger_writer;
+            INSERT INTO s8.dataset_resolve_audit (
+                dataset_id,
+                version,
+                split_id,
+                requester_scope,
+                verdict
+            ) VALUES (
+                'ewpt-corpus',
+                '1.0.0',
+                'blind',
+                'agent',
+                'ALLOWED'
+            );
+            """,
+            check=False,
+        )
+        update = self._psql(
+            """
+            UPDATE s8.dataset_resolve_audit
+            SET verdict = 'DENIED'
+            WHERE dataset_id = 'ewpt-corpus';
+            """,
+            check=False,
+        )
+
+        self.assertNotEqual(missing_label.returncode, 0)
+        self.assertIn("requires label_seal_ref", missing_label.stderr)
+        self.assertEqual(agent_train.stdout.strip(), "blake3:train|<null>")
+        self.assertNotEqual(agent_blind.returncode, 0)
+        self.assertIn("SCOPE_DENIED", agent_blind.stderr)
+        self.assertNotIn("c4://labels/blind-sealed", agent_blind.stderr)
+        self.assertEqual(verifier_blind.stdout.strip(), "blake3:blind-features|c4://labels/blind-sealed")
+        self.assertEqual(audit.stdout.strip(), "2|train:<null>,blind:c4://labels/blind-sealed")
+        self.assertNotEqual(direct_insert.returncode, 0)
+        self.assertIn("permission denied", direct_insert.stderr)
+        self.assertNotEqual(update.returncode, 0)
+        self.assertIn("append-only table dataset_resolve_audit", update.stderr)
 
     def test_audit_export_proofs_verify_and_detect_record_tamper(self) -> None:
         zero_root = "blake3:" + ("0" * 64)

@@ -3,7 +3,7 @@
 > **Part of the Project Argus design set.** Start at **README.md** for the doc map and reading order. Related docs: **Architecture.md**, **PRD.md**, **TechDesign.md**, **Backlog-and-Interfaces.md**, **TestPlan.md**, **Roadmap.md**.
 
 **Owner:** Tech-Program Manager
-**Scope:** All 12 subsystems (S1–S12), 377 subtasks, contracts C1–C6 plus named subsystem APIs.
+**Scope:** All 12 subsystems (S1–S12), 380 subtasks, contracts C1–C6 plus named subsystem APIs.
 **Purpose:** This is the decoupling audit. It proves that every subtask can be built independently, that every cross-subsystem dependency crosses only through a published contract (C1–C6) or a named API, and that every produced interface has a matching consumer (and vice-versa). It is the coherence gate before parallel build begins.
 
 ## 0. How to read this document
@@ -25,11 +25,11 @@
 | C6 | S7 | Compute-Adapter Tool Interface | describe/evaluate/grad/batch_evaluate with mandatory units + uncertainty + validity domain |
 
 **Estimate legend:** S = small, M = medium, L = large, XL = extra-large.
-**Estimate distribution across the 377 subtasks:** S=39, M=208, L=118, XL=12. (The 11 new adversarial-debate subtasks add M=7, L=4.)
+**Estimate distribution across the 380 subtasks:** S=39, M=211, L=118, XL=12. (The 11 adversarial-debate subtasks add M=7, L=4; the 3 Rev B.1 Observatory subtasks S11-T36/T37/T38 add M=3.)
 
 ---
 
-## 1. Consolidated backlog (all 377 subtasks)
+## 1. Consolidated backlog (all 380 subtasks)
 
 Grouped by subsystem for readability; the id namespace is globally unique. Every subtask lists the exact `depends_on` and `interfaces_touched` used by the audit in Sections 2–3.
 
@@ -434,6 +434,9 @@ Grouped by subsystem for readability; the id namespace is globally unique. Every
 | S11-T33 | Self-metering & overhead cap | M | S11-T03, S11-T16 | MetricSample, tail-sampling policy | FR-26 overhead cap enforced |
 | S11-T34 | Perf & load test harness | L | S11-T02, S11-T22, S11-T24 | ingest, Query API | TC29/30/31 pass |
 | S11-T35 | Security test suite | L | S11-T02, S11-T10, S11-T13, S11-T15, S11-T28, S11-T30 | all S11 trust boundaries | TC23/24/25/26/27/28/37 pass |
+| S11-T36 | Observatory v0: static verified-run report page | M | - | C3 report render, C4 lineage read, argusverify | S11-TC39 passes: signed C3 v1.1 report + C4 lineage render to a self-contained static HTML page (six-check verdicts, perturbation pairs, insensitivity flags, tier justification, referee identity, provenance chain); report signature re-verified offline via argusverify at render time; tampered report or lineage renders an explicit FAIL banner, never a silent page; the M1.5 pilot-demo artifact |
+| S11-T37 | Observatory v1: live pipeline view | M | S11-T05 | C2/C3/C4/C6/S10 semantic events, obs.read query API | S11-TC40 passes: read-only live view of jobs flowing intake→build→adapter→verify→report fed by FR-04 events with ledger-append stream and per-node drill-down; event-to-render freshness <60s; view identity holds only obs.read scopes; degrades to last-known-good with staleness banner per FR-24 |
+| S11-T38 | Observatory v2: debate arena & evolution view | M | S11-T37 | C4 DebateLedger, C3 v1.1 debate fields | S11-TC41 passes: renders an artifact's DebateLedger per-round (proponent/challenger/referee, ChallengeVerdict fields, attack kinds), fitness series sourced exclusively from signature-valid aggregate.score (unsigned scores never plotted), and killed-spurious counter; makes the M5 red-blue loop auditable at a glance |
 
 #### S12 - Interop Standard & Federation
 
@@ -475,7 +478,7 @@ Grouped by subsystem for readability; the id namespace is globally unique. Every
 
 **Method.** Every `depends_on` entry is one of three kinds: (a) a contract token `C1..C6`; (b) a bare subsystem-level token (e.g. `S10`); or (c) a task id `Sx-Tyy`. The decoupling rule is: **no subtask may `depends_on` a task id belonging to a different subsystem.** Cross-subsystem coupling must be expressed only as a contract token or as a named/bare subsystem dependency, so the two teams integrate against a published surface, not each other's internals.
 
-**Result of the full scan (all 377 subtasks, all 720+ `depends_on` edges):**
+**Result of the full scan (all 380 subtasks incl. Rev B.1, all 720+ `depends_on` edges):**
 
 | Edge class | Count | Verdict |
 |------------|-------|---------|
@@ -600,4 +603,4 @@ Ranked most-severe first. These are the places where, even though the backlog is
 
 ---
 
-*End of Backlog & Interface Registry. Total: 377 subtasks (S3 +5, S4 +6 for Adversarial Red-Blue Debate Evolution), 12 subsystems, 6 contracts (C3 at v1.1); 0 cross-subsystem task-to-task dependencies; 0 missing-producer / 0 missing-consumer; 0 interface-registry mismatches (all 5 prior declaration-list defects fixed).*
+*End of Backlog & Interface Registry. Total: 380 subtasks (S3 +5, S4 +6 for Adversarial Red-Blue Debate Evolution; S11 +3 for the Rev B.1 Observatory), 12 subsystems, 6 contracts (C3 at v1.1); 0 cross-subsystem task-to-task dependencies; 0 missing-producer / 0 missing-consumer; 0 interface-registry mismatches (all 5 prior declaration-list defects fixed).*
