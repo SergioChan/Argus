@@ -1,6 +1,14 @@
 """Core utilities shared by the Argus implementation."""
 
-from .canonical import canonical_json_bytes
+from .canonical import (
+    CANONICALIZATION_SPEC,
+    CANONICALIZATION_SPEC_VERSION,
+    CANONICAL_RECORD_EXCLUDED_FIELDS,
+    CanonicalizationSpec,
+    canonical_json_bytes,
+    canonical_record_bytes,
+    canonical_record_payload,
+)
 from .c3 import (
     C3ReportSigner,
     C3ReportVerifier,
@@ -340,12 +348,16 @@ __all__ = [
     "C3SignatureVerification",
     "C3_SIGNATURE_ALGORITHM",
     "C3_SIGNATURE_PREFIX",
+    "CANONICALIZATION_SPEC",
+    "CANONICALIZATION_SPEC_VERSION",
+    "CANONICAL_RECORD_EXCLUDED_FIELDS",
     "C2ContractError",
     "C2JobEnvelope",
     "C2MigrationWindow",
     "C2VersionPolicy",
     "CONFORMANCE_LEVEL_ORDER",
     "CanaryResult",
+    "CanonicalizationSpec",
     "CapabilityDescriptor",
     "CheckResult",
     "ControlTower",
@@ -571,6 +583,8 @@ __all__ = [
     "build_error_envelope",
     "build_referee_block",
     "canonical_json_bytes",
+    "canonical_record_bytes",
+    "canonical_record_payload",
     "challenge_conformance_record",
     "challenge_verdict_from_report",
     "classify_schema_change",
