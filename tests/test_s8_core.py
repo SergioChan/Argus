@@ -288,7 +288,7 @@ class S8TierCouplingTests(unittest.TestCase):
             lineage=Lineage(input_refs=(), code_ref="git:verify", environment_digest="oci:verify"),
         )
 
-        with self.assertRaises(IllegalTierError):
+        with self.assertRaises(IllegalTierError) as raised:
             self.store.create_artifact(
                 kind="model",
                 payload={"weights": [1], "uncertainty_tag": {"kind": "interval", "radius": 0.1}},
@@ -298,25 +298,47 @@ class S8TierCouplingTests(unittest.TestCase):
                 validation_report_ref=report.artifact_ref,
             )
 
+        self.assertEqual(raised.exception.category, "ILLEGAL_TIER")
+        self.assertEqual(raised.exception.reason, "tier must match validation report claim_tier")
+
     def test_unknown_or_tampered_report_signature_is_rejected(self) -> None:
         unknown_signer = C3ReportSigner(key_id="unknown-key", secret=b"unknown-secret")
-        with self.assertRaises(SignatureInvalidError):
+        with self.assertRaises(SignatureInvalidError) as unknown:
             self.store.create_artifact(
                 kind="report",
                 payload=unknown_signer.sign(self._report(claim_tier="recapitulated-known")),
                 producer=Producer(subsystem="S3", version="0.0.0"),
                 lineage=Lineage(input_refs=(), code_ref="git:verify", environment_digest="oci:verify"),
             )
+        self.assertEqual(unknown.exception.category, "SIGNATURE_INVALID")
+        self.assertEqual(unknown.exception.reason, "unknown_key")
 
         tampered = self.signer.sign(self._report(claim_tier="recapitulated-known"))
         tampered["aggregate"]["score"] = 0.1
-        with self.assertRaises(SignatureInvalidError):
+        with self.assertRaises(SignatureInvalidError) as tamper:
             self.store.create_artifact(
                 kind="report",
                 payload=tampered,
                 producer=Producer(subsystem="S3", version="0.0.0"),
                 lineage=Lineage(input_refs=(), code_ref="git:verify", environment_digest="oci:verify"),
             )
+        self.assertEqual(tamper.exception.category, "SIGNATURE_INVALID")
+        self.assertEqual(tamper.exception.reason, "signature_invalid")
+
+    def test_revoked_report_signing_key_is_rejected(self) -> None:
+        self.trust_store.revoke_key("s3-key")
+
+        with self.assertRaises(SignatureInvalidError) as raised:
+            self.store.create_artifact(
+                kind="report",
+                payload=self.signer.sign(self._report(claim_tier="recapitulated-known")),
+                producer=Producer(subsystem="S3", version="0.0.0"),
+                lineage=Lineage(input_refs=(), code_ref="git:verify", environment_digest="oci:verify"),
+            )
+
+        self.assertEqual(raised.exception.category, "SIGNATURE_INVALID")
+        self.assertEqual(raised.exception.reason, "revoked_key")
+        self.assertEqual(len(self.store), 0)
 
     def test_novel_tier_requires_leakage_and_cross_code_pass(self) -> None:
         report_payload = self.signer.sign(
@@ -335,7 +357,7 @@ class S8TierCouplingTests(unittest.TestCase):
             lineage=Lineage(input_refs=(), code_ref="git:verify", environment_digest="oci:verify"),
         )
 
-        with self.assertRaises(IllegalTierError):
+        with self.assertRaises(IllegalTierError) as raised:
             self.store.create_artifact(
                 kind="model",
                 payload={"weights": [1], "uncertainty_tag": {"kind": "interval", "radius": 0.1}},
@@ -344,6 +366,9 @@ class S8TierCouplingTests(unittest.TestCase):
                 claim_tier="novel-needs-human",
                 validation_report_ref=report.artifact_ref,
             )
+
+        self.assertEqual(raised.exception.category, "ILLEGAL_TIER")
+        self.assertEqual(raised.exception.reason, "novel tier requires LEAKAGE PASS")
 
     @staticmethod
     def _report(

@@ -28,6 +28,11 @@ class IncompleteLineageError(S8Error):
 class IllegalTierError(S8Error):
     """Raised when a promoted tier is not coupled to a validation report."""
 
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.category = "ILLEGAL_TIER"
+        self.reason = reason
+
 
 class HashMismatchError(S8Error):
     """Raised when verify-on-read detects payload tampering."""
@@ -39,6 +44,11 @@ class WriteOnceViolationError(S8Error):
 
 class SignatureInvalidError(S8Error):
     """Raised when a C3 report signature is missing, unknown, revoked, or invalid."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.category = "SIGNATURE_INVALID"
+        self.reason = reason
 
 
 class CycleDetectedError(S8Error):
