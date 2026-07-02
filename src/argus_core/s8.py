@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 import json
-from typing import Any
+from typing import Any, Mapping
 
 from .canonical import canonical_json_bytes
 from .c3 import C3ReportVerifier
@@ -17,6 +17,12 @@ class S8Error(Exception):
 
 class IncompleteLineageError(S8Error):
     """Raised when an artifact lacks required provenance lineage."""
+
+    def __init__(self, missing_fields: tuple[str, ...]) -> None:
+        super().__init__("incomplete lineage: " + ", ".join(missing_fields))
+        self.category = "INCOMPLETE_LINEAGE"
+        self.missing_fields = missing_fields
+        self.non_promotable = True
 
 
 class IllegalTierError(S8Error):
@@ -51,6 +57,17 @@ class Lineage:
     code_ref: str
     environment_digest: str
     seeds: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class LineageCompleteness:
+    complete: bool
+    missing_fields: tuple[str, ...] = ()
+    non_promotable: bool = False
+
+    @property
+    def category(self) -> str | None:
+        return None if self.complete else "INCOMPLETE_LINEAGE"
 
 
 @dataclass(frozen=True)
@@ -105,6 +122,47 @@ class AuditVerification:
     break_sequence: int | None = None
 
 
+def assert_lineage_complete(
+    lineage: Lineage | Mapping[str, Any],
+    *,
+    kind: str | None = None,
+    payload: Mapping[str, Any] | None = None,
+    claim_tier: str = "ran-toy",
+    validation_report_ref: str | None = None,
+) -> LineageCompleteness:
+    missing_fields = _missing_lineage_fields(lineage)
+    if (
+        claim_tier != "ran-toy"
+        and validation_report_ref is not None
+        and kind in {"model", "container", "pipeline"}
+        and (payload is None or not payload.get("uncertainty_tag"))
+    ):
+        missing_fields.append("payload.uncertainty_tag")
+
+    result = LineageCompleteness(
+        complete=not missing_fields,
+        missing_fields=tuple(missing_fields),
+        non_promotable=bool(missing_fields),
+    )
+    if not result.complete:
+        raise IncompleteLineageError(result.missing_fields)
+    return result
+
+
+def _missing_lineage_fields(lineage: Lineage | Mapping[str, Any]) -> list[str]:
+    values = asdict(lineage) if isinstance(lineage, Lineage) else dict(lineage)
+    missing: list[str] = []
+    if "input_refs" not in values or values.get("input_refs") is None:
+        missing.append("lineage.input_refs")
+    if not values.get("code_ref"):
+        missing.append("lineage.code_ref")
+    if not values.get("environment_digest"):
+        missing.append("lineage.environment_digest")
+    if "seeds" not in values or values.get("seeds") is None:
+        missing.append("lineage.seeds")
+    return missing
+
+
 class InMemoryArtifactStore:
     """A small write-once C4 store for exercising S8 invariants."""
 
@@ -129,7 +187,13 @@ class InMemoryArtifactStore:
         claim_tier: str = "ran-toy",
         validation_report_ref: str | None = None,
     ) -> ArtifactRecord:
-        self._assert_lineage_complete(lineage)
+        self._assert_lineage_complete(
+            lineage,
+            kind=kind,
+            payload=payload if isinstance(payload, Mapping) else None,
+            claim_tier=claim_tier,
+            validation_report_ref=validation_report_ref,
+        )
 
         payload_bytes = canonical_json_bytes(payload)
         self._assert_report_payload_if_present(kind, payload)
@@ -285,11 +349,21 @@ class InMemoryArtifactStore:
         return len(self._records)
 
     @staticmethod
-    def _assert_lineage_complete(lineage: Lineage) -> None:
-        if not lineage.code_ref:
-            raise IncompleteLineageError("lineage.code_ref is required")
-        if not lineage.environment_digest:
-            raise IncompleteLineageError("lineage.environment_digest is required")
+    def _assert_lineage_complete(
+        lineage: Lineage,
+        *,
+        kind: str,
+        payload: Mapping[str, Any] | None,
+        claim_tier: str,
+        validation_report_ref: str | None,
+    ) -> None:
+        assert_lineage_complete(
+            lineage,
+            kind=kind,
+            payload=payload,
+            claim_tier=claim_tier,
+            validation_report_ref=validation_report_ref,
+        )
 
     def _assert_report_payload_if_present(self, kind: str, payload: Any) -> None:
         if kind == "report" and isinstance(payload, dict) and "signature" in payload:

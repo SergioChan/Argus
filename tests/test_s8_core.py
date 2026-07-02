@@ -270,7 +270,7 @@ class S8TierCouplingTests(unittest.TestCase):
 
         model = self.store.create_artifact(
             kind="model",
-            payload={"weights": [1]},
+            payload={"weights": [1], "uncertainty_tag": {"kind": "interval", "radius": 0.1}},
             producer=self.producer,
             lineage=self.lineage,
             claim_tier="recapitulated-known",
@@ -291,7 +291,7 @@ class S8TierCouplingTests(unittest.TestCase):
         with self.assertRaises(IllegalTierError):
             self.store.create_artifact(
                 kind="model",
-                payload={"weights": [1]},
+                payload={"weights": [1], "uncertainty_tag": {"kind": "interval", "radius": 0.1}},
                 producer=self.producer,
                 lineage=self.lineage,
                 claim_tier="novel-needs-human",
@@ -338,7 +338,7 @@ class S8TierCouplingTests(unittest.TestCase):
         with self.assertRaises(IllegalTierError):
             self.store.create_artifact(
                 kind="model",
-                payload={"weights": [1]},
+                payload={"weights": [1], "uncertainty_tag": {"kind": "interval", "radius": 0.1}},
                 producer=self.producer,
                 lineage=self.lineage,
                 claim_tier="novel-needs-human",

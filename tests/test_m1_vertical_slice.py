@@ -122,7 +122,11 @@ class M1OracleGatedVerticalSliceTests(unittest.TestCase):
 
         promoted = artifacts.create_artifact(
             kind="model",
-            payload={"promoted_model_ref": build.model_ref, "report_id": signed_report["report_id"]},
+            payload={
+                "promoted_model_ref": build.model_ref,
+                "report_id": signed_report["report_id"],
+                "uncertainty_tag": {"kind": "interval", "source": "signed-c3-report"},
+            },
             producer=Producer(subsystem="S1", version="0.0.0"),
             lineage=Lineage(
                 input_refs=(build.model_ref, report_record.artifact_ref),
