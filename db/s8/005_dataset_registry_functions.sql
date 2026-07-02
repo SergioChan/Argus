@@ -184,6 +184,7 @@ AS $$
 DECLARE
     dataset s8.dataset_registry%ROWTYPE;
     artifact s8.artifact_record%ROWTYPE;
+    masked_splits jsonb;
 BEGIN
     IF p_version IS NULL THEN
         SELECT *
@@ -210,10 +211,23 @@ BEGIN
     FROM s8.artifact_record
     WHERE artifact_id = dataset.dataset_artifact_id;
 
+    SELECT COALESCE(
+        jsonb_agg(
+            CASE
+                WHEN value->>'access_scope' = 'verifier-only' THEN value - 'content_hash' - 'label_seal_ref'
+                ELSE value
+            END
+            ORDER BY ordinality
+        ),
+        '[]'::jsonb
+    )
+    INTO masked_splits
+    FROM jsonb_array_elements(dataset.splits) WITH ORDINALITY AS item(value, ordinality);
+
     RETURN jsonb_build_object(
         'dataset_id', dataset.dataset_id,
         'version', dataset.version,
-        'splits', dataset.splits,
+        'splits', masked_splits,
         'contamination_index_version', dataset.contamination_index_version,
         'provenance_ref', jsonb_build_object(
             'artifact_id', artifact.artifact_id,
@@ -238,7 +252,7 @@ AS $$
 $$;
 
 REVOKE ALL ON s8.dataset_registry FROM PUBLIC;
-GRANT SELECT ON s8.dataset_registry TO argus_s8_reader, argus_s8_ledger_writer;
+REVOKE ALL ON s8.dataset_registry FROM argus_s8_reader, argus_s8_ledger_writer;
 
 REVOKE ALL ON FUNCTION s8.assert_dataset_splits_valid(jsonb) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION s8.assert_dataset_splits_valid(jsonb)

@@ -43,12 +43,37 @@ class DatasetRegistryTests(unittest.TestCase):
         )
 
         self.assertEqual(self.registry.list_versions("ewpt-corpus"), ("1.0.0", "1.1.0"))
-        self.assertEqual(self.registry.get("ewpt-corpus", "1.0.0"), v1)
+        self.assertEqual(
+            self.registry.get("ewpt-corpus", "1.0.0", include_verifier_only_seals=True),
+            v1,
+        )
         self.assertEqual(self.registry.get("ewpt-corpus"), v2)
         self.assertEqual(v1.provenance_ref.artifact_ref, "c4://dataset/ewpt-corpus/1.0.0")
         self.assertEqual(self.store.get_record(v1.provenance_ref.artifact_ref).kind, "dataset")
         self.assertEqual({split.role for split in v1.splits}, {"blind", "train"})
         self.assertEqual(v1.splits[0].split_id, "blind")
+
+    def test_get_masks_verifier_only_split_refs_by_default(self) -> None:
+        self.registry.register(
+            dataset_id="ewpt-corpus",
+            version="1.0.0",
+            splits=(
+                self._split("blind", "blind", access_scope="verifier-only", label_seal_ref="c4://labels/blind"),
+                self._split("train", "train"),
+            ),
+            contamination_index_version="contam-2026-07-01",
+        )
+
+        visible = self.registry.get("ewpt-corpus", "1.0.0")
+        internal = self.registry.get("ewpt-corpus", "1.0.0", include_verifier_only_seals=True)
+        visible_by_id = {split.split_id: split for split in visible.splits}
+        internal_by_id = {split.split_id: split for split in internal.splits}
+
+        self.assertIsNone(visible_by_id["blind"].content_hash)
+        self.assertIsNone(visible_by_id["blind"].label_seal_ref)
+        self.assertEqual(visible_by_id["train"].content_hash, "blake3:train")
+        self.assertEqual(internal_by_id["blind"].content_hash, "blake3:blind")
+        self.assertEqual(internal_by_id["blind"].label_seal_ref, "c4://labels/blind")
 
     def test_register_is_idempotent_but_conflicting_version_is_rejected(self) -> None:
         first = self.registry.register(

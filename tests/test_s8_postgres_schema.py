@@ -885,6 +885,18 @@ class S8PostgresSchemaTests(unittest.TestCase):
             FROM s8.list_dataset_versions('ewpt-corpus');
             """
         )
+        reader_masked_splits = self._psql(
+            """
+            SET ROLE argus_s8_reader;
+            SELECT string_agg(
+                (value->>'split_id')
+                || ':' || COALESCE(value->>'content_hash', '<null>')
+                || ':' || COALESCE(value->>'label_seal_ref', '<null>'),
+                ',' ORDER BY value->>'split_id'
+            )
+            FROM jsonb_array_elements(s8.get_dataset('ewpt-corpus', '1.0.0')->'splits') AS item(value);
+            """
+        )
         direct_insert = self._psql(
             f"""
             SET ROLE argus_s8_ledger_writer;
@@ -901,6 +913,20 @@ class S8PostgresSchemaTests(unittest.TestCase):
                 {_jsonb_literal(splits_v1)},
                 'contam'
             );
+            """,
+            check=False,
+        )
+        reader_direct_select = self._psql(
+            """
+            SET ROLE argus_s8_reader;
+            SELECT count(*) FROM s8.dataset_registry;
+            """,
+            check=False,
+        )
+        writer_direct_select = self._psql(
+            """
+            SET ROLE argus_s8_ledger_writer;
+            SELECT count(*) FROM s8.dataset_registry;
             """,
             check=False,
         )
@@ -926,8 +952,13 @@ class S8PostgresSchemaTests(unittest.TestCase):
         self.assertEqual(reader_v1_artifact.stdout.strip(), "c4://dataset/ewpt/1.0.0")
         self.assertEqual(reader_latest.stdout.strip(), "1.1.0")
         self.assertEqual(reader_versions.stdout.strip(), "1.0.0,1.1.0")
+        self.assertEqual(reader_masked_splits.stdout.strip(), "blind:<null>:<null>,train:blake3:train:<null>")
         self.assertNotEqual(direct_insert.returncode, 0)
         self.assertIn("permission denied", direct_insert.stderr)
+        self.assertNotEqual(reader_direct_select.returncode, 0)
+        self.assertIn("permission denied", reader_direct_select.stderr)
+        self.assertNotEqual(writer_direct_select.returncode, 0)
+        self.assertIn("permission denied", writer_direct_select.stderr)
         self.assertNotEqual(update.returncode, 0)
         self.assertIn("append-only table dataset_registry", update.stderr)
         self.assertEqual(row_count.stdout.strip(), "2")

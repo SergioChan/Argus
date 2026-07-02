@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 import json
 from pathlib import Path
 from typing import Any, Callable, Mapping, Protocol
@@ -327,7 +327,7 @@ class ExternalSourceRef:
 class DatasetSplit:
     split_id: str
     role: str
-    content_hash: str
+    content_hash: str | None
     row_count: int
     schema_ref: str
     access_scope: str
@@ -1400,12 +1400,21 @@ class DatasetRegistry:
         self._records[(dataset_id, version)] = dataset_record
         return dataset_record
 
-    def get(self, dataset_id: str, version: str | None = None) -> DatasetRecord:
+    def get(
+        self,
+        dataset_id: str,
+        version: str | None = None,
+        *,
+        include_verifier_only_seals: bool = False,
+    ) -> DatasetRecord:
         selected_version = version or self._latest_version(dataset_id)
         try:
-            return self._records[(dataset_id, selected_version)]
+            record = self._records[(dataset_id, selected_version)]
         except KeyError as exc:
             raise DatasetRegistryError(f"dataset not found: {dataset_id}@{selected_version}") from exc
+        if include_verifier_only_seals:
+            return record
+        return _mask_verifier_only_splits(record)
 
     def list_versions(self, dataset_id: str) -> tuple[str, ...]:
         return tuple(
@@ -1426,7 +1435,7 @@ class DatasetRegistry:
         split_id: str,
         scope_token: Any,
     ) -> DatasetSplitResolution:
-        record = self.get(dataset_id, version)
+        record = self.get(dataset_id, version, include_verifier_only_seals=True)
         split = self._split(record, split_id)
         requester_audiences = _scope_broker_audiences(scope_token)
         _assert_dataset_scope_allows(record, scope_token)
@@ -1630,6 +1639,18 @@ def _dataset_split_from_mapping(value: Mapping[str, Any]) -> DatasetSplit:
         schema_ref=str(value.get("schema_ref", "")),
         access_scope=str(value.get("access_scope", "")),
         label_seal_ref=str(value["label_seal_ref"]) if value.get("label_seal_ref") is not None else None,
+    )
+
+
+def _mask_verifier_only_splits(record: DatasetRecord) -> DatasetRecord:
+    return replace(
+        record,
+        splits=tuple(
+            replace(split, content_hash=None, label_seal_ref=None)
+            if split.access_scope == "verifier-only"
+            else split
+            for split in record.splits
+        ),
     )
 
 
