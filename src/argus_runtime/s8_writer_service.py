@@ -93,6 +93,11 @@ class S8WriterApp:
             "edges": [asdict(edge) for edge in graph.edges],
         }
 
+    def query_impact_set(self, seed_refs: tuple[str, ...], *, edge_types: set[str] | None = None) -> dict[str, Any]:
+        self._refresh_store()
+        records = self.store.query_impact_set(seed_refs, edge_types=edge_types)
+        return {"records": [asdict(record) for record in records]}
+
     def _refresh_store(self) -> None:
         if self._data_dir is not None:
             self.store = FileSystemArtifactStore(self._data_dir)
@@ -197,6 +202,20 @@ class S8WriterApp:
             direction = request.query.get("direction", ["both"])[0]
             try:
                 return 200, self.get_lineage(artifact_ref, direction=direction)
+            except Exception as exc:
+                return 400, {"error": type(exc).__name__, "message": str(exc)}
+
+        @self.http.route("GET", "/v1/impact-set")
+        def impact_set(request: JsonRequest) -> tuple[int, Any]:
+            authenticated, error_response = self._authenticate(request)
+            if not authenticated:
+                return 401, error_response
+            seed_refs = tuple(request.query.get("seed_ref") or ())
+            edge_types = set(request.query.get("edge_type") or ()) or None
+            if not seed_refs:
+                return 400, {"error": "seed_ref_required"}
+            try:
+                return 200, self.query_impact_set(seed_refs, edge_types=edge_types)
             except Exception as exc:
                 return 400, {"error": type(exc).__name__, "message": str(exc)}
 

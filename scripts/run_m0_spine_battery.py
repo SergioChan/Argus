@@ -18,7 +18,7 @@ import subprocess
 import sys
 import time
 from typing import Any
-from urllib import error, request
+from urllib import error, parse, request
 from uuid import uuid4
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -200,19 +200,27 @@ def main() -> int:
             f"{s8_url}/v1/lineage/{model_record['artifact_ref']}?direction=ancestors",
             token=auth_tokens["read"],
         )
+        impact = _get_json(
+            f"{s8_url}/v1/impact-set?seed_ref={parse.quote(launch_result['launch_provenance_ref'], safe='')}",
+            token=auth_tokens["read"],
+        )
         ancestor_refs = {node["artifact_ref"] for node in lineage["nodes"]}
+        impact_refs = {record["artifact_ref"] for record in impact["records"]}
         if fetched["producer"]["job_id"] != "m0-spine-job":
             raise AssertionError("broker did not seal producer job_id")
         if launch_result["launch_provenance_ref"] not in ancestor_refs:
             raise AssertionError("model lineage did not include launch provenance")
+        if model_record["artifact_ref"] not in impact_refs:
+            raise AssertionError("model impact set did not include downstream model")
         _record(
             evidence,
             "f",
-            "real Docker launch had no default route; S10 broker wrote model C4 record; S8 read and lineage passed",
+            "real Docker launch had no default route; S10 broker wrote model C4 record; S8 read, lineage, and impact-set passed",
             {
                 "sandbox_stdout": launch_result["stdout"],
                 "launch_provenance_ref": launch_result["launch_provenance_ref"],
                 "model_ref": model_record["artifact_ref"],
+                "impact_refs": sorted(impact_refs),
             },
         )
 

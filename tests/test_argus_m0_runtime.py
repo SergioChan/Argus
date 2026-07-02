@@ -311,6 +311,43 @@ class ArgusM0RuntimeServiceTests(unittest.TestCase):
             self.assertEqual(reloaded.get_artifact_record(chained_payload["artifact_ref"]).artifact_ref, chained_payload["artifact_ref"])
             self.assertEqual(reloaded.record_count, 3)
 
+            impact_status, impact_payload = app.http.handle(
+                JsonRequest(
+                    method="GET",
+                    path="/v1/impact-set",
+                    query={"seed_ref": [external.artifact_ref]},
+                    body=None,
+                    headers=_auth_headers(),
+                )
+            )
+            unauth_impact_status, unauth_impact_payload = app.http.handle(
+                JsonRequest(
+                    method="GET",
+                    path="/v1/impact-set",
+                    query={"seed_ref": [external.artifact_ref]},
+                    body=None,
+                )
+            )
+            missing_seed_status, missing_seed_payload = app.http.handle(
+                JsonRequest(
+                    method="GET",
+                    path="/v1/impact-set",
+                    query={},
+                    body=None,
+                    headers=_auth_headers(),
+                )
+            )
+
+            self.assertEqual(impact_status, 200)
+            self.assertEqual(
+                [record["artifact_ref"] for record in impact_payload["records"]],
+                [chained_payload["artifact_ref"]],
+            )
+            self.assertEqual(unauth_impact_status, 401)
+            self.assertEqual(unauth_impact_payload["error"], "Unauthorized")
+            self.assertEqual(missing_seed_status, 400)
+            self.assertEqual(missing_seed_payload["error"], "seed_ref_required")
+
     def test_runtime_http_routes_require_bearer_authentication(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             s8 = S8WriterApp(

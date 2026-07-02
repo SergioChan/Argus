@@ -320,6 +320,15 @@ class PostgresArtifactStore:
             max_depth=max_depth,
         )
 
+    def query_impact_set(
+        self,
+        seed_refs: tuple[str, ...],
+        *,
+        edge_types: set[str] | None = None,
+    ) -> tuple[ArtifactRecord, ...]:
+        self.refresh()
+        return self._snapshot.query_impact_set(seed_refs, edge_types=edge_types)
+
     def query_artifacts(
         self,
         query: ArtifactQueryFilter | dict[str, Any] | None = None,
