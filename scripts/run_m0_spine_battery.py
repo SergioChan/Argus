@@ -37,6 +37,8 @@ from argus_core import (
     ResourceCeilings,
     ScopeGrant,
     ScopeToken,
+    SCRATCH_BUCKET,
+    WRITE_ONCE_BUCKET,
 )
 from argus_core.s8 import LedgerReplayError
 from argusverify import C3ReportSigner, InMemoryVerifierTrustStore, verify_report
@@ -67,6 +69,7 @@ def main() -> int:
     }
     data_tmp = tempfile.TemporaryDirectory(prefix="argus-m0-s8-")
     data_dir = Path(data_tmp.name)
+    _prepare_shared_data_dir(data_dir)
     ports = {
         "ARGUS_M0_POSTGRES_PORT": str(_free_port()),
         "ARGUS_M0_MINIO_PORT": str(_free_port()),
@@ -485,6 +488,17 @@ def _ensure_image(docker: str, image: str) -> None:
     if inspected.returncode == 0:
         return
     _run([docker, "pull", image], timeout=120)
+
+
+def _prepare_shared_data_dir(data_dir: Path) -> None:
+    for path in (
+        data_dir,
+        data_dir / "objects",
+        data_dir / "objects" / WRITE_ONCE_BUCKET,
+        data_dir / "objects" / SCRATCH_BUCKET,
+    ):
+        path.mkdir(parents=True, exist_ok=True)
+        path.chmod(0o777)
 
 
 def _run(
