@@ -12,7 +12,7 @@ import sys
 
 
 ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_MIGRATION = ROOT / "db" / "s8" / "001_append_only_schema.sql"
+DEFAULT_MIGRATION_TARGET = ROOT / "db" / "s8"
 
 
 def main() -> int:
@@ -21,10 +21,17 @@ def main() -> int:
     parser.add_argument("--port", default=os.environ.get("PGPORT"))
     parser.add_argument("--database", default=os.environ.get("PGDATABASE", "postgres"))
     parser.add_argument("--user", default=os.environ.get("PGUSER"))
-    parser.add_argument("--migration", type=Path, default=DEFAULT_MIGRATION)
+    parser.add_argument("--migration", type=Path, default=DEFAULT_MIGRATION_TARGET)
     args = parser.parse_args()
 
-    migration = args.migration.resolve()
+    for migration in _resolve_migrations(args.migration):
+        result = _apply_migration(args, migration)
+        if result != 0:
+            return result
+    return 0
+
+
+def _apply_migration(args: argparse.Namespace, migration: Path) -> int:
     migration_id = migration.stem
     checksum = _sha256(migration)
     existing = _existing_checksum(args, migration_id)
@@ -52,6 +59,18 @@ def main() -> int:
     )
     print(f"S8 migration {migration_id} applied with checksum {checksum}")
     return 0
+
+
+def _resolve_migrations(target: Path) -> list[Path]:
+    migration_target = target.resolve()
+    if migration_target.is_file():
+        return [migration_target]
+    if migration_target.is_dir():
+        migrations = sorted(migration_target.glob("*.sql"))
+        if migrations:
+            return migrations
+        raise RuntimeError(f"no SQL migrations found in {migration_target}")
+    raise RuntimeError(f"migration target does not exist: {migration_target}")
 
 
 def _existing_checksum(args: argparse.Namespace, migration_id: str) -> str | None:

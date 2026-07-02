@@ -12,7 +12,7 @@ import unittest
 
 
 ROOT = Path(__file__).resolve().parents[1]
-SCHEMA_SQL = ROOT / "db" / "s8" / "001_append_only_schema.sql"
+MIGRATIONS_DIR = ROOT / "db" / "s8"
 MIGRATION_SCRIPT = ROOT / "scripts" / "apply_s8_migrations.py"
 
 
@@ -248,6 +248,173 @@ class S8PostgresSchemaTests(unittest.TestCase):
         self.assertNotEqual(cyclic.returncode, 0)
         self.assertIn("lineage cycle detected", cyclic.stderr)
 
+    def test_lineage_query_functions_match_closure_recursive_and_impact_set(self) -> None:
+        self._commit_record("c4://artifact/source", sequence=1, kind="external_source")
+        self._commit_record(
+            "c4://artifact/dataset",
+            sequence=2,
+            kind="dataset",
+            input_refs=["c4://artifact/source"],
+        )
+        self._commit_record("c4://artifact/report", sequence=3, kind="validation_report")
+        self._commit_record(
+            "c4://artifact/model",
+            sequence=4,
+            kind="model",
+            input_refs=["c4://artifact/dataset"],
+            validation_report_ref="c4://artifact/report",
+        )
+        self._commit_record("c4://artifact/child", sequence=5, kind="model")
+        self._psql(
+            """
+            SET ROLE argus_s8_ledger_writer;
+            SELECT s8.insert_lineage_edge(
+                'c4://artifact/model',
+                'c4://artifact/child',
+                'derived_from',
+                NULL
+            );
+            RESET ROLE;
+            """
+        )
+
+        closure_ancestors = _stdout_lines(
+            self._psql(
+                """
+                SELECT artifact_id || '|' || direction || '|' || depth
+                FROM s8.query_lineage_closure('c4://artifact/child', 'ancestors', NULL::integer)
+                ORDER BY depth, artifact_id;
+                """
+            )
+        )
+        recursive_ancestors = _stdout_lines(
+            self._psql(
+                """
+                SELECT artifact_id || '|' || direction || '|' || depth
+                FROM s8.query_lineage_recursive(
+                    'c4://artifact/child',
+                    'ancestors',
+                    NULL::text[],
+                    NULL::integer
+                )
+                ORDER BY depth, artifact_id;
+                """
+            )
+        )
+        descendants = _stdout_lines(
+            self._psql(
+                """
+                SELECT artifact_id || '|' || direction || '|' || depth
+                FROM s8.query_lineage_closure('c4://artifact/source', 'descendants', NULL::integer)
+                ORDER BY depth, artifact_id;
+                """
+            )
+        )
+        max_depth_one = _stdout_lines(
+            self._psql(
+                """
+                SELECT artifact_id || '|' || direction || '|' || depth
+                FROM s8.query_lineage_closure('c4://artifact/child', 'ancestors', 1)
+                ORDER BY depth, artifact_id;
+                """
+            )
+        )
+        input_only = _stdout_lines(
+            self._psql(
+                """
+                SELECT artifact_id || '|' || direction || '|' || depth
+                FROM s8.query_lineage_recursive(
+                    'c4://artifact/model',
+                    'ancestors',
+                    ARRAY['input']::text[],
+                    NULL::integer
+                )
+                ORDER BY depth, artifact_id;
+                """
+            )
+        )
+        default_impact = _stdout_lines(
+            self._psql(
+                """
+                SELECT artifact_id || '|' || depth
+                FROM s8.query_impact_set(ARRAY['c4://artifact/source']::text[])
+                ORDER BY depth, artifact_id;
+                """
+            )
+        )
+        validation_impact = _stdout_lines(
+            self._psql(
+                """
+                SELECT artifact_id || '|' || depth
+                FROM s8.query_impact_set(
+                    ARRAY['c4://artifact/report']::text[],
+                    ARRAY['validation_report']::text[]
+                )
+                ORDER BY depth, artifact_id;
+                """
+            )
+        )
+        closure_verified = self._psql("SELECT s8.verify_lineage_closure('c4://artifact/child');")
+        reader_count = self._psql(
+            """
+            SET ROLE argus_s8_reader;
+            SELECT count(*)
+            FROM s8.query_lineage_recursive(
+                'c4://artifact/child',
+                'ancestors',
+                NULL::text[],
+                NULL::integer
+            );
+            """
+        )
+
+        self.assertEqual(
+            closure_ancestors,
+            [
+                "c4://artifact/child|self|0",
+                "c4://artifact/model|ancestor|1",
+                "c4://artifact/dataset|ancestor|2",
+                "c4://artifact/report|ancestor|2",
+                "c4://artifact/source|ancestor|3",
+            ],
+        )
+        self.assertEqual(recursive_ancestors, closure_ancestors)
+        self.assertEqual(
+            descendants,
+            [
+                "c4://artifact/source|self|0",
+                "c4://artifact/dataset|descendant|1",
+                "c4://artifact/model|descendant|2",
+                "c4://artifact/child|descendant|3",
+            ],
+        )
+        self.assertEqual(
+            max_depth_one,
+            [
+                "c4://artifact/child|self|0",
+                "c4://artifact/model|ancestor|1",
+            ],
+        )
+        self.assertEqual(
+            input_only,
+            [
+                "c4://artifact/model|self|0",
+                "c4://artifact/dataset|ancestor|1",
+                "c4://artifact/source|ancestor|2",
+            ],
+        )
+        self.assertEqual(
+            default_impact,
+            [
+                "c4://artifact/dataset|1",
+                "c4://artifact/model|2",
+                "c4://artifact/child|3",
+            ],
+        )
+        self.assertEqual(validation_impact, ["c4://artifact/model|1"])
+        self.assertEqual(closure_verified.stdout.strip(), "t")
+        self.assertEqual(reader_count.stdout.strip(), "5")
+
     def test_ledger_leaf_function_enforces_sequence_and_denies_direct_insert(self) -> None:
         zero_root = "blake3:" + ("0" * 64)
         first_root = "blake3:leaf-root-1"
@@ -478,9 +645,9 @@ class S8PostgresSchemaTests(unittest.TestCase):
         )
         drift = self._apply_s8_migrations(check=False)
 
-        self.assertEqual(first_count.stdout.strip(), "1")
+        self.assertEqual(first_count.stdout.strip(), "2")
         self.assertIn("already applied with matching checksum", reapplied.stdout)
-        self.assertEqual(second_count.stdout.strip(), "1")
+        self.assertEqual(second_count.stdout.strip(), "2")
         self.assertNotEqual(drift.returncode, 0)
         self.assertIn("checksum drift", drift.stderr)
 
@@ -533,7 +700,7 @@ class S8PostgresSchemaTests(unittest.TestCase):
             "--database",
             self.pg_database,
             "--migration",
-            str(SCHEMA_SQL),
+            str(MIGRATIONS_DIR),
         ]
         if self.pg_port is not None:
             command.extend(["--port", str(self.pg_port)])
@@ -591,6 +758,10 @@ def _text_array_literal(values: list[str]) -> str:
     if not values:
         return "ARRAY[]::text[]"
     return "ARRAY[" + ", ".join(_sql_literal(value) for value in values) + "]::text[]"
+
+
+def _stdout_lines(result: subprocess.CompletedProcess[str]) -> list[str]:
+    return [line.strip() for line in result.stdout.splitlines() if line.strip()]
 
 
 def _run_checked(args: list[str]) -> subprocess.CompletedProcess[str]:
