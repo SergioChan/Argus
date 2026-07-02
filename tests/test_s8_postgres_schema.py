@@ -645,11 +645,196 @@ class S8PostgresSchemaTests(unittest.TestCase):
         )
         drift = self._apply_s8_migrations(check=False)
 
-        self.assertEqual(first_count.stdout.strip(), "4")
+        self.assertEqual(first_count.stdout.strip(), "5")
         self.assertIn("already applied with matching checksum", reapplied.stdout)
-        self.assertEqual(second_count.stdout.strip(), "4")
+        self.assertEqual(second_count.stdout.strip(), "5")
         self.assertNotEqual(drift.returncode, 0)
         self.assertIn("checksum drift", drift.stderr)
+
+    def test_dataset_registry_functions_are_versioned_typed_and_append_only(self) -> None:
+        splits_v1 = [
+            {
+                "split_id": "train",
+                "role": "train",
+                "content_hash": "blake3:train",
+                "row_count": 10,
+                "schema_ref": "c4://schema/ewpt/v1",
+                "access_scope": "agent-readable",
+            },
+            {
+                "split_id": "blind",
+                "role": "blind",
+                "content_hash": "blake3:blind",
+                "row_count": 3,
+                "schema_ref": "c4://schema/ewpt/v1",
+                "access_scope": "verifier-only",
+                "label_seal_ref": "c4://labels/blind",
+            },
+        ]
+        splits_v2 = [
+            {
+                "split_id": "train",
+                "role": "train",
+                "content_hash": "blake3:train-v2",
+                "row_count": 12,
+                "schema_ref": "c4://schema/ewpt/v2",
+                "access_scope": "agent-readable",
+            }
+        ]
+        invalid_blind_splits = [
+            {
+                "split_id": "blind",
+                "role": "blind",
+                "content_hash": "blake3:blind",
+                "row_count": 3,
+                "schema_ref": "c4://schema/ewpt/v1",
+                "access_scope": "agent-readable",
+            }
+        ]
+        self._commit_record("c4://dataset/ewpt/1.0.0", sequence=1, kind="dataset")
+        self._commit_record("c4://dataset/ewpt/1.1.0", sequence=2, kind="dataset")
+        self._commit_record("c4://artifact/model", sequence=3, kind="model")
+
+        first = self._psql(
+            f"""
+            SET ROLE argus_s8_ledger_writer;
+            SELECT s8.register_dataset(
+                'ewpt-corpus',
+                '1.0.0',
+                'c4://dataset/ewpt/1.0.0',
+                {_jsonb_literal(splits_v1)},
+                'contam-2026-07-01'
+            );
+            """
+        )
+        second = self._psql(
+            f"""
+            SET ROLE argus_s8_ledger_writer;
+            SELECT s8.register_dataset(
+                'ewpt-corpus',
+                '1.0.0',
+                'c4://dataset/ewpt/1.0.0',
+                {_jsonb_literal(splits_v1)},
+                'contam-2026-07-01'
+            );
+            """
+        )
+        third = self._psql(
+            f"""
+            SET ROLE argus_s8_ledger_writer;
+            SELECT s8.register_dataset(
+                'ewpt-corpus',
+                '1.1.0',
+                'c4://dataset/ewpt/1.1.0',
+                {_jsonb_literal(splits_v2)},
+                'contam-2026-07-02'
+            );
+            """
+        )
+        conflict = self._psql(
+            f"""
+            SET ROLE argus_s8_ledger_writer;
+            SELECT s8.register_dataset(
+                'ewpt-corpus',
+                '1.0.0',
+                'c4://dataset/ewpt/1.0.0',
+                {_jsonb_literal(splits_v2)},
+                'contam-2026-07-01'
+            );
+            """,
+            check=False,
+        )
+        invalid_blind = self._psql(
+            f"""
+            SET ROLE argus_s8_ledger_writer;
+            SELECT s8.register_dataset(
+                'ewpt-invalid',
+                '1.0.0',
+                'c4://dataset/ewpt/1.0.0',
+                {_jsonb_literal(invalid_blind_splits)},
+                'contam-2026-07-01'
+            );
+            """,
+            check=False,
+        )
+        wrong_kind = self._psql(
+            f"""
+            SET ROLE argus_s8_ledger_writer;
+            SELECT s8.register_dataset(
+                'ewpt-wrong-kind',
+                '1.0.0',
+                'c4://artifact/model',
+                {_jsonb_literal(splits_v1)},
+                'contam-2026-07-01'
+            );
+            """,
+            check=False,
+        )
+        reader_v1_artifact = self._psql(
+            """
+            SET ROLE argus_s8_reader;
+            SELECT s8.get_dataset('ewpt-corpus', '1.0.0')->'provenance_ref'->>'artifact_id';
+            """
+        )
+        reader_latest = self._psql(
+            """
+            SET ROLE argus_s8_reader;
+            SELECT s8.get_dataset('ewpt-corpus', NULL)->>'version';
+            """
+        )
+        reader_versions = self._psql(
+            """
+            SET ROLE argus_s8_reader;
+            SELECT string_agg(version, ',' ORDER BY version)
+            FROM s8.list_dataset_versions('ewpt-corpus');
+            """
+        )
+        direct_insert = self._psql(
+            f"""
+            SET ROLE argus_s8_ledger_writer;
+            INSERT INTO s8.dataset_registry (
+                dataset_id,
+                version,
+                dataset_artifact_id,
+                splits,
+                contamination_index_version
+            ) VALUES (
+                'direct',
+                '1.0.0',
+                'c4://dataset/ewpt/1.0.0',
+                {_jsonb_literal(splits_v1)},
+                'contam'
+            );
+            """,
+            check=False,
+        )
+        update = self._psql(
+            """
+            UPDATE s8.dataset_registry
+            SET contamination_index_version = 'tampered'
+            WHERE dataset_id = 'ewpt-corpus';
+            """,
+            check=False,
+        )
+        row_count = self._psql("SELECT count(*) FROM s8.dataset_registry;")
+
+        self.assertEqual(first.stdout.strip(), "t")
+        self.assertEqual(second.stdout.strip(), "f")
+        self.assertEqual(third.stdout.strip(), "t")
+        self.assertNotEqual(conflict.returncode, 0)
+        self.assertIn("already exists with different payload", conflict.stderr)
+        self.assertNotEqual(invalid_blind.returncode, 0)
+        self.assertIn("verifier-only access_scope", invalid_blind.stderr)
+        self.assertNotEqual(wrong_kind.returncode, 0)
+        self.assertIn("has kind model", wrong_kind.stderr)
+        self.assertEqual(reader_v1_artifact.stdout.strip(), "c4://dataset/ewpt/1.0.0")
+        self.assertEqual(reader_latest.stdout.strip(), "1.1.0")
+        self.assertEqual(reader_versions.stdout.strip(), "1.0.0,1.1.0")
+        self.assertNotEqual(direct_insert.returncode, 0)
+        self.assertIn("permission denied", direct_insert.stderr)
+        self.assertNotEqual(update.returncode, 0)
+        self.assertIn("append-only table dataset_registry", update.stderr)
+        self.assertEqual(row_count.stdout.strip(), "2")
 
     def test_audit_export_proofs_verify_and_detect_record_tamper(self) -> None:
         zero_root = "blake3:" + ("0" * 64)

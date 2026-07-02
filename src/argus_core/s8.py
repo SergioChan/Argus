@@ -80,6 +80,15 @@ class LedgerReplayError(S8Error):
         self.reason = reason
 
 
+class DatasetRegistryError(S8Error):
+    """Raised when a dataset registry record violates S8 dataset invariants."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.category = "DATASET_REGISTRY_INVALID"
+        self.reason = reason
+
+
 @dataclass(frozen=True)
 class Producer:
     subsystem: str
@@ -283,8 +292,37 @@ class ExternalSourceRef:
         return f"{self.source}:{self.external_id}"
 
 
+@dataclass(frozen=True)
+class DatasetSplit:
+    split_id: str
+    role: str
+    content_hash: str
+    row_count: int
+    schema_ref: str
+    access_scope: str
+    label_seal_ref: str | None = None
+
+
+@dataclass(frozen=True)
+class DatasetProvenanceRef:
+    artifact_ref: str
+    content_hash: str
+
+
+@dataclass(frozen=True)
+class DatasetRecord:
+    dataset_id: str
+    version: str
+    splits: tuple[DatasetSplit, ...]
+    contamination_index_version: str
+    provenance_ref: DatasetProvenanceRef
+
+
 WRITE_ONCE_BUCKET = "write_once"
 SCRATCH_BUCKET = "scratch"
+DATASET_SPLIT_ROLES = ("train", "val", "test", "blind", "null_control", "injection")
+DATASET_VERIFIER_ONLY_ROLES = ("blind", "null_control", "injection")
+DATASET_ACCESS_SCOPES = ("agent-readable", "verifier-only")
 
 
 class ObjectStoreFacade(Protocol):
@@ -1136,6 +1174,161 @@ class ExternalSourceRegistry:
         return f"c4://external_source/{source_id}"
 
 
+class DatasetRegistry:
+    """C4-backed dataset registry projection with versioned, typed splits."""
+
+    def __init__(self, *, artifact_store: InMemoryArtifactStore) -> None:
+        self._artifact_store = artifact_store
+        self._records: dict[tuple[str, str], DatasetRecord] = {}
+        self._rebuild_index()
+
+    def register(
+        self,
+        *,
+        dataset_id: str,
+        version: str,
+        splits: tuple[DatasetSplit, ...],
+        contamination_index_version: str,
+        producer: Producer | None = None,
+        lineage: Lineage | None = None,
+    ) -> DatasetRecord:
+        normalized = self._normalize_dataset_input(
+            dataset_id=dataset_id,
+            version=version,
+            splits=splits,
+            contamination_index_version=contamination_index_version,
+        )
+        payload = _dataset_payload(
+            dataset_id=dataset_id,
+            version=version,
+            splits=normalized,
+            contamination_index_version=contamination_index_version,
+        )
+        artifact = self._artifact_store.create_artifact(
+            artifact_ref=self._artifact_ref(dataset_id, version),
+            kind="dataset",
+            payload=payload,
+            producer=producer or Producer(subsystem="S8", version="0.0.0"),
+            lineage=lineage
+            or Lineage(
+                input_refs=tuple(split.content_hash for split in normalized),
+                code_ref="s8:dataset-registry",
+                environment_digest="s8:dataset-registry-v1",
+            ),
+        )
+        dataset_record = DatasetRecord(
+            dataset_id=dataset_id,
+            version=version,
+            splits=normalized,
+            contamination_index_version=contamination_index_version,
+            provenance_ref=DatasetProvenanceRef(
+                artifact_ref=artifact.artifact_ref,
+                content_hash=artifact.content_hash,
+            ),
+        )
+        self._records[(dataset_id, version)] = dataset_record
+        return dataset_record
+
+    def get(self, dataset_id: str, version: str | None = None) -> DatasetRecord:
+        selected_version = version or self._latest_version(dataset_id)
+        try:
+            return self._records[(dataset_id, selected_version)]
+        except KeyError as exc:
+            raise DatasetRegistryError(f"dataset not found: {dataset_id}@{selected_version}") from exc
+
+    def list_versions(self, dataset_id: str) -> tuple[str, ...]:
+        return tuple(
+            version
+            for stored_dataset_id, version in sorted(self._records, key=lambda item: _dataset_version_key(item[1]))
+            if stored_dataset_id == dataset_id
+        )
+
+    def _latest_version(self, dataset_id: str) -> str:
+        versions = self.list_versions(dataset_id)
+        if not versions:
+            raise DatasetRegistryError(f"dataset not found: {dataset_id}")
+        return versions[-1]
+
+    def _rebuild_index(self) -> None:
+        for artifact in getattr(self._artifact_store, "_records", {}).values():
+            if artifact.kind != "dataset":
+                continue
+            payload = self._artifact_store._payload_for_record(artifact)
+            if not isinstance(payload, Mapping):
+                continue
+            required = {"dataset_id", "version", "splits", "contamination_index_version"}
+            if not required <= set(payload):
+                continue
+            dataset_id = payload.get("dataset_id")
+            version = payload.get("version")
+            contamination_index_version = payload.get("contamination_index_version")
+            raw_splits = payload.get("splits")
+            if not isinstance(dataset_id, str) or not isinstance(version, str):
+                continue
+            if not isinstance(contamination_index_version, str) or not isinstance(raw_splits, list):
+                continue
+            splits = tuple(_dataset_split_from_mapping(split) for split in raw_splits if isinstance(split, Mapping))
+            normalized = self._normalize_dataset_input(
+                dataset_id=dataset_id,
+                version=version,
+                splits=splits,
+                contamination_index_version=contamination_index_version,
+            )
+            self._records[(dataset_id, version)] = DatasetRecord(
+                dataset_id=dataset_id,
+                version=version,
+                splits=normalized,
+                contamination_index_version=contamination_index_version,
+                provenance_ref=DatasetProvenanceRef(
+                    artifact_ref=artifact.artifact_ref,
+                    content_hash=artifact.content_hash,
+                ),
+            )
+
+    @staticmethod
+    def _normalize_dataset_input(
+        *,
+        dataset_id: str,
+        version: str,
+        splits: tuple[DatasetSplit, ...],
+        contamination_index_version: str,
+    ) -> tuple[DatasetSplit, ...]:
+        if not dataset_id:
+            raise DatasetRegistryError("dataset_id is required")
+        if not version:
+            raise DatasetRegistryError("dataset version is required")
+        if not contamination_index_version:
+            raise DatasetRegistryError("contamination_index_version is required")
+        if not splits:
+            raise DatasetRegistryError("at least one dataset split is required")
+        seen_split_ids: set[str] = set()
+        normalized: list[DatasetSplit] = []
+        for split in splits:
+            if not split.split_id:
+                raise DatasetRegistryError("split_id is required")
+            if split.split_id in seen_split_ids:
+                raise DatasetRegistryError(f"duplicate split_id: {split.split_id}")
+            seen_split_ids.add(split.split_id)
+            if split.role not in DATASET_SPLIT_ROLES:
+                raise DatasetRegistryError(f"unsupported split role: {split.role}")
+            if split.access_scope not in DATASET_ACCESS_SCOPES:
+                raise DatasetRegistryError(f"unsupported access_scope: {split.access_scope}")
+            if split.role in DATASET_VERIFIER_ONLY_ROLES and split.access_scope != "verifier-only":
+                raise DatasetRegistryError(f"{split.role} split must use verifier-only access_scope")
+            if split.row_count < 0:
+                raise DatasetRegistryError("split row_count must be non-negative")
+            if not split.content_hash:
+                raise DatasetRegistryError("split content_hash is required")
+            if not split.schema_ref:
+                raise DatasetRegistryError("split schema_ref is required")
+            normalized.append(split)
+        return tuple(sorted(normalized, key=lambda split: split.split_id))
+
+    @staticmethod
+    def _artifact_ref(dataset_id: str, version: str) -> str:
+        return "c4://dataset/" + dataset_id.replace("/", "_") + "/" + version.replace("/", "_")
+
+
 def _assert_known_bucket_class(bucket_class: str) -> None:
     if bucket_class not in {WRITE_ONCE_BUCKET, SCRATCH_BUCKET}:
         raise ValueError(f"unknown bucket_class: {bucket_class}")
@@ -1144,6 +1337,51 @@ def _assert_known_bucket_class(bucket_class: str) -> None:
 def _assert_payload_matches_hash(content_hash: str, payload: bytes) -> None:
     if hash_bytes(payload) != content_hash:
         raise HashMismatchError(f"hash mismatch for {content_hash}")
+
+
+def _dataset_payload(
+    *,
+    dataset_id: str,
+    version: str,
+    splits: tuple[DatasetSplit, ...],
+    contamination_index_version: str,
+) -> dict[str, Any]:
+    return {
+        "dataset_id": dataset_id,
+        "version": version,
+        "splits": [
+            {
+                "split_id": split.split_id,
+                "role": split.role,
+                "content_hash": split.content_hash,
+                "row_count": split.row_count,
+                "schema_ref": split.schema_ref,
+                "access_scope": split.access_scope,
+                **({"label_seal_ref": split.label_seal_ref} if split.label_seal_ref is not None else {}),
+            }
+            for split in splits
+        ],
+        "contamination_index_version": contamination_index_version,
+    }
+
+
+def _dataset_split_from_mapping(value: Mapping[str, Any]) -> DatasetSplit:
+    return DatasetSplit(
+        split_id=str(value.get("split_id", "")),
+        role=str(value.get("role", "")),
+        content_hash=str(value.get("content_hash", "")),
+        row_count=int(value.get("row_count", -1)),
+        schema_ref=str(value.get("schema_ref", "")),
+        access_scope=str(value.get("access_scope", "")),
+        label_seal_ref=str(value["label_seal_ref"]) if value.get("label_seal_ref") is not None else None,
+    )
+
+
+def _dataset_version_key(version: str) -> tuple[Any, ...]:
+    parts = version.split(".")
+    if all(part.isdigit() for part in parts):
+        return (0, *(int(part) for part in parts))
+    return (1, version)
 
 
 def _record_from_ledger_event(event: Mapping[str, Any]) -> ArtifactRecord:
