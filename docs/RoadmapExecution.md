@@ -45,6 +45,29 @@ A roadmap subtask may be marked `complete` only when all of these are true:
 7. Any required integration contract evidence is linked in the roadmap status
    file.
 
+## Declared Deployment Targets (Rev B, 2026-07-01)
+
+The "declared real target environment" referenced by the stage rules below is:
+
+- **M0–M2:** a Linux host (Ubuntu 24.04 LTS VM or GitHub Actions `ubuntu-latest`)
+  running the `argus-m0` docker-compose stack (Postgres 16 + MinIO + S8 writer +
+  S10 supervisor). macOS development machines never satisfy a stage gate.
+- **M3+:** to be declared before M3 starts, as part of the M1.5/M2 review.
+
+## Stage E2E Binding (Rev B)
+
+A stage's "real end-to-end test" is not self-selected: it MUST be the
+demo/acceptance battery defined for that milestone in `docs/Roadmap.md`
+(e.g. the M0 Spine Integration Slice battery items (a)–(g)), executed against
+the declared target above, with the battery item IDs recorded in the evidence.
+
+## M1.5 Demand-Validation Gate (Rev B)
+
+M2 work may not start until the M1.5 gate defined in `docs/Roadmap.md` §0a.4 is
+recorded in this repository: pilot-physicist demo evidence, net-time accounting,
+and the measured build:verify cost ratio. A negative pilot signal triggers a
+direction re-review before further infrastructure investment.
+
 ## Stage Completion Rule
 
 A roadmap stage may be marked `complete` only when all of these are true:

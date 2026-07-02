@@ -3,7 +3,7 @@
 > **Part of the Project Argus design set.** Start at README.md for the doc map and reading order. Related docs: Architecture.md, PRD.md, TechDesign.md, Backlog-and-Interfaces.md, TestPlan.md, Roadmap.md.
 
 **Document owner:** Delivery Lead
-**Status:** Complete build plan (not an MVP). Covers 100% of the decoupled backlog across all 12 subsystems.
+**Status:** **Rev B (2026-07-01)** — depth-first re-cut per the adversarial design review. Still covers 100% of the decoupled backlog across all 12 subsystems, but M0/M1 are re-scoped to a minimal trustworthy spine + one thin oracle-gated slice, with hardening mass deferred to M2. See §0a.
 **Scope of this roadmap:** ordered milestones M0..M6, each with goal, entry/exit criteria, the explicit set of included subtask IDs, the cross-subsystem integration deliverable, a concrete demo/acceptance test, and the parallelizable tracks. Followed by the critical path and decoupling notes.
 
 ---
@@ -27,6 +27,21 @@ Argus's whole architecture is a bet on **decoupling through published contracts*
 
 ---
 
+## 0a. Rev B (2026-07-01) — depth-first re-cut
+
+Rev B implements the required corrections from the 2026-07-01 adversarial design review (56-agent verification; 16 findings survived 3-stance refutation). The backlog itself is unchanged (377 subtasks, same IDs, same estimates); what changes is **milestone assignment, milestone scope, and gate definitions**:
+
+1. **M0 is re-scoped to the *Minimal Trustworthy Spine* (38 tasks, was 73).** M0 keeps: the six contract schema roots + bindings, the S8 core commit path (S8-T01–T17, T21), a **minimal S10 execution boundary** (S10-T01/T02/T03/T04/T05/T08/T14/T19 — token mint/verify, pure policy decide, quota ledger, node supervisor, admission+launch of a digest-pinned container with **no network**, store-writer broker as the sole agent write path, launch provenance), and **`argusverify` (S3-T06) pulled forward into M0** as the single shared C3 signature-verification library that every later verification point (S4-T09, S8-T10, S9-T03, S11-T10) MUST consume instead of re-implementing. gVisor/Firecracker, egress proxy + DNS pinning, eBPF escape detection, GPU/MIG, warm pools, and the red-team battery move to M2 as the *hardening* wave: real isolation classes harden an already-proven spine — they are not prerequisites for proving the thesis.
+2. **Declared deployment target (fixes the dangling gate reference).** For M0–M2 the declared real target environment is: **a Linux host (Ubuntu 24.04 LTS VM or GitHub Actions `ubuntu-latest`) running the `argus-m0` docker-compose stack (Postgres 16 + MinIO + the S8 writer + S10 supervisor)**. "Deployed" in RoadmapExecution.md means deployed to that stack; "real E2E" means the milestone's demo/acceptance battery below executed against it. macOS dev machines are for development only — stage gates run on the declared Linux target.
+3. **M1 is slimmed to the thinnest oracle-gated slice that can prove the thesis (60 tasks, was 93).** One C1 subagent (core lifecycle only), the S2 tabular baseline path, **one** S7 reference adapter (`gw_spectrum`, its independent twin joins in M3 with CROSS_CODE), and the minimal S3 (INJECTION + NULL_CONTROL + PHYSICAL_CONSISTENCY + signer + tiering + the bidirectional perturbation oracle TPR2/TPR3/TPR4). Deferred S1/S2/S7 conveniences (auto-repair, cancel/heartbeat, egress derivation, CLIs, observability plumbing, caches, batch, extra adapters) move to M2–M4.
+4. **M1.5 — demand-validation gate (new, blocking).** Before M2 work starts: (a) the M1 slice is demonstrated to **at least one pilot physicist** on a real subtopic; (b) a net-time accounting is recorded (pilot's wall-clock to a verified artifact vs. their status-quo estimate); (c) the first real **build:verify cost ratio** is measured and written into the budget-envelope numbers that M2+ gates reference. If the pilot signal is negative, the direction is re-reviewed before further infrastructure investment. This gate exists because the design set currently contains zero demand-side evidence (review finding C-2).
+5. **Design directives binding M1 implementation (review findings C-3, M-1, M-2, M-3):** (a) **Oracle semantics must be generalized before S3 check implementation** — INJECTION/NULL/insensitivity semantics parameterized by `task_type` (signal-detection vs. forward-emulator vs. classifier), tiering keyed to the profile's declared mandatory-check set; the design author (Claude) owns this spec revision and will publish it as a C3/profile-schema addendum; Codex must not implement S3 check plugins ahead of it. (b) `sensitivity_floor`, `K` (min independent challengers), and correlation thresholds get **concrete default values and owners** in the same addendum. (c) C3 `aggregate` gains a `score_se` (standard-error) field and the independence attestation gains a **model-lineage dimension** (both additive-minor) so that S4 selection can use significance tests and challenger independence can account for shared-foundation-model common mode. (d) The two planted-case "100%" KPIs are re-stated as **planted regression-audit batteries** (like the escape battery's 0/N), not population guarantees.
+6. **M2 is re-themed "Hardening, Orchestration & Provenance at Scale"** and absorbs the deferred S10 isolation classes, S8 operational surfaces, and S1/S2/S3/S7 hardening tasks (114 tasks). Its internal sequencing is decided *after* the M1.5 gate — deliberately, so that hardening investment follows a proven, wanted spine.
+
+The coverage ledger in §9 and the per-milestone ID lists below are Rev B-authoritative. Architecture.md/README.md milestone-theme tables will be synced in the M0 errata batch; where they disagree, **this document wins**.
+
+---
+
 ## M0 — Spine & Contracts First
 
 **Goal.** Freeze C1..C6 as versioned draft-2020-12 JSON Schemas with multi-language bindings; stand up the two foundational zero-dependency subsystems — the S8 data/provenance plane and the S10 sandbox/runtime/security substrate — so all 12 teams build against stable, tested seams. Nothing agent-authored can execute or persist an artifact except through S10 and S8. **C3 is frozen at v1.1** (additive, backward-compatible) from M0 — pre-implementation, so there is no migration — carrying the six new ValidationReport fields (`perturbation_pairs`, `insensitivity_flags`, `challenger_panel`, `independence_attestation_debate`, `referee`, `debate_ref`) that the M1 perturbation oracle and the M5 red-blue debate will populate.
@@ -38,8 +53,10 @@ Argus's whole architecture is a bet on **decoupling through published contracts*
 **Exit criteria.**
 - All six contract schemas (C1..C6) are authored, meta-validated, semver-1.0.0 tagged, published to the schema registry, and have compiling round-trip bindings in Python/TS/Rust with a CI drift gate. **C3 is frozen at v1.1** with the six new ValidationReport fields (`perturbation_pairs`, `insensitivity_flags`, `challenger_panel`, `independence_attestation_debate`, `referee`, `debate_ref`), meta-validated and round-trip-bound like the rest (S3-TPR1); consumers tolerate the additive fields with no migration.
 - S8 can commit a content-addressed C4 ArtifactRecord with complete lineage, fail-closed on incomplete lineage or illegal tier coupling, enforce append-only/write-once, and answer ancestor/descendant/impact-set lineage queries; Merkle audit chain verifiable.
-- S10 can mint/verify budget+scope tokens, meter a running sandbox against a budget and halt on breach, launch a digest-pinned cosign-verified image under gVisor/Firecracker with default-deny egress via the proxy, broker credentialed calls with zero secrets in the sandbox, and emit launch provenance to S8.
+- S10 (minimal execution boundary, Rev B) can mint/verify budget+scope tokens, make pure allow/deny/halt policy decisions, keep a reserve→consume→release quota ledger, launch a digest-pinned container **with no network attached** under the node supervisor, route every agent write through the store-writer broker (the sole agent write path), and emit launch provenance to S8. *(gVisor/Firecracker isolation classes, the egress proxy + DNS pinning, eBPF escape detection, GPU/MIG metering, warm pools, and the red-team escape battery are the M2 hardening wave.)*
+- `argusverify` (S3-T06) ships as the single shared multi-language C3 signature-verification library; S8-T10's tier-coupling check consumes it (no per-subsystem re-implementations).
 - Cross-language hashing/canonicalization agree byte-for-byte.
+- Everything above is deployed to the **declared M0 target** (the `argus-m0` docker-compose stack on a Linux host — see §0a.2) and the demo battery below runs against it.
 
 **Included subtask IDs.**
 
@@ -49,31 +66,34 @@ Argus's whole architecture is a bet on **decoupling through published contracts*
 `S3-T01, S3-TPR1` (C3 schemas + bindings; C3 frozen at v1.1 with the six new ValidationReport fields),
 `S5-T01, S5-T31` (C2 schema + version-compat/dual-serve),
 `S7-T01, S7-T02` (C6 schemas + bindings),
-`S8-T01, S8-T02, S8-T04, S8-T27` (C4 schema, canonicalization spec, bindings+generator, schema registry service).
+`S8-T01, S8-T02, S8-T04` (C4 schema, canonicalization spec, bindings+generator). *(S8-T27 schema-registry service → M2.)*
 
-*S8 foundational data/provenance plane (owner of C4):*
-`S8-T03, S8-T05, S8-T06, S8-T07, S8-T08, S8-T09, S8-T10, S8-T11, S8-T12, S8-T13, S8-T14, S8-T15, S8-T16, S8-T17, S8-T18, S8-T19, S8-T20, S8-T21, S8-T22, S8-T23, S8-T24, S8-T25, S8-T26`.
+*Shared verification library (Rev B — pulled forward from M1):*
+`S3-T06` (`argusverify` multi-language C3 signature-verification library — the single implementation all later verification points consume).
 
-*S10 foundational sandbox/runtime/security substrate:*
-`S10-T01, S10-T02, S10-T02b, S10-T03, S10-T04, S10-T04b, S10-T05, S10-T06, S10-T07, S10-T08, S10-T09, S10-T09b, S10-T10, S10-T11, S10-T12, S10-T13, S10-T14, S10-T15, S10-T16, S10-T17, S10-T18, S10-T19, S10-T20, S10-T21, S10-T22, S10-T23, S10-T24, S10-T25, S10-T26, S10-T27, S10-T30, S10-T31`.
+*S8 core commit path (owner of C4; Rev B — operational surfaces T18–T20/T22–T27 → M2):*
+`S8-T03, S8-T05, S8-T06, S8-T07, S8-T08, S8-T09, S8-T10, S8-T11, S8-T12, S8-T13, S8-T14, S8-T15, S8-T16, S8-T17, S8-T21`.
+
+*S10 minimal execution boundary (Rev B — isolation-class hardening → M2):*
+`S10-T01, S10-T02, S10-T03, S10-T04, S10-T05, S10-T08, S10-T14, S10-T19`.
 
 **Cross-subsystem integration deliverable.**
-The **Spine Integration Slice**: a scripted flow that mints a budget+scope token (S10-T02), launches a digest-pinned image in a gVisor sandbox with default-deny egress (S10-T06/T08/T09/T20), writes a small artifact through the store-writer broker (S10-T14) which lands a complete, hashed, lineage-linked C4 ArtifactRecord in S8 (S8-T07), and emits launch provenance (S10-T19 → S8-T07). The C4 record is then read back with verify-on-read (S8-T21) and its lineage queried (S8-T12). All six contract binding packages are consumable from a fresh checkout with the CI drift gate green.
+The **Spine Integration Slice** (Rev B): a scripted flow on the declared M0 target that mints a budget+scope token (S10-T02), launches a digest-pinned container **with no network attached** under the node supervisor (S10-T05/T08), writes a small artifact through the store-writer broker — the sole agent write path (S10-T14) — which lands a complete, hashed, lineage-linked C4 ArtifactRecord in S8 (S8-T07), and emits launch provenance (S10-T19 → S8-T07). The C4 record is then read back with verify-on-read (S8-T21), its lineage queried (S8-T12), and its (stub) report signature checked through `argusverify` (S3-T06). All six contract binding packages are consumable from a fresh checkout with the CI drift gate green.
 
 **Demo / acceptance test.**
-"Foundations are trustworthy and the seams are stable." Run: (a) meta-validate + round-trip all six schemas across three languages, including C3 v1.1 with its six new ValidationReport fields present and additive-compatible (CI drift gate green; S3-TPR1); (b) attempt a write with incomplete lineage → rejected fail-closed (S8-TC07); (c) attempt to overwrite a write-once artifact → blocked (S8-TC13); (d) tamper with a committed record → detected via Merkle chain (S8-TC22/TC23); (e) run the red-team escape battery in the sandbox → 0/N escapes (S10-TC20/TC26); (f) run a sandbox past its budget → halt within SLA with partial capture (S10-TC12/TC13); (g) confirm no secret-shaped value reaches the sandbox and direct bucket writes are egress-denied (S10-TC05/TC15/TC36).
+"Foundations are trustworthy and the seams are stable." Run: (a) meta-validate + round-trip all six schemas across three languages, including C3 v1.1 with its six new ValidationReport fields present and additive-compatible (CI drift gate green; S3-TPR1); (b) attempt a write with incomplete lineage → rejected fail-closed (S8-TC07); (c) attempt to overwrite a write-once artifact → blocked (S8-TC13); (d) tamper with a committed record → detected via Merkle chain (S8-TC22/TC23); (e) run a sandboxed job past its budget → the quota ledger + supervisor halt it with partial capture (S10-TC12/TC13); (f) confirm the launched container has no network route and that the store-writer broker is the only path by which the sandboxed process can persist an artifact (S10-TC05/TC15); (g) verify a signed record's signature offline through `argusverify` and confirm a tampered signature is rejected (S3-TC02/TC03). *(The red-team escape battery, egress-proxy, and secret-broker acceptance items move to the M2 hardening wave with their tasks.)*
 
 **Parallel tracks.**
-- **Track A (Contracts):** the six schema-authoring roots (S1-T01/T03/T25/T30, S3-T01/S3-TPR1, S5-T01/T31, S7-T01/T02, S8-T01/T02/T04/T27, S2-T01) — independent per contract; only cross-touch is C4 being consumed by others' bindings. C3 is authored directly at v1.1 (six new fields) so no later migration is needed.
-- **Track B (S8 data plane):** all remaining S8 tasks — depends only on the C4 schema root + base infra.
-- **Track C (S10 substrate):** all S10 M0 tasks — depends only on the S10 schema root + base infra.
+- **Track A (Contracts):** the six schema-authoring roots (S1-T01/T03/T25/T30, S3-T01/S3-TPR1, S5-T01/T31, S7-T01/T02, S8-T01/T02/T04, S2-T01) plus `argusverify` (S3-T06) — independent per contract; only cross-touch is C4 being consumed by others' bindings. C3 is authored directly at v1.1 (six new fields) so no later migration is needed.
+- **Track B (S8 core commit path):** S8-T03/T05–T17/T21 — depends only on the C4 schema root + base infra.
+- **Track C (S10 minimal execution boundary):** S10-T01/T02/T03/T04/T05/T08/T14/T19 — depends only on the S10 schema root + base infra.
 Tracks B and C are fully independent of each other except at the two integration touchpoints (store-writer broker → S8 writer; launch provenance → S8), which are wired last in M0.
 
 ---
 
 ## M1 — One Vertical Slice, Oracle-Gated
 
-**Goal.** Prove *verify-before-trust* on one real subtopic end-to-end: a single C1 subagent (S1 runtime) driving an S2 classical/tabular baseline build, calling one or two S7 physics adapters for physics-aware features/targets, and handing a frozen pipeline to a minimal S3 verifier (injection + null + physical-consistency) that returns a **signed** ValidationReport. The minimal S3 verifier now explicitly includes the **bidirectional perturbation oracle**: a MUST-REACT / MUST-NOT-REACT perturbation-pair runner (S3-TPR2), an **insensitivity detector** that FAILs any claim invariant to a perturbation it should have reacted to (S3-TPR3), and **non-gameable referee enforcement** — the referee is oracle-backed, signed, and `distinct_from_proponent` (referee != builder) (S3-TPR4). Claim-tiering is wired end-to-end to `ran-toy` / `recapitulated-known`, with structural prevention of self-promotion and self-attestation.
+**Goal.** Prove *verify-before-trust* on one real subtopic end-to-end: a single C1 subagent (S1 runtime) driving an S2 classical/tabular baseline build, calling **one** S7 physics adapter (Rev B) for physics-aware features/targets, and handing a frozen pipeline to a minimal S3 verifier (injection + null + physical-consistency) that returns a **signed** ValidationReport. The minimal S3 verifier now explicitly includes the **bidirectional perturbation oracle**: a MUST-REACT / MUST-NOT-REACT perturbation-pair runner (S3-TPR2), an **insensitivity detector** that FAILs any claim invariant to a perturbation it should have reacted to (S3-TPR3), and **non-gameable referee enforcement** — the referee is oracle-backed, signed, and `distinct_from_proponent` (referee != builder) (S3-TPR4). Claim-tiering is wired end-to-end to `ran-toy` / `recapitulated-known`, with structural prevention of self-promotion and self-attestation.
 
 **Entry criteria.**
 - M0 exit met: C1..C6 frozen; S8 and S10 operational.
@@ -82,7 +102,7 @@ Tracks B and C are fully independent of each other except at the two integration
 **Exit criteria.**
 - The full C1 lifecycle (REGISTERED→…→REPORTED) runs for one reference subagent, executing only in S10 and emitting fail-closed C4 provenance for every artifact.
 - S2 builds a deterministic frozen inference pipeline (features + model + calibration) with mandatory uncertainty, capped at `ran-toy`, with no self-grading path.
-- At least two S7 reference adapters (a bounce/effective-potential wrapper + a GW-spectrum solver, one with an independent twin) are registered, units/uncertainty/domain-tagged, and callable via the broker with per-call provenance.
+- One S7 reference adapter (the GW-spectrum solver, S7-T23) is registered, units/uncertainty/domain-tagged, and callable via the broker with per-call provenance. *(Rev B: its independent twin and the bounce adapter join in M3 with CROSS_CODE; the M1 slice proves the oracle mechanics, not cross-code independence.)*
 - S3 runs INJECTION, NULL_CONTROL, and PHYSICAL_CONSISTENCY over a blind-data vault against the frozen pipeline in a nested sandbox, assembles a canonicalized, signed, write-once ValidationReport, and assigns a tier deterministically. The subagent's `report()` sources tier **only** from that signed report.
 - S3 runs **bidirectional perturbation pairs** via `run_perturbation_pair(model_ref, perturbation_spec)`: a MUST-REACT probe plants a known-real signal and requires proportional, amplitude-linear recovery (no recovery → FAIL); a MUST-NOT-REACT probe injects noise / shuffled labels / fake-contamination and requires appropriate degradation (a strong result surviving unchanged → FAIL). Results populate `perturbation_pairs` on the C3 v1.1 ValidationReport (S3-TPR2).
 - S3's **insensitivity detector** (`detect_insensitivity(model_ref, perturbation_set)`) flags any claim invariant to a perturbation it should have reacted to (memorized / constant / spurious-feature) and populates `insensitivity_flags`; a claim passes only when BOTH perturbation directions pass AND no insensitivity is detected (S3-TPR3).
@@ -90,27 +110,29 @@ Tracks B and C are fully independent of each other except at the two integration
 
 **Included subtask IDs.**
 
-*S1 subagent framework/runtime (full — the contract's reference implementation):*
-`S1-T02, S1-T04, S1-T05, S1-T06, S1-T07, S1-T08, S1-T09, S1-T10, S1-T11, S1-T12, S1-T13, S1-T14, S1-T15, S1-T16, S1-T17, S1-T18, S1-T19, S1-T20, S1-T21, S1-T22, S1-T23, S1-T24, S1-T26, S1-T27, S1-T28, S1-T29`.
-*(S1-T01/T03/T25/T30 were delivered in M0.)*
+*S1 subagent runtime — core lifecycle only (Rev B; conveniences → M2, registry/conformance surfaces → M3/M4):*
+`S1-T04, S1-T05, S1-T06, S1-T07, S1-T08, S1-T09, S1-T10, S1-T11, S1-T14, S1-T15, S1-T16, S1-T17, S1-T28`.
+*(S1-T01/T03/T25/T30 delivered in M0. Deferred: codegen pipeline T02, egress derivation T12, secret-proxy binding T13, auto-repair T18, cancel/heartbeat T19, quarantine T20, OTel/NATS T24, CLI T26, restart recovery T27, perf T29 → M2; C5 descriptor T21 → M3; conformance harness T22/T23 → M4.)*
 
-*S2 ML builder (baseline path sufficient for one slice; deep/advanced families deferred to M4):*
-`S2-T02, S2-T03, S2-T04, S2-T05, S2-T06, S2-T07, S2-T08, S2-T10, S2-T11, S2-T12, S2-T13, S2-T15, S2-T16, S2-T17, S2-T18, S2-T19, S2-T20, S2-T22, S2-T23, S2-T24`.
-*(S2-T01 in M0; deep families S2-T09, HPO S2-T14, Evolver-facing build_variant S2-T21, conformance/perf hooks S2-T25/T26 deferred.)*
+*S2 ML builder — tabular baseline path only (Rev B):*
+`S2-T02, S2-T03, S2-T05, S2-T06, S2-T07, S2-T08, S2-T10, S2-T11, S2-T12, S2-T13, S2-T15, S2-T18, S2-T19, S2-T20`.
+*(S2-T01 in M0. Deferred: FailureDoctor T16, S10 integration T22, observability T23 → M2; Buckingham-π T04, advisory self-check T17, explainability T24, deep families T09, HPO T14, build_variant T21, conformance/perf T25/T26 → M4.)*
 
-*S7 physics adapters (SDK, backends, broker, provenance, two+ reference adapters):*
-`S7-T03, S7-T04, S7-T05, S7-T06, S7-T07, S7-T08, S7-T09, S7-T10, S7-T11, S7-T12, S7-T13, S7-T14, S7-T15, S7-T16, S7-T17, S7-T19, S7-T20, S7-T21, S7-T22, S7-T23, S7-T24, S7-T27, S7-T28, S7-T32`.
-*(Independence resolution S7-T18, determinism and security hardening are T19/T21-in-M1; multi-adapter breadth S7-T25, CLI S7-T26, version/revocation S7-T29/T30, perf S7-T31 deferred to M3/M4.)*
+*S7 physics adapters — SDK + one backend + broker + ONE reference adapter (Rev B):*
+`S7-T03, S7-T04, S7-T06, S7-T07, S7-T08, S7-T09, S7-T12, S7-T13, S7-T14, S7-T17, S7-T19, S7-T23, S7-T32`.
+*(Deferred: subprocess backend T10, cache T15, batch T16, observability T20, security hardening T21 → M2; calibration harness T05, bounce adapter T22 (the independent twin joins CROSS_CODE), independence T18, breadth T25, CLI T26, versioning T29/T30, perf T31 → M3; emulator backends T11, surrogate T24, conformance T27, multi-fidelity T28 → M4.)*
 
-*S3 minimal-but-real verifier (schema in M0; core service + three check families + tiering + signing + bidirectional perturbation oracle + insensitivity detector + non-gameable referee):*
-`S3-T02, S3-T03, S3-T04, S3-T05, S3-T06, S3-T07, S3-T08, S3-T09, S3-T10, S3-T11, S3-T12, S3-T13, S3-T15, S3-T16, S3-T17, S3-T19, S3-T22, S3-T23, S3-T26, S3-T30, S3-TPR2, S3-TPR3, S3-TPR4`.
-*(Cross-code S3-T18, leakage S3-T20, calibration S3-T21, recap-benchmark S3-T24, challenge/canary S3-T25, independence resolver S3-T14, cost metering S3-T27, author tooling S3-T28, observability S3-T29, reward-for-recursion contract S3-T31, perf S3-T32, security audit S3-T33, and challenger-independence attestation S3-TPR5 land in M2/M3/M4/M5.)*
+*S3 minimal-but-real verifier (schema in M0; core service + three check families + tiering + signing + bidirectional perturbation oracle + insensitivity detector + non-gameable referee). Per §0a.5, check-plugin implementation waits for the task-type-parameterized oracle-semantics addendum:*
+`S3-T02, S3-T03, S3-T04, S3-T05, S3-T07, S3-T08, S3-T09, S3-T10, S3-T11, S3-T12, S3-T13, S3-T15, S3-T16, S3-T17, S3-T19, S3-T22, S3-T23, S3-TPR2, S3-TPR3, S3-TPR4`.
+*(S3-T06 argusverify delivered in M0. Deferred: degradation engine T26, CLI T30 → M2; cross-code T18, leakage T20, calibration T21, recap-benchmark T24, challenge/canary T25, independence resolver T14, cost metering T27, author tooling T28, observability T29, reward-for-recursion T31, perf T32, security audit T33, challenger-independence attestation TPR5 → M3.)*
 
 **Cross-subsystem integration deliverable.**
 The **Oracle-Gated Vertical Slice**: S5 is not yet present, so the slice is driven via the S1 CLI / a thin harness. One reference subagent accepts a job, S2 builds a frozen pipeline using S7 adapter-derived features (with propagated uncertainty), S1 freezes and hands the blind pipeline handle to S3, S3 runs the three checks in a verifier-zone sandbox against the blind vault, and returns a signed ValidationReport whose tier flows back through `report()` into a C4-coupled artifact. `recapitulated-known` is achievable only when the subtopic's established result is recovered under injection + null + physical-consistency.
 
 **Demo / acceptance test.**
-"One subtopic, verified, tiered, and un-self-promotable." (a) Recapitulate the chosen established result and obtain a **signed** `recapitulated-known` ValidationReport (S3-TC32 e2e signed report; S1-TC15/T15b/T31 blind handoff). (b) Verify the signature offline via the shipped library (S3-TC02/TC03). (c) Confirm the subagent has no `set_claim_tier` and cannot self-promote (S1-TC07/TC24; S2-TC11/TC33). (d) Confirm the frozen pipeline runs in an egress-denied sandbox with labels never delivered and any sandbox write raising Sev-1 (S3-TC25/TC26/TC27/TC44). (e) Confirm the independent-twin GW adapter agrees within uncertainty on a grid (S7-TC26). (f) MUST-REACT: plant a known-real signal and confirm the claim recovers it proportionally (amplitude-linear); a blind/insensitive claim FAILs (S3-TC51-PR). (g) MUST-NOT-REACT: feed pure noise / shuffled labels and confirm the claim manufactures no signal and degrades appropriately (S3-TC52-PR). (h) Insensitivity → FAIL: a claim invariant to a contamination it should have reacted to is caught by the insensitivity detector (S3-TC53-PR). (i) Referee != builder: a builder self-attestation is rejected — the referee must be `distinct_from_proponent` and signed (S3-TC55-PR).
+"One subtopic, verified, tiered, and un-self-promotable." (a) Recapitulate the chosen established result and obtain a **signed** `recapitulated-known` ValidationReport (S3-TC32 e2e signed report; S1-TC15/T15b/T31 blind handoff). (b) Verify the signature offline via the shipped library (S3-TC02/TC03). (c) Confirm the subagent has no `set_claim_tier` and cannot self-promote (S1-TC07/TC24; S2-TC11/TC33). (d) Confirm the frozen pipeline runs in an egress-denied sandbox with labels never delivered and any sandbox write raising Sev-1 (S3-TC25/TC26/TC27/TC44). (e) *(moved to M3 with the independent twin — S7-TC26.)* (f) MUST-REACT: plant a known-real signal and confirm the claim recovers it proportionally (amplitude-linear); a blind/insensitive claim FAILs (S3-TC51-PR). (g) MUST-NOT-REACT: feed pure noise / shuffled labels and confirm the claim manufactures no signal and degrades appropriately (S3-TC52-PR). (h) Insensitivity → FAIL: a claim invariant to a contamination it should have reacted to is caught by the insensitivity detector (S3-TC53-PR). (i) Referee != builder: a builder self-attestation is rejected — the referee must be `distinct_from_proponent` and signed (S3-TC55-PR).
+
+**M1.5 — demand-validation gate (Rev B, blocking; see §0a.4).** After the battery above is green on the declared target: demo the slice to ≥1 pilot physicist on a real subtopic, record the net-time accounting (pilot wall-clock to a verified artifact vs. status-quo estimate), and measure the first real build:verify cost ratio into the budget-envelope numbers. M2 work does not start until this gate is recorded; a negative pilot signal triggers a direction re-review.
 
 **Parallel tracks.**
 - **Track A (S1 runtime):** the entire S1 stack — depends on M0 C1 schema + S8/S10.
@@ -120,9 +142,9 @@ The **Oracle-Gated Vertical Slice**: S5 is not yet present, so the slice is driv
 
 ---
 
-## M2 — Orchestration & Provenance at Scale
+## M2 — Hardening, Orchestration & Provenance at Scale *(Rev B retheme)*
 
-**Goal.** Turn the single slice into a governed multi-job platform: stand up the Control Tower (S5, owner of C2) with durable DAG execution, budget/concurrency governance, routing, retries, and human-gate wait-state plumbing; complete the S8 provenance-at-scale surfaces; and stand up the S11 observability spine with the re-run reproducibility canary that proves artifacts are reproducible.
+**Goal.** Two waves, sequenced after the M1.5 gate confirms the spine is wanted. **Wave 1 — Hardening:** land the deferred S10 isolation classes (gVisor/Firecracker, egress proxy + DNS pinning, secrets brokering, eBPF escape detection, GPU/MIG, warm pools, red-team escape battery as a CI gate), the S8 operational surfaces (gateway, GC/holds, events, CLI, fail-closed hardening, perf, schema-registry service), and the deferred S1/S2/S3/S7 conveniences — hardening an already-proven spine. **Wave 2 — Orchestration:** stand up the Control Tower (S5, owner of C2) with durable DAG execution, budget/concurrency governance, routing, retries, and human-gate wait-state plumbing; and the S11 observability spine with the re-run reproducibility canary. Internal wave sequencing is decided at the M1.5 review.
 
 **Entry criteria.**
 - M1 exit met: a signed ValidationReport is produced on one slice; S1/S2/S3/S7 baseline operational.
@@ -139,8 +161,17 @@ The **Oracle-Gated Vertical Slice**: S5 is not yet present, so the slice is driv
 `S5-T02, S5-T02b, S5-T03, S5-T04, S5-T05, S5-T06, S5-T07, S5-T08, S5-T09, S5-T10, S5-T11, S5-T12, S5-T13, S5-T14, S5-T15, S5-T16, S5-T17, S5-T18, S5-T19, S5-T20, S5-T21, S5-T22, S5-T23, S5-T24, S5-T25, S5-T26, S5-T27, S5-T28, S5-T29, S5-T30, S5-T32`.
 *(S5-T01/T31 delivered in M0. Note: S5-T21 Recursion Governor and S5-T18/T19 human-gate plumbing are built here but exercised end-to-end only once S4 (M5) and S9 (M4) are live; they are tested against mocks/stubs in M2.)*
 
-*S8 remaining provenance-at-scale surfaces held for load context:*
-*(All S8 tasks were delivered in M0 as the foundational plane; the retraction-cascade + perf harnesses S8-T25/T26 are re-run here as scale-acceptance gates rather than new development. No new S8 IDs are introduced in M2 — S8 is 100% covered in M0.)*
+*S10 isolation-class hardening (Rev B — deferred from M0):*
+`S10-T02b, S10-T04b, S10-T06, S10-T07, S10-T09, S10-T09b, S10-T10, S10-T11, S10-T12, S10-T13, S10-T15, S10-T16, S10-T17, S10-T18, S10-T20, S10-T21, S10-T22, S10-T23, S10-T24, S10-T25, S10-T26, S10-T27, S10-T28, S10-T29, S10-T30, S10-T31, S10-T32`.
+
+*S8 operational surfaces (Rev B — deferred from M0):*
+`S8-T18, S8-T19, S8-T20, S8-T22, S8-T23, S8-T24, S8-T25, S8-T26, S8-T27`.
+
+*S1/S2/S3/S7 hardening & conveniences (Rev B — deferred from M1):*
+`S1-T02, S1-T12, S1-T13, S1-T18, S1-T19, S1-T20, S1-T24, S1-T26, S1-T27, S1-T29`,
+`S2-T16, S2-T22, S2-T23`,
+`S3-T26, S3-T30`,
+`S7-T10, S7-T15, S7-T16, S7-T20, S7-T21`.
 
 *S11 observability spine + reproducibility canary (core):*
 `S11-T01, S11-T02, S11-T03, S11-T04, S11-T05, S11-T06, S11-T07, S11-T08, S11-T09, S11-T10, S11-T11, S11-T12, S11-T13, S11-T14, S11-T16, S11-T22, S11-T23, S11-T24, S11-T25, S11-T26, S11-T28, S11-T29, S11-T30, S11-T31, S11-T33, S11-T34, S11-T35`.
@@ -182,11 +213,13 @@ These three tracks share only the NATS event contracts and C4 read paths, which 
 
 *S3 contamination-dependent + hardening checks + challenger-independence attestation (completing S3):*
 `S3-T14, S3-T18, S3-T20, S3-T21, S3-T24, S3-T25, S3-T27, S3-T28, S3-T29, S3-T31, S3-T32, S3-T33, S3-TPR5`.
-*(S3 is now 100% covered: M0=T01,TPR1; M1=T02..T13,T15,T16,T17,T19,T22,T23,T26,T30,TPR2,TPR3,TPR4; M3=T14,T18,T20,T21,T24,T25,T27,T28,T29,T31,T32,T33,TPR5.)*
+*(S3 is now 100% covered: M0=T01,T06,TPR1; M1=T02–T05,T07–T13,T15,T16,T17,T19,T22,T23,TPR2,TPR3,TPR4; M2=T26,T30; M3=T14,T18,T20,T21,T24,T25,T27,T28,T29,T31,T32,T33,TPR5.)*
 
-*S7 completion (independence, breadth, CLI, versioning, perf):*
-`S7-T18, S7-T25, S7-T26, S7-T29, S7-T30, S7-T31`.
-*(S7 now 100% covered.)*
+*S7 completion (independence, breadth, CLI, versioning, perf; Rev B adds the calibration harness + the bounce adapter / independent twin deferred from M1):*
+`S7-T05, S7-T18, S7-T22, S7-T25, S7-T26, S7-T29, S7-T30, S7-T31`.
+
+*S1 registry surface (Rev B — deferred from M1):*
+`S1-T21` (C5 CapabilityDescriptor builder & registry publish — lands with the registry it publishes to).
 
 **Cross-subsystem integration deliverable.**
 The **Contamination-Aware Novelty Gate**: S6 freezes a contamination-index snapshot and registers it as a C5 entity; S3's LEAKAGE plugin queries that frozen index (read-only, pinned version) and, together with CROSS_CODE (via S3-T14 independence resolver + S7 independent twin) and CALIBRATION, gates any promotion above `recapitulated-known`. The recap-benchmark gate (S3-T24) is required before `recapitulated-known` for known subtopics. S5's router (S5-T08/T17) now consumes real C5 descriptors and halts on revocation.
@@ -222,9 +255,15 @@ Tracks A and B run concurrently; C waits on B's frozen-index + resolve endpoints
 *S9 human-in-the-loop review & governance (full):*
 `S9-T01, S9-T02, S9-T03, S9-T04, S9-T05, S9-T06, S9-T07, S9-T08, S9-T09, S9-T10, S9-T11, S9-T12, S9-T13, S9-T14, S9-T15, S9-T16, S9-T17, S9-T18, S9-T19, S9-T20, S9-T21, S9-T22, S9-T23, S9-T24, S9-T25`.
 
-*S2 completion (deep families, HPO, build_variant, conformance/perf hooks):*
-`S2-T09, S2-T14, S2-T21, S2-T25, S2-T26`.
-*(S2 now 100% covered: M0=T01; M1=T02..T08,T10..T13,T15..T20,T22,T23,T24; M4=T09,T14,T21,T25,T26. Note: S2-T21 build_variant and S2-T25 recursion-safe hooks are delivered here as prerequisites for S4 in M5.)*
+*S2 completion (deep families, HPO, build_variant, conformance/perf hooks; Rev B adds Buckingham-π, advisory self-check, explainability deferred from M1):*
+`S2-T04, S2-T09, S2-T14, S2-T17, S2-T21, S2-T24, S2-T25, S2-T26`.
+*(Note: S2-T21 build_variant and S2-T25 recursion-safe hooks are delivered here as prerequisites for S4 in M5.)*
+
+*S1 conformance surface (Rev B — deferred from M1):*
+`S1-T22, S1-T23` (reference conformance harness + attestation block — land with the breadth rollout they certify).
+
+*S7 advanced backends (Rev B — deferred from M1):*
+`S7-T11, S7-T24, S7-T27, S7-T28` (emulator backends, differentiable surrogate, conformance harness, multi-fidelity).
 
 **Cross-subsystem integration deliverable.**
 The **Human Gate + Breadth Fleet**: multiple subtopic subagents run through S5, each producing S3-signed reports; when S3 assigns `novel-needs-human`, S5 (S5-T18) pauses the DAG on a Temporal wait state and opens an S9 review task carrying the signed report, C4 lineage, S6 novelty context (vs frozen index), and S11 calibration view (S9-T15). A reviewer signs off under COI/quorum rules; only then does S9 mint a single-use, scope-bound, HSM-signed emission authorization (S9-T09), and S5 resumes. External-emission rate limiting + back-pressure (S5-T19 ↔ S9-T10) keep intake sized to review capacity.
@@ -357,31 +396,31 @@ The architecture's premise is that teams communicate **only through published co
 
 | Subsystem | Total | M0 | M1 | M2 | M3 | M4 | M5 | M6 |
 |---|---|---|---|---|---|---|---|---|
-| **S1** (30) | 30 | T01,T03,T25,T30 (4) | T02,T04–T24,T26–T29 (26) | — | — | — | — | — |
-| **S2** (26) | 26 | T01 (1) | T02–T08,T10–T13,T15–T20,T22,T23,T24 (20) | — | — | T09,T14,T21,T25,T26 (5) | — | — |
-| **S3** (38) | 38 | T01,TPR1 (2) | T02–T13,T15,T16,T17,T19,T22,T23,T26,T30,TPR2,TPR3,TPR4 (23) | — | T14,T18,T20,T21,T24,T25,T27,T28,T29,T31,T32,T33,TPR5 (13) | — | — | — |
+| **S1** (30) | 30 | T01,T03,T25,T30 (4) | T04–T11,T14,T15,T16,T17,T28 (13) | T02,T12,T13,T18,T19,T20,T24,T26,T27,T29 (10) | T21 (1) | T22,T23 (2) | — | — |
+| **S2** (26) | 26 | T01 (1) | T02,T03,T05,T06,T07,T08,T10,T11,T12,T13,T15,T18,T19,T20 (14) | T16,T22,T23 (3) | — | T04,T09,T14,T17,T21,T24,T25,T26 (8) | — | — |
+| **S3** (38) | 38 | T01,T06,TPR1 (3) | T02,T03,T04,T05,T07–T13,T15,T16,T17,T19,T22,T23,TPR2,TPR3,TPR4 (20) | T26,T30 (2) | T14,T18,T20,T21,T24,T25,T27,T28,T29,T31,T32,T33,TPR5 (13) | — | — | — |
 | **S4** (31) | 31 | — | — | — | — | — | T01–T25,TDB1,TDB2,TDB3,TDB4,TDB5,TDB6 (31) | — |
 | **S5** (33) | 33 | T01,T31 (2) | — | T02,T02b,T03–T30,T32 (31) | — | — | — | — |
 | **S6** (35) | 35 | — | — | — | T01–T35 (35) | — | — | — |
-| **S7** (32) | 32 | T01,T02 (2) | T03–T17,T19,T20,T21,T22,T23,T24,T27,T28,T32 (24) | — | T18,T25,T26,T29,T30,T31 (6) | — | — | — |
-| **S8** (27) | 27 | T01–T27 (27) | — | — | — | — | — | — |
+| **S7** (32) | 32 | T01,T02 (2) | T03,T04,T06,T07,T08,T09,T12,T13,T14,T17,T19,T23,T32 (13) | T10,T15,T16,T20,T21 (5) | T05,T18,T22,T25,T26,T29,T30,T31 (8) | T11,T24,T27,T28 (4) | — | — |
+| **S8** (27) | 27 | T01–T17,T21 (18) | — | T18,T19,T20,T22,T23,T24,T25,T26,T27 (9) | — | — | — | — |
 | **S9** (25) | 25 | — | — | — | — | T01–T25 (25) | — | — |
-| **S10** (35) | 35 | T01–T32 + T02b,T04b,T09b (35) | — | — | — | — | — | — |
+| **S10** (35) | 35 | T01,T02,T03,T04,T05,T08,T14,T19 (8) | — | T02b,T04b,T06,T07,T09,T09b,T10–T13,T15–T18,T20–T32 (27) | — | — | — | — |
 | **S11** (35) | 35 | — | — | T01–T14,T16,T22–T26,T28–T31,T33,T34,T35 (27) | — | — | T15,T17,T18,T19,T20,T21,T27,T32 (8) | — |
 | **S12** (30) | 30 | — | — | — | — | — | — | T01–T30 (30) |
-| **TOTAL** | **377** | **73** | **93** | **58** | **54** | **30** | **39** | **30** |
+| **TOTAL** | **377** | **38** | **60** | **114** | **57** | **39** | **39** | **30** |
 
-Sum of milestone columns: 73 + 93 + 58 + 54 + 30 + 39 + 30 = **377** = full backlog. Every subtask ID is assigned to exactly one milestone. The **11 new Adversarial Red-Blue Debate Evolution subtasks** land as: S3-TPR1 [M0]; S3-TPR2/TPR3/TPR4 [M1]; S3-TPR5 [M3]; S4-TDB1..S4-TDB6 [M5].
+Sum of milestone columns: 38 + 60 + 114 + 57 + 39 + 39 + 30 = **377** = full backlog. Every subtask ID is assigned to exactly one milestone. The **11 new Adversarial Red-Blue Debate Evolution subtasks** land as: S3-TPR1 [M0]; S3-TPR2/TPR3/TPR4 [M1]; S3-TPR5 [M3]; S4-TDB1..S4-TDB6 [M5]. *(Rev B: M2's 114 tasks are deliberately the post-M1.5 hardening + orchestration bucket — its internal sequencing is re-planned at the M1.5 gate, and portions may be re-staged to M3/M4 then; any such re-staging updates this ledger.)*
 
-*Coverage notes:* S8 (all 27) and S10 (all 35) are complete in M0 as the foundations. S5-T18/T19/T21 are **built** in M2 against mocks but only **exercised end-to-end** once S9 (M4) and S4 (M5) are live — they remain assigned to M2 for delivery. S2-T21/T25 (build_variant, recursion-safe hooks) are delivered in M4 as prerequisites for S4 in M5. The Adversarial Red-Blue Debate Evolution subtasks are staged by dependency: the referee machinery (S3-TPR1 schema in M0; S3-TPR2/TPR3/TPR4 perturbation oracle + insensitivity detector + referee!=builder in M1; S3-TPR5 challenger-independence attestation in M3) is delivered ahead of the S4 debate loop (S4-TDB1..S4-TDB6 in M5), which consumes it — recursion runs as adversarial debate only after the non-gameable referee and independent challenger panel exist.
+*Coverage notes (Rev B):* M0 delivers the S8 **core commit path** (T01–T17, T21) and the S10 **minimal execution boundary** (T01–T05, T08, T14, T19); their operational/hardening surfaces land in M2. S5-T18/T19/T21 are **built** in M2 against mocks but only **exercised end-to-end** once S9 (M4) and S4 (M5) are live — they remain assigned to M2 for delivery. S2-T21/T25 (build_variant, recursion-safe hooks) are delivered in M4 as prerequisites for S4 in M5. The Adversarial Red-Blue Debate Evolution subtasks are staged by dependency: the referee machinery (S3-TPR1 schema in M0; S3-TPR2/TPR3/TPR4 perturbation oracle + insensitivity detector + referee!=builder in M1; S3-TPR5 challenger-independence attestation in M3) is delivered ahead of the S4 debate loop (S4-TDB1..S4-TDB6 in M5), which consumes it — recursion runs as adversarial debate only after the non-gameable referee and independent challenger panel exist.
 
 ---
 
 ## 10. Milestone summary (one-line goals)
 
-- **M0 — Spine & Contracts First:** freeze C1..C6 as versioned schemas with bindings and stand up the zero-dependency foundations S8 (data/provenance) and S10 (sandbox/runtime) so all 12 teams build against stable seams.
-- **M1 — One Vertical Slice, Oracle-Gated:** prove verify-before-trust on one subtopic end-to-end — one C1 subagent + S2 baseline builder + S7 adapters + minimal S3 verifier producing a signed ValidationReport with claim-tiering.
-- **M2 — Orchestration & Provenance at Scale:** stand up the Control Tower (S5) with durable DAG execution, budget/concurrency governance, and routing, plus S8 lineage-at-scale and the S11 re-run reproducibility canary.
+- **M0 — Minimal Trustworthy Spine (Rev B):** freeze C1..C6 as versioned schemas with bindings; stand up the S8 core commit path, the S10 minimal execution boundary (no-network container + sole-write-path broker), and the shared `argusverify` library — deployed to the declared Linux docker-compose target.
+- **M1 — One Thin Vertical Slice, Oracle-Gated (Rev B):** prove verify-before-trust on one subtopic end-to-end — one C1 subagent + S2 tabular baseline + ONE S7 adapter + minimal S3 verifier (3 checks + perturbation oracle + referee!=builder) producing a signed ValidationReport with claim-tiering; then the **M1.5 demand-validation gate** (pilot physicist + net-time accounting + measured build:verify cost ratio) before any M2 work.
+- **M2 — Hardening, Orchestration & Provenance at Scale (Rev B):** the post-M1.5 bucket — S10 isolation classes + red-team battery, S8 operational surfaces, deferred S1/S2/S3/S7 hardening, then the Control Tower (S5) with durable DAG execution/budget governance/routing plus the S11 observability spine and re-run reproducibility canary.
 - **M3 — Knowledge, Registry & Contamination Control:** bulk-ingest arXiv/GitHub/HEPData (S6), ship curated RAG + the registry/C5 + the frozen contamination index, and complete S3's leakage/cross-code/calibration gates on top of it.
 - **M4 — Breadth Rollout & Human Governance:** onboard many subtopic subagents and stand up the mandatory human gate (S9) — review queues, claim-tier UI, guardrails, emission authorization, and review-capacity rate limits — plus S2 deep families/HPO.
 - **M5 — Adversarial Red-Blue Debate Evolution (recursion under oracle):** enable the Evolver (S4) as a proponent / independent-challenger-panel / non-gameable-referee debate loop with hard bounds, challenger diversity, and reward-hacking + collusion defenses, running only under a cheap valid S3 verifier + oracle, recording every ChallengeRound in the C4 DebateLedger, and add the S11 benchmark/eval + planted-exploit + planted-spurious-model harnesses.
