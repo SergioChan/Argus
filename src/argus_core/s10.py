@@ -9,8 +9,9 @@ import subprocess
 import time
 from dataclasses import asdict, dataclass, replace
 from hashlib import sha256
-from typing import Any, Callable
+from typing import Any, Callable, NoReturn
 from uuid import uuid4
+from weakref import ReferenceType, ref
 
 from .canonical import canonical_json_bytes
 from .c3 import C3_SIGNATURE_PREFIX, SIGNATURE_VERIFICATION_ACCEPTED, VerifierKey
@@ -245,6 +246,16 @@ class AuditEvent:
 class AuditVerification:
     valid: bool
     break_sequence: int | None = None
+
+
+@dataclass(frozen=True)
+class StoreBrokerHandle:
+    handle_id: str
+    scope_id: str
+    expires_at: int
+
+
+_STORE_WRITER_BROKERS: dict[str, ReferenceType["StoreWriterBroker"]] = {}
 
 
 @dataclass(frozen=True)
@@ -771,9 +782,17 @@ class StoreWriterBroker:
         self._token_service = token_service
         self._artifact_store = artifact_store
         self._audit_ledger = audit_ledger
+        self._capabilities: dict[str, ScopeToken] = {}
 
     def client_for(self, scope_token: ScopeToken) -> "BrokeredStoreClient":
-        return BrokeredStoreClient(broker=self, scope_token=scope_token)
+        handle = StoreBrokerHandle(
+            handle_id=str(uuid4()),
+            scope_id=scope_token.scope_id,
+            expires_at=scope_token.expires_at,
+        )
+        self._capabilities[handle.handle_id] = scope_token
+        _STORE_WRITER_BROKERS[handle.handle_id] = ref(self)
+        return BrokeredStoreClient(handle=handle)
 
     def put_artifact(
         self,
@@ -828,6 +847,40 @@ class StoreWriterBroker:
         )
         raise ScopeDeniedError("direct S8 writes are denied; use StoreWriterBroker.put_artifact")
 
+    def _put_artifact_by_handle(
+        self,
+        *,
+        handle: StoreBrokerHandle,
+        kind: str,
+        payload: Any,
+        producer: Producer,
+        lineage: Lineage,
+        claim_tier: str = "ran-toy",
+        validation_report_ref: str | None = None,
+    ) -> ArtifactRecord:
+        return self.put_artifact(
+            scope_token=self._scope_for_handle(handle),
+            kind=kind,
+            payload=payload,
+            producer=producer,
+            lineage=lineage,
+            claim_tier=claim_tier,
+            validation_report_ref=validation_report_ref,
+        )
+
+    def _deny_direct_write_by_handle(self, *, handle: StoreBrokerHandle, op: str) -> NoReturn:
+        self.deny_direct_write(scope_token=self._scope_for_handle(handle), op=op)
+
+    def _scope_for_handle(self, handle: StoreBrokerHandle) -> ScopeToken:
+        scope_token = self._capabilities.get(handle.handle_id)
+        if scope_token is None or scope_token.scope_id != handle.scope_id:
+            self._audit_ledger.append(
+                "store.denied",
+                {"audience": "store", "reason": "invalid_handle", "scope_id": handle.scope_id},
+            )
+            raise ScopeDeniedError("invalid store broker handle")
+        return scope_token
+
     def _seal_store_identity(
         self,
         *,
@@ -867,9 +920,10 @@ class StoreWriterBroker:
 class BrokeredStoreClient:
     """Sandbox-facing store client exposing only the brokered artifact put path."""
 
-    def __init__(self, *, broker: StoreWriterBroker, scope_token: ScopeToken) -> None:
-        self._broker = broker
-        self._scope_token = scope_token
+    __slots__ = ("_handle",)
+
+    def __init__(self, *, handle: StoreBrokerHandle) -> None:
+        self._handle = handle
 
     def put_artifact(
         self,
@@ -881,8 +935,8 @@ class BrokeredStoreClient:
         claim_tier: str = "ran-toy",
         validation_report_ref: str | None = None,
     ) -> ArtifactRecord:
-        return self._broker.put_artifact(
-            scope_token=self._scope_token,
+        return _dispatch_store_put(
+            handle=self._handle,
             kind=kind,
             payload=payload,
             producer=producer,
@@ -891,8 +945,41 @@ class BrokeredStoreClient:
             validation_report_ref=validation_report_ref,
         )
 
-    def create_artifact(self, *args: Any, **kwargs: Any) -> ArtifactRecord:
-        self._broker.deny_direct_write(scope_token=self._scope_token, op="create_artifact")
+    def create_artifact(self, *args: Any, **kwargs: Any) -> NoReturn:
+        _dispatch_store_direct_write_denied(handle=self._handle, op="create_artifact")
+
+
+def _broker_for_handle(handle: StoreBrokerHandle) -> StoreWriterBroker:
+    broker_ref = _STORE_WRITER_BROKERS.get(handle.handle_id)
+    broker = broker_ref() if broker_ref is not None else None
+    if broker is None:
+        raise ScopeDeniedError("store broker handle is no longer valid")
+    return broker
+
+
+def _dispatch_store_put(
+    *,
+    handle: StoreBrokerHandle,
+    kind: str,
+    payload: Any,
+    producer: Producer,
+    lineage: Lineage,
+    claim_tier: str = "ran-toy",
+    validation_report_ref: str | None = None,
+) -> ArtifactRecord:
+    return _broker_for_handle(handle)._put_artifact_by_handle(
+        handle=handle,
+        kind=kind,
+        payload=payload,
+        producer=producer,
+        lineage=lineage,
+        claim_tier=claim_tier,
+        validation_report_ref=validation_report_ref,
+    )
+
+
+def _dispatch_store_direct_write_denied(*, handle: StoreBrokerHandle, op: str) -> NoReturn:
+    _broker_for_handle(handle)._deny_direct_write_by_handle(handle=handle, op=op)
 
 
 class DockerSandboxSupervisor:

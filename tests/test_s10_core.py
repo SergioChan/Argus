@@ -311,6 +311,22 @@ class S10StoreWriterBrokerTests(unittest.TestCase):
         self.assertEqual(self.artifacts.record_count, 1)
         self.assertEqual(self.audit.events()[-1].event_type, "store.put")
 
+    def test_sandbox_client_holds_opaque_handle_without_broker_reference(self) -> None:
+        scope = self.tokens.mint_scope(
+            job_id="job-1",
+            scopes=ScopeGrant(broker_audiences=("store",), producer_subsystems=("S2",)),
+        )
+        client = self.broker.client_for(scope)
+        handle = getattr(client, "_handle")
+
+        self.assertFalse(hasattr(client, "_broker"))
+        self.assertFalse(hasattr(client, "_scope_token"))
+        self.assertFalse(hasattr(client, "__dict__"))
+        self.assertEqual(handle.scope_id, scope.scope_id)
+        self.assertEqual(handle.expires_at, scope.expires_at)
+        self.assertFalse(hasattr(handle, "scopes"))
+        self.assertIsNot(handle, scope)
+
     def test_sandbox_client_denies_direct_store_write_method(self) -> None:
         scope = self.tokens.mint_scope(
             job_id="job-1",
