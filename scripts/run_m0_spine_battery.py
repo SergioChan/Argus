@@ -208,6 +208,20 @@ def main() -> int:
             f"{s8_url}/v1/artifacts?kind=model&producer_subsystem=S2&page_size=10",
             token=auth_tokens["read"],
         )
+        manifest = _get_json(
+            f"{s8_url}/v1/reproducibility-manifest/{parse.quote(model_record['artifact_ref'], safe='')}",
+            token=auth_tokens["read"],
+        )
+        reproducibility_check = _post_json(
+            f"{s8_url}/v1/reproducibility-checks",
+            {
+                "artifact_ref": model_record["artifact_ref"],
+                "rerun_payload": {"weights": [1, 2, 3], "source": "m0-spine"},
+                "tolerance_id": "m0-spine-hash-equal",
+            },
+            expected_status=201,
+            token=auth_tokens["write"],
+        )
         ancestor_refs = {node["artifact_ref"] for node in lineage["nodes"]}
         impact_refs = {record["artifact_ref"] for record in impact["records"]}
         query_refs = {record["artifact_ref"] for record in query["records"]}
@@ -219,16 +233,28 @@ def main() -> int:
             raise AssertionError("model impact set did not include downstream model")
         if model_record["artifact_ref"] not in query_refs:
             raise AssertionError("artifact query did not include broker-written model")
+        if manifest["lineage"]["code_ref"] != "git:m0-spine-model":
+            raise AssertionError("reproducibility manifest did not preserve model code_ref")
+        if launch_result["launch_provenance_ref"] not in manifest["lineage"]["input_refs"]:
+            raise AssertionError("reproducibility manifest did not include launch provenance input")
+        if manifest["lineage"]["environment_digest"] != launch_result["exec_environment_digest"]:
+            raise AssertionError("reproducibility manifest did not preserve environment digest")
+        if "seed-1" not in manifest["lineage"]["seeds"]:
+            raise AssertionError("reproducibility manifest did not preserve seed material")
+        if reproducibility_check["verdict"] != "PASS" or reproducibility_check["comparator_id"] != "hash_equal":
+            raise AssertionError("deployed reproducibility check did not record hash_equal PASS")
         _record(
             evidence,
             "f",
-            "real Docker launch had no default route; S10 broker wrote model C4 record; S8 read, query, lineage, and impact-set passed",
+            "real Docker launch had no default route; S10 broker wrote model C4 record; S8 read, query, lineage, impact-set, and reproducibility manifest/check passed",
             {
                 "sandbox_stdout": launch_result["stdout"],
                 "launch_provenance_ref": launch_result["launch_provenance_ref"],
                 "model_ref": model_record["artifact_ref"],
                 "impact_refs": sorted(impact_refs),
                 "query_refs": sorted(query_refs),
+                "reproducibility_check_id": reproducibility_check["check_id"],
+                "reproducibility_verdict": reproducibility_check["verdict"],
             },
         )
 

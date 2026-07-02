@@ -112,6 +112,24 @@ class S8WriterApp:
         records = self.store.query_impact_set(seed_refs, edge_types=edge_types)
         return {"records": [asdict(record) for record in records]}
 
+    def get_reproducibility_manifest(self, ref: str) -> dict[str, Any]:
+        self._refresh_store()
+        return asdict(self.store.get_reproducibility_manifest(ref))
+
+    def record_reproducibility_check(self, body: dict[str, Any]) -> dict[str, Any]:
+        self._refresh_store()
+        return asdict(
+            self.store.record_reproducibility_check(
+                _required_str(body, "artifact_ref"),
+                rerun_payload=body.get("rerun_payload"),
+                rerun_content_hash=body.get("rerun_content_hash")
+                if isinstance(body.get("rerun_content_hash"), str)
+                else None,
+                comparator_id=body.get("comparator_id") if isinstance(body.get("comparator_id"), str) else None,
+                tolerance_id=body.get("tolerance_id") if isinstance(body.get("tolerance_id"), str) else None,
+            )
+        )
+
     def _refresh_store(self) -> None:
         if self._data_dir is not None:
             self.store = FileSystemArtifactStore(self._data_dir)
@@ -244,6 +262,29 @@ class S8WriterApp:
                 return 400, {"error": "seed_ref_required"}
             try:
                 return 200, self.query_impact_set(seed_refs, edge_types=edge_types)
+            except Exception as exc:
+                return 400, {"error": type(exc).__name__, "message": str(exc)}
+
+        @self.http.prefix("GET", "/v1/reproducibility-manifest/")
+        def reproducibility_manifest(request: JsonRequest) -> tuple[int, Any]:
+            authenticated, error_response = self._authenticate(request)
+            if not authenticated:
+                return 401, error_response
+            artifact_ref = request.path.removeprefix("/v1/reproducibility-manifest/")
+            try:
+                return 200, self.get_reproducibility_manifest(artifact_ref)
+            except Exception as exc:
+                return 404, {"error": type(exc).__name__, "message": str(exc)}
+
+        @self.http.route("POST", "/v1/reproducibility-checks")
+        def reproducibility_check(request: JsonRequest) -> tuple[int, Any]:
+            authenticated, error_response = self._authenticate(request)
+            if not authenticated:
+                return 401, error_response
+            try:
+                if not isinstance(request.body, dict):
+                    return 400, {"error": "json_object_required"}
+                return 201, self.record_reproducibility_check(request.body)
             except Exception as exc:
                 return 400, {"error": type(exc).__name__, "message": str(exc)}
 

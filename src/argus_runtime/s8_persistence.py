@@ -24,6 +24,8 @@ from argus_core import (
     Lineage,
     LineageGraph,
     Producer,
+    ReproducibilityCheck,
+    ReproducibilityManifest,
     SCRATCH_BUCKET,
     WRITE_ONCE_BUCKET,
     hash_json,
@@ -349,6 +351,30 @@ class PostgresArtifactStore:
         self.refresh()
         return self._snapshot.query_artifacts_page(query, page_size=page_size, page_token=page_token)
 
+    def get_reproducibility_manifest(self, artifact_ref: str) -> ReproducibilityManifest:
+        self.refresh()
+        return self._snapshot.get_reproducibility_manifest(artifact_ref)
+
+    def record_reproducibility_check(
+        self,
+        artifact_ref: str,
+        *,
+        rerun_payload: Any | None = None,
+        rerun_content_hash: str | None = None,
+        comparator_id: str | None = None,
+        tolerance_id: str | None = None,
+    ) -> ReproducibilityCheck:
+        self.refresh()
+        check = self._snapshot.record_reproducibility_check(
+            artifact_ref,
+            rerun_payload=rerun_payload,
+            rerun_content_hash=rerun_content_hash,
+            comparator_id=comparator_id,
+            tolerance_id=tolerance_id,
+        )
+        self._commit_reproducibility_check(check)
+        return check
+
     @property
     def record_count(self) -> int:
         import psycopg
@@ -434,6 +460,26 @@ class PostgresArtifactStore:
 
     def _commit_record(self, record: ArtifactRecord) -> None:
         self._ledger_writer.commit_record(record)
+
+    def _commit_reproducibility_check(self, check: ReproducibilityCheck) -> bool:
+        import psycopg
+
+        with psycopg.connect(self._dsn) as conn:
+            _set_role(conn, self._db_role)
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT s8.record_reproducibility_check(%s, %s, %s, %s, %s);
+                    """,
+                    (
+                        check.check_id,
+                        check.artifact_ref,
+                        check.rerun_content_hash,
+                        check.verdict,
+                        check.tolerance_id,
+                    ),
+                )
+                return bool(cur.fetchone()[0])
 
     def _record_from_row_with_metadata_size(self, row: dict[str, Any]) -> ArtifactRecord:
         size_bytes = row.get("size_bytes")

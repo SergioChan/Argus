@@ -853,6 +853,49 @@ class S8PostgresSchemaTests(unittest.TestCase):
                 db_role="argus_s8_ledger_writer",
             )
 
+    def test_postgres_store_reproducibility_manifest_and_checks_use_pg_append_only(self) -> None:
+        store = self._postgres_store()
+        payload = {
+            "metric": 1.0,
+            "nondeterminism_tolerance": {
+                "comparator_id": "numeric_abs_tolerance",
+                "params": {"field": "metric", "abs_tolerance": 0.1},
+            },
+        }
+        record = store.create_artifact(
+            kind="model",
+            payload=payload,
+            producer=Producer(subsystem="S2", version="0.0.0"),
+            lineage=Lineage(input_refs=(), code_ref="git:repro", environment_digest="oci:repro", seeds=("seed-1",)),
+        )
+
+        manifest = store.get_reproducibility_manifest(record.artifact_ref)
+        first = store.record_reproducibility_check(
+            record.artifact_ref,
+            rerun_payload={**payload, "metric": 1.05},
+            tolerance_id="metric-abs-0.1",
+        )
+        second = store.record_reproducibility_check(
+            record.artifact_ref,
+            rerun_payload={**payload, "metric": 1.05},
+            tolerance_id="metric-abs-0.1",
+        )
+        persisted = self._psql(
+            f"""
+            SELECT count(*) || '|' || max(verdict) || '|' || max(tolerance_id)
+            FROM s8.reproducibility_check
+            WHERE artifact_id = {_sql_literal(record.artifact_ref)};
+            """
+        )
+
+        self.assertEqual(manifest.artifact_ref, record.artifact_ref)
+        self.assertEqual(manifest.lineage.seeds, ("seed-1",))
+        self.assertEqual(manifest.nondeterminism_tolerance["comparator_id"], "numeric_abs_tolerance")
+        self.assertEqual(first.verdict, "PASS")
+        self.assertEqual(first.comparator_id, "numeric_abs_tolerance")
+        self.assertEqual(first.check_id, second.check_id)
+        self.assertEqual(persisted.stdout.strip(), "1|PASS|metric-abs-0.1")
+
     def test_postgres_store_uses_report_verifier_for_tier_coupling(self) -> None:
         trust_store = InMemoryVerifierTrustStore()
         trust_store.register_key("s3-key", b"s3-secret")

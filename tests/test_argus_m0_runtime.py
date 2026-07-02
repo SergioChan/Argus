@@ -363,6 +363,54 @@ class ArgusM0RuntimeServiceTests(unittest.TestCase):
                     headers=_auth_headers(),
                 )
             )
+            manifest_status, manifest_payload = app.http.handle(
+                JsonRequest(
+                    method="GET",
+                    path=f"/v1/reproducibility-manifest/{chained_payload['artifact_ref']}",
+                    query={},
+                    body=None,
+                    headers=_auth_headers(),
+                )
+            )
+            unauth_manifest_status, unauth_manifest_payload = app.http.handle(
+                JsonRequest(
+                    method="GET",
+                    path=f"/v1/reproducibility-manifest/{chained_payload['artifact_ref']}",
+                    query={},
+                    body=None,
+                )
+            )
+            missing_manifest_status, missing_manifest_payload = app.http.handle(
+                JsonRequest(
+                    method="GET",
+                    path="/v1/reproducibility-manifest/c4://artifact/missing",
+                    query={},
+                    body=None,
+                    headers=_auth_headers(),
+                )
+            )
+            check_body = {
+                "artifact_ref": chained_payload["artifact_ref"],
+                "rerun_payload": {"weights": [2]},
+                "tolerance_id": "m0-hash-equal",
+            }
+            check_status, check_payload = app.http.handle(
+                JsonRequest(
+                    method="POST",
+                    path="/v1/reproducibility-checks",
+                    query={},
+                    body=check_body,
+                    headers=_auth_headers(),
+                )
+            )
+            unauth_check_status, unauth_check_payload = app.http.handle(
+                JsonRequest(
+                    method="POST",
+                    path="/v1/reproducibility-checks",
+                    query={},
+                    body=check_body,
+                )
+            )
 
             self.assertEqual(impact_status, 200)
             self.assertEqual(
@@ -383,6 +431,20 @@ class ArgusM0RuntimeServiceTests(unittest.TestCase):
             self.assertEqual(unauth_query_payload["error"], "Unauthorized")
             self.assertEqual(bad_page_status, 400)
             self.assertEqual(bad_page_payload["error"], "ValueError")
+            self.assertEqual(manifest_status, 200)
+            self.assertEqual(manifest_payload["artifact_ref"], chained_payload["artifact_ref"])
+            self.assertEqual(manifest_payload["lineage"]["input_refs"], (external.artifact_ref,))
+            self.assertEqual(manifest_payload["lineage"]["code_ref"], "git:model")
+            self.assertEqual(unauth_manifest_status, 401)
+            self.assertEqual(unauth_manifest_payload["error"], "Unauthorized")
+            self.assertEqual(missing_manifest_status, 404)
+            self.assertEqual(missing_manifest_payload["error"], "KeyError")
+            self.assertEqual(check_status, 201)
+            self.assertEqual(check_payload["artifact_ref"], chained_payload["artifact_ref"])
+            self.assertEqual(check_payload["verdict"], "PASS")
+            self.assertEqual(check_payload["comparator_id"], "hash_equal")
+            self.assertEqual(unauth_check_status, 401)
+            self.assertEqual(unauth_check_payload["error"], "Unauthorized")
 
     def test_runtime_http_routes_require_bearer_authentication(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
