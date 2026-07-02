@@ -126,6 +126,28 @@ mod tests {
     }
 
     #[test]
+    fn streaming_500_mib_multipart_matches_single_pass_hash() {
+        const CHUNK_SIZE: usize = 1024 * 1024;
+        const CHUNK_COUNT: usize = 500;
+        const TOTAL_SIZE: u64 = (CHUNK_SIZE as u64) * (CHUNK_COUNT as u64);
+
+        let mut hasher = BlobHasher::new();
+        let mut single_pass_payload = Vec::with_capacity(CHUNK_SIZE * CHUNK_COUNT);
+
+        for index in 0..CHUNK_COUNT {
+            let chunk = vec![(index % 251) as u8; CHUNK_SIZE];
+            hasher.update(&chunk).expect("streaming update succeeds");
+            single_pass_payload.extend_from_slice(&chunk);
+        }
+
+        let streaming = hasher.finalize();
+        let single_pass = hash_blob(&single_pass_payload);
+
+        assert_eq!(streaming.size_bytes, TOTAL_SIZE);
+        assert_eq!(streaming, single_pass);
+    }
+
+    #[test]
     fn size_overflow_fails_before_hash_update() {
         let mut hasher = BlobHasher {
             hasher: blake3::Hasher::new(),
