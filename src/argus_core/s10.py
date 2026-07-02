@@ -209,7 +209,6 @@ class SandboxHandle:
     runtime_class: str
     budget_epoch: int
     policy_bundle_version: str
-    seccomp_profile_hash: str
     state: str
     launch_provenance_ref: str | None = None
 
@@ -995,7 +994,6 @@ class InMemorySandboxOrchestrator:
             runtime_class=verdict.runtime_class or "gvisor",
             budget_epoch=request.budget_token.budget_epoch,
             policy_bundle_version=self._policy_bundle.bundle_version,
-            seccomp_profile_hash=self._policy_bundle.seccomp_profile_hash,
             state="ADMITTED",
             launch_provenance_ref=launch_provenance_ref,
         )
@@ -1074,7 +1072,6 @@ def _launch_exec_environment(
         ],
         "cgroup_limits": asdict(request.requested_envelope),
         "policy_bundle_version": policy_bundle.bundle_version,
-        "seccomp_profile_hash": policy_bundle.seccomp_profile_hash,
         "risk_class": request.scope_token.scopes.sandbox_risk_class,
         "seed_material": [request.trace_id],
         "node_kernel_caps_dropped": ["ALL"],

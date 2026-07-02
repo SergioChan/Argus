@@ -377,6 +377,7 @@ class S10OrchestratorAndAuditTests(unittest.TestCase):
         exec_environment_digest = hash_json(exec_environment)
 
         self.assertEqual(record.kind, "container")
+        self.assertFalse(hasattr(handle, "seccomp_profile_hash"))
         self.assertEqual(record.lineage.code_ref, request.image)
         self.assertEqual(record.lineage.environment_digest, exec_environment_digest)
         self.assertEqual(record.lineage.seeds, (request.trace_id,))
@@ -385,6 +386,7 @@ class S10OrchestratorAndAuditTests(unittest.TestCase):
         self.assertEqual(exec_environment["runtime_class"], "gvisor")
         self.assertEqual(exec_environment["cgroup_limits"], asdict(request.requested_envelope))
         self.assertEqual(exec_environment["egress_acl"], [asdict(EgressRule("store.local", 443, "https"))])
+        self.assertNotIn("seccomp_profile_hash", exec_environment)
         self.assertEqual(payload["launch"]["budget_id"], request.budget_token.budget_id)
 
         replacement_budget = self.tokens.mint_budget(
@@ -627,7 +629,6 @@ class S10DockerSupervisorTests(unittest.TestCase):
             runtime_class="docker",
             budget_epoch=1,
             policy_bundle_version="1.0.0",
-            seccomp_profile_hash="blake3:" + "a" * 64,
             state="ADMITTED",
         )
 
@@ -698,6 +699,8 @@ class S10DockerOrchestratorTests(unittest.TestCase):
         provenance_payload = json.loads(self.artifacts.get_artifact(provenance_ref).decode("utf-8"))
         self.assertEqual(provenance_record.kind, "container")
         self.assertEqual(provenance_payload["exec_environment"]["runtime_class"], "docker")
+        self.assertNotIn("seccomp_profile_hash", provenance_payload["exec_environment"])
+        self.assertFalse(hasattr(result.handle, "seccomp_profile_hash"))
         self.assertEqual(
             provenance_payload["exec_environment_digest"],
             provenance_record.lineage.environment_digest,
