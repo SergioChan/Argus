@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import unittest
 
+import argus_core.s10 as s10_module
 from argus_core import (
     BudgetCaps,
     BudgetExceededError,
@@ -355,6 +356,18 @@ class S10StoreWriterBrokerTests(unittest.TestCase):
         self.assertEqual(handle.expires_at, scope.expires_at)
         self.assertFalse(hasattr(handle, "scopes"))
         self.assertIsNot(handle, scope)
+
+    def test_store_broker_resolution_is_not_module_global(self) -> None:
+        scope = self.tokens.mint_scope(
+            job_id="job-1",
+            scopes=ScopeGrant(broker_audiences=("store",), producer_subsystems=("S2",)),
+        )
+        client = self.broker.client_for(scope)
+
+        self.assertFalse(hasattr(s10_module, "_STORE_WRITER_BROKERS"))
+        self.assertFalse(hasattr(s10_module, "_broker_for_handle"))
+        self.assertFalse(hasattr(s10_module, "_dispatch_store_put"))
+        self.assertEqual(getattr(client, "_handle").scope_id, scope.scope_id)
 
     def test_sandbox_client_denies_direct_store_write_method(self) -> None:
         scope = self.tokens.mint_scope(
