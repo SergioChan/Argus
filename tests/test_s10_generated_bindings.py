@@ -6,6 +6,8 @@ import json
 from pathlib import Path
 import subprocess
 import sys
+import types
+from typing import Annotated, Any, Literal, Union, get_args, get_origin, get_type_hints
 import unittest
 
 from pydantic import ValidationError
@@ -117,14 +119,37 @@ class S10GeneratedBindingsTests(unittest.TestCase):
 
         for definition_name, runtime_cls, generated_cls in C10_RUNTIME_FIELD_GUARDS:
             with self.subTest(definition=definition_name):
-                schema_fields = set(definitions[definition_name]["properties"])
+                schema_properties = definitions[definition_name]["properties"]
+                schema_fields = set(schema_properties)
                 required_fields = set(definitions[definition_name]["required"])
                 runtime_fields = {field.name for field in dataclass_fields(runtime_cls)}
                 generated_fields = set(generated_cls.model_fields)
+                schema_types = {
+                    field_name: _schema_wire_type(schema_properties[field_name], definitions)
+                    for field_name in schema_fields
+                }
+                runtime_types = {
+                    field_name: _annotation_wire_type(annotation, definitions)
+                    for field_name, annotation in get_type_hints(runtime_cls).items()
+                }
+                generated_types = {
+                    field_name: _annotation_wire_type(field.annotation, definitions)
+                    for field_name, field in generated_cls.model_fields.items()
+                }
 
                 self.assertEqual(schema_fields, required_fields)
                 self.assertEqual(schema_fields, generated_fields)
                 self.assertEqual(schema_fields, runtime_fields)
+                self.assertEqual(schema_types, generated_types)
+                self.assertEqual(schema_types, runtime_types)
+
+    def test_c10_type_guard_distinguishes_integer_and_string_wire_shapes(self) -> None:
+        schema = json.loads(C10_SCHEMA.read_text(encoding="utf-8"))
+        definitions = schema["$defs"]
+
+        self.assertEqual(_schema_wire_type(definitions["BudgetToken"]["properties"]["budget_epoch"], definitions), "integer")
+        self.assertEqual(_annotation_wire_type(int, definitions), "integer")
+        self.assertEqual(_annotation_wire_type(str, definitions), "string")
 
     def test_binding_generator_is_byte_stable_after_c10_generation(self) -> None:
         result = subprocess.run(
@@ -136,6 +161,79 @@ class S10GeneratedBindingsTests(unittest.TestCase):
         )
 
         self.assertEqual(result.returncode, 0, msg=result.stderr)
+
+def _schema_wire_type(schema_fragment: dict[str, Any], definitions: dict[str, Any]) -> str:
+    ref = schema_fragment.get("$ref")
+    if isinstance(ref, str):
+        definition_name = ref.rsplit("/", 1)[-1]
+        definition = definitions[definition_name]
+        if definition.get("type") == "object":
+            return f"object:{definition_name}"
+        return _schema_wire_type(definition, definitions)
+
+    raw_type = schema_fragment.get("type")
+    if isinstance(raw_type, list):
+        return "|".join(sorted(_schema_wire_type({**schema_fragment, "type": item}, definitions) for item in raw_type))
+    if raw_type == "array":
+        return f"array[{_schema_wire_type(schema_fragment.get('items', {}), definitions)}]"
+    if raw_type == "object":
+        additional = schema_fragment.get("additionalProperties")
+        if additional is True:
+            return "map[any]"
+        if isinstance(additional, dict):
+            return f"map[{_schema_wire_type(additional, definitions)}]"
+        return "object"
+    if raw_type in {"string", "integer", "number", "boolean", "null"}:
+        return raw_type
+    raise AssertionError(f"unsupported C10 schema type fragment: {schema_fragment}")
+
+
+def _annotation_wire_type(annotation: Any, definitions: dict[str, Any]) -> str:
+    origin = get_origin(annotation)
+    args = get_args(annotation)
+    if origin is Annotated:
+        return _annotation_wire_type(args[0], definitions)
+    if origin is Literal:
+        literal_types = {_literal_wire_type(value) for value in args}
+        return "|".join(sorted(literal_types))
+    if origin in {Union, types.UnionType}:
+        return "|".join(sorted(_annotation_wire_type(arg, definitions) for arg in args))
+    if origin in {list, tuple}:
+        item_annotation = args[0] if args and args[0] is not Ellipsis else Any
+        return f"array[{_annotation_wire_type(item_annotation, definitions)}]"
+    if origin is dict:
+        value_annotation = args[1] if len(args) == 2 else Any
+        return f"map[{_annotation_wire_type(value_annotation, definitions)}]"
+    if annotation is Any:
+        return "any"
+    if annotation is str:
+        return "string"
+    if annotation is int:
+        return "integer"
+    if annotation is float:
+        return "number"
+    if annotation is bool:
+        return "boolean"
+    if annotation is type(None):
+        return "null"
+    definition_name = getattr(annotation, "__name__", None)
+    if isinstance(definition_name, str) and definitions.get(definition_name, {}).get("type") == "object":
+        return f"object:{definition_name}"
+    raise AssertionError(f"unsupported C10 annotation type: {annotation!r}")
+
+
+def _literal_wire_type(value: Any) -> str:
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, str):
+        return "string"
+    if isinstance(value, int):
+        return "integer"
+    if isinstance(value, float):
+        return "number"
+    if value is None:
+        return "null"
+    raise AssertionError(f"unsupported C10 literal value: {value!r}")
 
 
 if __name__ == "__main__":
