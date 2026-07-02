@@ -3,6 +3,7 @@ from __future__ import annotations
 import unittest
 
 from argus_core import (
+    C3_SIGNATURE_ALGORITHM,
     C3ReportSigner,
     C3ReportVerifier,
     CapabilityDescriptor,
@@ -119,6 +120,9 @@ class S3VerifierReportTests(unittest.TestCase):
         self.assertTrue(verification.valid)
         self.assertEqual(verification.claim_tier, "recapitulated-known")
         self.assertTrue(verification.aggregate_passed)
+        self.assertEqual(report["signature"]["algorithm"], C3_SIGNATURE_ALGORITHM)
+        self.assertEqual(report["signature"]["key_id"], "s3-key")
+        self.assertNotEqual(report["signature"]["value"], "placeholder")
         self.assertTrue(report["referee"]["distinct_from_proponent"])
 
     def test_insensitivity_forces_aggregate_fail_and_ran_toy(self) -> None:

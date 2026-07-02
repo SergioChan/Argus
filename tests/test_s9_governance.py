@@ -48,6 +48,34 @@ class S9GovernanceTests(unittest.TestCase):
         self.assertEqual(task.quarantine_reason, "SIGNATURE_INVALID")
         self.assertIn("SIGNATURE_INVALID", self.s9.ledger.entries[-1].payload["reason"])
 
+    def test_intake_rejects_placeholder_report_signature_before_emission(self) -> None:
+        task = self.s9.create_review_task(
+            report_payload=self._placeholder_report(claim_tier="novel-needs-human"),
+            validation_report_ref="c4://report/placeholder",
+            artifact_refs=(),
+            emission_class="claim-external",
+            idempotency_key="task-placeholder",
+        )
+
+        self.assertEqual(task.state, "QUARANTINED")
+        self.assertEqual(task.quarantine_reason, "SIGNATURE_INVALID")
+        with self.assertRaises(S9PolicyError):
+            self.s9.authorize_emission(task.task_id)
+
+    def test_intake_rejects_unsigned_report_before_emission(self) -> None:
+        task = self.s9.create_review_task(
+            report_payload=self._report_body(claim_tier="novel-needs-human"),
+            validation_report_ref="c4://report/unsigned",
+            artifact_refs=(),
+            emission_class="claim-external",
+            idempotency_key="task-unsigned",
+        )
+
+        self.assertEqual(task.state, "QUARANTINED")
+        self.assertEqual(task.quarantine_reason, "SIGNATURE_INVALID")
+        with self.assertRaises(S9PolicyError):
+            self.s9.authorize_emission(task.task_id)
+
     def test_intake_rejects_content_hash_mismatch(self) -> None:
         artifact = self._artifact()
         self.object_store._objects[artifact.content_hash] = b'{"tampered":true}'
@@ -176,6 +204,11 @@ class S9GovernanceTests(unittest.TestCase):
             lineage=Lineage(input_refs=(), code_ref="git:model", environment_digest="oci:model"),
         )
 
+    def _placeholder_report(self, *, claim_tier: str) -> dict:
+        report = self._report_body(claim_tier=claim_tier)
+        report["signature"] = {"algorithm": "placeholder", "key_id": "placeholder", "value": "placeholder"}
+        return report
+
     def _signed_report(
         self,
         *,
@@ -184,22 +217,35 @@ class S9GovernanceTests(unittest.TestCase):
         cross_code_status: str = "PASS",
     ) -> dict:
         return self.signer.sign(
-            {
-                "report_id": "report-1",
-                "profile_ref": "c4://profile/1",
-                "frozen_pipeline_ref": "c4://pipeline/1",
-                "claim_tier": claim_tier,
-                "checks": [
-                    {"check": "INJECTION", "status": "PASS"},
-                    {"check": "NULL_CONTROL", "status": "PASS"},
-                    {"check": "PHYSICAL_CONSISTENCY", "status": "PASS"},
-                    {"check": "CALIBRATION", "status": "PASS"},
-                    {"check": "CROSS_CODE", "status": cross_code_status},
-                    {"check": "LEAKAGE", "status": leakage_status},
-                ],
-                "aggregate": {"passed": True, "score": 1.0},
-            }
+            self._report_body(
+                claim_tier=claim_tier,
+                leakage_status=leakage_status,
+                cross_code_status=cross_code_status,
+            )
         )
+
+    @staticmethod
+    def _report_body(
+        *,
+        claim_tier: str,
+        leakage_status: str = "PASS",
+        cross_code_status: str = "PASS",
+    ) -> dict:
+        return {
+            "report_id": "report-1",
+            "profile_ref": "c4://profile/1",
+            "frozen_pipeline_ref": "c4://pipeline/1",
+            "claim_tier": claim_tier,
+            "checks": [
+                {"check": "INJECTION", "status": "PASS"},
+                {"check": "NULL_CONTROL", "status": "PASS"},
+                {"check": "PHYSICAL_CONSISTENCY", "status": "PASS"},
+                {"check": "CALIBRATION", "status": "PASS"},
+                {"check": "CROSS_CODE", "status": cross_code_status},
+                {"check": "LEAKAGE", "status": leakage_status},
+            ],
+            "aggregate": {"passed": True, "score": 1.0},
+        }
 
 
 if __name__ == "__main__":

@@ -502,6 +502,42 @@ class S8TierCouplingTests(unittest.TestCase):
         self.assertEqual(raised.exception.reason, "revoked_key")
         self.assertEqual(len(self.store), 0)
 
+    def test_placeholder_report_signature_is_rejected_fail_closed(self) -> None:
+        with self.assertRaises(SignatureInvalidError) as raised:
+            self.store.create_artifact(
+                kind="report",
+                payload=self._report(claim_tier="recapitulated-known"),
+                producer=Producer(subsystem="S3", version="0.0.0"),
+                lineage=Lineage(input_refs=(), code_ref="git:verify", environment_digest="oci:verify"),
+            )
+
+        self.assertEqual(raised.exception.category, "SIGNATURE_INVALID")
+        self.assertEqual(raised.exception.reason, "algorithm_unsupported")
+        self.assertEqual(len(self.store), 0)
+
+    def test_unsigned_report_cannot_promote_tier(self) -> None:
+        unsigned = self._report(claim_tier="recapitulated-known")
+        unsigned.pop("signature")
+        report = self.store.create_artifact(
+            kind="report",
+            payload=unsigned,
+            producer=Producer(subsystem="S3", version="0.0.0"),
+            lineage=Lineage(input_refs=(), code_ref="git:verify", environment_digest="oci:verify"),
+        )
+
+        with self.assertRaises(SignatureInvalidError) as raised:
+            self.store.create_artifact(
+                kind="model",
+                payload={"weights": [1], "uncertainty_tag": {"kind": "interval", "radius": 0.1}},
+                producer=self.producer,
+                lineage=self.lineage,
+                claim_tier="recapitulated-known",
+                validation_report_ref=report.artifact_ref,
+            )
+
+        self.assertEqual(raised.exception.category, "SIGNATURE_INVALID")
+        self.assertEqual(raised.exception.reason, "signature_missing")
+
     def test_novel_tier_requires_leakage_and_cross_code_pass(self) -> None:
         report_payload = self.signer.sign(
             self._report(

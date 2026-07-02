@@ -92,11 +92,6 @@ class S3Verifier:
             },
             "claim_tier": claim_tier,
             "claim_tier_is_candidate": claim_tier == "novel-needs-human",
-            "signature": {
-                "algorithm": "placeholder",
-                "key_id": "placeholder",
-                "value": "placeholder",
-            },
             "perturbation_pairs": [asdict(pair) for pair in perturbation_outcome.perturbation_pairs],
             "insensitivity_flags": [asdict(flag) for flag in perturbation_outcome.insensitivity_flags],
             "challenger_panel": {
