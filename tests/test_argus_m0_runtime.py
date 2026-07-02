@@ -411,6 +411,32 @@ class ArgusM0RuntimeServiceTests(unittest.TestCase):
                     body=check_body,
                 )
             )
+            audit_status, audit_payload = app.http.handle(
+                JsonRequest(
+                    method="GET",
+                    path="/v1/audit-slice",
+                    query={"artifact_ref": [chained_payload["artifact_ref"]]},
+                    body=None,
+                    headers=_auth_headers(),
+                )
+            )
+            unauth_audit_status, unauth_audit_payload = app.http.handle(
+                JsonRequest(
+                    method="GET",
+                    path="/v1/audit-slice",
+                    query={"artifact_ref": [chained_payload["artifact_ref"]]},
+                    body=None,
+                )
+            )
+            missing_audit_ref_status, missing_audit_ref_payload = app.http.handle(
+                JsonRequest(
+                    method="GET",
+                    path="/v1/audit-slice",
+                    query={},
+                    body=None,
+                    headers=_auth_headers(),
+                )
+            )
 
             self.assertEqual(impact_status, 200)
             self.assertEqual(
@@ -445,6 +471,17 @@ class ArgusM0RuntimeServiceTests(unittest.TestCase):
             self.assertEqual(check_payload["comparator_id"], "hash_equal")
             self.assertEqual(unauth_check_status, 401)
             self.assertEqual(unauth_check_payload["error"], "Unauthorized")
+            self.assertEqual(audit_status, 200)
+            self.assertTrue(audit_payload["verification"]["valid"])
+            self.assertEqual(audit_payload["audit_slice"]["leaves"][0]["artifact_id"], chained_payload["artifact_ref"])
+            self.assertEqual(
+                audit_payload["audit_slice"]["inclusion_proofs"][0]["artifact_id"],
+                chained_payload["artifact_ref"],
+            )
+            self.assertEqual(unauth_audit_status, 401)
+            self.assertEqual(unauth_audit_payload["error"], "Unauthorized")
+            self.assertEqual(missing_audit_ref_status, 400)
+            self.assertEqual(missing_audit_ref_payload["error"], "artifact_ref_required")
 
     def test_runtime_http_routes_require_bearer_authentication(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

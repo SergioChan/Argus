@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict
+from dataclasses import asdict, is_dataclass
 from hashlib import sha256
 import hmac
 import json
@@ -129,6 +129,15 @@ class S8WriterApp:
                 tolerance_id=body.get("tolerance_id") if isinstance(body.get("tolerance_id"), str) else None,
             )
         )
+
+    def export_audit_slice(self, artifact_refs: tuple[str, ...]) -> dict[str, Any]:
+        self._refresh_store()
+        audit_slice = self.store.export_audit_slice(artifact_refs)
+        verification = self.store.verify_audit_slice(audit_slice)
+        return {
+            "audit_slice": _audit_slice_wire_payload(audit_slice),
+            "verification": _structured_payload(verification),
+        }
 
     def _refresh_store(self) -> None:
         if self._data_dir is not None:
@@ -265,6 +274,19 @@ class S8WriterApp:
             except Exception as exc:
                 return 400, {"error": type(exc).__name__, "message": str(exc)}
 
+        @self.http.route("GET", "/v1/audit-slice")
+        def audit_slice(request: JsonRequest) -> tuple[int, Any]:
+            authenticated, error_response = self._authenticate(request)
+            if not authenticated:
+                return 401, error_response
+            artifact_refs = tuple(request.query.get("artifact_ref") or ())
+            if not artifact_refs:
+                return 400, {"error": "artifact_ref_required"}
+            try:
+                return 200, self.export_audit_slice(artifact_refs)
+            except Exception as exc:
+                return 400, {"error": type(exc).__name__, "message": str(exc)}
+
         @self.http.prefix("GET", "/v1/reproducibility-manifest/")
         def reproducibility_manifest(request: JsonRequest) -> tuple[int, Any]:
             authenticated, error_response = self._authenticate(request)
@@ -370,6 +392,57 @@ def _query_int(query: dict[str, list[str]], name: str) -> int | None:
         return int(value)
     except ValueError as exc:
         raise ValueError(f"{name} must be an integer") from exc
+
+
+def _structured_payload(value: Any) -> Any:
+    if is_dataclass(value):
+        return asdict(value)
+    return value
+
+
+def _audit_slice_wire_payload(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    payload = asdict(value)
+    return {
+        "leaves": [
+            {
+                "sequence": leaf["sequence"],
+                "artifact_id": leaf["artifact_ref"],
+                "record_hash": leaf["record_hash"],
+                "previous_root": leaf["previous_root"],
+                "root": leaf["root"],
+            }
+            for leaf in payload["leaves"]
+        ],
+        "merkle_checkpoints": [
+            {
+                "sequence": payload["checkpoint"]["sequence"],
+                "root": payload["checkpoint"]["root"],
+                "signature": payload["checkpoint"]["signature"],
+                "signer_key_id": payload["checkpoint"]["signer_key_id"],
+            }
+        ],
+        "inclusion_proofs": [
+            {
+                "artifact_id": proof["artifact_ref"],
+                "sequence": proof["sequence"],
+                "record_hash": proof["record_hash"],
+                "anchor_previous_root": proof["anchor_previous_root"],
+                "steps": [
+                    {
+                        "sequence": step["sequence"],
+                        "artifact_id": step["artifact_ref"],
+                        "record_hash": step["record_hash"],
+                        "previous_root": step["previous_root"],
+                        "root": step["root"],
+                    }
+                    for step in proof["steps"]
+                ],
+            }
+            for proof in payload["inclusion_proofs"]
+        ],
+    }
 
 
 if __name__ == "__main__":

@@ -896,6 +896,50 @@ class S8PostgresSchemaTests(unittest.TestCase):
         self.assertEqual(first.check_id, second.check_id)
         self.assertEqual(persisted.stdout.strip(), "1|PASS|metric-abs-0.1")
 
+    def test_postgres_store_exports_and_verifies_audit_slice(self) -> None:
+        store = self._postgres_store()
+        dataset = store.create_artifact(
+            kind="dataset",
+            payload={"rows": [1]},
+            producer=Producer(subsystem="S2", version="0.0.0"),
+            lineage=Lineage(input_refs=(), code_ref="git:data", environment_digest="oci:data"),
+        )
+        model = store.create_artifact(
+            kind="model",
+            payload={"weights": [1]},
+            producer=Producer(subsystem="S2", version="0.0.0"),
+            lineage=Lineage(input_refs=(dataset.artifact_ref,), code_ref="git:model", environment_digest="oci:model"),
+        )
+        self._psql(
+            """
+            SET ROLE argus_s8_ledger_writer;
+            WITH latest AS (
+                SELECT sequence, root
+                FROM s8.ledger_leaf
+                ORDER BY sequence DESC
+                LIMIT 1
+            )
+            SELECT s8.append_merkle_checkpoint(
+                latest.sequence,
+                latest.root,
+                'hmac-sha256:test-audit-signature',
+                's8-ledger-key'
+            )
+            FROM latest;
+            RESET ROLE;
+            """
+        )
+
+        audit_slice = store.export_audit_slice((model.artifact_ref,))
+        slice_verification = store.verify_audit_slice(audit_slice)
+        chain_verification = store.verify_audit_chain()
+
+        self.assertEqual(audit_slice["leaves"][0]["artifact_id"], model.artifact_ref)
+        self.assertEqual(audit_slice["merkle_checkpoints"][0]["sequence"], 2)
+        self.assertEqual(audit_slice["inclusion_proofs"][0]["artifact_id"], model.artifact_ref)
+        self.assertTrue(slice_verification["valid"])
+        self.assertTrue(chain_verification["valid"])
+
     def test_postgres_store_uses_report_verifier_for_tier_coupling(self) -> None:
         trust_store = InMemoryVerifierTrustStore()
         trust_store.register_key("s3-key", b"s3-secret")

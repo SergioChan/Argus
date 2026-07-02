@@ -375,6 +375,34 @@ class PostgresArtifactStore:
         self._commit_reproducibility_check(check)
         return check
 
+    def export_audit_slice(self, artifact_refs: tuple[str, ...]) -> dict[str, Any]:
+        import psycopg
+
+        refs = list(artifact_refs) if artifact_refs else None
+        with psycopg.connect(self._dsn) as conn:
+            _set_role(conn, self._db_role)
+            with conn.cursor() as cur:
+                cur.execute("SELECT s8.export_audit_slice(%s::text[]);", (refs,))
+                return _jsonb_object(cur.fetchone()[0])
+
+    def verify_audit_slice(self, audit_slice: dict[str, Any]) -> dict[str, Any]:
+        import psycopg
+
+        with psycopg.connect(self._dsn) as conn:
+            _set_role(conn, self._db_role)
+            with conn.cursor() as cur:
+                cur.execute("SELECT s8.verify_audit_slice(%s::jsonb);", (json.dumps(audit_slice, sort_keys=True),))
+                return _jsonb_object(cur.fetchone()[0])
+
+    def verify_audit_chain(self) -> dict[str, Any]:
+        import psycopg
+
+        with psycopg.connect(self._dsn) as conn:
+            _set_role(conn, self._db_role)
+            with conn.cursor() as cur:
+                cur.execute("SELECT s8.verify_audit_chain();")
+                return _jsonb_object(cur.fetchone()[0])
+
     @property
     def record_count(self) -> int:
         import psycopg
@@ -677,6 +705,16 @@ def _required_env(env: dict[str, str], name: str) -> str:
     if not value:
         raise RuntimeError(f"{name} is required for S8 Postgres/MinIO persistence")
     return value
+
+
+def _jsonb_object(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        parsed = json.loads(value)
+        if isinstance(parsed, dict):
+            return parsed
+    raise TypeError(f"expected json object, got {type(value).__name__}")
 
 
 def _sha256(path: Path) -> str:

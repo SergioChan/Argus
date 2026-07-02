@@ -222,6 +222,10 @@ def main() -> int:
             expected_status=201,
             token=auth_tokens["write"],
         )
+        audit_slice = _get_json(
+            f"{s8_url}/v1/audit-slice?artifact_ref={parse.quote(model_record['artifact_ref'], safe='')}",
+            token=auth_tokens["read"],
+        )
         ancestor_refs = {node["artifact_ref"] for node in lineage["nodes"]}
         impact_refs = {record["artifact_ref"] for record in impact["records"]}
         query_refs = {record["artifact_ref"] for record in query["records"]}
@@ -243,10 +247,17 @@ def main() -> int:
             raise AssertionError("reproducibility manifest did not preserve seed material")
         if reproducibility_check["verdict"] != "PASS" or reproducibility_check["comparator_id"] != "hash_equal":
             raise AssertionError("deployed reproducibility check did not record hash_equal PASS")
+        if not audit_slice["verification"]["valid"]:
+            raise AssertionError("deployed audit slice did not verify")
+        audit_leaf_refs = {leaf["artifact_id"] for leaf in audit_slice["audit_slice"]["leaves"]}
+        if model_record["artifact_ref"] not in audit_leaf_refs:
+            raise AssertionError("deployed audit slice did not include broker-written model leaf")
+        if not audit_slice["audit_slice"]["merkle_checkpoints"][0]["signature"].startswith("hmac-sha256:"):
+            raise AssertionError("deployed audit slice did not include signed checkpoint")
         _record(
             evidence,
             "f",
-            "real Docker launch had no default route; S10 broker wrote model C4 record; S8 read, query, lineage, impact-set, and reproducibility manifest/check passed",
+            "real Docker launch had no default route; S10 broker wrote model C4 record; S8 read, query, lineage, impact-set, reproducibility manifest/check, and audit-slice verification passed",
             {
                 "sandbox_stdout": launch_result["stdout"],
                 "launch_provenance_ref": launch_result["launch_provenance_ref"],
@@ -255,6 +266,8 @@ def main() -> int:
                 "query_refs": sorted(query_refs),
                 "reproducibility_check_id": reproducibility_check["check_id"],
                 "reproducibility_verdict": reproducibility_check["verdict"],
+                "audit_leaf_refs": sorted(audit_leaf_refs),
+                "audit_checkpoint_sequence": audit_slice["audit_slice"]["merkle_checkpoints"][0]["sequence"],
             },
         )
 
