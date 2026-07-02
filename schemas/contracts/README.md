@@ -10,7 +10,8 @@ The schemas are intentionally source-first:
 - C3 starts at version `1.1.0`, including the adversarial red-blue debate fields required by the roadmap.
 - C4 is the provenance spine. Its v1 schema is frozen through `compatibility/c4.artifact-record.v1.0.0.schema.json`; S8-T01 publishes that frozen version immutably through the S8 write-once object-store facade, while the service/API dual-serve registry remains S8-T27 scope.
 - C10 is the S10 runtime wire surface for tokens, policy, quota, launch,
-  sandbox, audit, and checkpoint-signing payloads.
+  sandbox, audit, and checkpoint-signing payloads. C10 v2 tightens the
+  `PolicyBundle.risk_to_runtime` map keys to the canonical `RiskClass` enum.
 - `examples/` contains one minimal validating example per contract.
 
 Compatibility rules:

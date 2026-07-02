@@ -7,7 +7,7 @@ from typing import Annotated, Any, Literal, Mapping
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
-C10_SCHEMA_SHA256 = "sha256:911b5bf1c78dd5f64947d3aa5e426c92fc8f477b190b8ba2c8a78da1f407daff"
+C10_SCHEMA_SHA256 = "sha256:6d3ec4964f831f9fd2e281248080f30630d2b3e75d1ffd8d1a0a7009d74c5506"
 
 ArtifactRef = Annotated[str, Field(pattern=r"^c4://[A-Za-z0-9._:/-]+$")]
 HashRef = Annotated[str, Field(pattern=r"^blake3:[a-f0-9]{64}$")]

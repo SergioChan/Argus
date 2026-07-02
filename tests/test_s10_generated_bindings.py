@@ -70,11 +70,6 @@ C10_RUNTIME_FIELD_GUARDS = (
     ("StoreBrokerHandle", runtime_s10.StoreBrokerHandle, StoreBrokerHandle),
 )
 
-C10_SCHEMA_MAP_KEY_REFS = {
-    ("PolicyBundle", "risk_to_runtime"): "#/$defs/RiskClass",
-}
-
-
 class S10GeneratedBindingsTests(unittest.TestCase):
     def setUp(self) -> None:
         self.launch_request = json.loads(C10_EXAMPLE.read_text(encoding="utf-8"))
@@ -129,11 +124,7 @@ class S10GeneratedBindingsTests(unittest.TestCase):
                 runtime_fields = {field.name for field in dataclass_fields(runtime_cls)}
                 generated_fields = set(generated_cls.model_fields)
                 schema_types = {
-                    field_name: _schema_wire_type(
-                        schema_properties[field_name],
-                        definitions,
-                        map_key_ref=C10_SCHEMA_MAP_KEY_REFS.get((definition_name, field_name)),
-                    )
+                    field_name: _schema_wire_type(schema_properties[field_name], definitions)
                     for field_name in schema_fields
                 }
                 runtime_types = {
@@ -186,13 +177,22 @@ class S10GeneratedBindingsTests(unittest.TestCase):
             '->enum[string:"auto","docker","firecracker","gvisor"]]'
         )
 
-        self.assertEqual(
-            _schema_wire_type(risk_map_schema, definitions, map_key_ref="#/$defs/RiskClass"),
-            expected,
-        )
+        self.assertEqual(risk_map_schema["propertyNames"], {"$ref": "#/$defs/RiskClass"})
+        self.assertEqual(_schema_wire_type(risk_map_schema, definitions), expected)
         self.assertEqual(_annotation_wire_type(risk_map_annotation, definitions), expected)
         self.assertNotEqual(
             _annotation_wire_type(dict[Literal["standard", "federated"], runtime_s10.RuntimeClass], definitions),
+            expected,
+        )
+        self.assertNotEqual(
+            _schema_wire_type({**risk_map_schema, "propertyNames": {"type": "string"}}, definitions),
+            expected,
+        )
+        self.assertNotEqual(
+            _schema_wire_type(
+                {**risk_map_schema, "propertyNames": {"type": "string", "enum": ["standard", "federated"]}},
+                definitions,
+            ),
             expected,
         )
 
@@ -210,8 +210,6 @@ class S10GeneratedBindingsTests(unittest.TestCase):
 def _schema_wire_type(
     schema_fragment: dict[str, Any],
     definitions: dict[str, Any],
-    *,
-    map_key_ref: str | None = None,
 ) -> str:
     ref = schema_fragment.get("$ref")
     if isinstance(ref, str):
@@ -235,7 +233,7 @@ def _schema_wire_type(
         if additional is True:
             return "map[string->any]"
         if isinstance(additional, dict):
-            key_wire_type = _schema_map_key_wire_type(schema_fragment, definitions, map_key_ref=map_key_ref)
+            key_wire_type = _schema_map_key_wire_type(schema_fragment, definitions)
             return f"map[{key_wire_type}->{_schema_wire_type(additional, definitions)}]"
         return "object"
     if raw_type in {"string", "integer", "number", "boolean", "null"}:
@@ -292,14 +290,10 @@ def _annotation_wire_type(annotation: Any, definitions: dict[str, Any]) -> str:
 def _schema_map_key_wire_type(
     schema_fragment: dict[str, Any],
     definitions: dict[str, Any],
-    *,
-    map_key_ref: str | None,
 ) -> str:
     property_names = schema_fragment.get("propertyNames")
     if isinstance(property_names, dict):
         return _schema_wire_type(property_names, definitions)
-    if map_key_ref is not None:
-        return _schema_wire_type({"$ref": map_key_ref}, definitions)
     return "string"
 
 
