@@ -124,7 +124,7 @@ def main() -> int:
         _ensure_image(docker, args.image)
 
         _battery_a_contracts(evidence)
-        _battery_runtime_auth_required(
+        s10_checkpoint_signer_from_health = _battery_runtime_auth_required(
             evidence,
             s8_url,
             s10_url,
@@ -234,6 +234,7 @@ def main() -> int:
             s8_url=s8_url,
             token=auth_tokens["read"],
             checkpoint_signing_key=runtime_secrets["s10_checkpoint_signing_key"].encode("utf-8"),
+            checkpoint_signer_provider_from_health=s10_checkpoint_signer_from_health,
         )
         _battery_d_tamper_detected(
             evidence,
@@ -399,7 +400,7 @@ def _battery_runtime_auth_required(
     *,
     bootstrap_token: str,
     health_token: str,
-) -> None:
+) -> str:
     s8_health_no_auth = _get_json(f"{s8_url}/healthz", expected_status=401)
     s10_scope_no_auth = _post_json(f"{s10_url}/v1/scope-tokens", {}, expected_status=401)
     s8_health_bootstrap = _get_json(f"{s8_url}/healthz", expected_status=401, token=bootstrap_token)
@@ -452,6 +453,7 @@ def _battery_runtime_auth_required(
             "s10_checkpoint_signer": s10_health["checkpoint_signer"],
         },
     )
+    return str(s10_health["checkpoint_signer"])
 
 
 def _battery_forged_scope_token_denied(
@@ -705,6 +707,7 @@ def _battery_real_persistence(
     s8_url: str,
     token: str,
     checkpoint_signing_key: bytes,
+    checkpoint_signer_provider_from_health: str,
 ) -> None:
     import psycopg
     from minio import Minio
@@ -792,7 +795,7 @@ def _battery_real_persistence(
             "merkle_checkpoints": checkpoint_count,
             "latest_checkpoint_sequence": checkpoint_sequence,
             "checkpoint_signer_key_id": checkpoint_signer_key_id,
-            "checkpoint_signer_provider": "s10-kms",
+            "checkpoint_signer_provider_asserted_by_s10_health": checkpoint_signer_provider_from_health,
             "checkpoint_signature_valid": checkpoint_signature_valid,
             "minio_objects": object_count,
             "record_hashes_match_refreshed_records": record_hashes_match,
