@@ -10,8 +10,6 @@ import unittest
 from argus_core import (
     ArtifactQueryFilter,
     BLAKE3_PREFIX,
-    C3ReportSigner,
-    C3ReportVerifier,
     CycleDetectedError,
     FileSystemArtifactStore,
     FileSystemObjectStore,
@@ -32,6 +30,7 @@ from argus_core import (
     hash_bytes,
     hash_json,
 )
+from argusverify import C3ReportSigner, C3ReportVerifier
 
 
 class CanonicalJsonTests(unittest.TestCase):

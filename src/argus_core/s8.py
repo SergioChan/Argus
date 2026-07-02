@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any, Callable, Mapping, Protocol
 
 from .canonical import canonical_json_bytes
-from .c3 import C3ReportVerifier
+from argusverify import C3ReportVerifier
 from .hashing import BLAKE3_PREFIX, hash_bytes, hash_json
 
 
