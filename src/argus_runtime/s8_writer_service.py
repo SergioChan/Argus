@@ -16,6 +16,10 @@ from .auth import RuntimeAuth, UnauthorizedError, health_token_from_env, require
 from .http_json import JsonHttpApp, JsonRequest, serve_json_app
 
 
+S8_READ_CAPABILITY = "s8.read"
+S8_REPRODUCIBILITY_WRITE_CAPABILITY = "s8.reproducibility.write"
+
+
 class S8WriterApp:
     def __init__(
         self,
@@ -146,13 +150,19 @@ class S8WriterApp:
             self.store.refresh()
 
     def _authenticate(self, request: JsonRequest) -> tuple[bool, dict[str, Any] | None]:
+        authorized, _, error_response = self._authorize(request)
+        return authorized, error_response
+
+    def _authorize(self, request: JsonRequest, *, capability: str | None = None) -> tuple[bool, int, dict[str, Any] | None]:
         try:
             if self.auth is None:
                 raise UnauthorizedError("runtime auth is not configured")
-            self.auth.authenticate(request)
-            return True, None
+            identity = self.auth.authenticate(request)
         except UnauthorizedError as exc:
-            return False, {"error": "Unauthorized", "message": str(exc)}
+            return False, 401, {"error": "Unauthorized", "message": str(exc)}
+        if capability is not None and capability not in identity.scopes.broker_audiences:
+            return False, 403, {"error": "CapabilityDenied", "message": f"missing capability: {capability}"}
+        return True, 200, None
 
     def _authenticate_health(self, request: JsonRequest) -> tuple[bool, dict[str, Any] | None]:
         try:
@@ -202,9 +212,9 @@ class S8WriterApp:
 
         @self.http.route("GET", "/v1/artifacts")
         def query_artifacts(request: JsonRequest) -> tuple[int, Any]:
-            authenticated, error_response = self._authenticate(request)
-            if not authenticated:
-                return 401, error_response
+            authorized, status, error_response = self._authorize(request, capability=S8_READ_CAPABILITY)
+            if not authorized:
+                return status, error_response
             try:
                 return 200, self.query_artifacts(
                     _artifact_query_filter_from_query(request.query),
@@ -230,9 +240,9 @@ class S8WriterApp:
 
         @self.http.prefix("GET", "/v1/artifacts/")
         def get_record(request: JsonRequest) -> tuple[int, Any]:
-            authenticated, error_response = self._authenticate(request)
-            if not authenticated:
-                return 401, error_response
+            authorized, status, error_response = self._authorize(request, capability=S8_READ_CAPABILITY)
+            if not authorized:
+                return status, error_response
             suffix = request.path.removeprefix("/v1/artifacts/")
             if suffix.endswith("/record"):
                 artifact_ref = suffix.removesuffix("/record")
@@ -250,9 +260,9 @@ class S8WriterApp:
 
         @self.http.prefix("GET", "/v1/lineage/")
         def lineage(request: JsonRequest) -> tuple[int, Any]:
-            authenticated, error_response = self._authenticate(request)
-            if not authenticated:
-                return 401, error_response
+            authorized, status, error_response = self._authorize(request, capability=S8_READ_CAPABILITY)
+            if not authorized:
+                return status, error_response
             artifact_ref = request.path.removeprefix("/v1/lineage/")
             direction = request.query.get("direction", ["both"])[0]
             try:
@@ -262,9 +272,9 @@ class S8WriterApp:
 
         @self.http.route("GET", "/v1/impact-set")
         def impact_set(request: JsonRequest) -> tuple[int, Any]:
-            authenticated, error_response = self._authenticate(request)
-            if not authenticated:
-                return 401, error_response
+            authorized, status, error_response = self._authorize(request, capability=S8_READ_CAPABILITY)
+            if not authorized:
+                return status, error_response
             seed_refs = tuple(request.query.get("seed_ref") or ())
             edge_types = set(request.query.get("edge_type") or ()) or None
             if not seed_refs:
@@ -276,9 +286,9 @@ class S8WriterApp:
 
         @self.http.route("GET", "/v1/audit-slice")
         def audit_slice(request: JsonRequest) -> tuple[int, Any]:
-            authenticated, error_response = self._authenticate(request)
-            if not authenticated:
-                return 401, error_response
+            authorized, status, error_response = self._authorize(request, capability=S8_READ_CAPABILITY)
+            if not authorized:
+                return status, error_response
             artifact_refs = tuple(request.query.get("artifact_ref") or ())
             if not artifact_refs:
                 return 400, {"error": "artifact_ref_required"}
@@ -289,9 +299,9 @@ class S8WriterApp:
 
         @self.http.prefix("GET", "/v1/reproducibility-manifest/")
         def reproducibility_manifest(request: JsonRequest) -> tuple[int, Any]:
-            authenticated, error_response = self._authenticate(request)
-            if not authenticated:
-                return 401, error_response
+            authorized, status, error_response = self._authorize(request, capability=S8_READ_CAPABILITY)
+            if not authorized:
+                return status, error_response
             artifact_ref = request.path.removeprefix("/v1/reproducibility-manifest/")
             try:
                 return 200, self.get_reproducibility_manifest(artifact_ref)
@@ -300,9 +310,12 @@ class S8WriterApp:
 
         @self.http.route("POST", "/v1/reproducibility-checks")
         def reproducibility_check(request: JsonRequest) -> tuple[int, Any]:
-            authenticated, error_response = self._authenticate(request)
-            if not authenticated:
-                return 401, error_response
+            authorized, status, error_response = self._authorize(
+                request,
+                capability=S8_REPRODUCIBILITY_WRITE_CAPABILITY,
+            )
+            if not authorized:
+                return status, error_response
             try:
                 if not isinstance(request.body, dict):
                     return 400, {"error": "json_object_required"}

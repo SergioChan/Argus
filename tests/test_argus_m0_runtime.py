@@ -36,6 +36,8 @@ from argus_runtime.s8_writer_service import S8WriterApp
 
 
 AUTH_TOKEN = "test-runtime-token"
+S8_READ_TOKEN = "test-s8-read-token"
+S8_REPRO_WRITE_TOKEN = "test-s8-repro-write-token"
 BOOTSTRAP_TOKEN = "test-bootstrap-token"
 IDENTITY_SIGNING_KEY = b"test-identity-signing-key"
 HEALTH_TOKEN = "test-health-token"
@@ -78,7 +80,7 @@ class ArgusM0RuntimeServiceTests(unittest.TestCase):
 
     def test_s8_writer_http_reads_payload_through_verify_on_read(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            app = S8WriterApp(FileSystemArtifactStore(tmp), data_dir=tmp, auth=_runtime_auth())
+            app = S8WriterApp(FileSystemArtifactStore(tmp), data_dir=tmp, auth=_s8_runtime_auth())
             record = app.create_artifact(
                 {
                     "kind": "model",
@@ -223,7 +225,7 @@ class ArgusM0RuntimeServiceTests(unittest.TestCase):
             app = S8WriterApp(
                 FileSystemArtifactStore(tmp),
                 data_dir=tmp,
-                auth=_runtime_auth(),
+                auth=_s8_runtime_auth(),
                 broker_write_key=BROKER_WRITE_KEY,
             )
             body = {
@@ -354,6 +356,15 @@ class ArgusM0RuntimeServiceTests(unittest.TestCase):
                     body=None,
                 )
             )
+            write_only_query_status, write_only_query_payload = app.http.handle(
+                JsonRequest(
+                    method="GET",
+                    path="/v1/artifacts",
+                    query={"kind": ["model"]},
+                    body=None,
+                    headers=_auth_headers(S8_REPRO_WRITE_TOKEN),
+                )
+            )
             bad_page_status, bad_page_payload = app.http.handle(
                 JsonRequest(
                     method="GET",
@@ -411,6 +422,15 @@ class ArgusM0RuntimeServiceTests(unittest.TestCase):
                     body=check_body,
                 )
             )
+            read_only_check_status, read_only_check_payload = app.http.handle(
+                JsonRequest(
+                    method="POST",
+                    path="/v1/reproducibility-checks",
+                    query={},
+                    body=check_body,
+                    headers=_auth_headers(S8_READ_TOKEN),
+                )
+            )
             audit_status, audit_payload = app.http.handle(
                 JsonRequest(
                     method="GET",
@@ -455,6 +475,8 @@ class ArgusM0RuntimeServiceTests(unittest.TestCase):
             self.assertIsNone(query_payload["next_page_token"])
             self.assertEqual(unauth_query_status, 401)
             self.assertEqual(unauth_query_payload["error"], "Unauthorized")
+            self.assertEqual(write_only_query_status, 403)
+            self.assertEqual(write_only_query_payload["error"], "CapabilityDenied")
             self.assertEqual(bad_page_status, 400)
             self.assertEqual(bad_page_payload["error"], "ValueError")
             self.assertEqual(manifest_status, 200)
@@ -471,6 +493,8 @@ class ArgusM0RuntimeServiceTests(unittest.TestCase):
             self.assertEqual(check_payload["comparator_id"], "hash_equal")
             self.assertEqual(unauth_check_status, 401)
             self.assertEqual(unauth_check_payload["error"], "Unauthorized")
+            self.assertEqual(read_only_check_status, 403)
+            self.assertEqual(read_only_check_payload["error"], "CapabilityDenied")
             self.assertEqual(audit_status, 200)
             self.assertTrue(audit_payload["verification"]["valid"])
             self.assertEqual(audit_payload["audit_slice"]["leaves"][0]["artifact_id"], chained_payload["artifact_ref"])
@@ -1108,6 +1132,40 @@ def _runtime_auth() -> RuntimeAuth:
                 budget_caps=BudgetCaps(max_compute_units=10, max_wallclock_s=30, max_cost_usd=5),
                 max_ttl_s=300,
             )
+        }
+    )
+
+
+def _s8_runtime_auth() -> RuntimeAuth:
+    return RuntimeAuth(
+        {
+            AUTH_TOKEN: RuntimeIdentity(
+                caller_id="test-caller",
+                job_id="job-auth",
+                root_request_id="root-auth",
+                scopes=ScopeGrant(
+                    broker_audiences=("store", "s8.read", "s8.reproducibility.write"),
+                    producer_subsystems=("S2",),
+                ),
+                budget_caps=BudgetCaps(max_compute_units=10, max_wallclock_s=30, max_cost_usd=5),
+                max_ttl_s=300,
+            ),
+            S8_READ_TOKEN: RuntimeIdentity(
+                caller_id="test-s8-read",
+                job_id="job-read",
+                root_request_id="root-read",
+                scopes=ScopeGrant(broker_audiences=("s8.read",)),
+                budget_caps=BudgetCaps(max_compute_units=10, max_wallclock_s=30, max_cost_usd=5),
+                max_ttl_s=300,
+            ),
+            S8_REPRO_WRITE_TOKEN: RuntimeIdentity(
+                caller_id="test-s8-repro-write",
+                job_id="job-repro-write",
+                root_request_id="root-repro-write",
+                scopes=ScopeGrant(broker_audiences=("s8.reproducibility.write",)),
+                budget_caps=BudgetCaps(max_compute_units=10, max_wallclock_s=30, max_cost_usd=5),
+                max_ttl_s=300,
+            ),
         }
     )
 

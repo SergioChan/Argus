@@ -124,6 +124,12 @@ def main() -> int:
         _ensure_image(docker, args.image)
 
         _battery_a_contracts(evidence)
+        _battery_s8_capability_scopes(
+            evidence,
+            s8_url,
+            read_token=auth_tokens["read"],
+            write_token=auth_tokens["write"],
+        )
         s10_checkpoint_signer_from_health = _battery_runtime_auth_required(
             evidence,
             s8_url,
@@ -344,13 +350,16 @@ def _m0_identity_requests() -> dict[str, dict[str, Any]]:
             "caller_id": "m0-read",
             "job_id": "m0-read",
             "root_request_id": "m0-read-root",
+            "scopes": {
+                "broker_audiences": ["s8.read"],
+            },
         },
         "write": {
             "caller_id": "m0-spine-write",
             "job_id": "m0-spine-write-tests",
             "root_request_id": "m0-spine-write-root",
             "scopes": {
-                "broker_audiences": ["store"],
+                "broker_audiences": ["store", "s8.reproducibility.write"],
                 "producer_subsystems": ["S2"],
                 "sandbox_risk_class": "standard",
             },
@@ -534,6 +543,39 @@ def _battery_forged_scope_token_denied(
     if response["error"] != "TokenInvalidError":
         raise AssertionError(f"unexpected forged-token denial error: {response}")
     _record(evidence, "scope-forged", "brokered write with forged scope token rejected fail-closed", response)
+
+
+def _battery_s8_capability_scopes(
+    evidence: dict[str, Any],
+    s8_url: str,
+    *,
+    read_token: str,
+    write_token: str,
+) -> None:
+    read_query = _get_json(f"{s8_url}/v1/artifacts?page_size=1", expected_status=200, token=read_token)
+    write_query = _get_json(f"{s8_url}/v1/artifacts?page_size=1", expected_status=403, token=write_token)
+    read_write = _post_json(
+        f"{s8_url}/v1/reproducibility-checks",
+        {
+            "artifact_ref": "c4://artifact/not-yet-written",
+            "rerun_content_hash": "blake3:" + "0" * 64,
+            "tolerance_id": "capability-negative",
+        },
+        expected_status=403,
+        token=read_token,
+    )
+    if write_query.get("error") != "CapabilityDenied" or read_write.get("error") != "CapabilityDenied":
+        raise AssertionError(f"S8 capability gates did not fail closed: {write_query}, {read_write}")
+    _record(
+        evidence,
+        "s8-capability",
+        "S8 HTTP routes enforce read and reproducibility-write capabilities before store access",
+        {
+            "read_query_records": len(read_query["records"]),
+            "write_token_query_error": write_query["error"],
+            "read_token_repro_write_error": read_write["error"],
+        },
+    )
 
 
 def _mint_store_scope(*, s10_url: str, token: str) -> dict[str, Any]:
