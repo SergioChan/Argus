@@ -6,7 +6,7 @@ from dataclasses import asdict, dataclass
 from typing import Any
 from uuid import uuid4
 
-from .c3 import C3ReportSigner
+from argusverify import C3ReportSigner
 from .s6 import (
     CapabilityDescriptor,
     ContaminationIndex,
@@ -21,6 +21,10 @@ class S3Error(Exception):
 
 class RefereePolicyError(S3Error):
     """Raised when the S3 referee is not distinct from the proponent."""
+
+
+class SignerIdentityError(S3Error):
+    """Raised when referee metadata does not match the real signer key."""
 
 
 @dataclass(frozen=True)
@@ -56,8 +60,10 @@ class S3Verifier:
     """Minimal non-gameable S3 referee that emits signed C3 reports."""
 
     def __init__(self, *, verifier_id: str, signer_key_id: str, signer: C3ReportSigner) -> None:
+        if signer_key_id != signer.key_id:
+            raise SignerIdentityError("referee signed_by must match the C3 signer key_id")
         self.verifier_id = verifier_id
-        self.signer_key_id = signer_key_id
+        self.signer_key_id = signer.key_id
         self.signer = signer
 
     def build_report(

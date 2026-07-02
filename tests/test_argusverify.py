@@ -4,7 +4,7 @@ from copy import deepcopy
 import unittest
 
 from argus_core import C3ReportVerifier
-from argusverify import InMemoryVerifierTrustStore, sign_report, verify_report
+from argusverify import C3ReportSigner, InMemoryVerifierTrustStore, sign_report, verify_report
 
 
 VECTOR_REPORT = {
@@ -48,11 +48,13 @@ class ArgusVerifyTests(unittest.TestCase):
         self.trust_store.register_key("s3-key", b"s3-secret")
 
     def test_valid_vector_matches_shared_signature_and_compat_layer(self) -> None:
-        signed = sign_report(VECTOR_REPORT, key_id="s3-key", secret=b"s3-secret")
+        signer = C3ReportSigner(key_id="s3-key", secret=b"s3-secret")
+        signed = signer.sign(VECTOR_REPORT)
 
         verification = verify_report(signed, self.trust_store)
         compat_verification = C3ReportVerifier(self.trust_store).verify(signed)
 
+        self.assertEqual(signer.key_id, "s3-key")
         self.assertEqual(signed["signature"]["value"], EXPECTED_SIGNATURE)
         self.assertTrue(verification.valid)
         self.assertEqual(verification.key_id, "s3-key")

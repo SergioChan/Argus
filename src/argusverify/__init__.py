@@ -70,6 +70,10 @@ class C3ReportSigner:
         self._key_id = key_id
         self._secret = secret
 
+    @property
+    def key_id(self) -> str:
+        return self._key_id
+
     def sign(self, report: dict[str, Any]) -> dict[str, Any]:
         return sign_report(report, key_id=self._key_id, secret=self._secret)
 

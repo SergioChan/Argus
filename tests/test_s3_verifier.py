@@ -13,6 +13,7 @@ from argus_core import (
     InMemoryVerifierTrustStore,
     RefereePolicyError,
     S3Verifier,
+    SignerIdentityError,
     SourceDocument,
     attest_challenger_independence,
     build_referee_block,
@@ -90,6 +91,10 @@ class S3VerifierReportTests(unittest.TestCase):
     def test_referee_must_be_distinct_from_proponent(self) -> None:
         with self.assertRaises(RefereePolicyError):
             build_referee_block(referee_id="builder", signer_key_id="s3-key", proponent_id="builder")
+
+    def test_referee_signed_by_must_match_real_signer_key(self) -> None:
+        with self.assertRaises(SignerIdentityError):
+            S3Verifier(verifier_id="s3-referee", signer_key_id="spoofed-key", signer=self.signer)
 
     def test_signed_report_verifies_with_c3_library(self) -> None:
         outcome = run_perturbation_pair(

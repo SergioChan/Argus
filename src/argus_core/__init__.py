@@ -77,6 +77,7 @@ from .s3 import (
     RefereePolicyError,
     S3Error,
     S3Verifier,
+    SignerIdentityError,
     attest_challenger_independence,
     build_referee_block,
     run_calibration_check,
