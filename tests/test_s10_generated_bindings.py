@@ -70,6 +70,10 @@ C10_RUNTIME_FIELD_GUARDS = (
     ("StoreBrokerHandle", runtime_s10.StoreBrokerHandle, StoreBrokerHandle),
 )
 
+C10_SCHEMA_MAP_KEY_REFS = {
+    ("PolicyBundle", "risk_to_runtime"): "#/$defs/RiskClass",
+}
+
 
 class S10GeneratedBindingsTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -125,7 +129,11 @@ class S10GeneratedBindingsTests(unittest.TestCase):
                 runtime_fields = {field.name for field in dataclass_fields(runtime_cls)}
                 generated_fields = set(generated_cls.model_fields)
                 schema_types = {
-                    field_name: _schema_wire_type(schema_properties[field_name], definitions)
+                    field_name: _schema_wire_type(
+                        schema_properties[field_name],
+                        definitions,
+                        map_key_ref=C10_SCHEMA_MAP_KEY_REFS.get((definition_name, field_name)),
+                    )
                     for field_name in schema_fields
                 }
                 runtime_types = {
@@ -167,6 +175,27 @@ class S10GeneratedBindingsTests(unittest.TestCase):
             _schema_wire_type({**proto_schema, "enum": ["https", "grpc"]}, definitions),
         )
 
+    def test_c10_map_key_enum_guard_distinguishes_member_set_drift(self) -> None:
+        schema = json.loads(C10_SCHEMA.read_text(encoding="utf-8"))
+        definitions = schema["$defs"]
+        risk_map_schema = definitions["PolicyBundle"]["properties"]["risk_to_runtime"]
+        risk_map_annotation = PolicyBundle.model_fields["risk_to_runtime"].annotation
+
+        expected = (
+            'map[enum[string:"federated","high","standard"]'
+            '->enum[string:"auto","docker","firecracker","gvisor"]]'
+        )
+
+        self.assertEqual(
+            _schema_wire_type(risk_map_schema, definitions, map_key_ref="#/$defs/RiskClass"),
+            expected,
+        )
+        self.assertEqual(_annotation_wire_type(risk_map_annotation, definitions), expected)
+        self.assertNotEqual(
+            _annotation_wire_type(dict[Literal["standard", "federated"], runtime_s10.RuntimeClass], definitions),
+            expected,
+        )
+
     def test_binding_generator_is_byte_stable_after_c10_generation(self) -> None:
         result = subprocess.run(
             ["python3", "scripts/generate_bindings.py", "--check"],
@@ -178,7 +207,12 @@ class S10GeneratedBindingsTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, msg=result.stderr)
 
-def _schema_wire_type(schema_fragment: dict[str, Any], definitions: dict[str, Any]) -> str:
+def _schema_wire_type(
+    schema_fragment: dict[str, Any],
+    definitions: dict[str, Any],
+    *,
+    map_key_ref: str | None = None,
+) -> str:
     ref = schema_fragment.get("$ref")
     if isinstance(ref, str):
         definition_name = ref.rsplit("/", 1)[-1]
@@ -199,9 +233,10 @@ def _schema_wire_type(schema_fragment: dict[str, Any], definitions: dict[str, An
     if raw_type == "object":
         additional = schema_fragment.get("additionalProperties")
         if additional is True:
-            return "map[any]"
+            return "map[string->any]"
         if isinstance(additional, dict):
-            return f"map[{_schema_wire_type(additional, definitions)}]"
+            key_wire_type = _schema_map_key_wire_type(schema_fragment, definitions, map_key_ref=map_key_ref)
+            return f"map[{key_wire_type}->{_schema_wire_type(additional, definitions)}]"
         return "object"
     if raw_type in {"string", "integer", "number", "boolean", "null"}:
         return raw_type
@@ -230,8 +265,12 @@ def _annotation_wire_type(annotation: Any, definitions: dict[str, Any]) -> str:
         item_annotation = args[0] if args and args[0] is not Ellipsis else Any
         return f"array[{_annotation_wire_type(item_annotation, definitions)}]"
     if origin is dict:
+        key_annotation = args[0] if len(args) == 2 else str
         value_annotation = args[1] if len(args) == 2 else Any
-        return f"map[{_annotation_wire_type(value_annotation, definitions)}]"
+        return (
+            f"map[{_annotation_wire_type(key_annotation, definitions)}"
+            f"->{_annotation_wire_type(value_annotation, definitions)}]"
+        )
     if annotation is Any:
         return "any"
     if annotation is str:
@@ -248,6 +287,20 @@ def _annotation_wire_type(annotation: Any, definitions: dict[str, Any]) -> str:
     if isinstance(definition_name, str) and definitions.get(definition_name, {}).get("type") == "object":
         return f"object:{definition_name}"
     raise AssertionError(f"unsupported C10 annotation type: {annotation!r}")
+
+
+def _schema_map_key_wire_type(
+    schema_fragment: dict[str, Any],
+    definitions: dict[str, Any],
+    *,
+    map_key_ref: str | None,
+) -> str:
+    property_names = schema_fragment.get("propertyNames")
+    if isinstance(property_names, dict):
+        return _schema_wire_type(property_names, definitions)
+    if map_key_ref is not None:
+        return _schema_wire_type({"$ref": map_key_ref}, definitions)
+    return "string"
 
 
 def _literal_wire_type(value: Any) -> str:
