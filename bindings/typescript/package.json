@@ -5,10 +5,11 @@
   "type": "module",
   "scripts": {
     "build": "tsc --project tsconfig.json",
-    "test": "npm run build && node dist/test/c4-smoke.js"
+    "test": "npm run build && node dist/test/c4-smoke.js && node dist/test/argusverify-smoke.js"
   },
   "exports": {
     ".": "./src/contracts.ts",
+    "./argusverify": "./src/argusverify.ts",
     "./c4": "./src/c4.ts"
   },
   "dependencies": {
