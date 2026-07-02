@@ -160,7 +160,10 @@ def parse_status(text: str) -> tuple[dict[str, StageStatus], dict[str, TaskStatu
 def parse_summary_counts(text: str) -> dict[str, int]:
     counts: dict[str, int] = {}
     for line in text.splitlines():
-        match = re.fullmatch(r"- (Real deployment gates passed|Real end-to-end gates passed): (\d+)", line.strip())
+        match = re.fullmatch(
+            r"- (Real deployment slice gates passed|Real end-to-end slice gates passed): (\d+)",
+            line.strip(),
+        )
         if match:
             counts[match.group(1)] = int(match.group(2))
     return counts
@@ -186,8 +189,8 @@ def render_status(tasks: tuple[BacklogTask, ...], stage_map: dict[str, str]) -> 
         f"- Backlog subtasks: {len(tasks)}",
         "- Strictly complete subtasks: 0",
         "- Strictly complete stages: 0",
-        f"- Real deployment gates passed: {gate_counts['Real deployment gates passed']}",
-        f"- Real end-to-end gates passed: {gate_counts['Real end-to-end gates passed']}",
+        f"- Real deployment slice gates passed: {gate_counts['Real deployment slice gates passed']}",
+        f"- Real end-to-end slice gates passed: {gate_counts['Real end-to-end slice gates passed']}",
         f"- Subsystems: {_counter_text(by_subsystem)}",
         f"- Estimates: {_counter_text(by_estimate)}",
         "",
@@ -281,8 +284,10 @@ def validate_status(
 
 def count_stage_gates(stages: Mapping[str, StageStatus]) -> dict[str, int]:
     return {
-        "Real deployment gates passed": sum(1 for status in stages.values() if status.status in STAGE_DEPLOYED_STATES),
-        "Real end-to-end gates passed": sum(1 for status in stages.values() if status.status in STAGE_E2E_STATES),
+        "Real deployment slice gates passed": sum(
+            1 for status in stages.values() if status.status in STAGE_DEPLOYED_STATES
+        ),
+        "Real end-to-end slice gates passed": sum(1 for status in stages.values() if status.status in STAGE_E2E_STATES),
     }
 
 

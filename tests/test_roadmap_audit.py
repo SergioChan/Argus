@@ -314,23 +314,23 @@ class RoadmapAuditTests(unittest.TestCase):
             },
             statuses=statuses,
             summary_counts={
-                "Real deployment gates passed": 999,
-                "Real end-to-end gates passed": 1,
+                "Real deployment slice gates passed": 999,
+                "Real end-to-end slice gates passed": 1,
             },
         )
 
-        self.assertTrue(any("Real deployment gates passed" in error for error in errors))
+        self.assertTrue(any("Real deployment slice gates passed" in error for error in errors))
 
     def test_parse_summary_counts_reads_gate_headlines(self) -> None:
         counts = parse_summary_counts(
             """
-- Real deployment gates passed: 1
-- Real end-to-end gates passed: 2
+- Real deployment slice gates passed: 1
+- Real end-to-end slice gates passed: 2
 """
         )
 
-        self.assertEqual(counts["Real deployment gates passed"], 1)
-        self.assertEqual(counts["Real end-to-end gates passed"], 2)
+        self.assertEqual(counts["Real deployment slice gates passed"], 1)
+        self.assertEqual(counts["Real end-to-end slice gates passed"], 2)
 
     def test_render_status_defaults_every_task_to_not_started(self) -> None:
         tasks = (
