@@ -30,6 +30,7 @@ VALID_TASK_STATES = {
 }
 VALID_STAGE_STATES = {"not_started", "in_progress", "deployed", "e2e_passed", "complete", "blocked"}
 COMPLETE_EVIDENCE_KEYS = ("acceptance", "impl", "unit", "local", "commit", "push")
+TASK_ANCHORED_STATES = {"deployed", "e2e_passed", "complete"}
 STAGE_DEPLOYED_STATES = {"deployed", "e2e_passed", "complete"}
 STAGE_E2E_STATES = {"e2e_passed", "complete"}
 LOCAL_ONLY_EVIDENCE_PATTERNS = ("/tmp/", "/Users/")
@@ -240,9 +241,10 @@ def validate_status(
             missing_keys = [key for key in COMPLETE_EVIDENCE_KEYS if f"{key}=" not in status.evidence]
             if missing_keys:
                 errors.append(f"{status.task_id} complete without required evidence keys: {missing_keys}")
+        if status.status in TASK_ANCHORED_STATES:
             anchor_error = stage_evidence_anchor_error(status.evidence)
             if anchor_error is not None:
-                errors.append(f"{status.task_id} complete evidence {anchor_error}")
+                errors.append(f"{status.task_id} {status.status} evidence {anchor_error}")
 
     expected_gate_counts = count_stage_gates(stages)
     if summary_counts is not None:

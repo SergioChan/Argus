@@ -150,6 +150,78 @@ class RoadmapAuditTests(unittest.TestCase):
         self.assertFalse(ci_anchor_errors)
         self.assertFalse(repo_anchor_errors)
 
+    def test_deployed_and_e2e_task_states_require_verifiable_evidence_anchor(self) -> None:
+        tasks = (
+            BacklogTask(
+                task_id="S1-T01",
+                title="Author canonical C1 JSON Schema",
+                estimate="M",
+                depends_on="C1",
+                interfaces_touched="C1",
+                acceptance_criteria="schema validates",
+            ),
+        )
+        stages = {"M0": StageStatus("M0", "not_started", "-", "-")}
+        stage_map = {"S1-T01": "M0"}
+
+        e2e_local_path_errors = validate_status(
+            tasks=tasks,
+            stage_map=stage_map,
+            stages=stages,
+            statuses={
+                "S1-T01": TaskStatus(
+                    task_id="S1-T01",
+                    stage="M0",
+                    status="e2e_passed",
+                    evidence="acceptance_partial=x; local=/tmp/evidence.json",
+                )
+            },
+        )
+        deployed_no_anchor_errors = validate_status(
+            tasks=tasks,
+            stage_map=stage_map,
+            stages=stages,
+            statuses={
+                "S1-T01": TaskStatus(
+                    task_id="S1-T01",
+                    stage="M0",
+                    status="deployed",
+                    evidence="acceptance_partial=x; local=compose passed",
+                )
+            },
+        )
+        e2e_ci_anchor_errors = validate_status(
+            tasks=tasks,
+            stage_map=stage_map,
+            stages=stages,
+            statuses={
+                "S1-T01": TaskStatus(
+                    task_id="S1-T01",
+                    stage="M0",
+                    status="e2e_passed",
+                    evidence="acceptance_partial=x; ci=GitHub Actions CI run 28613222944",
+                )
+            },
+        )
+        deployed_repo_anchor_errors = validate_status(
+            tasks=tasks,
+            stage_map=stage_map,
+            stages=stages,
+            statuses={
+                "S1-T01": TaskStatus(
+                    task_id="S1-T01",
+                    stage="M0",
+                    status="deployed",
+                    evidence="acceptance_partial=x; ci=docs/RoadmapStatus.md",
+                )
+            },
+        )
+
+        self.assertTrue(any("e2e_passed evidence uses local-only path" in error for error in e2e_local_path_errors))
+        self.assertTrue(any("deployed evidence lacks a verifiable" in error for error in deployed_no_anchor_errors))
+        self.assertFalse(e2e_ci_anchor_errors)
+        self.assertFalse(deployed_repo_anchor_errors)
+
     def test_complete_stage_requires_all_stage_tasks_and_real_gates(self) -> None:
         tasks = (
             BacklogTask("S1-T01", "Author canonical C1 JSON Schema", "M", "C1", "C1", "schema validates"),
