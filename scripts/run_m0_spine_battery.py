@@ -48,6 +48,7 @@ from argus_core import (
     ScopeToken,
     canonical_json_bytes,
     hash_json,
+    s8_checkpoint_signature_payload,
 )
 from argusverify import C3ReportSigner, InMemoryVerifierTrustStore, verify_report
 
@@ -807,13 +808,7 @@ def _s8_checkpoint_signature(
     signer_key_id: str,
     signing_key: bytes,
 ) -> str:
-    payload = (
-        "argus-s8-merkle-checkpoint-v1\n"
-        "algorithm:hmac-sha256\n"
-        f"seq:{sequence}\n"
-        f"root:{root}\n"
-        f"signer_key_id:{signer_key_id}\n"
-    )
+    payload = s8_checkpoint_signature_payload(sequence=sequence, root=root, signer_key_id=signer_key_id)
     return "hmac-sha256:" + hmac.new(signing_key, payload.encode("utf-8"), sha256).hexdigest()
 
 

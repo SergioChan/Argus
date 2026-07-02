@@ -1,14 +1,17 @@
 use crate::hash::{hash_bytes, BLAKE3_PREFIX};
 use chrono::{DateTime, Utc};
+#[cfg(test)]
 use hmac::{Hmac, KeyInit, Mac};
 use postgres::types::Json;
 use postgres::{Client, GenericClient, NoTls};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+#[cfg(test)]
 use sha2::Sha256;
 use std::error::Error;
 use std::fmt;
 
+#[cfg(test)]
 const CHECKPOINT_SIGNATURE_ALGORITHM: &str = "hmac-sha256";
 const CHECKPOINT_SIGNATURE_PREFIX: &str = "hmac-sha256:";
 
@@ -59,12 +62,14 @@ pub struct PostgresLedgerWriter {
     client: Client,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CheckpointSigner {
     key_id: String,
     secret: Vec<u8>,
 }
 
+#[cfg(test)]
 impl CheckpointSigner {
     pub fn new(key_id: impl Into<String>, secret: impl Into<Vec<u8>>) -> Self {
         Self {
@@ -236,6 +241,7 @@ impl PostgresLedgerWriter {
         Ok(Some(checkpoint))
     }
 
+    #[cfg(test)]
     pub fn append_latest_checkpoint(
         &mut self,
         signer: &CheckpointSigner,
@@ -423,12 +429,14 @@ fn zero_ledger_root() -> String {
     format!("{BLAKE3_PREFIX}{}", "0".repeat(64))
 }
 
+#[cfg(test)]
 fn checkpoint_signature_payload(sequence: i64, root: &str, signer_key_id: &str) -> String {
     format!(
         "argus-s8-merkle-checkpoint-v1\nalgorithm:{CHECKPOINT_SIGNATURE_ALGORITHM}\nseq:{sequence}\nroot:{root}\nsigner_key_id:{signer_key_id}\n"
     )
 }
 
+#[cfg(test)]
 fn hex_lower(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(bytes.len() * 2);
@@ -439,6 +447,7 @@ fn hex_lower(bytes: &[u8]) -> String {
     out
 }
 
+#[cfg(test)]
 fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
     if left.len() != right.len() {
         return false;

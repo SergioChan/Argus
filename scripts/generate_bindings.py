@@ -2004,7 +2004,7 @@ def render_rust_lib(items: list[dict]) -> str:
             "pub use argusverify::{sign_report, verify_report, C3SignatureVerification, InMemoryVerifierTrustStore, VerifierKey, VerifierTrustStore, C3_SIGNATURE_ALGORITHM, C3_SIGNATURE_PREFIX, SIGNATURE_VERIFICATION_ABSTAIN, SIGNATURE_VERIFICATION_ACCEPTED};",
             "pub use c4::{ArtifactRecord, ClaimTier, Lineage, Producer, RetentionPolicy, C4_SCHEMA_SHA256};",
             "pub use hash::{hash_blob, hash_blob_stream, hash_bytes, BlobHasher, HashBlob, HashBlobError, BLAKE3_PREFIX, CANON_VERSION};",
-            "pub use ledger::{ArtifactRecordDraft, CheckpointSigner, MerkleCheckpoint, PostgresLedgerWriter};",
+            "pub use ledger::{ArtifactRecordDraft, MerkleCheckpoint, PostgresLedgerWriter};",
             "pub use s10::{AuditEvent, BudgetCaps, BudgetToken, BudgetUsage, EgressDecision, EgressRule, LaunchEnvelope, LaunchRequest, PolicyBundle, PolicyVerdict, QuotaState, ResourceCeilings, S8CheckpointSignature, SandboxExecutionResult, SandboxHandle, ScopeGrant, ScopeToken, StoreBrokerHandle, C10_SCHEMA_SHA256};",
             "",
             "#[derive(Debug, Clone, Copy, PartialEq, Eq)]",
