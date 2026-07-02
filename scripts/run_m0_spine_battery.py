@@ -92,8 +92,9 @@ def main() -> int:
         "ARGUS_M0_HEALTH_TOKEN": runtime_secrets["health_token"],
         "ARGUS_S10_SIGNING_KEY": runtime_secrets["s10_signing_key"],
         "ARGUS_S10_POLICY_SIGNING_KEY": runtime_secrets["s10_policy_signing_key"],
+        "ARGUS_S10_CHECKPOINT_SIGNING_KEY": runtime_secrets["s10_checkpoint_signing_key"],
+        "ARGUS_S10_CHECKPOINT_SIGNER_AUTH_TOKEN": runtime_secrets["s10_checkpoint_signer_auth_token"],
         "ARGUS_S8_BROKER_WRITE_KEY": runtime_secrets["s8_broker_write_key"],
-        "ARGUS_S8_CHECKPOINT_SIGNING_KEY": runtime_secrets["s8_checkpoint_signing_key"],
         "ARGUS_S8_C3_VERIFIER_KEYS_JSON": json.dumps(
             {M0_C3_VERIFIER_KEY_ID: runtime_secrets["c3_verifier_signing_key"]},
             separators=(",", ":"),
@@ -231,7 +232,7 @@ def main() -> int:
             ports,
             s8_url=s8_url,
             token=auth_tokens["read"],
-            checkpoint_signing_key=runtime_secrets["s8_checkpoint_signing_key"].encode("utf-8"),
+            checkpoint_signing_key=runtime_secrets["s10_checkpoint_signing_key"].encode("utf-8"),
         )
         _battery_d_tamper_detected(
             evidence,
@@ -273,8 +274,9 @@ def _m0_runtime_secrets() -> dict[str, str]:
         "identity_signing_key": f"argus-identity-key-{uuid4().hex}",
         "s10_signing_key": f"argus-s10-key-{uuid4().hex}",
         "s10_policy_signing_key": f"argus-s10-policy-key-{uuid4().hex}",
+        "s10_checkpoint_signing_key": f"argus-s10-checkpoint-key-{uuid4().hex}",
+        "s10_checkpoint_signer_auth_token": f"argus-s10-checkpoint-signer-{uuid4().hex}",
         "s8_broker_write_key": f"argus-s8-broker-key-{uuid4().hex}",
-        "s8_checkpoint_signing_key": f"argus-s8-checkpoint-key-{uuid4().hex}",
         "c3_verifier_signing_key": f"argus-c3-verifier-key-{uuid4().hex}",
     }
 
@@ -429,8 +431,12 @@ def _battery_runtime_auth_required(
         raise AssertionError(f"unexpected health payloads: s8={s8_health}, s10={s10_health}")
     if s8_health.get("ledger_writer") != "rust-subprocess":
         raise AssertionError(f"S8 did not activate the Rust ledger writer boundary: {s8_health}")
+    if s8_health.get("checkpoint_signer") != "s10-http":
+        raise AssertionError(f"S8 did not delegate checkpoint signing to S10: {s8_health}")
     if s8_health.get("report_verifier") != "argusverify":
         raise AssertionError(f"S8 did not activate the C3 report verifier: {s8_health}")
+    if s10_health.get("checkpoint_signer") != "s10-kms":
+        raise AssertionError(f"S10 did not activate the KMS checkpoint signer: {s10_health}")
     _record(
         evidence,
         "auth",
@@ -439,8 +445,10 @@ def _battery_runtime_auth_required(
             **errors,
             "s8_health": s8_health["status"],
             "s8_ledger_writer": s8_health["ledger_writer"],
+            "s8_checkpoint_signer": s8_health["checkpoint_signer"],
             "s8_report_verifier": s8_health["report_verifier"],
             "s10_health": s10_health["status"],
+            "s10_checkpoint_signer": s10_health["checkpoint_signer"],
         },
     )
 
@@ -783,6 +791,7 @@ def _battery_real_persistence(
             "merkle_checkpoints": checkpoint_count,
             "latest_checkpoint_sequence": checkpoint_sequence,
             "checkpoint_signer_key_id": checkpoint_signer_key_id,
+            "checkpoint_signer_provider": "s10-kms",
             "checkpoint_signature_valid": checkpoint_signature_valid,
             "minio_objects": object_count,
             "record_hashes_match_refreshed_records": record_hashes_match,

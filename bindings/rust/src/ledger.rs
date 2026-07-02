@@ -177,6 +177,30 @@ impl PostgresLedgerWriter {
         Ok(Some(checkpoint))
     }
 
+    pub fn latest_ledger_tip(&mut self) -> Result<Option<(i64, String)>, postgres::Error> {
+        latest_ledger_leaf(&mut self.client)
+    }
+
+    pub fn append_checkpoint(
+        &mut self,
+        checkpoint: &MerkleCheckpoint,
+    ) -> Result<(), postgres::Error> {
+        let mut transaction = self.client.transaction()?;
+        transaction.execute(
+            "
+            SELECT s8.append_merkle_checkpoint($1, $2, $3, $4);
+            ",
+            &[
+                &checkpoint.sequence,
+                &checkpoint.root,
+                &checkpoint.signature,
+                &checkpoint.signer_key_id,
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
     pub fn into_client(self) -> Client {
         self.client
     }

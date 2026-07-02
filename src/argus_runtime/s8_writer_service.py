@@ -140,6 +140,7 @@ class S8WriterApp:
                 "status": "ok",
                 "record_count": self.store.record_count,
                 "ledger_writer": getattr(self.store, "ledger_writer_kind", "filesystem"),
+                "checkpoint_signer": getattr(self.store, "checkpoint_signer_kind", "unconfigured"),
                 "report_verifier": getattr(self.store, "report_verifier_kind", "unconfigured"),
             }
 

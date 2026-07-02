@@ -17,6 +17,7 @@ from argus_core import (
     BudgetCaps,
     BudgetToken,
     FileSystemArtifactStore,
+    InMemoryS10KmsCheckpointSigner,
     Lineage,
     Producer,
     ScopeGrant,
@@ -30,6 +31,7 @@ from argus_runtime.s10_supervisor_service import (
     S10SupervisorApp,
     build_app_from_env as build_s10_app_from_env,
 )
+from argus_runtime.s8_persistence import SubprocessRustLedgerWriter, _rust_ledger_writer_from_env
 from argus_runtime.s8_writer_service import S8WriterApp
 
 
@@ -39,6 +41,8 @@ IDENTITY_SIGNING_KEY = b"test-identity-signing-key"
 HEALTH_TOKEN = "test-health-token"
 BROKER_WRITE_KEY = b"test-s8-broker-write-key"
 POLICY_SIGNING_KEY = "test-s10-policy-signing-key"
+CHECKPOINT_SIGNING_KEY = "test-s10-checkpoint-signing-key"
+CHECKPOINT_SIGNER_AUTH_TOKEN = "test-checkpoint-signer-token"
 C3_VERIFIER_KEYS_JSON = json.dumps(
     {"argus-m0-c3-verifier": "test-c3-verifier-key"},
     separators=(",", ":"),
@@ -138,6 +142,55 @@ class ArgusM0RuntimeServiceTests(unittest.TestCase):
         app = S8WriterApp(LiveStore())
 
         self.assertEqual(app.get_artifact_record("c4://live")["artifact_ref"], "c4://live")
+
+    def test_subprocess_rust_ledger_writer_uses_s10_checkpoint_signer_env(self) -> None:
+        script = (
+            "import json, os, sys;"
+            "json.load(sys.stdin);"
+            "assert os.environ['ARGUS_S8_CHECKPOINT_SIGNER_URL'] == 'http://s10/sign';"
+            "assert os.environ['ARGUS_S8_CHECKPOINT_SIGNER_AUTH_TOKEN'] == 'signer-token';"
+            "assert 'ARGUS_S8_CHECKPOINT_SIGNING_KEY' not in os.environ;"
+            "assert 'ARGUS_S8_CHECKPOINT_SIGNER_KEY_ID' not in os.environ;"
+            "print('{\"status\":\"ok\",\"checkpoint\":null}')"
+        )
+        writer = SubprocessRustLedgerWriter(
+            command=["python3", "-c", script],
+            dsn="postgresql://argus@example/argus",
+            db_role="argus_s8_ledger_writer",
+            checkpoint_signer_url="http://s10/sign",
+            checkpoint_signer_auth_token="signer-token",
+        )
+        record = ArtifactRecord(
+            artifact_ref="c4://s8/signer-env",
+            kind="model",
+            content_hash="blake3:" + "0" * 64,
+            size_bytes=2,
+            producer=Producer(subsystem="S2", version="0.0.0"),
+            lineage=Lineage(input_refs=(), code_ref="git:signer-env", environment_digest="oci:signer-env"),
+            created_at="2026-07-02T00:00:00Z",
+        )
+
+        result = writer.commit_record(record)
+
+        self.assertEqual(writer.checkpoint_signer_kind, "s10-http")
+        self.assertEqual(result, {"status": "ok", "checkpoint": None})
+
+    def test_s8_postgres_env_requires_rust_ledger_writer_when_configured(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "ARGUS_S8_RUST_LEDGER_WRITER_CMD"):
+            _rust_ledger_writer_from_env(
+                {"ARGUS_S8_REQUIRE_RUST_LEDGER_WRITER": "1"},
+                dsn="postgresql://argus@example/argus",
+                db_role=None,
+            )
+        with self.assertRaisesRegex(RuntimeError, "ARGUS_S8_CHECKPOINT_SIGNER_URL"):
+            _rust_ledger_writer_from_env(
+                {
+                    "ARGUS_S8_REQUIRE_RUST_LEDGER_WRITER": "1",
+                    "ARGUS_S8_RUST_LEDGER_WRITER_CMD": "argus-s8-ledger-writer",
+                },
+                dsn="postgresql://argus@example/argus",
+                db_role=None,
+            )
 
     def test_s8_writer_http_denies_direct_artifact_writes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -528,6 +581,8 @@ class ArgusM0RuntimeServiceTests(unittest.TestCase):
             "ARGUS_RUNTIME_IDENTITY_SIGNING_KEY": IDENTITY_SIGNING_KEY.decode("utf-8"),
             "ARGUS_RUNTIME_IDENTITY_MINT_POLICY_JSON": _runtime_identity_mint_policy_json(),
             "ARGUS_M0_HEALTH_TOKEN": HEALTH_TOKEN,
+            "ARGUS_S10_CHECKPOINT_SIGNING_KEY": CHECKPOINT_SIGNING_KEY,
+            "ARGUS_S10_CHECKPOINT_SIGNER_AUTH_TOKEN": CHECKPOINT_SIGNER_AUTH_TOKEN,
         }
         with patch.dict(os.environ, base_env, clear=True):
             with self.assertRaisesRegex(RuntimeError, "ARGUS_S10_POLICY_SIGNING_KEY"):
@@ -543,6 +598,68 @@ class ArgusM0RuntimeServiceTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(payload["policy_bundle_version"], "argus-m0-dev")
         self.assertEqual(payload["policy_signer_key_id"], "argus-m0-policy")
+        self.assertEqual(payload["checkpoint_signer"], "s10-kms")
+
+    def test_s10_checkpoint_signer_route_is_internal_and_s10_owned(self) -> None:
+        app = S10SupervisorApp(
+            signing_key=b"test-key",
+            auth=_runtime_auth(),
+            checkpoint_signer=InMemoryS10KmsCheckpointSigner(
+                signer_key_id="argus-m0-s8-checkpoint",
+                signing_key=CHECKPOINT_SIGNING_KEY.encode("utf-8"),
+            ),
+            checkpoint_signer_auth_token=CHECKPOINT_SIGNER_AUTH_TOKEN,
+        )
+        body = {"sequence": 7, "root": "blake3:" + "a" * 64}
+
+        no_auth_status, no_auth_payload = app.http.handle(
+            JsonRequest(
+                method="POST",
+                path="/v1/internal/s8-checkpoint-signatures",
+                query={},
+                body=body,
+                headers={},
+            )
+        )
+        health_token_status, health_token_payload = app.http.handle(
+            JsonRequest(
+                method="POST",
+                path="/v1/internal/s8-checkpoint-signatures",
+                query={},
+                body=body,
+                headers=_auth_headers(HEALTH_TOKEN),
+            )
+        )
+        signed_status, signed_payload = app.http.handle(
+            JsonRequest(
+                method="POST",
+                path="/v1/internal/s8-checkpoint-signatures",
+                query={},
+                body=body,
+                headers=_auth_headers(CHECKPOINT_SIGNER_AUTH_TOKEN),
+            )
+        )
+        tampered_status, tampered_payload = app.http.handle(
+            JsonRequest(
+                method="POST",
+                path="/v1/internal/s8-checkpoint-signatures",
+                query={},
+                body={"sequence": 7, "root": "sha256:" + "a" * 64},
+                headers=_auth_headers(CHECKPOINT_SIGNER_AUTH_TOKEN),
+            )
+        )
+
+        self.assertEqual(no_auth_status, 401)
+        self.assertEqual(no_auth_payload["error"], "Unauthorized")
+        self.assertEqual(health_token_status, 401)
+        self.assertEqual(health_token_payload["error"], "Unauthorized")
+        self.assertEqual(signed_status, 201)
+        self.assertEqual(signed_payload["sequence"], 7)
+        self.assertEqual(signed_payload["root"], body["root"])
+        self.assertEqual(signed_payload["signer_key_id"], "argus-m0-s8-checkpoint")
+        self.assertTrue(signed_payload["signature"].startswith("hmac-sha256:"))
+        self.assertEqual(tampered_status, 400)
+        self.assertEqual(tampered_payload["error"], "ValueError")
 
     def test_s10_store_artifact_rejects_scope_token_from_other_identity(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -686,7 +803,8 @@ class ArgusM0ComposeTests(unittest.TestCase):
                 "ARGUS_S10_SIGNING_KEY": "test-s10-signing-key",
                 "ARGUS_S10_POLICY_SIGNING_KEY": POLICY_SIGNING_KEY,
                 "ARGUS_S8_BROKER_WRITE_KEY": BROKER_WRITE_KEY.decode("utf-8"),
-                "ARGUS_S8_CHECKPOINT_SIGNING_KEY": "test-s8-checkpoint-signing-key",
+                "ARGUS_S10_CHECKPOINT_SIGNING_KEY": CHECKPOINT_SIGNING_KEY,
+                "ARGUS_S10_CHECKPOINT_SIGNER_AUTH_TOKEN": CHECKPOINT_SIGNER_AUTH_TOKEN,
                 "ARGUS_S8_C3_VERIFIER_KEYS_JSON": C3_VERIFIER_KEYS_JSON,
             },
         )
@@ -710,10 +828,17 @@ class ArgusM0ComposeTests(unittest.TestCase):
             services["s8-writer"]["environment"]["ARGUS_S8_RUST_LEDGER_WRITER_CMD"],
             "/usr/local/bin/argus-s8-ledger-writer",
         )
+        self.assertEqual(services["s8-writer"]["environment"]["ARGUS_S8_REQUIRE_RUST_LEDGER_WRITER"], "1")
         self.assertEqual(
-            services["s8-writer"]["environment"]["ARGUS_S8_CHECKPOINT_SIGNER_KEY_ID"],
-            "argus-m0-s8-checkpoint",
+            services["s8-writer"]["environment"]["ARGUS_S8_CHECKPOINT_SIGNER_URL"],
+            "http://s10-supervisor:8080/v1/internal/s8-checkpoint-signatures",
         )
+        self.assertEqual(
+            services["s8-writer"]["environment"]["ARGUS_S8_CHECKPOINT_SIGNER_AUTH_TOKEN"],
+            CHECKPOINT_SIGNER_AUTH_TOKEN,
+        )
+        self.assertNotIn("ARGUS_S8_CHECKPOINT_SIGNING_KEY", services["s8-writer"]["environment"])
+        self.assertNotIn("ARGUS_S8_CHECKPOINT_SIGNER_KEY_ID", services["s8-writer"]["environment"])
         self.assertEqual(services["s8-writer"]["environment"]["ARGUS_S8_REQUIRE_REPORT_VERIFIER"], "1")
         self.assertEqual(services["s8-writer"]["environment"]["ARGUS_S8_C3_VERIFIER_KEYS_JSON"], C3_VERIFIER_KEYS_JSON)
         self.assertEqual(services["s8-writer"]["environment"]["ARGUS_S8_MINIO_ENDPOINT"], "minio:9000")
@@ -740,6 +865,18 @@ class ArgusM0ComposeTests(unittest.TestCase):
         self.assertIn("ARGUS_S8_BROKER_WRITE_KEY", services["s10-supervisor"]["environment"])
         self.assertEqual(services["s10-supervisor"]["environment"]["ARGUS_S10_SIGNING_KEY"], "test-s10-signing-key")
         self.assertEqual(services["s10-supervisor"]["environment"]["ARGUS_S10_POLICY_SIGNING_KEY"], POLICY_SIGNING_KEY)
+        self.assertEqual(
+            services["s10-supervisor"]["environment"]["ARGUS_S10_CHECKPOINT_SIGNER_KEY_ID"],
+            "argus-m0-s8-checkpoint",
+        )
+        self.assertEqual(
+            services["s10-supervisor"]["environment"]["ARGUS_S10_CHECKPOINT_SIGNING_KEY"],
+            CHECKPOINT_SIGNING_KEY,
+        )
+        self.assertEqual(
+            services["s10-supervisor"]["environment"]["ARGUS_S10_CHECKPOINT_SIGNER_AUTH_TOKEN"],
+            CHECKPOINT_SIGNER_AUTH_TOKEN,
+        )
         self.assertNotIn("volumes", services["s10-supervisor"])
         self.assertNotIn("s8-data", rendered["volumes"])
         self.assertIn("postgres-data", rendered["volumes"])

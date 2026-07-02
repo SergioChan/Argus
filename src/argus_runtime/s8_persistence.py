@@ -173,22 +173,25 @@ class SubprocessRustLedgerWriter:
         command: list[str],
         dsn: str,
         db_role: str | None,
-        checkpoint_signer_key_id: str,
-        checkpoint_signing_key: str,
+        checkpoint_signer_url: str,
+        checkpoint_signer_auth_token: str,
     ) -> None:
         self._command = command
         self._dsn = dsn
         self._db_role = db_role
-        self._checkpoint_signer_key_id = checkpoint_signer_key_id
-        self._checkpoint_signing_key = checkpoint_signing_key
+        self._checkpoint_signer_url = checkpoint_signer_url
+        self._checkpoint_signer_auth_token = checkpoint_signer_auth_token
+        self.checkpoint_signer_kind = "s10-http"
 
     def commit_record(self, record: ArtifactRecord) -> dict[str, Any]:
         env = {
             **os.environ,
             "ARGUS_S8_RUST_LEDGER_DSN": self._dsn,
-            "ARGUS_S8_CHECKPOINT_SIGNER_KEY_ID": self._checkpoint_signer_key_id,
-            "ARGUS_S8_CHECKPOINT_SIGNING_KEY": self._checkpoint_signing_key,
+            "ARGUS_S8_CHECKPOINT_SIGNER_URL": self._checkpoint_signer_url,
+            "ARGUS_S8_CHECKPOINT_SIGNER_AUTH_TOKEN": self._checkpoint_signer_auth_token,
         }
+        env.pop("ARGUS_S8_CHECKPOINT_SIGNING_KEY", None)
+        env.pop("ARGUS_S8_CHECKPOINT_SIGNER_KEY_ID", None)
         if self._db_role:
             env["ARGUS_S8_RUST_LEDGER_ROLE"] = self._db_role
         completed = subprocess.run(
@@ -222,13 +225,18 @@ class PostgresArtifactStore:
         db_role: str | None = None,
         ledger_writer: SubprocessRustLedgerWriter | None = None,
         report_verifier: C3ReportVerifier | None = None,
+        require_ledger_writer: bool = False,
     ) -> None:
+        if require_ledger_writer and ledger_writer is None:
+            raise RuntimeError("S8 Rust ledger writer is required")
         self._dsn = dsn
         self._object_store = object_store
         self._db_role = db_role
         self._ledger_writer = ledger_writer
         self._report_verifier = report_verifier
+        self._require_ledger_writer = require_ledger_writer
         self.ledger_writer_kind = "rust-subprocess" if ledger_writer is not None else "python-sql"
+        self.checkpoint_signer_kind = getattr(ledger_writer, "checkpoint_signer_kind", "unconfigured")
         self.report_verifier_kind = "argusverify" if report_verifier is not None else "unconfigured"
         self._snapshot = self._snapshot_store()
         self.refresh()
@@ -508,6 +516,7 @@ def build_postgres_minio_store_from_env(env: dict[str, str]) -> PostgresArtifact
         db_role=env.get("ARGUS_S8_POSTGRES_ROLE") or None,
         ledger_writer=ledger_writer,
         report_verifier=report_verifier_from_env(env),
+        require_ledger_writer=env.get("ARGUS_S8_REQUIRE_RUST_LEDGER_WRITER", "0") == "1",
     )
 
 
@@ -564,6 +573,8 @@ def _rust_ledger_writer_from_env(
 ) -> SubprocessRustLedgerWriter | None:
     command_text = env.get("ARGUS_S8_RUST_LEDGER_WRITER_CMD")
     if not command_text:
+        if env.get("ARGUS_S8_REQUIRE_RUST_LEDGER_WRITER", "0") == "1":
+            raise RuntimeError("ARGUS_S8_RUST_LEDGER_WRITER_CMD is required")
         return None
     command = shlex.split(command_text)
     if not command:
@@ -572,8 +583,8 @@ def _rust_ledger_writer_from_env(
         command=command,
         dsn=dsn,
         db_role=db_role,
-        checkpoint_signer_key_id=_required_env(env, "ARGUS_S8_CHECKPOINT_SIGNER_KEY_ID"),
-        checkpoint_signing_key=_required_env(env, "ARGUS_S8_CHECKPOINT_SIGNING_KEY"),
+        checkpoint_signer_url=_required_env(env, "ARGUS_S8_CHECKPOINT_SIGNER_URL"),
+        checkpoint_signer_auth_token=_required_env(env, "ARGUS_S8_CHECKPOINT_SIGNER_AUTH_TOKEN"),
     )
 
 

@@ -273,6 +273,14 @@ class S10VerifierKeyMetadata:
 
 
 @dataclass(frozen=True)
+class S8CheckpointSignature:
+    sequence: int
+    root: str
+    signature: str
+    signer_key_id: str
+
+
+@dataclass(frozen=True)
 class _S10VerifierKeyMaterial:
     key_id: str
     secret: bytes
@@ -339,6 +347,46 @@ class InMemoryS10KmsVerifierKeyProvider:
         return SIGNATURE_VERIFICATION_ACCEPTED
 
 
+class InMemoryS10KmsCheckpointSigner:
+    """S10-owned checkpoint signer that keeps S8 Merkle signing key material inside S10."""
+
+    kind = "s10-kms"
+
+    def __init__(self, *, signer_key_id: str, signing_key: bytes) -> None:
+        if not signer_key_id:
+            raise ValueError("checkpoint signer_key_id is required")
+        if not signing_key:
+            raise ValueError("checkpoint signing key is required")
+        self.signer_key_id = signer_key_id
+        self._signing_key = bytes(signing_key)
+
+    def sign_checkpoint(self, *, sequence: int, root: str) -> S8CheckpointSignature:
+        if sequence <= 0:
+            raise ValueError("checkpoint sequence must be positive")
+        if not root.startswith("blake3:"):
+            raise ValueError("checkpoint root must be a BLAKE3 hash")
+        digest = hmac.new(
+            self._signing_key,
+            s8_checkpoint_signature_payload(sequence=sequence, root=root, signer_key_id=self.signer_key_id).encode(
+                "utf-8"
+            ),
+            sha256,
+        ).hexdigest()
+        return S8CheckpointSignature(
+            sequence=sequence,
+            root=root,
+            signature=f"hmac-sha256:{digest}",
+            signer_key_id=self.signer_key_id,
+        )
+
+    def verify_checkpoint(self, checkpoint: S8CheckpointSignature) -> bool:
+        expected = self.sign_checkpoint(sequence=checkpoint.sequence, root=checkpoint.root)
+        return checkpoint.signer_key_id == self.signer_key_id and hmac.compare_digest(
+            checkpoint.signature,
+            expected.signature,
+        )
+
+
 class S10VerifierTrustStoreClient:
     """Read-only S8/S3 trust-store client backed by an S10 KMS verifier-key provider."""
 
@@ -378,6 +426,16 @@ class S10VerifierTrustStoreClient:
             report_with_empty_signature=report_with_empty_signature,
             signature_value=signature_value,
         )
+
+
+def s8_checkpoint_signature_payload(*, sequence: int, root: str, signer_key_id: str) -> str:
+    return (
+        "argus-s8-merkle-checkpoint-v1\n"
+        "algorithm:hmac-sha256\n"
+        f"seq:{sequence}\n"
+        f"root:{root}\n"
+        f"signer_key_id:{signer_key_id}\n"
+    )
 
 
 class InMemoryTokenService:

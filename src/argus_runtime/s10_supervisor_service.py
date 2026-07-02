@@ -20,6 +20,7 @@ from argus_core import (
     InMemoryAuditLedger,
     InMemoryPolicyBundleTrustStore,
     InMemoryPolicyService,
+    InMemoryS10KmsCheckpointSigner,
     InMemoryQuotaLedger,
     InMemoryTokenService,
     Lineage,
@@ -101,6 +102,8 @@ class S10SupervisorApp:
         runtime_identity_mint_policy: RuntimeIdentityMintPolicy | None = None,
         health_token: str | None = None,
         policy_service: InMemoryPolicyService | None = None,
+        checkpoint_signer: InMemoryS10KmsCheckpointSigner | None = None,
+        checkpoint_signer_auth_token: str | None = None,
     ) -> None:
         self.tokens = InMemoryTokenService(signing_key=signing_key)
         self.quota = InMemoryQuotaLedger()
@@ -112,6 +115,8 @@ class S10SupervisorApp:
         self._health_token = health_token
         self.policy_service = policy_service or _default_policy_service()
         self.policy = self.policy_service.active_bundle
+        self.checkpoint_signer = checkpoint_signer
+        self._checkpoint_signer_auth_token = checkpoint_signer_auth_token
         self.broker = StoreWriterBroker(
             token_service=self.tokens,
             artifact_store=self.artifacts,
@@ -239,6 +244,7 @@ class S10SupervisorApp:
                 "status": "ok",
                 "policy_bundle_version": self.policy.bundle_version,
                 "policy_signer_key_id": self.policy.signer_key_id,
+                "checkpoint_signer": self.checkpoint_signer.kind if self.checkpoint_signer is not None else "unconfigured",
                 "audit_events": len(self.audit.events()),
             }
 
@@ -290,6 +296,26 @@ class S10SupervisorApp:
             except Exception as exc:
                 return 400, {"error": type(exc).__name__, "message": str(exc)}
 
+        @self.http.route("POST", "/v1/internal/s8-checkpoint-signatures")
+        def checkpoint_signature(request: JsonRequest) -> tuple[int, Any]:
+            try:
+                self._authenticate_checkpoint_signer(request)
+                if self.checkpoint_signer is None:
+                    raise PermissionError("checkpoint signer is not configured")
+                if not isinstance(request.body, dict):
+                    return 400, {"error": "json_object_required"}
+                signature = self.checkpoint_signer.sign_checkpoint(
+                    sequence=int(request.body.get("sequence")),
+                    root=_required_str(request.body, "root"),
+                )
+                return 201, asdict(signature)
+            except UnauthorizedError as exc:
+                return 401, {"error": "Unauthorized", "message": str(exc)}
+            except PermissionError as exc:
+                return 403, {"error": type(exc).__name__, "message": str(exc)}
+            except Exception as exc:
+                return 400, {"error": type(exc).__name__, "message": str(exc)}
+
         @self.http.route("POST", "/v1/store/artifacts")
         def store_artifact(request: JsonRequest) -> tuple[int, Any]:
             try:
@@ -308,6 +334,13 @@ class S10SupervisorApp:
             except Exception as exc:
                 return 400, {"error": type(exc).__name__, "message": str(exc)}
 
+    def _authenticate_checkpoint_signer(self, request: JsonRequest) -> None:
+        require_static_bearer_token(
+            request,
+            expected_token=self._checkpoint_signer_auth_token,
+            purpose="checkpoint signer",
+        )
+
 
 def build_app_from_env() -> S10SupervisorApp:
     key_file = os.environ.get("ARGUS_S10_SIGNING_KEY_FILE")
@@ -323,6 +356,8 @@ def build_app_from_env() -> S10SupervisorApp:
     mint_policy = _runtime_identity_mint_policy_from_env()
     health_token = health_token_from_env()
     policy_service = _policy_service_from_env()
+    checkpoint_signer = _checkpoint_signer_from_env()
+    checkpoint_signer_auth_token = _required_env("ARGUS_S10_CHECKPOINT_SIGNER_AUTH_TOKEN")
     if s8_broker_url:
         if not s8_broker_key:
             raise RuntimeError("ARGUS_S8_BROKER_WRITE_KEY is required when ARGUS_S8_BROKER_URL is configured")
@@ -336,6 +371,8 @@ def build_app_from_env() -> S10SupervisorApp:
             runtime_identity_mint_policy=mint_policy,
             health_token=health_token,
             policy_service=policy_service,
+            checkpoint_signer=checkpoint_signer,
+            checkpoint_signer_auth_token=checkpoint_signer_auth_token,
         )
     data_dir = os.environ.get("ARGUS_S8_DATA_DIR")
     if data_dir:
@@ -347,6 +384,8 @@ def build_app_from_env() -> S10SupervisorApp:
             runtime_identity_mint_policy=mint_policy,
             health_token=health_token,
             policy_service=policy_service,
+            checkpoint_signer=checkpoint_signer,
+            checkpoint_signer_auth_token=checkpoint_signer_auth_token,
         )
     return S10SupervisorApp(
         signing_key=signing_key,
@@ -354,6 +393,8 @@ def build_app_from_env() -> S10SupervisorApp:
         runtime_identity_mint_policy=mint_policy,
         health_token=health_token,
         policy_service=policy_service,
+        checkpoint_signer=checkpoint_signer,
+        checkpoint_signer_auth_token=checkpoint_signer_auth_token,
     )
 
 
@@ -408,6 +449,21 @@ def _policy_service_from_signing_key(signing_key: bytes, *, signer_key_id: str) 
     return InMemoryPolicyService(
         initial_bundle=signed_bundle,
         trust_store=InMemoryPolicyBundleTrustStore({signer_key_id: signing_key}),
+    )
+
+
+def _checkpoint_signer_from_env() -> InMemoryS10KmsCheckpointSigner:
+    key_file = os.environ.get("ARGUS_S10_CHECKPOINT_SIGNING_KEY_FILE")
+    if key_file:
+        signing_key = Path(key_file).read_bytes()
+    else:
+        signing_key_value = os.environ.get("ARGUS_S10_CHECKPOINT_SIGNING_KEY")
+        if not signing_key_value:
+            raise RuntimeError("ARGUS_S10_CHECKPOINT_SIGNING_KEY or ARGUS_S10_CHECKPOINT_SIGNING_KEY_FILE is required")
+        signing_key = signing_key_value.encode("utf-8")
+    return InMemoryS10KmsCheckpointSigner(
+        signer_key_id=os.environ.get("ARGUS_S10_CHECKPOINT_SIGNER_KEY_ID", "argus-m0-s8-checkpoint"),
+        signing_key=signing_key,
     )
 
 
@@ -467,6 +523,13 @@ def _required_str(body: dict[str, Any], field: str) -> str:
     value = body.get(field)
     if not isinstance(value, str) or not value:
         raise ValueError(f"{field} is required")
+    return value
+
+
+def _required_env(name: str) -> str:
+    value = os.environ.get(name)
+    if not value:
+        raise RuntimeError(f"{name} is required")
     return value
 
 
