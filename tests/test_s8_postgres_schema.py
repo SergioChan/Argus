@@ -10,6 +10,8 @@ import subprocess
 from tempfile import TemporaryDirectory
 import unittest
 
+from argus_core import DatasetRegistry, DatasetSplit, InMemoryArtifactStore, Lineage, Producer
+
 
 ROOT = Path(__file__).resolve().parents[1]
 MIGRATIONS_DIR = ROOT / "db" / "s8"
@@ -747,6 +749,112 @@ class S8PostgresSchemaTests(unittest.TestCase):
         self.assertNotEqual(bad_limit.returncode, 0)
         self.assertIn("limit must be between 1 and 1000", bad_limit.stderr)
 
+    def test_query_artifacts_matches_python_store_for_shared_filters(self) -> None:
+        python_store = InMemoryArtifactStore()
+        python_records = [
+            python_store.create_artifact(
+                artifact_ref="c4://parity/dataset-a",
+                kind="dataset",
+                payload={"rows": [1]},
+                producer=Producer(subsystem="S6", version="1", actor_id="ingest-agent"),
+                lineage=Lineage(
+                    input_refs=(),
+                    code_ref="git:1",
+                    environment_digest="oci:1",
+                    job_id="job-42",
+                    contamination_index_version="contam-v1",
+                ),
+                created_at="2026-07-02T00:00:00Z",
+            ),
+            python_store.create_artifact(
+                artifact_ref="c4://parity/report-a",
+                kind="validation_report",
+                payload={"report": "unsigned"},
+                producer=Producer(subsystem="S3", version="1"),
+                lineage=Lineage(
+                    input_refs=(),
+                    code_ref="git:2",
+                    environment_digest="oci:2",
+                    actor_id="verifier-lineage",
+                    job_id="job-42",
+                ),
+                created_at="2026-07-02T00:05:00Z",
+            ),
+            python_store.create_artifact(
+                artifact_ref="c4://parity/model-a",
+                kind="model",
+                payload={"weights": [1]},
+                producer=Producer(subsystem="S2", version="1", actor_id="builder-a"),
+                lineage=Lineage(
+                    input_refs=("c4://parity/dataset-a",),
+                    code_ref="git:3",
+                    environment_digest="oci:3",
+                    job_id="job-42",
+                    contamination_index_version="contam-v1",
+                ),
+                validation_report_ref="c4://parity/report-a",
+                created_at="2026-07-02T01:00:00Z",
+            ),
+            python_store.create_artifact(
+                artifact_ref="c4://parity/model-b",
+                kind="model",
+                payload={"weights": [2]},
+                producer=Producer(subsystem="S2", version="2", actor_id="builder-b"),
+                lineage=Lineage(
+                    input_refs=(),
+                    code_ref="git:4",
+                    environment_digest="oci:4",
+                    job_id="job-99",
+                    contamination_index_version="contam-v2",
+                ),
+                created_at="2026-07-02T02:00:00Z",
+            ),
+        ]
+        for sequence, record in enumerate(python_records, start=1):
+            self._commit_record(
+                record.artifact_ref,
+                sequence=sequence,
+                kind=record.kind,
+                input_refs=list(record.lineage.input_refs),
+                validation_report_ref=record.validation_report_ref,
+                claim_tier=record.claim_tier,
+                producer={
+                    "subsystem": record.producer.subsystem,
+                    "version": record.producer.version,
+                    "actor_id": record.producer.actor_id,
+                    "job_id": record.producer.job_id,
+                },
+                lineage_extra={
+                    "actor_id": record.lineage.actor_id,
+                    "job_id": record.lineage.job_id,
+                    "contamination_index_version": record.lineage.contamination_index_version,
+                },
+                content_hash=record.content_hash,
+            )
+
+        query_filters = (
+            {"kind": "model"},
+            {"content_hash": python_records[0].content_hash},
+            {"producer_subsystem": "S2"},
+            {"producer_version": "1"},
+            {"actor_id": "builder-a"},
+            {"actor_id": "verifier-lineage"},
+            {"job_id": "job-42"},
+            {"contamination_index_version": "contam-v1"},
+            {"validation_report_ref": "c4://parity/report-a"},
+            {"created_after": "2000-01-01T00:00:00Z"},
+            {"created_after": "3000-01-01T00:00:00Z"},
+            {"created_before": "3000-01-01T00:00:00Z"},
+            {"created_before": "2000-01-01T00:00:00Z"},
+        )
+
+        for query_filter in query_filters:
+            with self.subTest(query_filter=query_filter):
+                self.assertEqual(
+                    _python_query_refs(python_store, query_filter),
+                    self._postgres_query_refs(query_filter),
+                )
+
     def test_dataset_registry_functions_are_versioned_typed_and_append_only(self) -> None:
         splits_v1 = [
             {
@@ -1019,6 +1127,94 @@ class S8PostgresSchemaTests(unittest.TestCase):
         self.assertEqual(latest.stdout.strip(), "1.10.0")
         self.assertEqual(versions.stdout.strip(), "1.9.0,1.10.0")
         self.assertEqual(latest_resolved.stdout.strip(), "1.10.0")
+
+    def test_dataset_registry_matches_python_for_semver_and_masked_splits(self) -> None:
+        python_registry = DatasetRegistry(artifact_store=InMemoryArtifactStore())
+        out_of_order_splits = (
+            DatasetSplit(
+                split_id="train",
+                role="train",
+                content_hash="blake3:train",
+                row_count=10,
+                schema_ref="c4://schema/ewpt/v1",
+                access_scope="agent-readable",
+            ),
+            DatasetSplit(
+                split_id="blind",
+                role="blind",
+                content_hash="blake3:blind",
+                row_count=3,
+                schema_ref="c4://schema/ewpt/v1",
+                access_scope="verifier-only",
+                label_seal_ref="c4://labels/blind",
+            ),
+        )
+        older = python_registry.register(
+            dataset_id="parity-corpus",
+            version="1.10.0",
+            splits=out_of_order_splits,
+            contamination_index_version="contam-2026-07-10",
+        )
+        newer_by_write_time_but_older_by_semver = python_registry.register(
+            dataset_id="parity-corpus",
+            version="1.9.0",
+            splits=(out_of_order_splits[0],),
+            contamination_index_version="contam-2026-07-09",
+        )
+        self._commit_record(older.provenance_ref.artifact_ref, sequence=1, kind="dataset")
+        self._commit_record(newer_by_write_time_but_older_by_semver.provenance_ref.artifact_ref, sequence=2, kind="dataset")
+        self._psql(
+            f"""
+            SET ROLE argus_s8_ledger_writer;
+            SELECT s8.register_dataset(
+                'parity-corpus',
+                '1.10.0',
+                {_sql_literal(older.provenance_ref.artifact_ref)},
+                {_jsonb_literal([_split_json(split) for split in out_of_order_splits])},
+                'contam-2026-07-10'
+            );
+            SELECT s8.register_dataset(
+                'parity-corpus',
+                '1.9.0',
+                {_sql_literal(newer_by_write_time_but_older_by_semver.provenance_ref.artifact_ref)},
+                {_jsonb_literal([_split_json(out_of_order_splits[0])])},
+                'contam-2026-07-09'
+            );
+            """
+        )
+
+        postgres_versions = self._psql(
+            """
+            SET ROLE argus_s8_reader;
+            SELECT string_agg(version, ',')
+            FROM s8.list_dataset_versions('parity-corpus');
+            """
+        )
+        postgres_latest = self._psql(
+            """
+            SET ROLE argus_s8_reader;
+            SELECT s8.get_dataset('parity-corpus', NULL)->>'version';
+            """
+        )
+        postgres_split_summary = self._psql(
+            """
+            SET ROLE argus_s8_reader;
+            SELECT string_agg(
+                (value->>'split_id')
+                || ':' || COALESCE(value->>'content_hash', '<null>')
+                || ':' || COALESCE(value->>'label_seal_ref', '<null>'),
+                ',' ORDER BY value->>'split_id'
+            )
+            FROM jsonb_array_elements(s8.get_dataset('parity-corpus', NULL)->'splits') AS item(value);
+            """
+        )
+
+        self.assertEqual(postgres_versions.stdout.strip(), ",".join(python_registry.list_versions("parity-corpus")))
+        self.assertEqual(postgres_latest.stdout.strip(), python_registry.get("parity-corpus").version)
+        self.assertEqual(
+            postgres_split_summary.stdout.strip(),
+            ",".join(_dataset_split_summary(python_registry.get("parity-corpus"))),
+        )
 
     def test_resolve_split_denies_non_verifier_labels_and_audits_verifier_resolution(self) -> None:
         splits = [
@@ -1406,6 +1602,7 @@ class S8PostgresSchemaTests(unittest.TestCase):
         claim_tier: str = "ran-toy",
         producer: dict[str, object] | None = None,
         lineage_extra: dict[str, object] | None = None,
+        content_hash: str | None = None,
         check: bool = True,
     ) -> subprocess.CompletedProcess[str]:
         input_refs = input_refs or []
@@ -1426,7 +1623,7 @@ class S8PostgresSchemaTests(unittest.TestCase):
             SET ROLE argus_s8_ledger_writer;
             SELECT s8.commit_artifact_record(
                 {_sql_literal(artifact_ref)},
-                {_sql_literal(f"blake3:{sequence}")},
+                {_sql_literal(content_hash or f"blake3:{sequence}")},
                 {_sql_literal(kind)},
                 {_jsonb_literal(producer)},
                 {_jsonb_literal(lineage)},
@@ -1439,6 +1636,18 @@ class S8PostgresSchemaTests(unittest.TestCase):
             """,
             check=check,
         )
+
+    def _postgres_query_refs(self, query_filter: dict[str, object]) -> tuple[str, ...]:
+        result = self._psql(
+            f"""
+            SELECT COALESCE(string_agg(record->>'artifact_id', ',' ORDER BY record->>'artifact_id'), '')
+            FROM s8.query_artifacts({_jsonb_literal(query_filter)}, 100, 0) AS query(record);
+            """
+        )
+        output = result.stdout.strip()
+        if not output:
+            return ()
+        return tuple(output.split(","))
 
     def _apply_s8_migrations(self, *, check: bool = True) -> subprocess.CompletedProcess[str]:
         command = [
@@ -1507,6 +1716,33 @@ def _text_array_literal(values: list[str]) -> str:
     if not values:
         return "ARRAY[]::text[]"
     return "ARRAY[" + ", ".join(_sql_literal(value) for value in values) + "]::text[]"
+
+
+def _python_query_refs(store: InMemoryArtifactStore, query_filter: dict[str, object]) -> tuple[str, ...]:
+    return tuple(sorted(record.artifact_ref for record in store.query_artifacts(query_filter)))
+
+
+def _split_json(split: DatasetSplit) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "split_id": split.split_id,
+        "role": split.role,
+        "content_hash": split.content_hash,
+        "row_count": split.row_count,
+        "schema_ref": split.schema_ref,
+        "access_scope": split.access_scope,
+    }
+    if split.label_seal_ref is not None:
+        payload["label_seal_ref"] = split.label_seal_ref
+    return payload
+
+
+def _dataset_split_summary(record) -> tuple[str, ...]:
+    return tuple(
+        sorted(
+            f"{split.split_id}:{split.content_hash or '<null>'}:{split.label_seal_ref or '<null>'}"
+            for split in record.splits
+        )
+    )
 
 
 def _stdout_lines(result: subprocess.CompletedProcess[str]) -> list[str]:
