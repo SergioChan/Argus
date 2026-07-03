@@ -2210,7 +2210,6 @@ class DockerSandboxSupervisor:
         return replace(
             conservative_usage,
             compute_units=max(cgroup_cpu_seconds, conservative_usage.compute_units),
-            gpu_seconds=0.0,
         )
 
     def _docker_api_logs(self, container_id: str) -> tuple[str, str]:

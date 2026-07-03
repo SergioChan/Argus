@@ -972,6 +972,87 @@ class S10OrchestratorAndAuditTests(unittest.TestCase):
 
 
 class S10ResourceMeterGapTests(unittest.TestCase):
+    def test_docker_stats_preserves_conservative_gpu_seconds_without_dcgm(self) -> None:
+        envelope = LaunchEnvelope(
+            cpu_m=500,
+            mem_bytes=64 * 1024 * 1024,
+            gpu_count=2,
+            wallclock_s=10,
+            scratch_bytes=1024 * 1024,
+            pids=16,
+            estimated_cost_usd=0.01,
+        )
+        stats = {
+            "cpu_stats": {"cpu_usage": {"total_usage": 1_000_000_000}},
+            "memory_stats": {"usage": 123},
+        }
+
+        usage = DockerSandboxSupervisor._usage_from_docker_stats(stats, envelope, elapsed_s=3.25)
+
+        self.assertEqual(usage.gpu_seconds, 6.5)
+        self.assertEqual(usage.wallclock_s, 3.25)
+        self.assertEqual(
+            s10_module._budget_usage_breach_dimensions(
+                BudgetCaps(max_compute_units=100, max_gpu_seconds=6, max_wallclock_s=100, max_cost_usd=100),
+                usage,
+            ),
+            ("gpu_seconds",),
+        )
+
+    def test_gpu_cap_halts_from_conservative_docker_meter_without_dcgm(self) -> None:
+        tokens = InMemoryTokenService(signing_key=b"test-key", now_fn=lambda: 1_000)
+        request = LaunchRequest(
+            job_id="job-gpu",
+            subagent_id="subagent-gpu",
+            trace_id="trace-gpu",
+            budget_token=tokens.mint_budget(
+                caps=BudgetCaps(max_compute_units=100, max_gpu_seconds=1, max_wallclock_s=10, max_cost_usd=10),
+                job_id="job-gpu",
+                root_request_id="root-gpu",
+            ),
+            scope_token=tokens.mint_scope(job_id="job-gpu", scopes=ScopeGrant()),
+            image="registry.local/argus@sha256:" + "b" * 64,
+            entrypoint=("/bin/sh",),
+            args=("-c", "sleep 30"),
+            env={},
+            env_allowlist=(),
+            requested_envelope=LaunchEnvelope(
+                cpu_m=500,
+                mem_bytes=64 * 1024 * 1024,
+                gpu_count=1,
+                wallclock_s=10,
+                scratch_bytes=1024 * 1024,
+                pids=16,
+                estimated_cost_usd=0.01,
+            ),
+        )
+        supervisor = _GpuBudgetBreachDockerApiSupervisor(elapsed_s=1.25)
+        started_at = s10_module.time.monotonic() - 1.25
+        samples: list[s10_module.ResourceMeterSample] = []
+
+        exit_code, timed_out, stderr, usage, partial_result = supervisor._wait_for_container_with_meter(
+            container_id="container-gpu",
+            request=request,
+            started_at=started_at,
+            meter_sample_sink=samples.append,
+        )
+
+        self.assertIsNone(exit_code)
+        self.assertTrue(timed_out)
+        self.assertEqual(stderr, "argus meter halted container: budget_caps")
+        self.assertIsNotNone(partial_result)
+        assert partial_result is not None
+        self.assertEqual(partial_result.reason, "budget_caps")
+        self.assertEqual(partial_result.stdout, "partial-gpu\n")
+        self.assertTrue(partial_result.captured_after_freeze)
+        self.assertTrue(supervisor.paused)
+        self.assertTrue(supervisor.unpaused)
+        self.assertTrue(supervisor.killed)
+        self.assertGreaterEqual(usage.gpu_seconds, 1.25)
+        self.assertTrue(any("gpu_seconds" in sample.breached_dimensions for sample in samples))
+        self.assertTrue(any(sample.halted for sample in samples))
+        self.assertTrue(all(not sample.dcgm_available for sample in samples))
+
     def test_metering_payload_splits_halt_detection_from_cleanup_latency(self) -> None:
         samples = (
             s10_module.ResourceMeterSample(
@@ -1908,6 +1989,67 @@ class _GapStallDockerApiSupervisor(DockerSandboxSupervisor):
             cadence_s=cadence_s,
             usage=s10_module._runtime_budget_usage(envelope, elapsed_s),
             memory_bytes=123,
+            source="test-docker-api-cgroup",
+        )
+
+
+class _GpuBudgetBreachDockerApiSupervisor(DockerSandboxSupervisor):
+    def __init__(self, *, elapsed_s: float) -> None:
+        super().__init__(meter_interval_s=0.1)
+        self.elapsed_s = elapsed_s
+        self.json_calls = 0
+        self.paused = False
+        self.unpaused = False
+        self.killed = False
+
+    def _docker_api_request(  # type: ignore[override]
+        self,
+        method: str,
+        path: str,
+        body=None,
+        *,
+        expected,
+        timeout: float = 10,
+    ):
+        if path.endswith("/json"):
+            self.json_calls += 1
+            return {"State": {"Running": self.json_calls == 1, "ExitCode": 0}}
+        if path.endswith("/pause"):
+            self.paused = True
+            return {}
+        if path.endswith("/unpause"):
+            self.unpaused = True
+            return {}
+        if path.endswith("/kill"):
+            self.killed = True
+            return {}
+        raise AssertionError(f"unexpected docker API request during GPU budget test: {method} {path}")
+
+    def _docker_api_logs(self, container_id: str) -> tuple[str, str]:  # type: ignore[override]
+        if not self.paused:
+            raise AssertionError("logs were captured before pause")
+        return "partial-gpu\n", ""
+
+    def _docker_api_resource_sample(  # type: ignore[override]
+        self,
+        *,
+        container_id: str,
+        envelope: LaunchEnvelope,
+        started_at: float,
+        sample_seq: int,
+        previous_sample_at: float | None,
+    ) -> s10_module.ResourceMeterSample:
+        stats = {
+            "cpu_stats": {"cpu_usage": {"total_usage": 0}},
+            "memory_stats": {"usage": 456},
+        }
+        usage = self._usage_from_docker_stats(stats, envelope, self.elapsed_s)
+        return s10_module.ResourceMeterSample(
+            sample_seq=sample_seq,
+            elapsed_s=self.elapsed_s,
+            cadence_s=0.0 if previous_sample_at is None else self.elapsed_s,
+            usage=usage,
+            memory_bytes=456,
             source="test-docker-api-cgroup",
         )
 
