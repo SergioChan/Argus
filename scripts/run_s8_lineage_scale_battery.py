@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import shutil
@@ -20,7 +21,6 @@ import psycopg
 
 
 ROOT = Path(__file__).resolve().parents[1]
-MIGRATION_SCRIPT = ROOT / "scripts" / "apply_s8_migrations.py"
 
 
 def main() -> int:
@@ -35,8 +35,8 @@ def main() -> int:
         raise SystemExit("--nodes must be at least 3")
     if args.samples < 1:
         raise SystemExit("--samples must be at least 1")
-    if not shutil.which("initdb") or not shutil.which("pg_ctl") or not shutil.which("psql"):
-        raise SystemExit("PostgreSQL command-line tools are required for the S8 lineage scale battery")
+    if not _has_local_postgres_tools() and not shutil.which("docker"):
+        raise SystemExit("PostgreSQL tools or Docker are required for the S8 lineage scale battery")
 
     with TemporaryDirectory() as tempdir:
         pg = _start_postgres(Path(tempdir))
@@ -259,6 +259,9 @@ def _percentile(values: list[float], fraction: float) -> float:
 
 
 def _start_postgres(root: Path) -> dict[str, Any]:
+    if not _has_local_postgres_tools():
+        return _start_docker_postgres()
+
     data_dir = root / "pgdata"
     socket_dir = root / "socket"
     socket_dir.mkdir()
@@ -268,7 +271,13 @@ def _start_postgres(root: Path) -> dict[str, Any]:
     except RuntimeError as exc:
         if "could not create shared memory segment" not in str(exc):
             raise
-        return _start_existing_postgres_database()
+        if shutil.which("psql"):
+            try:
+                return _start_existing_postgres_database()
+            except RuntimeError:
+                if not shutil.which("docker"):
+                    raise
+        return _start_docker_postgres()
     _run_checked(
         [
             "pg_ctl",
@@ -283,6 +292,49 @@ def _start_postgres(root: Path) -> dict[str, Any]:
         ]
     )
     return {"data_dir": data_dir, "socket_dir": socket_dir, "port": port, "database": "postgres"}
+
+
+def _has_local_postgres_tools() -> bool:
+    return all(shutil.which(binary) for binary in ("initdb", "pg_ctl"))
+
+
+def _start_docker_postgres() -> dict[str, Any]:
+    if not shutil.which("docker"):
+        raise RuntimeError("Docker is required when local PostgreSQL tools are unavailable")
+    port = _free_port()
+    result = _run_checked(
+        [
+            "docker",
+            "run",
+            "--rm",
+            "-d",
+            "-e",
+            "POSTGRES_HOST_AUTH_METHOD=trust",
+            "-p",
+            f"127.0.0.1:{port}:5432",
+            "postgres:16",
+        ]
+    )
+    pg = {
+        "docker_container": result.stdout.strip(),
+        "host": "127.0.0.1",
+        "port": port,
+        "database": "postgres",
+    }
+    deadline = time.monotonic() + 60
+    last_error: Exception | None = None
+    while time.monotonic() < deadline:
+        try:
+            with psycopg.connect(_dsn(pg), connect_timeout=2) as conn:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT 1;")
+                    cur.fetchone()
+            return pg
+        except psycopg.OperationalError as exc:
+            last_error = exc
+            time.sleep(1)
+    _stop_postgres(pg)
+    raise RuntimeError(f"Docker PostgreSQL did not become ready: {last_error}")
 
 
 def _start_existing_postgres_database() -> dict[str, Any]:
@@ -330,6 +382,14 @@ def _start_existing_postgres_database() -> dict[str, Any]:
 
 
 def _stop_postgres(pg: dict[str, Any]) -> None:
+    if pg.get("docker_container"):
+        subprocess.run(
+            ["docker", "rm", "-f", str(pg["docker_container"])],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        return
     if pg.get("external"):
         subprocess.run(
             [
@@ -376,17 +436,38 @@ def _stop_postgres(pg: dict[str, Any]) -> None:
 
 
 def _apply_migrations(pg: dict[str, Any]) -> None:
-    command = [
-        "python3",
-        str(MIGRATION_SCRIPT),
-        "--host",
-        str(pg.get("socket_dir") or pg["host"]),
-        "--database",
-        str(pg["database"]),
-    ]
-    if pg.get("port") is not None:
-        command.extend(["--port", str(pg["port"])])
-    _run_checked(command)
+    migration_dir = ROOT / "db" / "s8"
+    with psycopg.connect(_dsn(pg), autocommit=True) as conn:
+        for migration in sorted(migration_dir.glob("*.sql")):
+            migration_id = migration.stem
+            checksum = hashlib.sha256(migration.read_bytes()).hexdigest()
+            with conn.cursor() as cur:
+                cur.execute("SELECT to_regclass('s8.schema_migration') IS NOT NULL;")
+                table_exists = bool(cur.fetchone()[0])
+                existing = None
+                if table_exists:
+                    cur.execute(
+                        "SELECT checksum_sha256 FROM s8.schema_migration WHERE migration_id = %s;",
+                        (migration_id,),
+                    )
+                    row = cur.fetchone()
+                    existing = None if row is None else row[0]
+                if existing == checksum:
+                    continue
+                if existing is not None:
+                    raise RuntimeError(
+                        f"S8 migration checksum drift for {migration_id}: "
+                        f"recorded={existing} current={checksum}"
+                    )
+                cur.execute(migration.read_text())
+                cur.execute(
+                    """
+                    INSERT INTO s8.schema_migration (migration_id, checksum_sha256)
+                    VALUES (%s, %s)
+                    ON CONFLICT (migration_id) DO NOTHING;
+                    """,
+                    (migration_id, checksum),
+                )
 
 
 def _dsn(pg: dict[str, Any]) -> str:
