@@ -2150,6 +2150,8 @@ def _battery_partial_capture(
         raise AssertionError(f"partial result was not captured after freeze: {partial_payload}")
     if partial_payload.get("freeze_succeeded") is not True or partial_payload.get("terminate_succeeded") is not True:
         raise AssertionError(f"partial result did not record freeze+terminate success: {partial_payload}")
+    if partial_payload.get("frozen_state") != "FROZEN" or partial_payload.get("terminated_state") != "TERMINATED":
+        raise AssertionError(f"partial result did not record FROZEN->TERMINATED contract states: {partial_payload}")
     if partial_payload.get("capture_error") is not None:
         raise AssertionError(f"partial result capture_error was not empty: {partial_payload}")
     if partial_payload.get("logs_truncated") is not False:
@@ -2174,6 +2176,8 @@ def _battery_partial_capture(
             "partial_result_captured_after_freeze": partial_payload["captured_after_freeze"],
             "partial_result_freeze_succeeded": partial_payload["freeze_succeeded"],
             "partial_result_terminate_succeeded": partial_payload["terminate_succeeded"],
+            "partial_result_frozen_state": partial_payload["frozen_state"],
+            "partial_result_terminated_state": partial_payload["terminated_state"],
             "spend_final_ref": spend_final["artifact_ref"],
             "spend_final_partial_result_captured": spend_final["partial_result_captured"],
             "spend_final_state": spend_final["final_state"],

@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-pub const C10_SCHEMA_SHA256: &str = "sha256:db625d81a53c1427ff934239e77cdc44057c2a6a907dc9f30189e37ababa8546";
+pub const C10_SCHEMA_SHA256: &str = "sha256:44d35c3706762b4b6d1aa7d83598d6dceacaa0e6ee14c940ef92b582f9353523";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -230,6 +230,8 @@ pub struct SandboxPartialResult {
     pub stderr_bytes: u64,
     pub log_capture_limit_bytes: u64,
     pub logs_truncated: bool,
+    pub frozen_state: SandboxState,
+    pub terminated_state: SandboxState,
     pub capture_error: Option<String>,
 }
 

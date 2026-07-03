@@ -1252,6 +1252,79 @@ class S10ResourceMeterGapTests(unittest.TestCase):
         self.assertLessEqual(capture.stdout_bytes + capture.stderr_bytes, s10_module.PARTIAL_RESULT_LOG_CAPTURE_LIMIT_BYTES)
         self.assertTrue(capture.stdout.startswith("x"))
 
+    def test_partial_capture_freeze_failure_is_recorded_and_still_terminates(self) -> None:
+        request = self._halt_request("job-freeze-fail")
+        supervisor = _HaltFailureBranchDockerApiSupervisor(fail_pause=True)
+
+        exit_code, timed_out, stderr, usage, partial_result = supervisor._kill_metered_container(
+            container_id="container-freeze-fail",
+            request=request,
+            started_at=s10_module.time.monotonic() - 0.5,
+            reason="budget_caps",
+            last_sample=self._halt_sample(),
+            sample_seq=1,
+            meter_sample_sink=None,
+        )
+
+        self.assertIsNone(exit_code)
+        self.assertTrue(timed_out)
+        self.assertEqual(stderr, "argus meter halted container: budget_caps")
+        self.assertGreaterEqual(usage.wallclock_s, 0.5)
+        self.assertFalse(partial_result.freeze_succeeded)
+        self.assertFalse(partial_result.captured_after_freeze)
+        self.assertTrue(partial_result.terminate_succeeded)
+        self.assertEqual(partial_result.stdout, "partial-failure\n")
+        self.assertIn("freeze_failed:SandboxRuntimeUnavailableError", partial_result.capture_error or "")
+        self.assertEqual(partial_result.frozen_state, "FROZEN")
+        self.assertEqual(partial_result.terminated_state, "TERMINATED")
+        self.assertEqual(supervisor.calls, ["pause", "logs", "kill"])
+
+    def test_partial_capture_log_failure_is_recorded_after_freeze(self) -> None:
+        request = self._halt_request("job-log-fail")
+        supervisor = _HaltFailureBranchDockerApiSupervisor(fail_logs=True)
+
+        _, timed_out, _, _, partial_result = supervisor._kill_metered_container(
+            container_id="container-log-fail",
+            request=request,
+            started_at=s10_module.time.monotonic() - 0.5,
+            reason="wallclock_timeout",
+            last_sample=self._halt_sample(),
+            sample_seq=1,
+            meter_sample_sink=None,
+        )
+
+        self.assertTrue(timed_out)
+        self.assertTrue(partial_result.freeze_succeeded)
+        self.assertFalse(partial_result.captured_after_freeze)
+        self.assertTrue(partial_result.terminate_succeeded)
+        self.assertEqual(partial_result.stdout, "")
+        self.assertEqual(partial_result.stdout_bytes, 0)
+        self.assertIn("capture_failed:TimeoutError", partial_result.capture_error or "")
+        self.assertEqual(supervisor.calls, ["pause", "logs", "unpause", "kill"])
+
+    def test_partial_capture_unpause_and_terminate_failures_are_recorded(self) -> None:
+        request = self._halt_request("job-cleanup-fail")
+        supervisor = _HaltFailureBranchDockerApiSupervisor(fail_unpause=True, fail_kill=True)
+
+        _, timed_out, _, _, partial_result = supervisor._kill_metered_container(
+            container_id="container-cleanup-fail",
+            request=request,
+            started_at=s10_module.time.monotonic() - 0.5,
+            reason="meter_gap",
+            last_sample=self._halt_sample(),
+            sample_seq=1,
+            meter_sample_sink=None,
+        )
+
+        self.assertTrue(timed_out)
+        self.assertTrue(partial_result.freeze_succeeded)
+        self.assertTrue(partial_result.captured_after_freeze)
+        self.assertFalse(partial_result.terminate_succeeded)
+        self.assertEqual(partial_result.stdout, "partial-failure\n")
+        self.assertIn("unpause_failed:TimeoutError", partial_result.capture_error or "")
+        self.assertIn("terminate_failed:SandboxRuntimeUnavailableError", partial_result.capture_error or "")
+        self.assertEqual(supervisor.calls, ["pause", "logs", "unpause", "kill"])
+
     def test_metering_payload_splits_halt_detection_from_cleanup_latency(self) -> None:
         samples = (
             s10_module.ResourceMeterSample(
@@ -1373,6 +1446,46 @@ class S10ResourceMeterGapTests(unittest.TestCase):
         self.assertTrue(all("meter_gap" in sample.breached_dimensions for sample in gap_samples))
         self.assertEqual(samples[-1].source, "docker-api-cgroup-gap")
         self.assertIn("meter_gap", samples[-1].breached_dimensions)
+
+    def _halt_request(self, job_id: str) -> LaunchRequest:
+        tokens = InMemoryTokenService(signing_key=b"test-key", now_fn=lambda: 1_000)
+        return LaunchRequest(
+            job_id=job_id,
+            subagent_id="subagent-halt",
+            trace_id=f"trace-{job_id}",
+            budget_token=tokens.mint_budget(
+                caps=BudgetCaps(max_compute_units=100, max_wallclock_s=10, max_cost_usd=10),
+                job_id=job_id,
+                root_request_id=f"root-{job_id}",
+            ),
+            scope_token=tokens.mint_scope(job_id=job_id, scopes=ScopeGrant()),
+            image="registry.local/argus@sha256:" + "b" * 64,
+            entrypoint=("/bin/sh",),
+            args=("-c", "sleep 30"),
+            env={},
+            env_allowlist=(),
+            requested_envelope=LaunchEnvelope(
+                cpu_m=500,
+                mem_bytes=64 * 1024 * 1024,
+                gpu_count=0,
+                wallclock_s=10,
+                scratch_bytes=1024 * 1024,
+                pids=16,
+                estimated_cost_usd=0.01,
+            ),
+        )
+
+    @staticmethod
+    def _halt_sample() -> s10_module.ResourceMeterSample:
+        return s10_module.ResourceMeterSample(
+            sample_seq=1,
+            elapsed_s=0.5,
+            cadence_s=0.5,
+            usage=BudgetUsage(wallclock_s=0.5),
+            source="test-docker-api-cgroup",
+            breached_dimensions=("wallclock_s",),
+            halted=True,
+        )
 
 
 class S10DockerSupervisorTests(unittest.TestCase):
@@ -2000,8 +2113,18 @@ class S10DockerOrchestratorFailureTests(unittest.TestCase):
         partial_payload = json.loads(artifacts.get_artifact(partial_records[0].artifact_ref).decode("utf-8"))
         self.assertEqual(partial_payload["schema"], "argus.s10.partial_result.v1")
         self.assertEqual(partial_payload["reason"], "budget_caps")
+        self.assertEqual(partial_payload["final_state"], "TIMED_OUT")
+        self.assertEqual(partial_payload["frozen_state"], "FROZEN")
+        self.assertEqual(partial_payload["terminated_state"], "TERMINATED")
         self.assertEqual(partial_payload["stdout"], "partial-budget\n")
         self.assertTrue(partial_payload["captured_after_freeze"])
+        freeze_event = next(event for event in audit.events() if event.event_type == "sandbox.freeze")
+        terminate_event = next(event for event in audit.events() if event.event_type == "sandbox.terminate")
+        self.assertEqual(freeze_event.payload["state"], "FROZEN")
+        self.assertEqual(freeze_event.payload["final_state"], "TIMED_OUT")
+        self.assertEqual(terminate_event.payload["state"], "TERMINATED")
+        self.assertEqual(terminate_event.payload["final_state"], "TIMED_OUT")
+        self.assertEqual(orchestrator.get(next(iter(orchestrator._handles))).state, "BUDGET_HALTED")
         spend_records = artifacts.query_artifacts({"kind": "spend.final"})
         self.assertEqual(len(spend_records), 1)
         spend_payload = json.loads(artifacts.get_artifact(spend_records[0].artifact_ref).decode("utf-8"))
@@ -2385,6 +2508,63 @@ class _RuntimeHaltDockerApiSupervisor(DockerSandboxSupervisor):
         previous_sample_at: float | None,
     ) -> s10_module.ResourceMeterSample:
         raise AssertionError("runtime halt should be checked before another cgroup sample")
+
+
+class _HaltFailureBranchDockerApiSupervisor(DockerSandboxSupervisor):
+    def __init__(
+        self,
+        *,
+        fail_pause: bool = False,
+        fail_logs: bool = False,
+        fail_unpause: bool = False,
+        fail_kill: bool = False,
+    ) -> None:
+        super().__init__(meter_interval_s=0.1)
+        self.fail_pause = fail_pause
+        self.fail_logs = fail_logs
+        self.fail_unpause = fail_unpause
+        self.fail_kill = fail_kill
+        self.calls: list[str] = []
+
+    def _docker_api_request(  # type: ignore[override]
+        self,
+        method: str,
+        path: str,
+        body=None,
+        *,
+        expected,
+        timeout: float = 10,
+    ):
+        if path.endswith("/pause"):
+            self.calls.append("pause")
+            if self.fail_pause:
+                raise SandboxRuntimeUnavailableError("pause failed")
+            return {}
+        if path.endswith("/unpause"):
+            self.calls.append("unpause")
+            if self.fail_unpause:
+                raise TimeoutError("unpause timed out")
+            return {}
+        if path.endswith("/kill"):
+            self.calls.append("kill")
+            if self.fail_kill:
+                raise SandboxRuntimeUnavailableError("kill failed")
+            return {}
+        raise AssertionError(f"unexpected docker API request during halt failure test: {method} {path}")
+
+    def _docker_api_logs(self, container_id: str) -> s10_module._DockerLogCapture:  # type: ignore[override]
+        self.calls.append("logs")
+        if self.fail_logs:
+            raise TimeoutError("log capture timed out")
+        stdout = "partial-failure\n"
+        return s10_module._DockerLogCapture(
+            stdout=stdout,
+            stderr="",
+            stdout_bytes=len(stdout.encode("utf-8")),
+            stderr_bytes=0,
+            log_capture_limit_bytes=s10_module.PARTIAL_RESULT_LOG_CAPTURE_LIMIT_BYTES,
+            truncated=False,
+        )
 
 
 class _InjectedMeterGapSupervisor:

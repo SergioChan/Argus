@@ -379,6 +379,8 @@ class SandboxPartialResult:
     capture_error: str | None = None
     log_capture_limit_bytes: int = PARTIAL_RESULT_LOG_CAPTURE_LIMIT_BYTES
     logs_truncated: bool = False
+    frozen_state: Literal["FROZEN"] = "FROZEN"
+    terminated_state: Literal["TERMINATED"] = "TERMINATED"
 
 
 @dataclass(frozen=True)
@@ -3066,76 +3068,93 @@ class DockerSandboxOrchestrator(InMemorySandboxOrchestrator):
         if self._artifact_store is None or result.partial_result is None:
             return None
         partial = result.partial_result
+        frozen_handle = replace(handle, state=partial.frozen_state)
+        terminated_handle = replace(handle, state=partial.terminated_state)
+        self._handles[handle.sandbox_id] = frozen_handle
         freeze_payload = {
             "sandbox_id": handle.sandbox_id,
             "job_id": request.job_id,
             "reason": partial.reason,
-            "freeze_succeeded": partial.freeze_succeeded,
-        }
-        self._audit_ledger.append("sandbox.freeze", freeze_payload)
-        payload = {
-            "schema": "argus.s10.partial_result.v1",
-            "job_id": request.job_id,
-            "sandbox_id": handle.sandbox_id,
-            "budget_id": request.budget_token.budget_id,
-            "budget_epoch": request.budget_token.budget_epoch,
-            "reason": partial.reason,
+            "state": partial.frozen_state,
             "final_state": handle.state,
-            "stdout": partial.stdout,
-            "stderr": partial.stderr,
-            "stdout_bytes": partial.stdout_bytes,
-            "stderr_bytes": partial.stderr_bytes,
-            "log_capture_limit_bytes": partial.log_capture_limit_bytes,
-            "logs_truncated": partial.logs_truncated,
-            "captured_after_freeze": partial.captured_after_freeze,
             "freeze_succeeded": partial.freeze_succeeded,
-            "terminate_succeeded": partial.terminate_succeeded,
-            "capture_error": partial.capture_error,
         }
-        environment_digest = hash_json(
-            {
-                "kind": "argus.s10.partial_result.env.v1",
-                "launch_provenance_ref": handle.launch_provenance_ref,
-                "reason": partial.reason,
-                "image": request.image,
-            }
-        )
-        input_refs = (handle.launch_provenance_ref,) if handle.launch_provenance_ref else ()
-        record = self._artifact_store.create_artifact(
-            kind="sandbox.partial_result",
-            payload=payload,
-            producer=Producer(subsystem="S10", version=handle.policy_bundle_version, job_id=request.job_id),
-            lineage=Lineage(
-                input_refs=input_refs,
-                code_ref=request.image,
-                environment_digest=environment_digest,
-                seeds=(request.trace_id,),
-                job_id=request.job_id,
-            ),
-        )
-        self._audit_ledger.append(
-            "sandbox.partial_result",
-            {
-                "sandbox_id": handle.sandbox_id,
+        try:
+            self._audit_ledger.append("sandbox.freeze", freeze_payload)
+            payload = {
+                "schema": "argus.s10.partial_result.v1",
                 "job_id": request.job_id,
-                "artifact_ref": record.artifact_ref,
+                "sandbox_id": handle.sandbox_id,
+                "budget_id": request.budget_token.budget_id,
+                "budget_epoch": request.budget_token.budget_epoch,
+                "reason": partial.reason,
+                "final_state": handle.state,
+                "frozen_state": partial.frozen_state,
+                "terminated_state": partial.terminated_state,
+                "stdout": partial.stdout,
+                "stderr": partial.stderr,
                 "stdout_bytes": partial.stdout_bytes,
                 "stderr_bytes": partial.stderr_bytes,
                 "log_capture_limit_bytes": partial.log_capture_limit_bytes,
                 "logs_truncated": partial.logs_truncated,
                 "captured_after_freeze": partial.captured_after_freeze,
-            },
-        )
-        self._audit_ledger.append(
-            "sandbox.terminate",
-            {
-                "sandbox_id": handle.sandbox_id,
-                "job_id": request.job_id,
-                "reason": partial.reason,
+                "freeze_succeeded": partial.freeze_succeeded,
                 "terminate_succeeded": partial.terminate_succeeded,
-            },
-        )
-        return record.artifact_ref
+                "capture_error": partial.capture_error,
+            }
+            environment_digest = hash_json(
+                {
+                    "kind": "argus.s10.partial_result.env.v1",
+                    "launch_provenance_ref": handle.launch_provenance_ref,
+                    "reason": partial.reason,
+                    "image": request.image,
+                    "frozen_state": partial.frozen_state,
+                    "terminated_state": partial.terminated_state,
+                }
+            )
+            input_refs = (handle.launch_provenance_ref,) if handle.launch_provenance_ref else ()
+            record = self._artifact_store.create_artifact(
+                kind="sandbox.partial_result",
+                payload=payload,
+                producer=Producer(subsystem="S10", version=handle.policy_bundle_version, job_id=request.job_id),
+                lineage=Lineage(
+                    input_refs=input_refs,
+                    code_ref=request.image,
+                    environment_digest=environment_digest,
+                    seeds=(request.trace_id,),
+                    job_id=request.job_id,
+                ),
+            )
+            self._audit_ledger.append(
+                "sandbox.partial_result",
+                {
+                    "sandbox_id": handle.sandbox_id,
+                    "job_id": request.job_id,
+                    "artifact_ref": record.artifact_ref,
+                    "stdout_bytes": partial.stdout_bytes,
+                    "stderr_bytes": partial.stderr_bytes,
+                    "log_capture_limit_bytes": partial.log_capture_limit_bytes,
+                    "logs_truncated": partial.logs_truncated,
+                    "captured_after_freeze": partial.captured_after_freeze,
+                    "frozen_state": partial.frozen_state,
+                    "terminated_state": partial.terminated_state,
+                },
+            )
+            self._handles[handle.sandbox_id] = terminated_handle
+            self._audit_ledger.append(
+                "sandbox.terminate",
+                {
+                    "sandbox_id": handle.sandbox_id,
+                    "job_id": request.job_id,
+                    "reason": partial.reason,
+                    "state": partial.terminated_state,
+                    "final_state": handle.state,
+                    "terminate_succeeded": partial.terminate_succeeded,
+                },
+            )
+            return record.artifact_ref
+        finally:
+            self._handles[handle.sandbox_id] = handle
 
     def _release_runtime_reservation(self, request: LaunchRequest, reserved_usage: BudgetUsage) -> None:
         self._quota_ledger.release(request.budget_token.budget_id, reserved_usage)

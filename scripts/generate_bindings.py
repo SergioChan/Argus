@@ -998,6 +998,8 @@ class SandboxPartialResult(BaseModel):
     stderr_bytes: int = Field(ge=0)
     log_capture_limit_bytes: int = Field(ge=1)
     logs_truncated: bool
+    frozen_state: Literal["FROZEN"]
+    terminated_state: Literal["TERMINATED"]
     capture_error: str | None
 
 
@@ -1215,6 +1217,8 @@ export interface SandboxPartialResult {{
   stderr_bytes: number;
   log_capture_limit_bytes: number;
   logs_truncated: boolean;
+  frozen_state: "FROZEN";
+  terminated_state: "TERMINATED";
   capture_error: string | null;
 }}
 
@@ -2466,6 +2470,8 @@ pub struct SandboxPartialResult {{
     pub stderr_bytes: u64,
     pub log_capture_limit_bytes: u64,
     pub logs_truncated: bool,
+    pub frozen_state: SandboxState,
+    pub terminated_state: SandboxState,
     pub capture_error: Option<String>,
 }}
 

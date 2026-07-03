@@ -368,13 +368,15 @@
         "stderr_bytes",
         "log_capture_limit_bytes",
         "logs_truncated",
+        "frozen_state",
+        "terminated_state",
         "capture_error"
       ],
       "additionalProperties": false,
       "properties": {
         "reason": { "type": "string", "minLength": 1 },
-        "stdout": { "type": "string" },
-        "stderr": { "type": "string" },
+        "stdout": { "type": "string", "maxLength": 65536 },
+        "stderr": { "type": "string", "maxLength": 65536 },
         "captured_after_freeze": { "type": "boolean" },
         "freeze_succeeded": { "type": "boolean" },
         "terminate_succeeded": { "type": "boolean" },
@@ -382,6 +384,8 @@
         "stderr_bytes": { "type": "integer", "minimum": 0 },
         "log_capture_limit_bytes": { "type": "integer", "minimum": 1 },
         "logs_truncated": { "type": "boolean" },
+        "frozen_state": { "type": "string", "enum": ["FROZEN"] },
+        "terminated_state": { "type": "string", "enum": ["TERMINATED"] },
         "capture_error": { "type": ["string", "null"], "minLength": 1 }
       }
     },

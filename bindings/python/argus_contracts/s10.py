@@ -7,7 +7,7 @@ from typing import Annotated, Any, Literal, Mapping
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
-C10_SCHEMA_SHA256 = "sha256:db625d81a53c1427ff934239e77cdc44057c2a6a907dc9f30189e37ababa8546"
+C10_SCHEMA_SHA256 = "sha256:44d35c3706762b4b6d1aa7d83598d6dceacaa0e6ee14c940ef92b582f9353523"
 
 ArtifactRef = Annotated[str, Field(pattern=r"^c4://[A-Za-z0-9._:/-]+$")]
 HashRef = Annotated[str, Field(pattern=r"^blake3:[a-f0-9]{64}$")]
@@ -209,6 +209,8 @@ class SandboxPartialResult(BaseModel):
     stderr_bytes: int = Field(ge=0)
     log_capture_limit_bytes: int = Field(ge=1)
     logs_truncated: bool
+    frozen_state: Literal["FROZEN"]
+    terminated_state: Literal["TERMINATED"]
     capture_error: str | None
 
 
