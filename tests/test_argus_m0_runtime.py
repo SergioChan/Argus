@@ -12,6 +12,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import argus_core.s10 as s10_module
 from argus_core import (
     ArtifactRecord,
     BudgetCaps,
@@ -641,6 +642,9 @@ class ArgusM0RuntimeServiceTests(unittest.TestCase):
             self.assertEqual(s10_health_status, 200)
             self.assertEqual(s10_health_payload["status"], "ok")
             self.assertEqual(s10_health_payload["quota_ledger"], "memory")
+            self.assertEqual(s10_health_payload["resource_meter"], "docker-api-cgroup")
+            self.assertLessEqual(s10_health_payload["meter_interval_s"], 5)
+            self.assertFalse(s10_health_payload["dcgm_available"])
             self.assertEqual(s10_scope_status, 401)
             self.assertEqual(s10_scope_payload["error"], "Unauthorized")
             self.assertEqual(s10_mint_with_health_status, 401)
@@ -769,7 +773,11 @@ class ArgusM0RuntimeServiceTests(unittest.TestCase):
         self.assertEqual(len(spend_records), 1)
         spend_payload = json.loads(app.artifacts.get_artifact(spend_records[0].artifact_ref).decode("utf-8"))
         self.assertEqual(spend_payload["final_state"], "SUCCEEDED")
-        self.assertIn("sandbox.started", [event.event_type for event in app.audit.events()])
+        self.assertEqual(spend_payload["metering"]["sample_count"], 1)
+        self.assertEqual(spend_payload["metering"]["source"], "test-successful-supervisor")
+        event_types = [event.event_type for event in app.audit.events()]
+        self.assertIn("sandbox.started", event_types)
+        self.assertIn("meter.sample", event_types)
 
     def test_s10_http_launch_rejects_identity_bound_job_override(self) -> None:
         supervisor = _SuccessfulSupervisor()
@@ -816,6 +824,8 @@ class ArgusM0RuntimeServiceTests(unittest.TestCase):
         self.assertEqual(len(spend_records), 1)
         spend_payload = json.loads(app.artifacts.get_artifact(spend_records[0].artifact_ref).decode("utf-8"))
         self.assertEqual(spend_payload["final_state"], "BUDGET_HALTED")
+        self.assertEqual(spend_payload["metering"]["sample_count"], 1)
+        self.assertEqual(spend_payload["metering"]["source"], "test-successful-supervisor")
 
     def test_s10_runtime_identity_mint_policy_rejects_overrides_unknown_callers_and_ttl_widening(self) -> None:
         app = S10SupervisorApp(
@@ -928,6 +938,9 @@ class ArgusM0RuntimeServiceTests(unittest.TestCase):
         self.assertEqual(payload["quota_ledger"], "memory")
         self.assertEqual(payload["price_table"], "unconfigured")
         self.assertEqual(payload["price_table_signer_key_id"], "unconfigured")
+        self.assertEqual(payload["resource_meter"], "docker-api-cgroup")
+        self.assertLessEqual(payload["meter_interval_s"], 5)
+        self.assertFalse(payload["dcgm_available"])
 
     def test_s10_env_build_can_use_ed25519_token_signer_and_public_verifier(self) -> None:
         base_env = {
@@ -978,6 +991,9 @@ class ArgusM0RuntimeServiceTests(unittest.TestCase):
         self.assertEqual(health["token_revocation_store"], "file")
         self.assertEqual(health["quota_ledger"], "memory")
         self.assertEqual(health["price_table"], "unconfigured")
+        self.assertEqual(health["resource_meter"], "docker-api-cgroup")
+        self.assertLessEqual(health["meter_interval_s"], 5)
+        self.assertFalse(health["dcgm_available"])
         self.assertEqual(runtime_status, 201)
         self.assertEqual(budget_status, 201)
         self.assertEqual(budget["signer_key_id"], "argus-m0-token-root")
@@ -1018,6 +1034,9 @@ class ArgusM0RuntimeServiceTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(health["price_table"], "0.1.0")
         self.assertEqual(health["price_table_signer_key_id"], "argus-m0-price-table")
+        self.assertEqual(health["resource_meter"], "docker-api-cgroup")
+        self.assertLessEqual(health["meter_interval_s"], 5)
+        self.assertFalse(health["dcgm_available"])
         self.assertIsNotNone(app.price_table)
         self.assertTrue(app.price_table.signature.startswith("hmac-sha256:"))
 
@@ -1552,12 +1571,23 @@ class _SuccessfulSupervisor(DockerSandboxSupervisor):
         usage: BudgetUsage | None = None,
         stdout: str = "Iface Destination Gateway\\nno-default-route\\nARGUS_UID=65532\\nVISIBLE=ok\\n",
     ) -> None:
+        super().__init__(meter_interval_s=0.2)
         self.calls: list[dict[str, object]] = []
         self._usage = usage or BudgetUsage(wallclock_s=0.1)
         self._stdout = stdout
 
-    def run(self, *, handle, request, materialized_env):  # type: ignore[no-untyped-def]
+    def run(self, *, handle, request, materialized_env, meter_sample_sink=None):  # type: ignore[no-untyped-def]
         self.calls.append({"handle": handle, "request": request, "materialized_env": dict(materialized_env)})
+        if meter_sample_sink is not None:
+            meter_sample_sink(
+                s10_module.ResourceMeterSample(
+                    sample_seq=1,
+                    elapsed_s=max(self._usage.wallclock_s, 0.1),
+                    cadence_s=0.0,
+                    usage=self._usage,
+                    source="test-successful-supervisor",
+                )
+            )
         return SandboxExecutionResult(
             handle=handle,
             exit_code=0,

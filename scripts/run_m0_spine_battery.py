@@ -279,6 +279,9 @@ def main() -> int:
                 "spend_final_ref": spend_final["artifact_ref"],
                 "spend_final_price_table_version": spend_final["price_table_version"],
                 "spend_final_cost_usd_exact": spend_final["cost_usd_exact"],
+                "spend_final_meter_sample_count": spend_final["meter_sample_count"],
+                "spend_final_meter_max_cadence_s": spend_final["meter_max_cadence_s"],
+                "spend_final_meter_dcgm_available": spend_final["meter_dcgm_available"],
                 "model_ref": model_record["artifact_ref"],
                 "impact_refs": sorted(impact_refs),
                 "query_refs": sorted(query_refs),
@@ -532,6 +535,12 @@ def _battery_runtime_auth_required(
         raise AssertionError(f"S10 did not activate the signed M0 price table: {s10_health}")
     if s10_health.get("price_table_signer_key_id") != "argus-m0-price-table":
         raise AssertionError(f"S10 did not report the M0 price table signer: {s10_health}")
+    if s10_health.get("resource_meter") != "docker-api-cgroup":
+        raise AssertionError(f"S10 did not activate the Docker API cgroup resource meter: {s10_health}")
+    if float(s10_health.get("meter_interval_s", 999)) > 5:
+        raise AssertionError(f"S10 resource meter cadence exceeds the S10 bound: {s10_health}")
+    if s10_health.get("dcgm_available") is not False:
+        raise AssertionError(f"S10 M0 no-GPU health must report dcgm_available=false: {s10_health}")
     _record(
         evidence,
         "auth",
@@ -552,6 +561,9 @@ def _battery_runtime_auth_required(
             "s10_quota_ledger": s10_health["quota_ledger"],
             "s10_price_table": s10_health["price_table"],
             "s10_price_table_signer_key_id": s10_health["price_table_signer_key_id"],
+            "s10_resource_meter": s10_health["resource_meter"],
+            "s10_meter_interval_s": s10_health["meter_interval_s"],
+            "s10_dcgm_available": s10_health["dcgm_available"],
         },
     )
     return str(s10_health["checkpoint_signer"])
@@ -1246,6 +1258,11 @@ def _battery_e_budget_halt(
             "spend_final_ref": spend_final["artifact_ref"],
             "spend_final_state": spend_final["final_state"],
             "spend_final_cost_usd_exact": spend_final["cost_usd_exact"],
+            "spend_final_meter_sample_count": spend_final["meter_sample_count"],
+            "spend_final_meter_max_cadence_s": spend_final["meter_max_cadence_s"],
+            "spend_final_meter_halted_by_meter": spend_final["meter_halted_by_meter"],
+            "spend_final_meter_halt_latency_s": spend_final["meter_halt_latency_s"],
+            "spend_final_meter_dcgm_available": spend_final["meter_dcgm_available"],
         },
     )
 
@@ -1274,6 +1291,7 @@ def _battery_spend_final(
     price_table = payload.get("price_table") or {}
     usage = payload.get("usage") or {}
     rollup = payload.get("usd_rollup") or {}
+    metering = payload.get("metering") or {}
     if payload.get("schema") != "argus.s10.spend.final.v1":
         raise AssertionError(f"unexpected spend.final schema: {payload}")
     if payload.get("final_state") != expected_state:
@@ -1301,11 +1319,27 @@ def _battery_spend_final(
         )
     if usage.get("cost_usd") != rollup.get("cost_usd"):
         raise AssertionError(f"spend.final usage cost did not match roll-up float view: {payload}")
+    if int(metering.get("sample_count") or 0) < 1:
+        raise AssertionError(f"spend.final missing resource-meter samples: {payload}")
+    if float(metering.get("max_cadence_s") or 0) > 5:
+        raise AssertionError(f"spend.final resource-meter cadence exceeded S10 bound: {payload}")
+    if metering.get("dcgm_available") is not False:
+        raise AssertionError(f"spend.final M0 no-GPU metering must report dcgm_available=false: {payload}")
+    if expected_state == "BUDGET_HALTED":
+        if metering.get("halted_by_meter") is not True:
+            raise AssertionError(f"spend.final budget halt missing meter halt evidence: {payload}")
+        if float(metering.get("halt_latency_s") or 999) > 2:
+            raise AssertionError(f"spend.final budget halt latency exceeded S10 bound: {payload}")
     return {
         "artifact_ref": record["artifact_ref"],
         "final_state": payload["final_state"],
         "price_table_version": price_table["price_table_version"],
         "cost_usd_exact": expected_cost_exact,
+        "meter_sample_count": int(metering["sample_count"]),
+        "meter_max_cadence_s": float(metering["max_cadence_s"]),
+        "meter_halted_by_meter": bool(metering["halted_by_meter"]),
+        "meter_halt_latency_s": float(metering["halt_latency_s"]),
+        "meter_dcgm_available": bool(metering["dcgm_available"]),
     }
 
 

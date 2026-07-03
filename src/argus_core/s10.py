@@ -112,6 +112,20 @@ class BudgetUsage:
 
 
 @dataclass(frozen=True)
+class ResourceMeterSample:
+    sample_seq: int
+    elapsed_s: float
+    cadence_s: float
+    usage: BudgetUsage
+    memory_bytes: int = 0
+    source: str = "docker-api-cgroup"
+    dcgm_available: bool = False
+    breached_dimensions: tuple[str, ...] = ()
+    halted: bool = False
+    conservative_gap_s: float = 0.0
+
+
+@dataclass(frozen=True)
 class PriceTable:
     price_table_version: str
     usd_per_cpu_second: str
@@ -1236,12 +1250,79 @@ def _runtime_budget_usage(envelope: LaunchEnvelope, duration_s: float) -> Budget
     )
 
 
+def _max_budget_usage(left: BudgetUsage, right: BudgetUsage) -> BudgetUsage:
+    return BudgetUsage(**{field: max(getattr(left, field), getattr(right, field)) for field in asdict(left)})
+
+
+def _budget_usage_breach_dimensions(caps: BudgetCaps, usage: BudgetUsage) -> tuple[str, ...]:
+    cap_values = {
+        "compute_units": caps.max_compute_units,
+        "gpu_seconds": caps.max_gpu_seconds,
+        "model_tokens": caps.max_model_tokens,
+        "wallclock_s": caps.max_wallclock_s,
+        "cost_usd": caps.max_cost_usd,
+    }
+    breached: list[str] = []
+    for field, value in asdict(usage).items():
+        if value > cap_values[field]:
+            breached.append(field)
+    return tuple(breached)
+
+
+def _resource_meter_sample_payload(sample: ResourceMeterSample) -> dict[str, Any]:
+    return {
+        "sample_seq": sample.sample_seq,
+        "elapsed_s": round(sample.elapsed_s, 6),
+        "cadence_s": round(sample.cadence_s, 6),
+        "usage": asdict(sample.usage),
+        "memory_bytes": sample.memory_bytes,
+        "source": sample.source,
+        "dcgm_available": sample.dcgm_available,
+        "breached_dimensions": list(sample.breached_dimensions),
+        "halted": sample.halted,
+        "conservative_gap_s": round(sample.conservative_gap_s, 6),
+    }
+
+
+def _resource_metering_payload(
+    samples: tuple[ResourceMeterSample, ...],
+    *,
+    requested_wallclock_s: float,
+) -> dict[str, Any]:
+    max_cadence_s = max((sample.cadence_s for sample in samples), default=0.0)
+    halted_samples = tuple(sample for sample in samples if sample.halted)
+    halt_latency_s = 0.0
+    if halted_samples:
+        halt_latency_s = max(halted_samples[-1].elapsed_s - requested_wallclock_s, 0.0)
+    return {
+        "source": samples[-1].source if samples else "unavailable",
+        "sample_count": len(samples),
+        "max_cadence_s": round(max_cadence_s, 6),
+        "halted_by_meter": bool(halted_samples),
+        "halt_latency_s": round(halt_latency_s, 6),
+        "dcgm_available": any(sample.dcgm_available for sample in samples),
+        "samples": [_resource_meter_sample_payload(sample) for sample in samples],
+    }
+
+
 def _timeout_stream(value: bytes | str | None) -> str:
     if value is None:
         return ""
     if isinstance(value, bytes):
         return value.decode("utf-8", errors="replace")
     return value
+
+
+def _resolve_docker_socket_path() -> str | None:
+    docker_host = os.environ.get("DOCKER_HOST", "")
+    candidates: list[str] = []
+    if docker_host.startswith("unix://"):
+        candidates.append(docker_host.removeprefix("unix://"))
+    candidates.extend(("/var/run/docker.sock", os.path.expanduser("~/.docker/run/docker.sock")))
+    for candidate in candidates:
+        if candidate and os.path.exists(candidate):
+            return candidate
+    return None
 
 
 class EgressProxy:
@@ -1645,8 +1726,29 @@ class BrokeredStoreClient:
 class DockerSandboxSupervisor:
     """Node-level Docker supervisor that launches digest-pinned containers with no network."""
 
-    def __init__(self, *, docker_bin: str | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        docker_bin: str | None = None,
+        meter_interval_s: float = 1.0,
+        meter_gap_halt_s: float = 5.0,
+    ) -> None:
         self._docker_bin = docker_bin or shutil.which("docker") or "docker"
+        self._meter_interval_s = min(max(float(meter_interval_s), 0.1), 5.0)
+        self._meter_gap_halt_s = max(float(meter_gap_halt_s), self._meter_interval_s)
+        self._docker_socket_path = _resolve_docker_socket_path()
+
+    @property
+    def resource_meter_kind(self) -> str:
+        return "docker-api-cgroup"
+
+    @property
+    def meter_interval_s(self) -> float:
+        return self._meter_interval_s
+
+    @property
+    def dcgm_available(self) -> bool:
+        return False
 
     def run(
         self,
@@ -1654,14 +1756,24 @@ class DockerSandboxSupervisor:
         handle: SandboxHandle,
         request: LaunchRequest,
         materialized_env: dict[str, str],
+        meter_sample_sink: Callable[[ResourceMeterSample], None] | None = None,
     ) -> SandboxExecutionResult:
         if not _is_digest_pinned_image(request.image):
             raise PolicyDeniedError("image must be digest-pinned")
         if not request.entrypoint:
             raise PolicyDeniedError("entrypoint is required")
+        if self._docker_socket_path is not None:
+            try:
+                return self._run_via_docker_api(
+                    handle=handle,
+                    request=request,
+                    materialized_env=materialized_env,
+                    meter_sample_sink=meter_sample_sink,
+                )
+            except SandboxRuntimeUnavailableError:
+                if shutil.which(self._docker_bin) is None and "/" not in self._docker_bin:
+                    raise
         if shutil.which(self._docker_bin) is None and "/" not in self._docker_bin:
-            if os.path.exists("/var/run/docker.sock"):
-                return self._run_via_docker_api(handle=handle, request=request, materialized_env=materialized_env)
             raise SandboxRuntimeUnavailableError("docker runtime is unavailable")
 
         container_name = f"argus-{handle.sandbox_id.replace('-', '')[:24]}"
@@ -1749,6 +1861,7 @@ class DockerSandboxSupervisor:
         handle: SandboxHandle,
         request: LaunchRequest,
         materialized_env: dict[str, str],
+        meter_sample_sink: Callable[[ResourceMeterSample], None] | None = None,
     ) -> SandboxExecutionResult:
         container_name = f"argus-{handle.sandbox_id.replace('-', '')[:24]}"
         envelope = request.requested_envelope
@@ -1785,40 +1898,214 @@ class DockerSandboxSupervisor:
             if not container_id:
                 raise SandboxRuntimeUnavailableError("docker runtime did not return a container id")
             self._docker_api_request("POST", f"/containers/{container_id}/start", expected=(204, 304))
-            try:
-                wait_response = self._docker_api_request(
-                    "POST",
-                    f"/containers/{container_id}/wait",
-                    expected=(200,),
-                    timeout=max(envelope.wallclock_s, 1) + 1,
-                )
-            except TimeoutError:
-                self._docker_api_request("POST", f"/containers/{container_id}/kill", expected=(204, 304, 404, 409))
-                stdout, stderr = self._docker_api_logs(container_id)
-                duration_s = time.monotonic() - started_at
-                return SandboxExecutionResult(
-                    handle=handle,
-                    exit_code=None,
-                    stdout=stdout,
-                    stderr=stderr,
-                    timed_out=True,
-                    duration_s=duration_s,
-                    budget_usage=_runtime_budget_usage(envelope, duration_s),
-                )
+            exit_code, timed_out, runtime_stderr, budget_usage = self._wait_for_container_with_meter(
+                container_id=container_id,
+                request=request,
+                started_at=started_at,
+                meter_sample_sink=meter_sample_sink,
+            )
             stdout, stderr = self._docker_api_logs(container_id)
             duration_s = time.monotonic() - started_at
+            if runtime_stderr:
+                stderr = (stderr + ("\n" if stderr else "") + runtime_stderr).strip()
             return SandboxExecutionResult(
                 handle=handle,
-                exit_code=int(wait_response.get("StatusCode", 1)),
+                exit_code=exit_code,
                 stdout=stdout,
                 stderr=stderr,
-                timed_out=False,
+                timed_out=timed_out,
                 duration_s=duration_s,
-                budget_usage=_runtime_budget_usage(envelope, duration_s),
+                budget_usage=_max_budget_usage(budget_usage, _runtime_budget_usage(envelope, duration_s)),
             )
         finally:
             if container_id:
                 self._docker_api_request("DELETE", f"/containers/{container_id}?force=true", expected=(204, 404))
+
+    def _wait_for_container_with_meter(
+        self,
+        *,
+        container_id: str,
+        request: LaunchRequest,
+        started_at: float,
+        meter_sample_sink: Callable[[ResourceMeterSample], None] | None,
+    ) -> tuple[int | None, bool, str, BudgetUsage]:
+        envelope = request.requested_envelope
+        sample_seq = 0
+        last_sample_at: float | None = None
+        last_sample: ResourceMeterSample | None = None
+        next_sample_at = started_at
+
+        def emit(sample: ResourceMeterSample) -> None:
+            nonlocal last_sample, last_sample_at
+            last_sample = sample
+            last_sample_at = time.monotonic()
+            if meter_sample_sink is not None:
+                meter_sample_sink(sample)
+
+        while True:
+            now = time.monotonic()
+            elapsed_s = now - started_at
+            if last_sample_at is not None and now - last_sample_at > self._meter_gap_halt_s:
+                sample_seq += 1
+                gap_s = now - last_sample_at
+                sample = ResourceMeterSample(
+                    sample_seq=sample_seq,
+                    elapsed_s=elapsed_s,
+                    cadence_s=gap_s,
+                    usage=_runtime_budget_usage(envelope, elapsed_s),
+                    source="docker-api-cgroup-gap",
+                    breached_dimensions=("meter_gap",),
+                    halted=True,
+                    conservative_gap_s=gap_s,
+                )
+                emit(sample)
+                return self._kill_metered_container(
+                    container_id=container_id,
+                    request=request,
+                    started_at=started_at,
+                    reason="meter_gap",
+                    last_sample=sample,
+                    sample_seq=sample_seq,
+                    meter_sample_sink=meter_sample_sink,
+                )
+
+            state = self._docker_api_request("GET", f"/containers/{container_id}/json", expected=(200,), timeout=1)
+            container_state = state.get("State") or {}
+            if not container_state.get("Running", False):
+                duration_s = time.monotonic() - started_at
+                usage = _max_budget_usage(
+                    last_sample.usage if last_sample is not None else BudgetUsage(),
+                    _runtime_budget_usage(envelope, duration_s),
+                )
+                if last_sample is None:
+                    sample_seq += 1
+                    emit(
+                        ResourceMeterSample(
+                            sample_seq=sample_seq,
+                            elapsed_s=duration_s,
+                            cadence_s=0.0,
+                            usage=usage,
+                            source="docker-api-cgroup-final",
+                        )
+                    )
+                return int(container_state.get("ExitCode", 1)), False, "", usage
+
+            if now >= next_sample_at:
+                sample_seq += 1
+                sample = self._docker_api_resource_sample(
+                    container_id=container_id,
+                    envelope=envelope,
+                    started_at=started_at,
+                    sample_seq=sample_seq,
+                    previous_sample_at=last_sample_at,
+                )
+                breach_dimensions = _budget_usage_breach_dimensions(request.budget_token.caps, sample.usage)
+                requested_wallclock_exceeded = envelope.wallclock_s > 0 and sample.elapsed_s >= envelope.wallclock_s
+                halted = bool(breach_dimensions) or requested_wallclock_exceeded
+                sample = replace(
+                    sample,
+                    breached_dimensions=breach_dimensions,
+                    halted=halted,
+                )
+                emit(sample)
+                if halted:
+                    reason = "budget_caps" if breach_dimensions else "wallclock_timeout"
+                    return self._kill_metered_container(
+                        container_id=container_id,
+                        request=request,
+                        started_at=started_at,
+                        reason=reason,
+                        last_sample=sample,
+                        sample_seq=sample_seq,
+                        meter_sample_sink=meter_sample_sink,
+                    )
+                next_sample_at = time.monotonic() + self._meter_interval_s
+                if envelope.wallclock_s > 0:
+                    next_sample_at = min(next_sample_at, started_at + envelope.wallclock_s)
+
+            sleep_until = min(next_sample_at, started_at + max(envelope.wallclock_s, 0.0))
+            sleep_s = max(min(sleep_until - time.monotonic(), self._meter_interval_s / 4, 0.1), 0.01)
+            time.sleep(sleep_s)
+
+    def _kill_metered_container(
+        self,
+        *,
+        container_id: str,
+        request: LaunchRequest,
+        started_at: float,
+        reason: str,
+        last_sample: ResourceMeterSample,
+        sample_seq: int,
+        meter_sample_sink: Callable[[ResourceMeterSample], None] | None,
+    ) -> tuple[int | None, bool, str, BudgetUsage]:
+        self._docker_api_request("POST", f"/containers/{container_id}/kill", expected=(204, 304, 404, 409))
+        duration_s = time.monotonic() - started_at
+        final_usage = _max_budget_usage(last_sample.usage, _runtime_budget_usage(request.requested_envelope, duration_s))
+        final_breach_dimensions = _budget_usage_breach_dimensions(request.budget_token.caps, final_usage)
+        final_sample = replace(
+            last_sample,
+            sample_seq=sample_seq + 1,
+            elapsed_s=duration_s,
+            cadence_s=max(duration_s - last_sample.elapsed_s, 0.0),
+            usage=final_usage,
+            breached_dimensions=final_breach_dimensions,
+            halted=True,
+        )
+        if meter_sample_sink is not None:
+            meter_sample_sink(final_sample)
+        return None, True, f"argus meter halted container: {reason}", final_usage
+
+    def _docker_api_resource_sample(
+        self,
+        *,
+        container_id: str,
+        envelope: LaunchEnvelope,
+        started_at: float,
+        sample_seq: int,
+        previous_sample_at: float | None,
+    ) -> ResourceMeterSample:
+        stats_started_at = time.monotonic()
+        try:
+            stats = self._docker_api_request(
+                "GET",
+                f"/containers/{container_id}/stats?stream=false&one-shot=true",
+                expected=(200,),
+                timeout=max(self._meter_interval_s, 1.0),
+            )
+            stats_received_at = time.monotonic()
+            usage = self._usage_from_docker_stats(stats, envelope, stats_received_at - started_at)
+            memory_bytes = int((stats.get("memory_stats") or {}).get("usage") or 0)
+            source = "docker-api-cgroup"
+            conservative_gap_s = 0.0
+        except (SandboxRuntimeUnavailableError, TimeoutError):
+            stats_received_at = time.monotonic()
+            usage = _runtime_budget_usage(envelope, stats_received_at - started_at)
+            memory_bytes = 0
+            source = "docker-api-cgroup-unavailable"
+            conservative_gap_s = max(stats_received_at - stats_started_at, 0.0)
+        cadence_s = 0.0 if previous_sample_at is None else stats_received_at - previous_sample_at
+        return ResourceMeterSample(
+            sample_seq=sample_seq,
+            elapsed_s=stats_received_at - started_at,
+            cadence_s=cadence_s,
+            usage=usage,
+            memory_bytes=memory_bytes,
+            source=source,
+            dcgm_available=False,
+            conservative_gap_s=conservative_gap_s,
+        )
+
+    @staticmethod
+    def _usage_from_docker_stats(stats: dict[str, Any], envelope: LaunchEnvelope, elapsed_s: float) -> BudgetUsage:
+        cpu_stats = stats.get("cpu_stats") or {}
+        cpu_usage = cpu_stats.get("cpu_usage") or {}
+        cgroup_cpu_seconds = float(cpu_usage.get("total_usage") or 0.0) / 1_000_000_000.0
+        conservative_usage = _runtime_budget_usage(envelope, elapsed_s)
+        return replace(
+            conservative_usage,
+            compute_units=max(cgroup_cpu_seconds, conservative_usage.compute_units),
+            gpu_seconds=0.0,
+        )
 
     def _docker_api_logs(self, container_id: str) -> tuple[str, str]:
         raw = self._docker_api_request_bytes(
@@ -1853,7 +2140,9 @@ class DockerSandboxSupervisor:
         timeout: float = 10,
     ) -> bytes:
         encoded = None if body is None else json.dumps(body, sort_keys=True).encode("utf-8")
-        connection = _UnixSocketHTTPConnection("/var/run/docker.sock", timeout=timeout)
+        if self._docker_socket_path is None:
+            raise SandboxRuntimeUnavailableError("docker API socket is unavailable")
+        connection = _UnixSocketHTTPConnection(self._docker_socket_path, timeout=timeout)
         try:
             connection.request(
                 method,
@@ -2099,16 +2388,44 @@ class DockerSandboxOrchestrator(InMemorySandboxOrchestrator):
         handle = super().launch(request)
         materialized_env = materialize_sandbox_env(request.env, request.env_allowlist)
         reserved_usage = request.requested_envelope.budget_usage()
+        meter_samples: list[ResourceMeterSample] = []
+        meter_halt_recorded = False
+
+        def record_meter_sample(sample: ResourceMeterSample) -> None:
+            nonlocal meter_halt_recorded
+            meter_samples.append(sample)
+            payload = {
+                "sandbox_id": handle.sandbox_id,
+                "job_id": request.job_id,
+                **_resource_meter_sample_payload(sample),
+            }
+            self._audit_ledger.append("meter.sample", payload)
+            if sample.conservative_gap_s > 0:
+                self._audit_ledger.append("meter.gap", payload)
+            if sample.halted and not meter_halt_recorded:
+                meter_halt_recorded = True
+                self._audit_ledger.append("meter.halt", payload)
+
         self._audit_ledger.append(
             "sandbox.started",
             {"sandbox_id": handle.sandbox_id, "job_id": request.job_id, "runtime_class": handle.runtime_class},
         )
         try:
-            result = self._supervisor.run(
-                handle=handle,
-                request=request,
-                materialized_env=materialized_env,
-            )
+            try:
+                result = self._supervisor.run(
+                    handle=handle,
+                    request=request,
+                    materialized_env=materialized_env,
+                    meter_sample_sink=record_meter_sample,
+                )
+            except TypeError as exc:
+                if "meter_sample_sink" not in str(exc):
+                    raise
+                result = self._supervisor.run(
+                    handle=handle,
+                    request=request,
+                    materialized_env=materialized_env,
+                )
         except Exception as exc:
             self._record_runtime_failure(handle, request, reserved_usage, exc)
             raise
@@ -2151,6 +2468,7 @@ class DockerSandboxOrchestrator(InMemorySandboxOrchestrator):
                 handle=halted_handle,
                 usage=result.budget_usage,
                 price_rollup=price_rollup,
+                meter_samples=tuple(meter_samples),
             )
             raise
         self._audit_ledger.append(
@@ -2167,6 +2485,7 @@ class DockerSandboxOrchestrator(InMemorySandboxOrchestrator):
             handle=final_handle,
             usage=result.budget_usage,
             price_rollup=price_rollup,
+            meter_samples=tuple(meter_samples),
         )
         return replace(result, handle=final_handle)
 
@@ -2206,6 +2525,7 @@ class DockerSandboxOrchestrator(InMemorySandboxOrchestrator):
         handle: SandboxHandle,
         usage: BudgetUsage,
         price_rollup: PriceTableRollup,
+        meter_samples: tuple[ResourceMeterSample, ...] = (),
     ) -> str | None:
         if self._artifact_store is None:
             return None
@@ -2233,6 +2553,10 @@ class DockerSandboxOrchestrator(InMemorySandboxOrchestrator):
                 "source": "signed_price_table" if self._price_table is not None else "runtime_usage",
             },
             "price_table": price_table_payload,
+            "metering": _resource_metering_payload(
+                meter_samples,
+                requested_wallclock_s=request.requested_envelope.wallclock_s,
+            ),
         }
         environment_digest = hash_json(
             {

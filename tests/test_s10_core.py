@@ -1041,6 +1041,31 @@ class S10DockerSupervisorTests(unittest.TestCase):
         self.assertGreaterEqual(result.duration_s, 1)
         self.assertFalse(self._container_exists(container_name))
 
+    def test_resource_meter_samples_cgroup_usage_and_halts_wallclock_timeout(self) -> None:
+        if s10_module._resolve_docker_socket_path() is None:
+            self._skip_or_fail("docker API socket is unavailable")
+        samples: list[s10_module.ResourceMeterSample] = []
+        supervisor = DockerSandboxSupervisor(docker_bin=self.docker_bin, meter_interval_s=0.2)
+        request = self._launch_request(
+            entrypoint=("/bin/sh",),
+            args=("-c", "sleep 5"),
+            env={},
+            env_allowlist=(),
+            wallclock_s=1,
+        )
+
+        result = supervisor.run(handle=self._handle(), request=request, materialized_env={}, meter_sample_sink=samples.append)
+
+        self.assertTrue(result.timed_out)
+        self.assertIsNone(result.exit_code)
+        self.assertIn("argus meter halted container", result.stderr)
+        self.assertGreaterEqual(result.budget_usage.wallclock_s, 1)
+        self.assertGreaterEqual(len(samples), 2)
+        self.assertTrue(any(sample.halted for sample in samples))
+        self.assertLessEqual(max(sample.cadence_s for sample in samples), 5)
+        self.assertTrue(all(not sample.dcgm_available for sample in samples))
+        self.assertGreaterEqual(max(sample.memory_bytes for sample in samples), 0)
+
     def _container_exists(self, container_name: str) -> bool:
         inspect = subprocess.run(
             [self.docker_bin, "container", "inspect", container_name],
@@ -1203,10 +1228,15 @@ class S10DockerOrchestratorTests(unittest.TestCase):
         quota_state = self.quota.state(request.budget_token.budget_id)
         self.assertEqual(quota_state.reserved, BudgetUsage())
         self.assertGreater(quota_state.actual.wallclock_s, 0)
-        self.assertEqual(
-            [event.event_type for event in self.audit.events()[-6:]],
-            ["sandbox.launched", "sandbox.started", "sandbox.exited", "budget.consume", "budget.release", "spend.final"],
-        )
+        event_types = [event.event_type for event in self.audit.events()]
+        self.assertIn("meter.sample", event_types)
+        self.assertIn("sandbox.exited", event_types)
+        self.assertEqual(event_types[-3:], ["budget.consume", "budget.release", "spend.final"])
+        spend_records = self.artifacts.query_artifacts({"kind": "spend.final"})
+        spend_payload = json.loads(self.artifacts.get_artifact(spend_records[-1].artifact_ref).decode("utf-8"))
+        self.assertGreaterEqual(spend_payload["metering"]["sample_count"], 1)
+        self.assertLessEqual(spend_payload["metering"]["max_cadence_s"], 5)
+        self.assertFalse(spend_payload["metering"]["dcgm_available"])
 
     def test_timeout_launch_records_timed_out_state(self) -> None:
         request = self._launch_request(args=("-c", "sleep 5"), env={}, env_allowlist=(), wallclock_s=1)
@@ -1219,10 +1249,16 @@ class S10DockerOrchestratorTests(unittest.TestCase):
         quota_state = self.quota.state(request.budget_token.budget_id)
         self.assertEqual(quota_state.reserved, BudgetUsage())
         self.assertGreater(quota_state.actual.wallclock_s, 0)
-        self.assertEqual(
-            [event.event_type for event in self.audit.events()[-6:]],
-            ["sandbox.launched", "sandbox.started", "sandbox.timeout", "budget.consume", "budget.release", "spend.final"],
-        )
+        event_types = [event.event_type for event in self.audit.events()]
+        self.assertIn("meter.sample", event_types)
+        self.assertIn("meter.halt", event_types)
+        self.assertIn("sandbox.timeout", event_types)
+        self.assertEqual(event_types[-3:], ["budget.consume", "budget.release", "spend.final"])
+        spend_records = self.artifacts.query_artifacts({"kind": "spend.final"})
+        spend_payload = json.loads(self.artifacts.get_artifact(spend_records[-1].artifact_ref).decode("utf-8"))
+        self.assertGreaterEqual(spend_payload["metering"]["sample_count"], 1)
+        self.assertTrue(spend_payload["metering"]["halted_by_meter"])
+        self.assertLessEqual(spend_payload["metering"]["halt_latency_s"], 2)
 
     def test_runtime_budget_exceed_halts_and_releases_reservation(self) -> None:
         over_budget_usage = BudgetUsage(compute_units=11, wallclock_s=11)
@@ -1433,8 +1469,13 @@ class S10DockerOrchestratorFailureTests(unittest.TestCase):
         self.assertEqual(payload["usd_rollup"]["cost_usd_exact"], "0.2")
         self.assertEqual(payload["price_table"]["price_table_version"], "1.0.0")
         self.assertTrue(payload["price_table"]["signature"].startswith("hmac-sha256:"))
+        self.assertEqual(payload["metering"]["sample_count"], 1)
+        self.assertEqual(payload["metering"]["source"], "test-fixed-usage")
+        self.assertFalse(payload["metering"]["dcgm_available"])
         self.assertEqual(spend_records[0].lineage.input_refs, (result.handle.launch_provenance_ref,))
-        self.assertIn("spend.final", [event.event_type for event in orchestrator._audit_ledger.events()])
+        event_types = [event.event_type for event in orchestrator._audit_ledger.events()]
+        self.assertIn("meter.sample", event_types)
+        self.assertIn("spend.final", event_types)
 
     def test_docker_orchestrator_emits_spend_final_for_budget_halt(self) -> None:
         artifacts = InMemoryArtifactStore()
@@ -1459,6 +1500,7 @@ class S10DockerOrchestratorFailureTests(unittest.TestCase):
         self.assertEqual(payload["final_state"], "BUDGET_HALTED")
         self.assertEqual(payload["usd_rollup"]["cost_usd_exact"], "2")
         self.assertEqual(payload["usage"]["cost_usd"], 2.0)
+        self.assertEqual(payload["metering"]["sample_count"], 1)
 
     @staticmethod
     def _signed_price_table(*, cpu_rate: str) -> tuple[PriceTable, PriceTableTrustStore]:
@@ -1523,7 +1565,18 @@ class _FixedUsageSupervisor:
         handle: SandboxHandle,
         request: LaunchRequest,
         materialized_env: dict[str, str],
+        meter_sample_sink=None,
     ) -> SandboxExecutionResult:
+        if meter_sample_sink is not None:
+            meter_sample_sink(
+                s10_module.ResourceMeterSample(
+                    sample_seq=1,
+                    elapsed_s=self._budget_usage.wallclock_s,
+                    cadence_s=0.0,
+                    usage=self._budget_usage,
+                    source="test-fixed-usage",
+                )
+            )
         return SandboxExecutionResult(
             handle=handle,
             exit_code=0,
@@ -1545,6 +1598,7 @@ class _RaisingSupervisor:
         handle: SandboxHandle,
         request: LaunchRequest,
         materialized_env: dict[str, str],
+        meter_sample_sink=None,
     ) -> SandboxExecutionResult:
         raise self._exc
 

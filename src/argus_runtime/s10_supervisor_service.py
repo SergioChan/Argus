@@ -137,7 +137,7 @@ class S10SupervisorApp:
         self.policy = self.policy_service.active_bundle
         self.checkpoint_signer = checkpoint_signer
         self._checkpoint_signer_auth_token = checkpoint_signer_auth_token
-        self._docker_supervisor = docker_supervisor
+        self._docker_supervisor = docker_supervisor or DockerSandboxSupervisor()
         self.price_table = price_table
         self.price_table_trust_store = price_table_trust_store
         self.broker = StoreWriterBroker(
@@ -327,6 +327,9 @@ class S10SupervisorApp:
                 "quota_ledger": getattr(self.quota, "kind", type(self.quota).__name__),
                 "price_table": self._docker_orchestrator.price_table_version or "unconfigured",
                 "price_table_signer_key_id": self._docker_orchestrator.price_table_signer_key_id or "unconfigured",
+                "resource_meter": self._docker_supervisor.resource_meter_kind,
+                "meter_interval_s": self._docker_supervisor.meter_interval_s,
+                "dcgm_available": self._docker_supervisor.dcgm_available,
                 "audit_events": len(self.audit.events()),
             }
 
