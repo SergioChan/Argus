@@ -778,7 +778,7 @@ Any INDEPENDENCE_UNAVAILABLE caps tier at `recapitulated-known`. Any mandatory I
 ### S3.7 Data models
 All models are JSON-Schema-canonical (draft 2020-12), pydantic v2 in Python. C3-owned models are authoritative; S3 also defines internal models.
 
-**C3 contract version:** the Verifier Interface + Validation Report contract is frozen at **C3 v1.1** from M0 (additive, backward-compatible; pre-implementation, no migration). C3 v1.1 adds six new `ValidationReport` fields — `perturbation_pairs`, `insensitivity_flags`, `challenger_panel`, `independence_attestation_debate` (debate extension), `referee`, and `debate_ref` — supporting bidirectional perturbation pairing, insensitivity detection, challenger-independence, non-gameable referee separation, and a pointer into the C4 provenance DebateLedger.
+**C3 contract version:** the Verifier Interface + Validation Report contract keeps **C3 v1.1** as the M0 additive compatibility baseline. C3 v1.1 added six `ValidationReport` fields — `perturbation_pairs`, `insensitivity_flags`, `challenger_panel`, `independence_attestation_debate` (debate extension), `referee`, and `debate_ref` — supporting bidirectional perturbation pairing, insensitivity detection, challenger-independence, non-gameable referee separation, and a pointer into the C4 provenance DebateLedger. The current C3 schema is **v2.0**, which makes the trust-surface fields that Observatory renders schema-required and fail-closed in VERIFIED gating.
 
 **VerifierProfile (registry, immutable revision)**
 ```
@@ -857,7 +857,7 @@ ValidationReport {
   independence_attestation?: IndependenceAttestation,
   degradations: [ { code, detail, tier_effect } ],
   cost_actual: { compute_units, gpu_seconds, wallclock_s, cost_usd },
-  # --- C3 v1.1 additive fields (frozen from M0) ---
+  # --- C3 debate fields (introduced in v1.1; required subset in current v2.0) ---
   perturbation_pairs: [ { perturbation_id, kind: "must_react"|"must_not_react",
                           expected, observed, verdict } ],
   insensitivity_flags: [ { perturbation_id, reason } ],
@@ -947,7 +947,7 @@ rpc Challenge(ChallengeRequest{ report_ref, mode: full|checks_subset[] }) return
 HTTP: POST /v1/challenge  body={report_ref, mode}
 ```
 
-**3b. Bidirectional perturbation + debate APIs (C3 v1.1)**
+**3b. Bidirectional perturbation + debate APIs (current C3)**
 ```
 rpc RunPerturbationPair(model_ref, perturbation_spec) returns (PerturbationResult)
   # runs a {must_react, must_not_react} pair sharing a perturbation_id; returns per-direction
@@ -1177,7 +1177,7 @@ def admit(v, rep):
 7. Reward-hacking & collusion screens: detect proponent overfitting to a fixed challenger set;
    detect challenger correlation/collusion; detect referee tampering; hard bound on rounds;
    refresh challenger diversity each round.
-8. Emit signed C3 v1.1 ValidationReport with debate_ref; set claim tier by survival.
+8. Emit signed current C3 ValidationReport with debate_ref; set claim tier by survival.
 ```
 The referee's must_react / must_not_react adjudication maps 1:1 onto S3 `run_perturbation_pair` + `detect_insensitivity`; challenger independence maps onto S3 `attest_challenger_independence`. Every ChallengeRound is appended to the C4 `DebateLedger`; the emitted report's `debate_ref` points at it.
 
@@ -1457,7 +1457,7 @@ ChallengeVerdict {
 DebateLedger {
   debate_ledger_id, content_hash, evolution_job_id, artifact_ref(C4)   # the artifact under debate
   rounds: [ChallengeRound]                 # append-only, ordered; all ChallengeRounds for the artifact
-  # emitted via C4; the C3 v1.1 ValidationReport.debate_ref points here.
+  # emitted via C4; the current C3 ValidationReport.debate_ref points here.
 }
 ```
 
@@ -1520,9 +1520,9 @@ C1.build(Plan) -> BuildResult{artifact_refs[](C4), training_log_ref, diagnostics
 C1.validate(BuildResult) -> ValidationRequest                                       # hands frozen pipeline to S3
 # C3 (from S3 Verifier) — the ONLY reward source:
 C3.list_profiles() -> [VerifierProfile]
-C3.verify(VerificationRequest{...}) -> ValidationReport(signed C3 v1.1)
+C3.verify(VerificationRequest{...}) -> ValidationReport(signed current C3)
 C3.challenge(report_ref) -> ChallengeResult     # used for profile-rotation / re-run probe
-# C3 v1.1 debate/referee methods (referee = S3, != proponent, signed):
+# C3 debate/referee methods (referee = S3, != proponent, signed):
 C3.run_perturbation_pair(model_ref, perturbation_spec) -> PerturbationResult
 C3.detect_insensitivity(model_ref, perturbation_set) -> InsensitivityReport
 C3.attest_challenger_independence(challenger_ids[]) -> IndependenceAttestation
@@ -3895,8 +3895,8 @@ This section is assembled from every subsystem's declared `interfaces_produced` 
 - **ModelDescriptor / PriorInjectorDescriptor / RepairPlaybookDescriptor** *(contract)* — plugin descriptors enabling model families, physics-prior injectors, and repair playbooks to be registered without S2 core changes.
 
 **S3 (owns C3)**
-- **C3 Verifier Interface + Validation Report (v1.1)** *(contract)* — list_profiles/verify/challenge plus the C3 v1.1 debate methods run_perturbation_pair/detect_insensitivity/attest_challenger_independence over gRPC+HTTP (mTLS, scoped); returns a signed ValidationReport that is the sole admissible source of a claim tier > ran-toy and the sole admissible reward signal for S4. Frozen at v1.1 from M0 (additive, backward-compatible).
-- **ValidationReport (signed, C3 v1.1)** *(schema)* — signed, write-once C4 artifact: checks[], aggregate{passed,score}, claim_tier (novel is candidate-only), justification, independence_attestation, degradations, pins, signature + signer_key_id; plus the six C3 v1.1 fields perturbation_pairs, insensitivity_flags, challenger_panel, independence_attestation_debate (debate: min_independent_challengers/lineage_disjoint/correlation_warning), referee{referee_id,non_gameable,signed_by,distinct_from_proponent}, and debate_ref (pointer into the C4 DebateLedger).
+- **C3 Verifier Interface + Validation Report (current v2.0; v1.1 compatibility baseline)** *(contract)* — list_profiles/verify/challenge plus the C3 debate methods run_perturbation_pair/detect_insensitivity/attest_challenger_independence over gRPC+HTTP (mTLS, scoped); returns a signed ValidationReport that is the sole admissible source of a claim tier > ran-toy and the sole admissible reward signal for S4.
+- **ValidationReport (signed, current C3)** *(schema)* — signed, write-once C4 artifact: checks[], aggregate{passed,score}, claim_tier (novel is candidate-only), justification, independence_attestation, degradations, pins, signature + signer_key_id; plus the debate fields perturbation_pairs, insensitivity_flags, challenger_panel, independence_attestation_debate (debate: min_independent_challengers/lineage_disjoint/correlation_warning), referee{referee_id,non_gameable,signed_by,distinct_from_proponent}, and debate_ref (pointer into the C4 DebateLedger). The Observatory VERIFIED gate requires schema validity, every check status PASS, pass verdicts for both perturbation directions, empty insensitivity flags, and `referee.distinct_from_proponent == true`.
 - **VerifierProfile registry** *(api)* — append-only versioned profile store (publish/get/deprecate/revoke, dry-run) keyed by subtopic; pinned immutably into every report.
 - **Signature-verification library (argusverify)** *(contract)* — Python/Rust/TS library that recomputes the canonical form and verifies the report signature against the versioned trust store; used at every C3 consumption point.
 - **Frozen-pipeline entrypoint contract** *(contract)* — standard opaque entrypoint (inputs→prediction+uncertainty, pure, no network) every C1 subagent frozen artifact must satisfy so S3 can invoke it identically inside a nested sandbox.
@@ -4019,7 +4019,7 @@ This section is assembled from every subsystem's declared `interfaces_produced` 
 
 **S2 consumes:** C2 JobEnvelope + Plan (S5); C4 writer/reader (S8) — put/get with content-hash verification, write-once for frozen pipelines, fail-closed on incomplete lineage; C6 (S7) — describe/evaluate/grad/batch_evaluate for forward-model features + differentiable physics losses; C5 resolve (S6/S12) — resolve dataset/adapter descriptors, pin revisions, discover independence tags; C3 list_profiles presence-only (S3) — confirm verifier profile resolvable before building, never calls verify(); S6 curated docs/priors (RAG, read-only); S10 sandbox/egress/budget enforcement; S11 OTel sink + re-run canary consumption.
 
-**S3 consumes:** C4 (S8) — fetch frozen pipeline/model/config/lineage by ref, write signed reports + evidence to write-once with validation_report_ref/tier coupling, and emit the DebateLedger (C4) whose ref the C3 v1.1 report carries in debate_ref; C5 (S6/S12) — resolve(query{observable, independence_needed, min_conformance}) for genuinely independent cross-code adapters; C6 (S7) — describe/evaluate/grad/batch_evaluate for CROSS_CODE + forward-model consistency, units + uncertainty mandatory, and MUST consume S7's extrapolation / out-of-validity flag and set the affected check to INCONCLUSIVE (reciprocal to S7's obligation to emit it); S6 frozen contamination index (read-only, pinned) for LEAKAGE overlap; S10 nested sandbox lifecycle for the Frozen-Pipeline Runner; Vault/KMS signer identity to the Signer process only; C2 (S5) — verifier_profile_ref + metered budget_token, C2-compatible typed errors + JobResult fields; C1 validate handoff (S1); S11 OTel/NATS + challenge() re-run canary.
+**S3 consumes:** C4 (S8) — fetch frozen pipeline/model/config/lineage by ref, write signed reports + evidence to write-once with validation_report_ref/tier coupling, and emit the DebateLedger (C4) whose ref the current C3 report carries in debate_ref; C5 (S6/S12) — resolve(query{observable, independence_needed, min_conformance}) for genuinely independent cross-code adapters; C6 (S7) — describe/evaluate/grad/batch_evaluate for CROSS_CODE + forward-model consistency, units + uncertainty mandatory, and MUST consume S7's extrapolation / out-of-validity flag and set the affected check to INCONCLUSIVE (reciprocal to S7's obligation to emit it); S6 frozen contamination index (read-only, pinned) for LEAKAGE overlap; S10 nested sandbox lifecycle for the Frozen-Pipeline Runner; Vault/KMS signer identity to the Signer process only; C2 (S5) — verifier_profile_ref + metered budget_token, C2-compatible typed errors + JobResult fields; C1 validate handoff (S1); S11 OTel/NATS + challenge() re-run canary.
 
 **S4 consumes:** C1.build / C1.validate (S1) — drive the subagent lifecycle to train a frozen variant pipeline (build in S10 via S2) and hand the frozen pipeline to S3; S4 never trains directly; C3.list_profiles / verify / challenge (S3) — the ONLY reward source; C3 ValidationReport signed (S3) — read aggregate.score + claim_tier, verify signature, honor leakage/calibration/cross-code at admission; C4.put/get/query_lineage (S8) — persist/retrieve variants, checkpoints, LLM prompts, generation records; build genealogy DAG; enforce tier↔report coupling; C5.resolve (S6/S12) — verifier profile applicability + at least one INDEPENDENT cross-code adapter, detect revocation mid-run; C6 adapter descriptors read-only via C5 (S7) — confirm cross-code independence; S4 never calls C6 evaluate/grad (S2 does); C2 JobEnvelope/JobResult (S5) — inbound dispatch, outbound EvolutionResult, S9 wait-state on novel; S10 sandbox + budget_token + read-only trust store.
 
@@ -4052,10 +4052,10 @@ These invariants are the load-bearing guarantees that the contract fabric makes 
 7. **Strict sandboxing + metered budgets.** All agent/variant/federated code runs only in S10 (gVisor/Firecracker, read-only rootfs, egress-deny, seccomp); the metered `budget_token` and least-privilege `capability_scopes` are enforced at every call; secrets never enter a sandbox. (C2, S10.)
 8. **Reproducibility & tamper-evidence.** Content addressing (BLAKE3), Merkle-chained ledgers (S8, S9, S10), and the S11 re-run canary + `challenge()` make every claim re-derivable and every trust-boundary action auditable. (C4, C3, S11.)
 9. **Admission ≠ trust.** Federated entities are admitted by S12 only via a passing ConformanceRecord, with `trust_class` overwritten to `federated` and scopes stripped to the federation default; C5 revocation propagates and consumers halt in-flight references. (C5, S12.)
-10. **Bidirectional perturbation + insensitivity, both directions.** A claim passes only when the must-react probe recovers a planted KNOWN-REAL signal proportionally AND the must-not-react probe (noise/shuffle/contamination) does not manufacture a signal AND no insensitivity (invariance-to-a-should-react-perturbation) is detected; the three conditions are recorded in the C3 v1.1 `perturbation_pairs[]` + `insensitivity_flags[]`. (C3 v1.1, S3, S4.)
-11. **Non-gameable referee, referee ≠ proponent.** The debate REFEREE is the S3 verifier, oracle-backed and signed, and NEVER the same agent as the PROPONENT (Builder subagent); S3 fails closed if `referee.distinct_from_proponent` is false (a builder cannot self-attest), and emission of any such artifact is blocked at the S9 gate (X-16). (C3 v1.1, S3, S9.)
-12. **Challenger independence is machine-checked.** The challenger panel must be ≥K and lineage-disjoint (cross-code) via `attest_challenger_independence`; correlated/collusion-prone panels raise `correlation_warning` and are refreshed each round. (C3 v1.1, C5, S3, S4.)
-13. **C3-v1.1 field flow S4 → S3 → C4.** S4 (proponent + challenger panel) drives each debate round; S3 (referee) adjudicates and emits the signed C3 v1.1 ValidationReport with the six new fields; the DebateLedger of all ChallengeRounds is persisted to C4 provenance and pointed at by `debate_ref`. (S4, C3 v1.1, C4.)
+10. **Bidirectional perturbation + insensitivity, both directions.** A claim passes only when the must-react probe recovers a planted KNOWN-REAL signal proportionally AND the must-not-react probe (noise/shuffle/contamination) does not manufacture a signal AND no insensitivity (invariance-to-a-should-react-perturbation) is detected; the three conditions are recorded in the current C3 `perturbation_pairs[]` + `insensitivity_flags[]`. (C3, S3, S4.)
+11. **Non-gameable referee, referee ≠ proponent.** The debate REFEREE is the S3 verifier, oracle-backed and signed, and NEVER the same agent as the PROPONENT (Builder subagent); S3 fails closed if `referee.distinct_from_proponent` is false (a builder cannot self-attest), and emission of any such artifact is blocked at the S9 gate (X-16). (C3, S3, S9.)
+12. **Challenger independence is machine-checked.** The challenger panel must be ≥K and lineage-disjoint (cross-code) via `attest_challenger_independence`; correlated/collusion-prone panels raise `correlation_warning` and are refreshed each round. (C3, C5, S3, S4.)
+13. **C3 field flow S4 → S3 → C4.** S4 (proponent + challenger panel) drives each debate round; S3 (referee) adjudicates and emits the signed current C3 ValidationReport with the debate fields; the DebateLedger of all ChallengeRounds is persisted to C4 provenance and pointed at by `debate_ref`. (S4, C3, C4.)
 14. **Extrapolation reciprocity S7 ↔ S3.** S7 MUST emit an extrapolation / out-of-validity flag in its C6 tool result and S3 MUST consume it and set the affected check to INCONCLUSIVE (unless a profile explicitly permits); enforced at both the producer (S7) and consumer (S3) ends. (C6, C3.)
 
 ---
