@@ -219,8 +219,8 @@ class SandboxExecutionResult(BaseModel):
 
     handle: SandboxHandle
     exit_code: int | None
-    stdout: str
-    stderr: str
+    stdout: str = Field(max_length=65536)
+    stderr: str = Field(max_length=65536)
     timed_out: bool
     duration_s: float = Field(ge=0)
     budget_usage: BudgetUsage

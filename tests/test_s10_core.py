@@ -1488,6 +1488,114 @@ class S10ResourceMeterGapTests(unittest.TestCase):
         )
 
 
+class S10DockerSupervisorCliFallbackTests(unittest.TestCase):
+    def test_cli_fallback_bounds_stdout_and_stderr_without_docker_socket(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            docker_bin, _ = self._fake_docker(temp_dir, sleep_after_output_s=0)
+            supervisor = DockerSandboxSupervisor(docker_bin=docker_bin)
+            supervisor._docker_socket_path = None
+            result = supervisor.run(
+                handle=self._handle(),
+                request=self._launch_request(wallclock_s=2),
+                materialized_env={},
+            )
+
+        limit = s10_module.PARTIAL_RESULT_LOG_CAPTURE_LIMIT_BYTES
+        self.assertFalse(result.timed_out)
+        self.assertEqual(result.exit_code, 0)
+        self.assertLessEqual(len(result.stdout.encode("utf-8")), limit)
+        self.assertLessEqual(len(result.stderr.encode("utf-8")), limit)
+        self.assertIn(f"[argus stdout truncated at {limit} bytes]", result.stdout)
+        self.assertIn(f"[argus stderr truncated at {limit} bytes]", result.stderr)
+
+    def test_cli_fallback_timeout_bounds_streams_and_force_removes_container(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            docker_bin, remove_marker = self._fake_docker(temp_dir, sleep_after_output_s=5)
+            supervisor = DockerSandboxSupervisor(docker_bin=docker_bin)
+            supervisor._docker_socket_path = None
+            result = supervisor.run(
+                handle=self._handle(),
+                request=self._launch_request(wallclock_s=1),
+                materialized_env={},
+            )
+            removed = os.path.exists(remove_marker)
+
+        limit = s10_module.PARTIAL_RESULT_LOG_CAPTURE_LIMIT_BYTES
+        self.assertTrue(result.timed_out)
+        self.assertIsNone(result.exit_code)
+        self.assertTrue(removed)
+        self.assertLessEqual(len(result.stdout.encode("utf-8")), limit)
+        self.assertLessEqual(len(result.stderr.encode("utf-8")), limit)
+        self.assertIn(f"[argus stdout truncated at {limit} bytes]", result.stdout)
+        self.assertIn(f"[argus stderr truncated at {limit} bytes]", result.stderr)
+
+    def _fake_docker(self, temp_dir: str, *, sleep_after_output_s: float) -> tuple[str, str]:
+        docker_bin = os.path.join(temp_dir, "docker")
+        remove_marker = os.path.join(temp_dir, "removed")
+        output_bytes = s10_module.PARTIAL_RESULT_LOG_CAPTURE_LIMIT_BYTES * 2 + 123
+        script = f"""#!/usr/bin/env python3
+import pathlib
+import sys
+import time
+
+if len(sys.argv) > 1 and sys.argv[1] == "rm":
+    pathlib.Path({remove_marker!r}).write_text("removed", encoding="utf-8")
+    sys.exit(0)
+if len(sys.argv) > 1 and sys.argv[1] == "run":
+    sys.stdout.buffer.write(b"o" * {output_bytes})
+    sys.stdout.buffer.flush()
+    sys.stderr.buffer.write(b"e" * {output_bytes})
+    sys.stderr.buffer.flush()
+    time.sleep({sleep_after_output_s!r})
+    sys.exit(0)
+sys.exit(0)
+"""
+        with open(docker_bin, "w", encoding="utf-8") as handle:
+            handle.write(script)
+        os.chmod(docker_bin, 0o755)
+        return docker_bin, remove_marker
+
+    def _handle(self) -> SandboxHandle:
+        return SandboxHandle(
+            sandbox_id="sandbox-cli-fallback",
+            job_id="job-cli-fallback",
+            runtime_class="docker",
+            budget_epoch=1,
+            policy_bundle_version="1.0.0",
+            state="RUNNING",
+        )
+
+    def _launch_request(self, *, wallclock_s: int) -> LaunchRequest:
+        tokens = InMemoryTokenService(signing_key=b"test-key", now_fn=lambda: 1_000)
+        budget = tokens.mint_budget(
+            caps=BudgetCaps(max_compute_units=10, max_wallclock_s=10, max_cost_usd=1),
+            job_id="job-cli-fallback",
+            root_request_id="root-cli-fallback",
+        )
+        scope = tokens.mint_scope(job_id="job-cli-fallback", scopes=ScopeGrant())
+        return LaunchRequest(
+            job_id="job-cli-fallback",
+            subagent_id="subagent-cli-fallback",
+            trace_id="trace-cli-fallback",
+            budget_token=budget,
+            scope_token=scope,
+            image="registry.local/argus@sha256:" + "b" * 64,
+            entrypoint=("/bin/sh",),
+            args=("-c", "true"),
+            env={},
+            env_allowlist=(),
+            requested_envelope=LaunchEnvelope(
+                cpu_m=500,
+                mem_bytes=64 * 1024 * 1024,
+                gpu_count=0,
+                wallclock_s=wallclock_s,
+                scratch_bytes=1024 * 1024,
+                pids=16,
+                estimated_cost_usd=0.01,
+            ),
+        )
+
+
 class S10DockerSupervisorTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:

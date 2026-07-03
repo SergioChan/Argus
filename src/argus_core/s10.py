@@ -7,6 +7,7 @@ import hmac
 import json
 import os
 import re
+import selectors
 import shutil
 import socket
 import subprocess
@@ -403,6 +404,16 @@ class _DockerLogCapture:
     stderr_bytes: int
     log_capture_limit_bytes: int
     truncated: bool
+
+
+@dataclass(frozen=True)
+class _BoundedSubprocessResult:
+    returncode: int | None
+    stdout: str
+    stderr: str
+    stdout_truncated: bool
+    stderr_truncated: bool
+    timed_out: bool
 
 
 @dataclass(frozen=True)
@@ -1485,12 +1496,108 @@ def _resource_metering_payload(
     }
 
 
-def _timeout_stream(value: bytes | str | None) -> str:
-    if value is None:
-        return ""
-    if isinstance(value, bytes):
-        return value.decode("utf-8", errors="replace")
-    return value
+def _append_bounded_stream(buffer: bytearray, chunk: bytes, *, max_bytes: int) -> bool:
+    if not chunk:
+        return False
+    remaining = max(max_bytes - len(buffer), 0)
+    if remaining > 0:
+        buffer.extend(chunk[:remaining])
+    return len(chunk) > remaining
+
+
+def _decode_bounded_stream(buffer: bytearray, *, truncated: bool, stream_name: str, max_bytes: int) -> str:
+    payload = bytes(buffer)
+    if truncated:
+        marker = f"\n[argus {stream_name} truncated at {max_bytes} bytes]".encode("utf-8")
+        payload = payload[: max(max_bytes - len(marker), 0)] + marker
+        payload = payload[:max_bytes]
+    return payload.decode("utf-8", errors="replace")
+
+
+def _run_subprocess_bounded(
+    command: list[str],
+    *,
+    timeout_s: float,
+    max_bytes: int = PARTIAL_RESULT_LOG_CAPTURE_LIMIT_BYTES,
+) -> _BoundedSubprocessResult:
+    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    assert process.stdout is not None
+    assert process.stderr is not None
+
+    selector = selectors.DefaultSelector()
+    buffers = {"stdout": bytearray(), "stderr": bytearray()}
+    truncated = {"stdout": False, "stderr": False}
+    streams = {
+        process.stdout.fileno(): ("stdout", process.stdout),
+        process.stderr.fileno(): ("stderr", process.stderr),
+    }
+    for fd, (stream_name, stream) in streams.items():
+        os.set_blocking(fd, False)
+        selector.register(fd, selectors.EVENT_READ, data=stream_name)
+
+    deadline = time.monotonic() + max(timeout_s, 0.0)
+    timed_out = False
+
+    try:
+        while selector.get_map():
+            if not timed_out and process.poll() is None and time.monotonic() >= deadline:
+                process.kill()
+                timed_out = True
+
+            if process.poll() is None:
+                wait_s = 0.05 if timed_out else max(min(deadline - time.monotonic(), 0.05), 0.0)
+                events = selector.select(wait_s)
+                if not events:
+                    continue
+                keys = [key for key, _ in events]
+            else:
+                keys = list(selector.get_map().values())
+
+            for key in keys:
+                fd = int(key.fileobj)
+                stream_name = str(key.data)
+                try:
+                    chunk = os.read(fd, 8192)
+                except BlockingIOError:
+                    continue
+                except OSError:
+                    chunk = b""
+                if chunk:
+                    truncated[stream_name] = (
+                        _append_bounded_stream(buffers[stream_name], chunk, max_bytes=max_bytes)
+                        or truncated[stream_name]
+                    )
+                    continue
+                try:
+                    selector.unregister(fd)
+                except KeyError:
+                    pass
+                streams[fd][1].close()
+        returncode = process.wait()
+    finally:
+        selector.close()
+        for fd, (_, stream) in streams.items():
+            if not stream.closed:
+                stream.close()
+
+    return _BoundedSubprocessResult(
+        returncode=None if timed_out else returncode,
+        stdout=_decode_bounded_stream(
+            buffers["stdout"],
+            truncated=truncated["stdout"],
+            stream_name="stdout",
+            max_bytes=max_bytes,
+        ),
+        stderr=_decode_bounded_stream(
+            buffers["stderr"],
+            truncated=truncated["stderr"],
+            stream_name="stderr",
+            max_bytes=max_bytes,
+        ),
+        stdout_truncated=truncated["stdout"],
+        stderr_truncated=truncated["stderr"],
+        timed_out=timed_out,
+    )
 
 
 def _resolve_docker_socket_path() -> str | None:
@@ -2004,37 +2111,24 @@ class DockerSandboxSupervisor:
         command = self._docker_command(container_name, request, materialized_env)
         started_at = time.monotonic()
         try:
-            completed = subprocess.run(
+            completed = _run_subprocess_bounded(
                 command,
-                check=False,
-                capture_output=True,
-                text=True,
-                timeout=max(request.requested_envelope.wallclock_s, 1),
+                timeout_s=max(request.requested_envelope.wallclock_s, 1),
             )
             duration_s = time.monotonic() - started_at
+            if completed.timed_out:
+                self._force_remove(container_name)
             return SandboxExecutionResult(
                 handle=handle,
                 exit_code=completed.returncode,
                 stdout=completed.stdout,
                 stderr=completed.stderr,
-                timed_out=False,
+                timed_out=completed.timed_out,
                 duration_s=duration_s,
                 budget_usage=_runtime_budget_usage(request.requested_envelope, duration_s),
             )
         except FileNotFoundError as exc:
             raise SandboxRuntimeUnavailableError("docker runtime is unavailable") from exc
-        except subprocess.TimeoutExpired as exc:
-            self._force_remove(container_name)
-            duration_s = time.monotonic() - started_at
-            return SandboxExecutionResult(
-                handle=handle,
-                exit_code=None,
-                stdout=_timeout_stream(exc.stdout),
-                stderr=_timeout_stream(exc.stderr),
-                timed_out=True,
-                duration_s=duration_s,
-                budget_usage=_runtime_budget_usage(request.requested_envelope, duration_s),
-            )
 
     def _docker_command(self, container_name: str, request: LaunchRequest, env: dict[str, str]) -> list[str]:
         envelope = request.requested_envelope
@@ -3068,9 +3162,6 @@ class DockerSandboxOrchestrator(InMemorySandboxOrchestrator):
         if self._artifact_store is None or result.partial_result is None:
             return None
         partial = result.partial_result
-        frozen_handle = replace(handle, state=partial.frozen_state)
-        terminated_handle = replace(handle, state=partial.terminated_state)
-        self._handles[handle.sandbox_id] = frozen_handle
         freeze_payload = {
             "sandbox_id": handle.sandbox_id,
             "job_id": request.job_id,
@@ -3140,7 +3231,6 @@ class DockerSandboxOrchestrator(InMemorySandboxOrchestrator):
                     "terminated_state": partial.terminated_state,
                 },
             )
-            self._handles[handle.sandbox_id] = terminated_handle
             self._audit_ledger.append(
                 "sandbox.terminate",
                 {

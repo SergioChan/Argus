@@ -157,6 +157,78 @@ class S10GeneratedBindingsTests(unittest.TestCase):
                 self.assertEqual(schema_types, generated_types)
                 self.assertEqual(schema_types, runtime_types)
 
+    def test_c10_result_log_max_lengths_match_schema_and_are_enforced(self) -> None:
+        schema = json.loads(C10_SCHEMA.read_text(encoding="utf-8"))
+        definitions = schema["$defs"]
+        result_models = {
+            "SandboxExecutionResult": SandboxExecutionResult,
+            "SandboxPartialResult": SandboxPartialResult,
+        }
+
+        for definition_name, generated_cls in result_models.items():
+            for field_name in ("stdout", "stderr"):
+                with self.subTest(definition=definition_name, field=field_name):
+                    expected = definitions[definition_name]["properties"][field_name]["maxLength"]
+                    self.assertEqual(_pydantic_max_length(generated_cls, field_name), expected)
+
+        limit = definitions["SandboxExecutionResult"]["properties"]["stdout"]["maxLength"]
+        handle = SandboxHandle(
+            sandbox_id="sandbox-1",
+            job_id="job-1",
+            runtime_class="docker",
+            budget_epoch=1,
+            policy_bundle_version="1.0.0",
+            state="SUCCEEDED",
+            launch_provenance_ref=None,
+        )
+        budget_usage = BudgetUsage(
+            compute_units=0,
+            gpu_seconds=0,
+            model_tokens=0,
+            wallclock_s=0,
+            cost_usd=0,
+        )
+        oversized = "x" * (limit + 1)
+
+        with self.assertRaises(ValidationError):
+            SandboxExecutionResult(
+                handle=handle,
+                exit_code=0,
+                stdout=oversized,
+                stderr="",
+                timed_out=False,
+                duration_s=0,
+                budget_usage=budget_usage,
+                partial_result=None,
+            )
+        with self.assertRaises(ValidationError):
+            SandboxExecutionResult(
+                handle=handle,
+                exit_code=0,
+                stdout="",
+                stderr=oversized,
+                timed_out=False,
+                duration_s=0,
+                budget_usage=budget_usage,
+                partial_result=None,
+            )
+        with self.assertRaises(ValidationError):
+            SandboxPartialResult(
+                reason="budget_caps",
+                stdout=oversized,
+                stderr="",
+                captured_after_freeze=True,
+                freeze_succeeded=True,
+                terminate_succeeded=True,
+                stdout_bytes=len(oversized),
+                stderr_bytes=0,
+                log_capture_limit_bytes=limit,
+                logs_truncated=True,
+                frozen_state="FROZEN",
+                terminated_state="TERMINATED",
+                capture_error=None,
+            )
+
     def test_c10_type_guard_distinguishes_integer_and_string_wire_shapes(self) -> None:
         schema = json.loads(C10_SCHEMA.read_text(encoding="utf-8"))
         definitions = schema["$defs"]
@@ -258,6 +330,14 @@ def _schema_wire_type(
     if raw_type in {"string", "integer", "number", "boolean", "null"}:
         return raw_type
     raise AssertionError(f"unsupported C10 schema type fragment: {schema_fragment}")
+
+
+def _pydantic_max_length(model_cls: type[Any], field_name: str) -> int | None:
+    for item in model_cls.model_fields[field_name].metadata:
+        max_length = getattr(item, "max_length", None)
+        if isinstance(max_length, int):
+            return max_length
+    return None
 
 
 def _annotation_wire_type(annotation: Any, definitions: dict[str, Any]) -> str:
