@@ -13,6 +13,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import argus_core.s10 as s10_module
+from scripts import run_m0_spine_battery as m0_battery
 from argus_core import (
     ArtifactRecord,
     BudgetCaps,
@@ -68,6 +69,35 @@ S10_C3_VERIFIER_KEYS_JSON = json.dumps(
 
 
 class ArgusM0RuntimeServiceTests(unittest.TestCase):
+    def test_halt_latency_summary_uses_conservative_nearest_rank_p99(self) -> None:
+        latencies = [0.01] * 49 + [1.75]
+
+        summary = m0_battery._halt_latency_summary(latencies)
+
+        self.assertEqual(summary["trial_count"], 50)
+        self.assertEqual(summary["p50_nearest_rank_s"], 0.01)
+        self.assertEqual(summary["p95_nearest_rank_s"], 0.01)
+        self.assertEqual(summary["p99_nearest_rank_s"], 1.75)
+        self.assertEqual(summary["max_s"], 1.75)
+
+    def test_halt_latency_summary_rejects_missing_trials_and_p99_breach(self) -> None:
+        with self.assertRaisesRegex(AssertionError, "expected 50 halt latency trials"):
+            m0_battery._halt_latency_summary([0.01] * 49)
+        with self.assertRaisesRegex(AssertionError, "p99 exceeded"):
+            m0_battery._halt_latency_summary([0.01] * 49 + [2.01])
+        with self.assertRaisesRegex(AssertionError, "cannot be negative"):
+            m0_battery._halt_latency_summary([0.01] * 49 + [-0.1])
+
+    def test_m0_identity_policy_declares_halt_latency_caller(self) -> None:
+        requests = m0_battery._m0_identity_requests()
+        policy = json.loads(m0_battery._m0_identity_mint_policy_json())
+
+        self.assertIn("halt-latency", requests)
+        self.assertEqual(requests["halt-latency"]["caller_id"], "m0-halt-latency")
+        self.assertEqual(requests["halt-latency"]["job_id"], "m0-halt-latency-job")
+        self.assertEqual(policy["m0-halt-latency"]["job_id"], "m0-halt-latency-job")
+        self.assertEqual(policy["m0-halt-latency"]["budget_caps"]["max_wallclock_s"], 1)
+
     def test_s8_writer_service_commits_and_replays_c4_records(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             app = S8WriterApp(FileSystemArtifactStore(tmp))

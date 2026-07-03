@@ -11,6 +11,7 @@ from hashlib import sha256
 import hmac
 from io import BytesIO
 import json
+import math
 import os
 from pathlib import Path
 import shutil
@@ -49,6 +50,8 @@ from argusverify import C3ReportSigner, InMemoryVerifierTrustStore, verify_repor
 
 DEFAULT_IMAGE = "busybox@sha256:73aaf090f3d85aa34ee199857f03fa3a95c8ede2ffd4cc2cdb5b94e566b11662"
 M0_C3_VERIFIER_KEY_ID = "argus-m0-c3-verifier"
+HALT_LATENCY_TRIALS = 50
+HALT_LATENCY_LIMIT_S = 2.0
 
 
 def main() -> int:
@@ -110,7 +113,7 @@ def main() -> int:
         "s10_url": s10_url,
         "ports": ports,
         "persistence": "postgres-minio",
-        "auth_callers": ["read", "write", "dataset", "verifier-label", "spine", "halt", "meter-gap", "verify"],
+        "auth_callers": list(_m0_identity_requests().keys()),
     }
 
     try:
@@ -362,6 +365,14 @@ def main() -> int:
             token=auth_tokens["halt"],
             read_token=auth_tokens["read"],
         )
+        _battery_halt_latency_trials(
+            evidence,
+            s10_url,
+            args.image,
+            s8_url,
+            token=auth_tokens["halt-latency"],
+            read_token=auth_tokens["read"],
+        )
         _battery_non_injected_meter_gap(
             evidence,
             docker=docker,
@@ -491,6 +502,13 @@ def _m0_identity_requests() -> dict[str, dict[str, Any]]:
             "caller_id": "m0-budget-halt",
             "job_id": "m0-budget-halt-job",
             "root_request_id": "m0-budget-halt-root",
+            "budget_caps": {"max_compute_units": 1, "max_wallclock_s": 1, "max_cost_usd": 5},
+            "scopes": {"sandbox_risk_class": "standard"},
+        },
+        "halt-latency": {
+            "caller_id": "m0-halt-latency",
+            "job_id": "m0-halt-latency-job",
+            "root_request_id": "m0-halt-latency-root",
             "budget_caps": {"max_compute_units": 1, "max_wallclock_s": 1, "max_cost_usd": 5},
             "scopes": {"sandbox_risk_class": "standard"},
         },
@@ -1749,6 +1767,126 @@ def _battery_e_budget_halt(
     )
 
 
+def _nearest_rank_percentile(values: list[float], percentile: float) -> float:
+    if not values:
+        raise AssertionError("percentile requires at least one value")
+    if percentile <= 0 or percentile > 100:
+        raise AssertionError(f"percentile must be in (0, 100], got {percentile}")
+    ordered = sorted(float(value) for value in values)
+    rank = max(1, math.ceil(len(ordered) * percentile / 100.0))
+    return ordered[rank - 1]
+
+
+def _halt_latency_summary(
+    latencies_s: list[float],
+    *,
+    expected_trials: int = HALT_LATENCY_TRIALS,
+    limit_s: float = HALT_LATENCY_LIMIT_S,
+) -> dict[str, Any]:
+    if len(latencies_s) != expected_trials:
+        raise AssertionError(f"expected {expected_trials} halt latency trials, got {len(latencies_s)}")
+    if any(float(latency) < 0 for latency in latencies_s):
+        raise AssertionError(f"halt latency cannot be negative: {latencies_s}")
+    summary = {
+        "trial_count": len(latencies_s),
+        "limit_s": limit_s,
+        "p50_nearest_rank_s": round(_nearest_rank_percentile(latencies_s, 50), 6),
+        "p95_nearest_rank_s": round(_nearest_rank_percentile(latencies_s, 95), 6),
+        "p99_nearest_rank_s": round(_nearest_rank_percentile(latencies_s, 99), 6),
+        "max_s": round(max(latencies_s), 6),
+    }
+    if summary["p99_nearest_rank_s"] > limit_s:
+        raise AssertionError(f"halt latency p99 exceeded {limit_s}s: {summary}")
+    return summary
+
+
+def _battery_halt_latency_trials(
+    evidence: dict[str, Any],
+    s10_url: str,
+    image: str,
+    s8_url: str,
+    *,
+    token: str,
+    read_token: str,
+    trials: int = HALT_LATENCY_TRIALS,
+) -> None:
+    latencies_s: list[float] = []
+    max_cadences_s: list[float] = []
+    sample_counts: list[int] = []
+    launch_refs: list[str] = []
+    spend_refs: list[str] = []
+    for trial in range(1, trials + 1):
+        budget_json = _post_json(
+            f"{s10_url}/v1/budget-tokens",
+            {},
+            expected_status=201,
+            token=token,
+        )
+        scope_json = _post_json(
+            f"{s10_url}/v1/scope-tokens",
+            {},
+            expected_status=201,
+            token=token,
+        )
+        launch_body = _launch_request_json(
+            job_id="m0-halt-latency-job",
+            image=image,
+            budget=budget_json,
+            scope=scope_json,
+            args=("-c", "sleep 2"),
+            env={},
+            env_allowlist=(),
+            wallclock_s=1,
+        )
+        response = _post_json(
+            f"{s10_url}/v1/sandboxes:launch",
+            launch_body,
+            expected_status=403,
+            token=token,
+        )
+        if response.get("error") != "BudgetExceededError":
+            raise AssertionError(f"halt latency trial {trial} did not fail with BudgetExceededError: {response}")
+        events = response.get("audit_events") or []
+        if "budget.halt" not in events or "spend.final" not in events:
+            raise AssertionError(f"halt latency trial {trial} missing audit events: {events}")
+        handle = response.get("handle") or {}
+        if handle.get("state") != "BUDGET_HALTED":
+            raise AssertionError(f"halt latency trial {trial} handle was not BUDGET_HALTED: {response}")
+        launch_provenance_ref = handle.get("launch_provenance_ref")
+        if not isinstance(launch_provenance_ref, str) or not launch_provenance_ref:
+            raise AssertionError(f"halt latency trial {trial} launch provenance missing: {response}")
+        _get_json(f"{s8_url}/v1/artifacts/{launch_provenance_ref}/record", token=read_token)
+        spend_final = _battery_spend_final(
+            s8_url=s8_url,
+            read_token=read_token,
+            job_id="m0-halt-latency-job",
+            launch_provenance_ref=launch_provenance_ref,
+            expected_state="BUDGET_HALTED",
+            page_size=max(100, trials * 2),
+        )
+        latencies_s.append(spend_final["meter_halt_latency_s"])
+        max_cadences_s.append(spend_final["meter_max_cadence_s"])
+        sample_counts.append(spend_final["meter_sample_count"])
+        launch_refs.append(launch_provenance_ref)
+        spend_refs.append(spend_final["artifact_ref"])
+
+    summary = _halt_latency_summary(latencies_s, expected_trials=trials)
+    _record(
+        evidence,
+        "halt-latency-50",
+        "deployed S10 real Docker budget halt p99 latency stayed within the 2s S10 bound over 50 trials",
+        {
+            **summary,
+            "latencies_s": [round(latency, 6) for latency in latencies_s],
+            "max_cadence_s": round(max(max_cadences_s), 6),
+            "min_meter_sample_count": min(sample_counts),
+            "max_meter_sample_count": max(sample_counts),
+            "launch_provenance_refs": launch_refs,
+            "spend_final_refs": spend_refs,
+        },
+    )
+
+
 def _battery_non_injected_meter_gap(
     evidence: dict[str, Any],
     *,
@@ -1874,9 +2012,10 @@ def _battery_spend_final(
     job_id: str,
     launch_provenance_ref: str,
     expected_state: str,
+    page_size: int = 20,
 ) -> dict[str, Any]:
     query = _get_json(
-        f"{s8_url}/v1/artifacts?kind=spend.final&job_id={parse.quote(job_id, safe='')}&page_size=20",
+        f"{s8_url}/v1/artifacts?kind=spend.final&job_id={parse.quote(job_id, safe='')}&page_size={page_size}",
         token=read_token,
     )
     matching_records = [
