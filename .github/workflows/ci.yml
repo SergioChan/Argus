@@ -31,13 +31,13 @@ jobs:
         run: python3 scripts/check.py
 
       - name: Run S8 lineage scale battery
-        run: python3 scripts/run_s8_lineage_scale_battery.py --evidence-file s8-lineage-scale-evidence.json
+        run: python3 scripts/run_s8_lineage_scale_battery.py --evidence-file "$RUNNER_TEMP/s8-lineage-scale-evidence.json"
 
       - name: Upload S8 lineage scale evidence
         uses: actions/upload-artifact@v4
         with:
           name: s8-lineage-scale-evidence
-          path: s8-lineage-scale-evidence.json
+          path: ${{ runner.temp }}/s8-lineage-scale-evidence.json
 
       - name: Run M0 spine battery
         env:
