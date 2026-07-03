@@ -1,7 +1,13 @@
 from __future__ import annotations
 
+from copy import deepcopy
+from dataclasses import asdict, replace
 from decimal import Decimal
 import json
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
 import unittest
 
 from argus_core import (
@@ -15,6 +21,8 @@ from argus_core import (
     InMemoryVerifierTrustStore,
     KPIProcessor,
     Lineage,
+    LineageGraph,
+    ObservatoryLineageBundle,
     PlatformEvent,
     PlantedExploitRecord,
     Producer,
@@ -27,11 +35,147 @@ from argus_core import (
     assemble_trust_digest,
     detect_cost_anomaly,
     detect_reward_hacking,
+    render_observatory_v0_html,
     planted_exploit_catch_rate,
     recommend_pause,
     run_planted_spurious_model_harness,
 )
 from argus_core.s8 import ArtifactRecord
+
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+class S11ObservatoryV0Tests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.fixture = _observatory_fixture()
+
+    def test_static_report_renders_signed_c3_and_c4_lineage(self) -> None:
+        result = render_observatory_v0_html(
+            report_payload=self.fixture["report"],
+            lineage=self.fixture["lineage"],
+            report_verifier=self.fixture["verifier"],
+        )
+
+        self.assertTrue(result.verification.trusted)
+        html = result.html
+        self.assertIn('data-verdict="VERIFIED"', html)
+        for check_name in (
+            "INJECTION",
+            "NULL_CONTROL",
+            "CROSS_CODE",
+            "PHYSICAL_CONSISTENCY",
+            "LEAKAGE",
+            "CALIBRATION",
+        ):
+            self.assertIn(check_name, html)
+        self.assertIn("must-react-1", html)
+        self.assertIn("must-not-react-1", html)
+        self.assertIn("No insensitivity flags recorded.", html)
+        self.assertIn("recapitulated-known", html)
+        self.assertIn("s3-referee", html)
+        self.assertIn("c4://profile/ewpt-toy/v1", html)
+        self.assertIn("c4://pipeline/ewpt-toy/baseline", html)
+        self.assertIn("validation_report", html)
+        self.assertNotIn("http://", html)
+        self.assertNotIn("https://", html)
+        self.assertNotIn("<script", html.lower())
+
+    def test_tampered_report_renders_fail_banner(self) -> None:
+        tampered = deepcopy(self.fixture["report"])
+        tampered["checks"][0]["metrics"]["recovery_rate"] = 0.11
+
+        result = render_observatory_v0_html(
+            report_payload=tampered,
+            lineage=self.fixture["lineage"],
+            report_verifier=self.fixture["verifier"],
+        )
+
+        self.assertFalse(result.verification.trusted)
+        self.assertIn("signature verification failed: signature_invalid", result.html)
+        self.assertIn("validation report content hash mismatch", result.html)
+        self.assertIn('data-verdict="FAIL"', result.html)
+
+    def test_tampered_lineage_renders_fail_banner(self) -> None:
+        lineage = self.fixture["lineage"]
+        nodes = tuple(
+            replace(record, validation_report_ref="c4://report/other")
+            if record.artifact_ref == lineage.subject_ref
+            else record
+            for record in lineage.graph.nodes
+        )
+        tampered_lineage = ObservatoryLineageBundle(
+            subject_ref=lineage.subject_ref,
+            report_ref=lineage.report_ref,
+            graph=LineageGraph(nodes=nodes, edges=lineage.graph.edges),
+        )
+
+        result = render_observatory_v0_html(
+            report_payload=self.fixture["report"],
+            lineage=tampered_lineage,
+            report_verifier=self.fixture["verifier"],
+        )
+
+        self.assertFalse(result.verification.trusted)
+        self.assertIn("subject validation_report_ref mismatch", result.html)
+        self.assertIn('data-verdict="FAIL"', result.html)
+
+    def test_cli_writes_html_and_returns_nonzero_for_tamper(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            report_path = tmp_path / "report.json"
+            tampered_path = tmp_path / "tampered-report.json"
+            lineage_path = tmp_path / "lineage.json"
+            trust_path = tmp_path / "trust.json"
+            out_path = tmp_path / "observatory.html"
+            fail_out_path = tmp_path / "observatory-fail.html"
+            report_path.write_text(json.dumps(self.fixture["report"]), encoding="utf-8")
+            lineage_path.write_text(json.dumps(_lineage_bundle_payload(self.fixture["lineage"])), encoding="utf-8")
+            trust_path.write_text(json.dumps({"keys": [{"key_id": "s3-key", "secret": "s3-secret"}]}), encoding="utf-8")
+            tampered = deepcopy(self.fixture["report"])
+            tampered["aggregate"]["score"] = 0.01
+            tampered_path.write_text(json.dumps(tampered), encoding="utf-8")
+
+            ok = subprocess.run(
+                [
+                    sys.executable,
+                    str(ROOT / "scripts" / "render_observatory_v0.py"),
+                    "--report",
+                    str(report_path),
+                    "--lineage",
+                    str(lineage_path),
+                    "--trust-store",
+                    str(trust_path),
+                    "--out",
+                    str(out_path),
+                ],
+                check=False,
+                text=True,
+                capture_output=True,
+            )
+            fail = subprocess.run(
+                [
+                    sys.executable,
+                    str(ROOT / "scripts" / "render_observatory_v0.py"),
+                    "--report",
+                    str(tampered_path),
+                    "--lineage",
+                    str(lineage_path),
+                    "--trust-store",
+                    str(trust_path),
+                    "--out",
+                    str(fail_out_path),
+                ],
+                check=False,
+                text=True,
+                capture_output=True,
+            )
+
+            self.assertEqual(ok.returncode, 0, ok.stderr)
+            self.assertIn('data-verdict="VERIFIED"', out_path.read_text(encoding="utf-8"))
+            self.assertNotEqual(fail.returncode, 0)
+            self.assertIn("FAIL", fail.stderr)
+            self.assertIn('data-verdict="FAIL"', fail_out_path.read_text(encoding="utf-8"))
 
 
 class S11TelemetryAndKpiTests(unittest.TestCase):
@@ -396,6 +540,154 @@ class S11EvalHarnessTests(unittest.TestCase):
         self.assertEqual(digest.canary_summary, {"non_reproducible": 1})
         self.assertEqual(digest.eval_regressions, (scorecard.scorecard_id,))
         self.assertEqual(digest.quarantined_jobs, ("job-a", "job-b"))
+
+
+def _observatory_fixture() -> dict[str, object]:
+    trust_store = InMemoryVerifierTrustStore()
+    trust_store.register_key("s3-key", b"s3-secret")
+    verifier = C3ReportVerifier(trust_store)
+    signer = C3ReportSigner(key_id="s3-key", secret=b"s3-secret")
+    store = InMemoryArtifactStore(report_verifier=verifier)
+    profile = store.create_artifact(
+        kind="verifier_profile",
+        payload={"profile": "ewpt-toy", "checks": ["six-check"]},
+        artifact_ref="c4://profile/ewpt-toy/v1",
+        producer=Producer(subsystem="S3", version="0.0.0"),
+        lineage=Lineage(input_refs=(), code_ref="git:s3-profile", environment_digest="oci:s3-profile"),
+    )
+    pipeline = store.create_artifact(
+        kind="pipeline",
+        payload={"pipeline": "ewpt-toy", "uncertainty_tag": "toy-recap"},
+        artifact_ref="c4://pipeline/ewpt-toy/baseline",
+        producer=Producer(subsystem="S2", version="0.0.0"),
+        lineage=Lineage(input_refs=(), code_ref="git:s2-pipeline", environment_digest="oci:s2-pipeline"),
+    )
+    report = signer.sign(_observatory_report(profile_ref=profile.artifact_ref, pipeline_ref=pipeline.artifact_ref))
+    report_record = store.create_artifact(
+        kind="report",
+        payload=report,
+        artifact_ref="c4://report/ewpt-toy/verified-run",
+        producer=Producer(subsystem="S3", version="0.0.0"),
+        lineage=Lineage(
+            input_refs=(profile.artifact_ref, pipeline.artifact_ref),
+            code_ref="git:s3-verifier",
+            environment_digest="oci:s3-verifier",
+        ),
+    )
+    subject = store.create_artifact(
+        kind="model",
+        payload={"weights": [1, 2, 3], "uncertainty_tag": "toy-recap"},
+        artifact_ref="c4://artifact/ewpt-toy/model",
+        producer=Producer(subsystem="S2", version="0.0.0"),
+        lineage=Lineage(
+            input_refs=(pipeline.artifact_ref,),
+            code_ref="git:s2-builder",
+            environment_digest="oci:s2-builder",
+        ),
+        claim_tier="recapitulated-known",
+        validation_report_ref=report_record.artifact_ref,
+    )
+    return {
+        "store": store,
+        "report": report,
+        "verifier": verifier,
+        "lineage": ObservatoryLineageBundle(
+            subject_ref=subject.artifact_ref,
+            report_ref=report_record.artifact_ref,
+            graph=store.get_lineage(subject.artifact_ref, direction="ancestors"),
+        ),
+    }
+
+
+def _observatory_report(*, profile_ref: str, pipeline_ref: str) -> dict[str, object]:
+    return {
+        "report_id": "33333333-3333-4333-8333-333333333333",
+        "profile_ref": profile_ref,
+        "frozen_pipeline_ref": pipeline_ref,
+        "checks": [
+            {
+                "check": "INJECTION",
+                "status": "PASS",
+                "metrics": {"recovery_rate": 0.98},
+                "evidence_refs": ["c4://evidence/injection/example"],
+            },
+            {
+                "check": "NULL_CONTROL",
+                "status": "PASS",
+                "metrics": {"false_positive_rate": 0.0},
+                "evidence_refs": ["c4://evidence/null/example"],
+            },
+            {
+                "check": "CROSS_CODE",
+                "status": "PASS",
+                "metrics": {"independent_reimplementation_delta": 0.002},
+                "evidence_refs": ["c4://evidence/cross-code/example"],
+            },
+            {
+                "check": "PHYSICAL_CONSISTENCY",
+                "status": "PASS",
+                "metrics": {"unit_balance": "ok"},
+                "evidence_refs": ["c4://evidence/physics/example"],
+            },
+            {
+                "check": "LEAKAGE",
+                "status": "PASS",
+                "metrics": {"blind_label_access": 0},
+                "evidence_refs": ["c4://evidence/leakage/example"],
+            },
+            {
+                "check": "CALIBRATION",
+                "status": "PASS",
+                "metrics": {"ece": 0.01},
+                "evidence_refs": ["c4://evidence/calibration/example"],
+            },
+        ],
+        "aggregate": {"passed": True, "score": 0.98},
+        "claim_tier": "recapitulated-known",
+        "claim_tier_is_candidate": False,
+        "perturbation_pairs": [
+            {
+                "perturbation_id": "must-react-1",
+                "kind": "must_react",
+                "verdict": "pass",
+                "amplitude_linearity": {"slope": 1.0, "intercept": 0.0},
+            },
+            {
+                "perturbation_id": "must-not-react-1",
+                "kind": "must_not_react",
+                "verdict": "pass",
+                "observed_degradation": {"signal": 0.0},
+            },
+        ],
+        "insensitivity_flags": [],
+        "challenger_panel": {
+            "challenger_ids": ["challenger-a", "challenger-b"],
+            "min_required": 2,
+            "attack_types": ["signal_injection", "null_noise"],
+        },
+        "independence_attestation_debate": {
+            "min_independent_challengers": 2,
+            "lineage_disjoint": True,
+            "correlation_warning": False,
+            "evidence_refs": ["c4://evidence/independence/example"],
+        },
+        "referee": {
+            "referee_id": "s3-referee",
+            "non_gameable": True,
+            "signed_by": "s3-key",
+            "distinct_from_proponent": True,
+        },
+        "debate_ref": "c4://debate/ewpt-toy/example",
+    }
+
+
+def _lineage_bundle_payload(bundle: ObservatoryLineageBundle) -> dict[str, object]:
+    return {
+        "subject_ref": bundle.subject_ref,
+        "report_ref": bundle.report_ref,
+        "nodes": [asdict(record) for record in bundle.graph.nodes],
+        "edges": [asdict(edge) for edge in bundle.graph.edges],
+    }
 
 
 if __name__ == "__main__":

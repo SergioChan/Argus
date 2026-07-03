@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass, replace
 from decimal import Decimal
+from html import escape
+import json
 from typing import Any
 
 from argusverify import C3ReportVerifier
 from .hashing import hash_json
-from .s8 import ArtifactRecord, InMemoryArtifactStore, Lineage, Producer
+from .s8 import ArtifactRecord, InMemoryArtifactStore, Lineage, LineageEdge, LineageGraph, Producer
 
 
 class S11Error(Exception):
@@ -161,6 +164,150 @@ class TrustDigest:
     canary_summary: dict[str, int]
     eval_regressions: tuple[str, ...]
     quarantined_jobs: tuple[str, ...]
+
+
+OBSERVATORY_SIX_CHECKS = (
+    "INJECTION",
+    "NULL_CONTROL",
+    "CROSS_CODE",
+    "PHYSICAL_CONSISTENCY",
+    "LEAKAGE",
+    "CALIBRATION",
+)
+
+
+@dataclass(frozen=True)
+class ObservatoryLineageBundle:
+    subject_ref: str
+    report_ref: str
+    graph: LineageGraph
+
+
+@dataclass(frozen=True)
+class ObservatoryVerification:
+    trusted: bool
+    failures: tuple[str, ...]
+    signature_valid: bool
+    signature_key_id: str | None
+    subject_ref: str
+    report_ref: str
+
+
+@dataclass(frozen=True)
+class ObservatoryRenderResult:
+    html: str
+    verification: ObservatoryVerification
+
+
+def render_observatory_v0_html(
+    *,
+    report_payload: dict[str, Any],
+    lineage: ObservatoryLineageBundle,
+    report_verifier: C3ReportVerifier,
+) -> ObservatoryRenderResult:
+    verification = verify_observatory_v0(
+        report_payload=report_payload,
+        lineage=lineage,
+        report_verifier=report_verifier,
+    )
+    return ObservatoryRenderResult(
+        html=_observatory_v0_html(report_payload=report_payload, lineage=lineage, verification=verification),
+        verification=verification,
+    )
+
+
+def verify_observatory_v0(
+    *,
+    report_payload: dict[str, Any],
+    lineage: ObservatoryLineageBundle,
+    report_verifier: C3ReportVerifier,
+) -> ObservatoryVerification:
+    failures: list[str] = []
+    signature = report_verifier.verify(report_payload)
+    if not signature.valid:
+        failures.append(f"signature verification failed: {signature.reason or signature.error_code or 'unknown'}")
+    nodes_by_ref = _nodes_by_ref(lineage.graph.nodes, failures)
+    subject = nodes_by_ref.get(lineage.subject_ref)
+    report_record = nodes_by_ref.get(lineage.report_ref)
+    if subject is None:
+        failures.append(f"lineage missing subject record: {lineage.subject_ref}")
+    if report_record is None:
+        failures.append(f"lineage missing report record: {lineage.report_ref}")
+
+    if report_record is not None:
+        report_hash = hash_json(report_payload)
+        if report_record.content_hash != report_hash:
+            failures.append(
+                "validation report content hash mismatch: "
+                f"record={report_record.content_hash} computed={report_hash}"
+            )
+    if subject is not None:
+        if subject.validation_report_ref != lineage.report_ref:
+            failures.append(
+                "subject validation_report_ref mismatch: "
+                f"record={subject.validation_report_ref or '<missing>'} expected={lineage.report_ref}"
+            )
+        report_tier = _string_field(report_payload, "claim_tier")
+        if report_tier and subject.claim_tier != report_tier:
+            failures.append(f"subject tier mismatch: record={subject.claim_tier} report={report_tier}")
+
+    aggregate = report_payload.get("aggregate")
+    if not isinstance(aggregate, Mapping) or aggregate.get("passed") is not True:
+        failures.append("validation report aggregate.passed is not true")
+
+    checks = _check_map(report_payload)
+    for check_name in OBSERVATORY_SIX_CHECKS:
+        if check_name not in checks:
+            failures.append(f"missing six-check verdict: {check_name}")
+
+    profile_ref = _string_field(report_payload, "profile_ref")
+    pipeline_ref = _string_field(report_payload, "frozen_pipeline_ref")
+    for ref_name, ref in (("profile_ref", profile_ref), ("frozen_pipeline_ref", pipeline_ref)):
+        if not ref:
+            failures.append(f"report missing {ref_name}")
+        elif ref not in nodes_by_ref:
+            failures.append(f"lineage missing report {ref_name}: {ref}")
+
+    if report_record is not None and profile_ref and not _has_edge(
+        lineage.graph.edges,
+        source_ref=profile_ref,
+        target_ref=lineage.report_ref,
+        edge_type="input",
+    ):
+        failures.append(f"lineage missing profile input edge: {profile_ref} -> {lineage.report_ref}")
+    if report_record is not None and pipeline_ref and not _has_edge(
+        lineage.graph.edges,
+        source_ref=pipeline_ref,
+        target_ref=lineage.report_ref,
+        edge_type="input",
+    ):
+        failures.append(f"lineage missing frozen-pipeline input edge: {pipeline_ref} -> {lineage.report_ref}")
+    if subject is not None and report_record is not None and not _has_edge(
+        lineage.graph.edges,
+        source_ref=lineage.report_ref,
+        target_ref=lineage.subject_ref,
+        edge_type="validation_report",
+    ):
+        failures.append(f"lineage missing validation-report edge: {lineage.report_ref} -> {lineage.subject_ref}")
+
+    return ObservatoryVerification(
+        trusted=not failures,
+        failures=tuple(failures),
+        signature_valid=signature.valid,
+        signature_key_id=signature.key_id,
+        subject_ref=lineage.subject_ref,
+        report_ref=lineage.report_ref,
+    )
+
+
+def observatory_lineage_bundle_from_json(payload: Mapping[str, Any]) -> ObservatoryLineageBundle:
+    nodes = tuple(_artifact_record_from_json(item) for item in _sequence_field(payload, "nodes"))
+    edges = tuple(_lineage_edge_from_json(item) for item in _sequence_field(payload, "edges"))
+    return ObservatoryLineageBundle(
+        subject_ref=_required_string(payload, "subject_ref"),
+        report_ref=_required_string(payload, "report_ref"),
+        graph=LineageGraph(nodes=nodes, edges=edges),
+    )
 
 
 class TelemetryScrubber:
@@ -635,3 +782,434 @@ def _eval_result_payload(result: EvalTaskResult) -> dict[str, Any]:
     if result.finding is not None:
         payload["finding"] = asdict(result.finding)
     return payload
+
+
+def _observatory_v0_html(
+    *,
+    report_payload: dict[str, Any],
+    lineage: ObservatoryLineageBundle,
+    verification: ObservatoryVerification,
+) -> str:
+    title = f"Argus Observatory v0 - {_string_field(report_payload, 'report_id') or lineage.report_ref}"
+    status_class = "ok" if verification.trusted else "fail"
+    status_label = "VERIFIED" if verification.trusted else "FAIL"
+    failures = (
+        "<p class=\"quiet\">No verification failures.</p>"
+        if verification.trusted
+        else "<ul>" + "".join(f"<li>{escape(item)}</li>" for item in verification.failures) + "</ul>"
+    )
+    return "\n".join(
+        (
+            "<!doctype html>",
+            "<html lang=\"en\">",
+            "<head>",
+            "  <meta charset=\"utf-8\">",
+            "  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">",
+            f"  <title>{escape(title)}</title>",
+            "  <style>",
+            _observatory_css(),
+            "  </style>",
+            "</head>",
+            "<body>",
+            "  <main>",
+            f"    <section class=\"banner {status_class}\" data-verdict=\"{status_label}\">",
+            f"      <div><span class=\"eyebrow\">Argus Observatory v0</span><h1>{escape(status_label)} verified-run report</h1></div>",
+            f"      <p>{escape(lineage.subject_ref)}</p>",
+            "    </section>",
+            "    <section>",
+            "      <h2>Verification Gate</h2>",
+            f"      {failures}",
+            "    </section>",
+            "    <section>",
+            "      <h2>Report Summary</h2>",
+            _summary_table(report_payload=report_payload, verification=verification),
+            "    </section>",
+            "    <section>",
+            "      <h2>Six Checks</h2>",
+            _checks_table(report_payload),
+            "    </section>",
+            "    <section>",
+            "      <h2>Perturbation Pairs</h2>",
+            _perturbation_table(report_payload),
+            "    </section>",
+            "    <section>",
+            "      <h2>Insensitivity Flags</h2>",
+            _insensitivity_table(report_payload),
+            "    </section>",
+            "    <section>",
+            "      <h2>Tier Justification</h2>",
+            _tier_justification(report_payload),
+            "    </section>",
+            "    <section>",
+            "      <h2>Referee</h2>",
+            _referee_table(report_payload),
+            "    </section>",
+            "    <section>",
+            "      <h2>Provenance Chain</h2>",
+            _lineage_table(lineage.graph),
+            "    </section>",
+            "  </main>",
+            "</body>",
+            "</html>",
+            "",
+        )
+    )
+
+
+def _observatory_css() -> str:
+    return """
+    :root {
+      color-scheme: light;
+      --ink: #17202a;
+      --muted: #5a6472;
+      --line: #cfd8e3;
+      --ok: #146c43;
+      --ok-bg: #e8f5ed;
+      --fail: #b42318;
+      --fail-bg: #fff0ee;
+      --panel: #ffffff;
+      --page: #f5f7fa;
+      --accent: #2454a6;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--page);
+      color: var(--ink);
+      font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      font-size: 15px;
+      line-height: 1.45;
+    }
+    main {
+      width: min(1180px, calc(100vw - 32px));
+      margin: 0 auto;
+      padding: 24px 0 48px;
+    }
+    section {
+      margin-top: 18px;
+      padding: 18px;
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      overflow: hidden;
+    }
+    .banner {
+      display: flex;
+      justify-content: space-between;
+      gap: 16px;
+      align-items: end;
+      color: var(--ink);
+      border-width: 2px;
+    }
+    .banner.ok { background: var(--ok-bg); border-color: var(--ok); }
+    .banner.fail { background: var(--fail-bg); border-color: var(--fail); }
+    .banner p { margin: 0; color: var(--muted); overflow-wrap: anywhere; }
+    .eyebrow {
+      display: block;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 700;
+      text-transform: uppercase;
+    }
+    h1, h2 { margin: 0; letter-spacing: 0; }
+    h1 { font-size: 30px; line-height: 1.1; }
+    h2 { font-size: 18px; margin-bottom: 12px; }
+    h3 { font-size: 15px; margin: 12px 0 8px; }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      table-layout: fixed;
+    }
+    th, td {
+      padding: 10px 8px;
+      border-top: 1px solid var(--line);
+      text-align: left;
+      vertical-align: top;
+      overflow-wrap: anywhere;
+    }
+    th {
+      color: var(--muted);
+      font-size: 12px;
+      text-transform: uppercase;
+      width: 24%;
+    }
+    .pill {
+      display: inline-block;
+      padding: 2px 7px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      font-weight: 700;
+      font-size: 12px;
+    }
+    .pill.pass, .pill.verified { color: var(--ok); border-color: var(--ok); }
+    .pill.fail, .pill.missing { color: var(--fail); border-color: var(--fail); }
+    .quiet { color: var(--muted); }
+    code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 13px; }
+    @media (max-width: 700px) {
+      main { width: min(100vw - 20px, 1180px); padding-top: 10px; }
+      .banner { align-items: start; flex-direction: column; }
+      h1 { font-size: 24px; }
+      th, td { display: block; width: 100%; }
+      td { border-top: 0; padding-top: 0; }
+    }
+    """
+
+
+def _summary_table(*, report_payload: dict[str, Any], verification: ObservatoryVerification) -> str:
+    aggregate = report_payload.get("aggregate") if isinstance(report_payload.get("aggregate"), Mapping) else {}
+    rows = (
+        ("Report ID", _string_field(report_payload, "report_id")),
+        ("Report Ref", verification.report_ref),
+        ("Subject Ref", verification.subject_ref),
+        ("Profile Ref", _string_field(report_payload, "profile_ref")),
+        ("Frozen Pipeline Ref", _string_field(report_payload, "frozen_pipeline_ref")),
+        ("Claim Tier", _string_field(report_payload, "claim_tier")),
+        ("Aggregate Passed", str(aggregate.get("passed"))),
+        ("Aggregate Score", _json_cell(aggregate.get("score"))),
+        ("Signature", "valid" if verification.signature_valid else "invalid"),
+        ("Signature Key", verification.signature_key_id or ""),
+    )
+    return _key_value_table(rows)
+
+
+def _checks_table(report_payload: dict[str, Any]) -> str:
+    checks = _check_map(report_payload)
+    rows = []
+    for check_name in OBSERVATORY_SIX_CHECKS:
+        check = checks.get(check_name, {})
+        status = _string_field(check, "status") if isinstance(check, Mapping) else ""
+        rows.append(
+            "<tr>"
+            f"<td>{escape(check_name)}</td>"
+            f"<td>{_status_pill(status or 'MISSING')}</td>"
+            f"<td><code>{escape(_json_cell(check.get('metrics') if isinstance(check, Mapping) else None))}</code></td>"
+            f"<td>{escape(', '.join(_string_items(check.get('evidence_refs') if isinstance(check, Mapping) else ())))}</td>"
+            "</tr>"
+        )
+    return (
+        "<table><thead><tr><th>Check</th><th>Status</th><th>Metrics</th><th>Evidence</th></tr></thead><tbody>"
+        + "".join(rows)
+        + "</tbody></table>"
+    )
+
+
+def _perturbation_table(report_payload: dict[str, Any]) -> str:
+    pairs = _sequence_field(report_payload, "perturbation_pairs")
+    if not pairs:
+        return "<p class=\"quiet\">No perturbation pairs recorded.</p>"
+    rows = []
+    for pair in pairs:
+        if not isinstance(pair, Mapping):
+            continue
+        details = {k: v for k, v in pair.items() if k not in {"perturbation_id", "kind", "verdict"}}
+        rows.append(
+            "<tr>"
+            f"<td>{escape(str(pair.get('perturbation_id', '')))}</td>"
+            f"<td>{escape(str(pair.get('kind', '')))}</td>"
+            f"<td>{_status_pill(str(pair.get('verdict', '')))}</td>"
+            f"<td><code>{escape(_json_cell(details))}</code></td>"
+            "</tr>"
+        )
+    return (
+        "<table><thead><tr><th>ID</th><th>Kind</th><th>Verdict</th><th>Details</th></tr></thead><tbody>"
+        + "".join(rows)
+        + "</tbody></table>"
+    )
+
+
+def _insensitivity_table(report_payload: dict[str, Any]) -> str:
+    flags = _sequence_field(report_payload, "insensitivity_flags")
+    if not flags:
+        return "<p class=\"quiet\">No insensitivity flags recorded.</p>"
+    rows = []
+    for flag in flags:
+        if not isinstance(flag, Mapping):
+            continue
+        rows.append(
+            "<tr>"
+            f"<td>{escape(str(flag.get('perturbation_id', '')))}</td>"
+            f"<td>{escape(str(flag.get('severity', '')))}</td>"
+            f"<td>{escape(str(flag.get('reason', '')))}</td>"
+            "</tr>"
+        )
+    return "<table><thead><tr><th>Perturbation</th><th>Severity</th><th>Reason</th></tr></thead><tbody>" + "".join(rows) + "</tbody></table>"
+
+
+def _tier_justification(report_payload: dict[str, Any]) -> str:
+    aggregate = report_payload.get("aggregate") if isinstance(report_payload.get("aggregate"), Mapping) else {}
+    independence = (
+        report_payload.get("independence_attestation_debate")
+        if isinstance(report_payload.get("independence_attestation_debate"), Mapping)
+        else {}
+    )
+    rows = (
+        ("Claim Tier", _string_field(report_payload, "claim_tier")),
+        ("Aggregate Passed", str(aggregate.get("passed"))),
+        ("Aggregate Score", _json_cell(aggregate.get("score"))),
+        ("Lineage Disjoint", str(independence.get("lineage_disjoint"))),
+        ("Correlation Warning", str(independence.get("correlation_warning"))),
+        ("Min Independent Challengers", _json_cell(independence.get("min_independent_challengers"))),
+    )
+    return _key_value_table(rows)
+
+
+def _referee_table(report_payload: dict[str, Any]) -> str:
+    referee = report_payload.get("referee") if isinstance(report_payload.get("referee"), Mapping) else {}
+    rows = (
+        ("Referee ID", _string_field(referee, "referee_id")),
+        ("Non-gameable", str(referee.get("non_gameable"))),
+        ("Signed By", _string_field(referee, "signed_by")),
+        ("Distinct From Proponent", str(referee.get("distinct_from_proponent"))),
+    )
+    return _key_value_table(rows)
+
+
+def _lineage_table(graph: LineageGraph) -> str:
+    node_rows = [
+        "<tr>"
+        f"<td>{escape(record.artifact_ref)}</td>"
+        f"<td>{escape(record.kind)}</td>"
+        f"<td>{escape(record.producer.subsystem)}</td>"
+        f"<td><code>{escape(record.content_hash)}</code></td>"
+        f"<td>{escape(record.lineage.code_ref)}</td>"
+        "</tr>"
+        for record in graph.nodes
+    ]
+    edge_rows = [
+        "<tr>"
+        f"<td>{escape(edge.source_ref)}</td>"
+        f"<td>{escape(edge.edge_type)}</td>"
+        f"<td>{escape(edge.target_ref)}</td>"
+        "</tr>"
+        for edge in graph.edges
+    ]
+    return (
+        "<h3>Nodes</h3>"
+        "<table><thead><tr><th>Artifact</th><th>Kind</th><th>Producer</th><th>Content Hash</th><th>Code Ref</th></tr></thead><tbody>"
+        + "".join(node_rows)
+        + "</tbody></table>"
+        "<h3>Edges</h3>"
+        "<table><thead><tr><th>Source</th><th>Type</th><th>Target</th></tr></thead><tbody>"
+        + "".join(edge_rows)
+        + "</tbody></table>"
+    )
+
+
+def _key_value_table(rows: tuple[tuple[str, str], ...]) -> str:
+    return "<table><tbody>" + "".join(f"<tr><th>{escape(key)}</th><td>{escape(value)}</td></tr>" for key, value in rows) + "</tbody></table>"
+
+
+def _status_pill(value: str) -> str:
+    label = value or "UNKNOWN"
+    css = label.lower().replace("_", "-")
+    return f"<span class=\"pill {escape(css)}\">{escape(label)}</span>"
+
+
+def _json_cell(value: Any) -> str:
+    if value is None:
+        return ""
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def _check_map(report_payload: Mapping[str, Any]) -> dict[str, Mapping[str, Any]]:
+    checks = report_payload.get("checks")
+    if not isinstance(checks, list):
+        return {}
+    result: dict[str, Mapping[str, Any]] = {}
+    for check in checks:
+        if isinstance(check, Mapping) and isinstance(check.get("check"), str):
+            result[check["check"]] = check
+    return result
+
+
+def _nodes_by_ref(records: tuple[ArtifactRecord, ...], failures: list[str]) -> dict[str, ArtifactRecord]:
+    nodes: dict[str, ArtifactRecord] = {}
+    for record in records:
+        if record.artifact_ref in nodes:
+            failures.append(f"duplicate lineage node: {record.artifact_ref}")
+        nodes[record.artifact_ref] = record
+    return nodes
+
+
+def _has_edge(edges: tuple[LineageEdge, ...], *, source_ref: str, target_ref: str, edge_type: str) -> bool:
+    return any(
+        edge.source_ref == source_ref and edge.target_ref == target_ref and edge.edge_type == edge_type
+        for edge in edges
+    )
+
+
+def _artifact_record_from_json(payload: Any) -> ArtifactRecord:
+    if not isinstance(payload, Mapping):
+        raise ValueError("lineage node must be an object")
+    producer = payload.get("producer")
+    lineage = payload.get("lineage")
+    if not isinstance(producer, Mapping):
+        raise ValueError("lineage node producer must be an object")
+    if not isinstance(lineage, Mapping):
+        raise ValueError("lineage node lineage must be an object")
+    return ArtifactRecord(
+        artifact_ref=_required_string(payload, "artifact_ref"),
+        kind=_required_string(payload, "kind"),
+        content_hash=_required_string(payload, "content_hash"),
+        size_bytes=int(payload.get("size_bytes", 0)),
+        producer=Producer(
+            subsystem=_required_string(producer, "subsystem"),
+            version=_required_string(producer, "version"),
+            actor_id=_optional_string(producer, "actor_id"),
+            job_id=_optional_string(producer, "job_id"),
+        ),
+        lineage=Lineage(
+            input_refs=tuple(_string_items(lineage.get("input_refs", ()))),
+            code_ref=_required_string(lineage, "code_ref"),
+            environment_digest=_required_string(lineage, "environment_digest"),
+            seeds=tuple(_string_items(lineage.get("seeds", ()))),
+            actor_id=_optional_string(lineage, "actor_id"),
+            job_id=_optional_string(lineage, "job_id"),
+            contamination_index_version=_optional_string(lineage, "contamination_index_version"),
+        ),
+        claim_tier=str(payload.get("claim_tier", "ran-toy")),
+        validation_report_ref=_optional_string(payload, "validation_report_ref"),
+        created_at=str(payload.get("created_at", "")),
+    )
+
+
+def _lineage_edge_from_json(payload: Any) -> LineageEdge:
+    if not isinstance(payload, Mapping):
+        raise ValueError("lineage edge must be an object")
+    return LineageEdge(
+        source_ref=_required_string(payload, "source_ref"),
+        target_ref=_required_string(payload, "target_ref"),
+        edge_type=_required_string(payload, "edge_type"),
+    )
+
+
+def _sequence_field(payload: Mapping[str, Any], field_name: str) -> tuple[Any, ...]:
+    value = payload.get(field_name, ())
+    if value is None:
+        return ()
+    if not isinstance(value, list | tuple):
+        raise ValueError(f"{field_name} must be an array")
+    return tuple(value)
+
+
+def _required_string(payload: Mapping[str, Any], field_name: str) -> str:
+    value = payload.get(field_name)
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"{field_name} is required")
+    return value
+
+
+def _optional_string(payload: Mapping[str, Any], field_name: str) -> str | None:
+    value = payload.get(field_name)
+    return value if isinstance(value, str) else None
+
+
+def _string_field(payload: Mapping[str, Any], field_name: str) -> str:
+    value = payload.get(field_name)
+    return value if isinstance(value, str) else ""
+
+
+def _string_items(value: Any) -> tuple[str, ...]:
+    if not isinstance(value, list | tuple):
+        return ()
+    return tuple(str(item) for item in value if isinstance(item, str))
