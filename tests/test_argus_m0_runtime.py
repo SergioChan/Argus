@@ -416,6 +416,50 @@ class ArgusM0RuntimeServiceTests(unittest.TestCase):
                     headers=_auth_headers(S8_BROKER_AUDIENCE_ONLY_READ_TOKEN),
                 )
             )
+            record_status, record_payload = app.http.handle(
+                JsonRequest(
+                    method="GET",
+                    path=f"/v1/artifacts/{chained_payload['artifact_ref']}/record",
+                    query={},
+                    body=None,
+                    headers=_auth_headers(),
+                )
+            )
+            payload_status, payload_payload = app.http.handle(
+                JsonRequest(
+                    method="GET",
+                    path=f"/v1/artifacts/{chained_payload['artifact_ref']}/payload",
+                    query={},
+                    body=None,
+                    headers=_auth_headers(),
+                )
+            )
+            unauth_record_status, unauth_record_payload = app.http.handle(
+                JsonRequest(
+                    method="GET",
+                    path=f"/v1/artifacts/{chained_payload['artifact_ref']}/record",
+                    query={},
+                    body=None,
+                )
+            )
+            write_only_record_status, write_only_record_payload = app.http.handle(
+                JsonRequest(
+                    method="GET",
+                    path=f"/v1/artifacts/{chained_payload['artifact_ref']}/record",
+                    query={},
+                    body=None,
+                    headers=_auth_headers(S8_REPRO_WRITE_TOKEN),
+                )
+            )
+            write_only_payload_status, write_only_payload_payload = app.http.handle(
+                JsonRequest(
+                    method="GET",
+                    path=f"/v1/artifacts/{chained_payload['artifact_ref']}/payload",
+                    query={},
+                    body=None,
+                    headers=_auth_headers(S8_REPRO_WRITE_TOKEN),
+                )
+            )
             bad_page_status, bad_page_payload = app.http.handle(
                 JsonRequest(
                     method="GET",
@@ -530,6 +574,16 @@ class ArgusM0RuntimeServiceTests(unittest.TestCase):
             self.assertEqual(write_only_query_payload["error"], "CapabilityDenied")
             self.assertEqual(broker_audience_only_query_status, 403)
             self.assertEqual(broker_audience_only_query_payload["error"], "CapabilityDenied")
+            self.assertEqual(record_status, 200)
+            self.assertEqual(record_payload["artifact_ref"], chained_payload["artifact_ref"])
+            self.assertEqual(payload_status, 200)
+            self.assertEqual(payload_payload, {"weights": [2]})
+            self.assertEqual(unauth_record_status, 401)
+            self.assertEqual(unauth_record_payload["error"], "Unauthorized")
+            self.assertEqual(write_only_record_status, 403)
+            self.assertEqual(write_only_record_payload["error"], "CapabilityDenied")
+            self.assertEqual(write_only_payload_status, 403)
+            self.assertEqual(write_only_payload_payload["error"], "CapabilityDenied")
             self.assertEqual(bad_page_status, 400)
             self.assertEqual(bad_page_payload["error"], "ValueError")
             self.assertEqual(manifest_status, 200)

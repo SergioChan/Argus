@@ -642,8 +642,24 @@ def _battery_s8_capability_scopes(
     read_token: str,
     write_token: str,
 ) -> None:
+    protected_ref = parse.quote("c4://artifact/not-yet-written", safe="")
     read_query = _get_json(f"{s8_url}/v1/artifacts?page_size=1", expected_status=200, token=read_token)
     write_query = _get_json(f"{s8_url}/v1/artifacts?page_size=1", expected_status=403, token=write_token)
+    write_record = _get_json(
+        f"{s8_url}/v1/artifacts/{protected_ref}/record",
+        expected_status=403,
+        token=write_token,
+    )
+    write_payload = _get_json(
+        f"{s8_url}/v1/artifacts/{protected_ref}/payload",
+        expected_status=403,
+        token=write_token,
+    )
+    unauth_record = _get_json(
+        f"{s8_url}/v1/artifacts/{protected_ref}/record",
+        expected_status=401,
+        token=None,
+    )
     read_write = _post_json(
         f"{s8_url}/v1/reproducibility-checks",
         {
@@ -654,15 +670,21 @@ def _battery_s8_capability_scopes(
         expected_status=403,
         token=read_token,
     )
-    if write_query.get("error") != "CapabilityDenied" or read_write.get("error") != "CapabilityDenied":
-        raise AssertionError(f"S8 capability gates did not fail closed: {write_query}, {read_write}")
+    capability_errors = (write_query, write_record, write_payload, read_write)
+    if any(error.get("error") != "CapabilityDenied" for error in capability_errors):
+        raise AssertionError(f"S8 capability gates did not fail closed: {capability_errors}")
+    if unauth_record.get("error") != "Unauthorized":
+        raise AssertionError(f"S8 unauthenticated read did not fail closed: {unauth_record}")
     _record(
         evidence,
         "s8-capability",
-        "S8 HTTP routes enforce read and reproducibility-write capabilities before store access",
+        "S8 HTTP query, record, payload, and reproducibility-write routes enforce capabilities before store access",
         {
             "read_query_records": len(read_query["records"]),
             "write_token_query_error": write_query["error"],
+            "write_token_record_error": write_record["error"],
+            "write_token_payload_error": write_payload["error"],
+            "unauth_record_error": unauth_record["error"],
             "read_token_repro_write_error": read_write["error"],
         },
     )
