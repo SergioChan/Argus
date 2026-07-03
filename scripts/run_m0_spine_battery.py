@@ -1413,6 +1413,19 @@ def _postgres_audit_root_tamper_denial(
 ) -> dict[str, Any]:
     import psycopg
 
+    def audit_slice_url(
+        artifact_refs: tuple[str, ...],
+        *,
+        page_size: int | None = None,
+        page_token: int | None = None,
+    ) -> str:
+        params: list[tuple[str, str]] = [("artifact_ref", artifact_ref) for artifact_ref in artifact_refs]
+        if page_size is not None:
+            params.append(("page_size", str(page_size)))
+        if page_token is not None:
+            params.append(("page_token", str(page_token)))
+        return f"{s8_url}/v1/audit-slice?" + parse.urlencode(params)
+
     tampered_root = "blake3:" + ("f" * 64)
     with psycopg.connect(dsn) as conn:
         with conn.cursor() as cur:
@@ -1423,16 +1436,19 @@ def _postgres_audit_root_tamper_denial(
                 JOIN s8.merkle_checkpoint AS checkpoint
                   ON checkpoint.seq = leaf.sequence
                 ORDER BY leaf.sequence DESC
-                LIMIT 1;
+                LIMIT 2;
                 """
             )
-            row = cur.fetchone()
-            if row is None:
-                raise AssertionError("no deployed audit leaf/checkpoint available for tamper-negative verification")
-            sequence = int(row[0])
-            artifact_ref = str(row[1])
-            original_leaf_root = str(row[2])
-            original_checkpoint_root = str(row[3])
+            rows = cur.fetchall()
+            if len(rows) < 2:
+                raise AssertionError("at least two deployed audit leaves are required for paged tamper verification")
+            rows = sorted(rows, key=lambda row: int(row[0]))
+            page_artifact_refs = tuple(str(row[1]) for row in rows)
+            target_row = rows[-1]
+            sequence = int(target_row[0])
+            artifact_ref = str(target_row[1])
+            original_leaf_root = str(target_row[2])
+            original_checkpoint_root = str(target_row[3])
             if original_leaf_root == tampered_root:
                 tampered_root = "blake3:" + ("e" * 64)
             cur.execute("ALTER TABLE s8.ledger_leaf DISABLE TRIGGER ledger_leaf_append_only;")
@@ -1444,16 +1460,41 @@ def _postgres_audit_root_tamper_denial(
 
     try:
         tampered_audit = _get_json(
-            f"{s8_url}/v1/audit-slice?artifact_ref={parse.quote(artifact_ref, safe='')}",
+            audit_slice_url((artifact_ref,)),
             token=token,
         )
         verification = dict(tampered_audit["verification"])
         if verification.get("valid"):
             raise AssertionError(f"deployed audit verifier accepted tampered audit root: {verification}")
+        paged_tampered_audit = _get_json(
+            audit_slice_url(page_artifact_refs, page_size=1),
+            token=token,
+        )
+        paged_verification = dict(paged_tampered_audit["verification"])
+        if paged_verification.get("valid"):
+            raise AssertionError(f"deployed paged audit verifier accepted tampered audit root: {paged_verification}")
+        next_page_token = paged_tampered_audit.get("next_page_token")
+        if next_page_token is None:
+            raise AssertionError("deployed paged audit tamper check did not return a second page token")
+        second_page_tampered_audit = _get_json(
+            audit_slice_url(page_artifact_refs, page_size=1, page_token=int(next_page_token)),
+            token=token,
+        )
+        second_page_verification = dict(second_page_tampered_audit["verification"])
+        if second_page_verification.get("valid"):
+            raise AssertionError(
+                f"deployed second-page audit verifier accepted tampered audit root: {second_page_verification}"
+            )
         return {
             "artifact_ref": artifact_ref,
             "break_sequence": verification.get("break_sequence"),
             "reason": verification.get("reason"),
+            "paged_artifact_refs": list(page_artifact_refs),
+            "paged_next_page_token": next_page_token,
+            "paged_break_sequence": paged_verification.get("break_sequence"),
+            "paged_reason": paged_verification.get("reason"),
+            "paged_second_break_sequence": second_page_verification.get("break_sequence"),
+            "paged_second_reason": second_page_verification.get("reason"),
         }
     finally:
         with psycopg.connect(dsn) as conn:

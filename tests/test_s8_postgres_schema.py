@@ -1148,12 +1148,26 @@ class S8PostgresSchemaTests(unittest.TestCase):
             """
         )
         tampered_slice = store.export_audit_slice((model.artifact_ref,))
+        tampered_first_page = store.export_audit_slice((dataset.artifact_ref, model.artifact_ref), page_size=1)
+        tampered_second_page = store.export_audit_slice(
+            (dataset.artifact_ref, model.artifact_ref),
+            page_size=1,
+            page_token=tampered_first_page["next_page_token"],
+        )
         tampered_slice_verification = store.verify_audit_slice(tampered_slice)
+        tampered_first_page_verification = store.verify_audit_slice(tampered_first_page)
+        tampered_second_page_verification = store.verify_audit_slice(tampered_second_page)
         tampered_chain_verification = store.verify_audit_chain()
 
         self.assertFalse(tampered_slice_verification["valid"])
         self.assertEqual(tampered_slice_verification["break_sequence"], 2)
         self.assertEqual(tampered_slice_verification["reason"], "root_mismatch")
+        self.assertFalse(tampered_first_page_verification["valid"])
+        self.assertEqual(tampered_first_page_verification["break_sequence"], 2)
+        self.assertEqual(tampered_first_page_verification["reason"], "root_mismatch")
+        self.assertFalse(tampered_second_page_verification["valid"])
+        self.assertEqual(tampered_second_page_verification["break_sequence"], 2)
+        self.assertEqual(tampered_second_page_verification["reason"], "root_mismatch")
         self.assertFalse(tampered_chain_verification["valid"])
         self.assertEqual(tampered_chain_verification["break_sequence"], 2)
         self.assertEqual(tampered_chain_verification["reason"], "root_mismatch")
