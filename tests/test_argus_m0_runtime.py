@@ -1425,6 +1425,46 @@ class ArgusM0RuntimeServiceTests(unittest.TestCase):
         self.assertIn("launch job_id", payload["message"])
         self.assertEqual(supervisor.calls, [])
 
+    def test_s10_http_launch_rejects_preflight_over_budget_without_handle(self) -> None:
+        supervisor = _SuccessfulSupervisor()
+        auth = RuntimeAuth(
+            {
+                AUTH_TOKEN: RuntimeIdentity(
+                    caller_id="test-caller",
+                    job_id="job-auth",
+                    root_request_id="root-auth",
+                    scopes=ScopeGrant(broker_audiences=("store",), producer_subsystems=("S2",)),
+                    budget_caps=BudgetCaps(max_compute_units=10, max_wallclock_s=30, max_cost_usd=0.01),
+                    max_ttl_s=300,
+                )
+            }
+        )
+        app = S10SupervisorApp(signing_key=b"test-key", auth=auth, docker_supervisor=supervisor)
+        launch = _launch_body(app)
+        requested_envelope = dict(launch["requested_envelope"])
+        requested_envelope["estimated_cost_usd"] = 0.02
+        launch["requested_envelope"] = requested_envelope
+
+        status, payload = app.http.handle(
+            JsonRequest(
+                method="POST",
+                path="/v1/sandboxes:launch",
+                query={},
+                body=launch,
+                headers=_auth_headers(),
+            )
+        )
+
+        self.assertEqual(status, 403)
+        self.assertEqual(payload["error"], "BudgetExceededError")
+        self.assertIsNone(payload["handle"])
+        self.assertIn("budget.reject", payload["audit_events"])
+        self.assertNotIn("sandbox.launched", payload["audit_events"])
+        self.assertNotIn("sandbox.started", payload["audit_events"])
+        self.assertNotIn("spend.final", payload["audit_events"])
+        self.assertEqual(supervisor.calls, [])
+        self.assertEqual(app.artifacts.record_count, 0)
+
     def test_s10_http_launch_budget_halt_returns_audit_and_provenance(self) -> None:
         supervisor = _SuccessfulSupervisor(usage=BudgetUsage(compute_units=11, wallclock_s=1))
         app = S10SupervisorApp(signing_key=b"test-key", auth=_runtime_auth(), docker_supervisor=supervisor)

@@ -436,6 +436,14 @@ def main() -> int:
             token=auth_tokens["halt"],
             read_token=auth_tokens["read"],
         )
+        _battery_s10_preflight_budget_reject(
+            evidence,
+            s10_url,
+            args.image,
+            s8_url,
+            token=auth_tokens["budget-reject"],
+            read_token=auth_tokens["read"],
+        )
         _battery_partial_capture(
             evidence,
             s10_url,
@@ -582,6 +590,13 @@ def _m0_identity_requests() -> dict[str, dict[str, Any]]:
             "job_id": "m0-budget-halt-job",
             "root_request_id": "m0-budget-halt-root",
             "budget_caps": {"max_compute_units": 1, "max_wallclock_s": 1, "max_cost_usd": 5},
+            "scopes": {"sandbox_risk_class": "standard"},
+        },
+        "budget-reject": {
+            "caller_id": "m0-budget-reject",
+            "job_id": "m0-budget-reject-job",
+            "root_request_id": "m0-budget-reject-root",
+            "budget_caps": {"max_compute_units": 10, "max_wallclock_s": 10, "max_cost_usd": 0.01},
             "scopes": {"sandbox_risk_class": "standard"},
         },
         "halt-latency": {
@@ -2077,6 +2092,82 @@ def _battery_e_budget_halt(
     )
 
 
+def _battery_s10_preflight_budget_reject(
+    evidence: dict[str, Any],
+    s10_url: str,
+    image: str,
+    s8_url: str,
+    *,
+    token: str,
+    read_token: str,
+) -> None:
+    job_id = "m0-budget-reject-job"
+    budget_json = _post_json(
+        f"{s10_url}/v1/budget-tokens",
+        {},
+        expected_status=201,
+        token=token,
+    )
+    scope_json = _post_json(
+        f"{s10_url}/v1/scope-tokens",
+        {},
+        expected_status=201,
+        token=token,
+    )
+    launch_body = _launch_request_json(
+        job_id=job_id,
+        image=image,
+        budget=budget_json,
+        scope=scope_json,
+        args=("-c", "echo should-not-run"),
+        env={},
+        env_allowlist=(),
+        wallclock_s=1,
+        estimated_cost_usd=0.02,
+    )
+    response = _post_json(
+        f"{s10_url}/v1/sandboxes:launch",
+        launch_body,
+        expected_status=403,
+        token=token,
+    )
+    if response.get("error") != "BudgetExceededError":
+        raise AssertionError(f"pre-flight budget reject did not fail with BudgetExceededError: {response}")
+    if response.get("handle") is not None:
+        raise AssertionError(f"pre-flight budget reject unexpectedly returned a sandbox handle: {response}")
+    events = response.get("audit_events") or []
+    if "budget.reject" not in events:
+        raise AssertionError(f"pre-flight budget reject event missing from deployed S10 response: {events}")
+    if events[-1] != "budget.reject":
+        raise AssertionError(f"pre-flight budget reject was not the terminal audit event: {events}")
+    spend_query = _get_json(
+        f"{s8_url}/v1/artifacts?kind=spend.final&job_id={parse.quote(job_id, safe='')}&page_size=20",
+        token=read_token,
+    )
+    container_query = _get_json(
+        f"{s8_url}/v1/artifacts?kind=container&job_id={parse.quote(job_id, safe='')}&page_size=20",
+        token=read_token,
+    )
+    if spend_query.get("records"):
+        raise AssertionError(f"pre-flight budget reject wrote spend.final records: {spend_query}")
+    if container_query.get("records"):
+        raise AssertionError(f"pre-flight budget reject wrote launch provenance records: {container_query}")
+    _record(
+        evidence,
+        "s10-admission-reject",
+        "deployed S10 rejected an over-budget launch before creating a sandbox handle, launch provenance, or spend.final",
+        {
+            "error": response["error"],
+            "handle_absent": response.get("handle") is None,
+            "events": events,
+            "spend_final_records": len(spend_query.get("records") or []),
+            "container_records": len(container_query.get("records") or []),
+            "estimated_cost_usd": 0.02,
+            "max_cost_usd": budget_json["caps"]["max_cost_usd"],
+        },
+    )
+
+
 def _battery_partial_capture(
     evidence: dict[str, Any],
     s10_url: str,
@@ -2815,6 +2906,7 @@ def _launch_request_json(
     env: dict[str, str],
     env_allowlist: tuple[str, ...],
     wallclock_s: int,
+    estimated_cost_usd: float = 0,
 ) -> dict[str, Any]:
     return {
         "job_id": job_id,
@@ -2834,7 +2926,7 @@ def _launch_request_json(
             "wallclock_s": wallclock_s,
             "scratch_bytes": 1024 * 1024,
             "pids": 16,
-            "estimated_cost_usd": 0,
+            "estimated_cost_usd": estimated_cost_usd,
         },
         "runtime_class_hint": "auto",
         "policy_pin": None,

@@ -939,12 +939,26 @@ class S10OrchestratorAndAuditTests(unittest.TestCase):
         self.assertEqual(self.audit.events()[-1].event_type, "image.verify_fail")
 
     def test_launch_rejects_over_budget_without_handle(self) -> None:
+        artifacts = InMemoryArtifactStore()
+        orchestrator = InMemorySandboxOrchestrator(
+            token_service=self.tokens,
+            quota_ledger=self.quota,
+            audit_ledger=self.audit,
+            policy_bundle=self.bundle,
+            artifact_store=artifacts,
+        )
         request = self._launch_request(max_cost_usd=1, estimated_cost_usd=2)
 
         with self.assertRaises(BudgetExceededError):
-            self.orchestrator.launch(request)
+            orchestrator.launch(request)
 
+        quota_state = self.quota.state(request.budget_token.budget_id)
+        self.assertEqual(quota_state.reserved, BudgetUsage())
+        self.assertEqual(quota_state.actual, BudgetUsage())
+        self.assertEqual(orchestrator._handles, {})
+        self.assertEqual(artifacts.record_count, 0)
         self.assertEqual(self.audit.events()[-1].event_type, "budget.reject")
+        self.assertNotIn("sandbox.launched", [event.event_type for event in self.audit.events()])
 
     def test_launch_rejects_invalid_token_fail_closed(self) -> None:
         request = self._launch_request(max_cost_usd=10, estimated_cost_usd=2)
@@ -2133,6 +2147,39 @@ class S10DockerOrchestratorFailureTests(unittest.TestCase):
                     ["sandbox.launched", "sandbox.started", "budget.release", "sandbox.runtime_failed"],
                 )
                 self.assertEqual(audit.events()[-1].payload["error_type"], type(exc).__name__)
+
+    def test_preflight_over_budget_rejects_before_supervisor_or_provenance(self) -> None:
+        artifacts = InMemoryArtifactStore()
+        orchestrator = DockerSandboxOrchestrator(
+            token_service=self.tokens,
+            quota_ledger=self.quota,
+            audit_ledger=self.audit,
+            policy_bundle=self.bundle,
+            artifact_store=artifacts,
+            supervisor=_RaisingSupervisor(AssertionError("supervisor must not run after admission reject")),
+        )
+        base_request = self._launch_request()
+        budget = self.tokens.mint_budget(
+            caps=BudgetCaps(max_compute_units=10, max_wallclock_s=10, max_cost_usd=0.01),
+            job_id=base_request.job_id,
+            root_request_id=base_request.budget_token.root_request_id,
+        )
+        request = replace(
+            base_request,
+            budget_token=budget,
+            requested_envelope=replace(base_request.requested_envelope, estimated_cost_usd=0.02),
+        )
+
+        with self.assertRaises(BudgetExceededError):
+            orchestrator.launch_and_wait(request)
+
+        quota_state = self.quota.state(request.budget_token.budget_id)
+        self.assertEqual(quota_state.reserved, BudgetUsage())
+        self.assertEqual(quota_state.actual, BudgetUsage())
+        self.assertEqual(orchestrator._handles, {})
+        self.assertEqual(artifacts.record_count, 0)
+        event_types = [event.event_type for event in self.audit.events()]
+        self.assertEqual(event_types, ["budget.reject"])
 
     def test_docker_orchestrator_emits_spend_final_with_signed_price_table(self) -> None:
         artifacts = InMemoryArtifactStore()
