@@ -972,6 +972,63 @@ class S10OrchestratorAndAuditTests(unittest.TestCase):
 
 
 class S10ResourceMeterGapTests(unittest.TestCase):
+    def test_metering_payload_splits_halt_detection_from_cleanup_latency(self) -> None:
+        samples = (
+            s10_module.ResourceMeterSample(
+                sample_seq=1,
+                elapsed_s=0.5,
+                cadence_s=0.5,
+                usage=BudgetUsage(wallclock_s=0.5),
+                source="docker-api-cgroup",
+            ),
+            s10_module.ResourceMeterSample(
+                sample_seq=2,
+                elapsed_s=1.25,
+                cadence_s=0.75,
+                usage=BudgetUsage(wallclock_s=1.25),
+                source="docker-api-cgroup",
+                halted=True,
+                breached_dimensions=("wallclock_s",),
+            ),
+            s10_module.ResourceMeterSample(
+                sample_seq=3,
+                elapsed_s=3.75,
+                cadence_s=2.5,
+                usage=BudgetUsage(wallclock_s=3.75),
+                source="docker-api-cgroup-final",
+                halted=True,
+                breached_dimensions=("wallclock_s",),
+            ),
+        )
+
+        payload = s10_module._resource_metering_payload(samples, requested_wallclock_s=1.0)
+
+        self.assertEqual(payload["halt_latency_s"], 0.25)
+        self.assertEqual(payload["halt_detection_elapsed_s"], 1.25)
+        self.assertEqual(payload["halt_completion_elapsed_s"], 3.75)
+        self.assertEqual(payload["halt_completion_latency_s"], 2.75)
+        self.assertEqual(payload["freeze_capture_latency_s"], 2.5)
+
+    def test_metering_payload_uses_zero_latency_fields_without_halt(self) -> None:
+        samples = (
+            s10_module.ResourceMeterSample(
+                sample_seq=1,
+                elapsed_s=0.5,
+                cadence_s=0.5,
+                usage=BudgetUsage(wallclock_s=0.5),
+                source="docker-api-cgroup",
+            ),
+        )
+
+        payload = s10_module._resource_metering_payload(samples, requested_wallclock_s=1.0)
+
+        self.assertFalse(payload["halted_by_meter"])
+        self.assertEqual(payload["halt_latency_s"], 0.0)
+        self.assertEqual(payload["halt_detection_elapsed_s"], 0.0)
+        self.assertEqual(payload["halt_completion_elapsed_s"], 0.0)
+        self.assertEqual(payload["halt_completion_latency_s"], 0.0)
+        self.assertEqual(payload["freeze_capture_latency_s"], 0.0)
+
     def test_injected_sampler_gap_halts_conservatively_and_preserves_gap_dimension(self) -> None:
         tokens = InMemoryTokenService(signing_key=b"test-key", now_fn=lambda: 1_000)
         request = LaunchRequest(

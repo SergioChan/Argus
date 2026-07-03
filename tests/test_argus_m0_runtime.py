@@ -88,6 +88,126 @@ class ArgusM0RuntimeServiceTests(unittest.TestCase):
         with self.assertRaisesRegex(AssertionError, "cannot be negative"):
             m0_battery._halt_latency_summary([0.01] * 49 + [-0.1])
 
+    def test_meter_gap_probe_restores_default_supervisor_config(self) -> None:
+        evidence: dict[str, object] = {"results": []}
+        run_envs: list[dict[str, str]] = []
+
+        def fake_run(command: list[str], *, env: dict[str, str] | None = None, timeout: int = 60, check: bool = True):
+            run_envs.append(dict(env or {}))
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        get_payloads = iter(
+            [
+                {
+                    "status": "ok",
+                    "resource_meter": "docker-api-cgroup",
+                    "meter_interval_s": 0.1,
+                    "meter_gap_halt_s": 0.1,
+                },
+                {"artifact_ref": "launch-ref"},
+                {"status": "ok", "meter_interval_s": 1.0, "meter_gap_halt_s": 5.0},
+            ]
+        )
+        post_payloads = iter(
+            [
+                {"budget_id": "budget-1"},
+                {"scope_id": "scope-1"},
+                {
+                    "timed_out": True,
+                    "stderr": "argus meter halted container: meter_gap",
+                    "handle": {"state": "TIMED_OUT", "launch_provenance_ref": "launch-ref"},
+                },
+            ]
+        )
+        spend_final = {
+            "artifact_ref": "spend-ref",
+            "final_state": "TIMED_OUT",
+            "meter_sample_count": 2,
+            "meter_gap_sample_count": 1,
+            "meter_gap_sources": ["docker-api-cgroup-gap"],
+            "meter_gap_max_conservative_gap_s": 0.1,
+            "meter_halted_by_meter": True,
+            "meter_max_cadence_s": 0.1,
+            "meter_dcgm_available": False,
+        }
+
+        with (
+            patch.object(m0_battery, "_run", side_effect=fake_run),
+            patch.object(m0_battery, "_wait_health"),
+            patch.object(m0_battery, "_get_json", side_effect=lambda *args, **kwargs: next(get_payloads)),
+            patch.object(m0_battery, "_post_json", side_effect=lambda *args, **kwargs: next(post_payloads)),
+            patch.object(m0_battery, "_battery_spend_final", return_value=spend_final),
+        ):
+            m0_battery._battery_non_injected_meter_gap(
+                evidence,
+                docker="docker",
+                compose_file="compose.yaml",
+                compose_env={"BASE": "1"},
+                s10_url="http://s10",
+                s8_url="http://s8",
+                image="busybox@sha256:" + "1" * 64,
+                token="runtime-token",
+                read_token="read-token",
+                health_token="health-token",
+            )
+
+        self.assertEqual(len(run_envs), 2)
+        self.assertEqual(run_envs[0]["ARGUS_S10_METER_INTERVAL_S"], "0.1")
+        self.assertEqual(run_envs[0]["ARGUS_S10_METER_GAP_HALT_S"], "0.1")
+        self.assertNotIn("ARGUS_S10_METER_INTERVAL_S", run_envs[1])
+        self.assertNotIn("ARGUS_S10_METER_GAP_HALT_S", run_envs[1])
+        result = evidence["results"][-1]  # type: ignore[index]
+        detail = result["detail"]  # type: ignore[index]
+        self.assertEqual(detail["s10_meter_restored_interval_s"], 1.0)
+        self.assertEqual(detail["s10_meter_restored_gap_halt_s"], 5.0)
+
+    def test_meter_gap_probe_restores_default_supervisor_config_on_failure(self) -> None:
+        evidence: dict[str, object] = {"results": []}
+        run_envs: list[dict[str, str]] = []
+
+        def fake_run(command: list[str], *, env: dict[str, str] | None = None, timeout: int = 60, check: bool = True):
+            run_envs.append(dict(env or {}))
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        get_payloads = iter(
+            [
+                {
+                    "status": "ok",
+                    "resource_meter": "docker-api-cgroup",
+                    "meter_interval_s": 0.1,
+                    "meter_gap_halt_s": 0.1,
+                },
+                {"status": "ok", "meter_interval_s": 1.0, "meter_gap_halt_s": 5.0},
+            ]
+        )
+
+        def raise_probe_failure(*args, **kwargs):
+            raise AssertionError("probe boom")
+
+        with (
+            patch.object(m0_battery, "_run", side_effect=fake_run),
+            patch.object(m0_battery, "_wait_health"),
+            patch.object(m0_battery, "_get_json", side_effect=lambda *args, **kwargs: next(get_payloads)),
+            patch.object(m0_battery, "_post_json", side_effect=raise_probe_failure),
+        ):
+            with self.assertRaisesRegex(AssertionError, "probe boom"):
+                m0_battery._battery_non_injected_meter_gap(
+                    evidence,
+                    docker="docker",
+                    compose_file="compose.yaml",
+                    compose_env={"BASE": "1"},
+                    s10_url="http://s10",
+                    s8_url="http://s8",
+                    image="busybox@sha256:" + "1" * 64,
+                    token="runtime-token",
+                    read_token="read-token",
+                    health_token="health-token",
+                )
+
+        self.assertEqual(len(run_envs), 2)
+        self.assertEqual(run_envs[0]["ARGUS_S10_METER_INTERVAL_S"], "0.1")
+        self.assertNotIn("ARGUS_S10_METER_INTERVAL_S", run_envs[1])
+
     def test_m0_identity_policy_declares_halt_latency_caller(self) -> None:
         requests = m0_battery._m0_identity_requests()
         policy = json.loads(m0_battery._m0_identity_mint_policy_json())

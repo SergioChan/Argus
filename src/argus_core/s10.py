@@ -1331,14 +1331,26 @@ def _resource_metering_payload(
     max_cadence_s = max((sample.cadence_s for sample in samples), default=0.0)
     halted_samples = tuple(sample for sample in samples if sample.halted)
     halt_latency_s = 0.0
+    halt_detection_elapsed_s = 0.0
+    halt_completion_elapsed_s = 0.0
+    halt_completion_latency_s = 0.0
+    freeze_capture_latency_s = 0.0
     if halted_samples:
-        halt_latency_s = max(halted_samples[-1].elapsed_s - requested_wallclock_s, 0.0)
+        halt_detection_elapsed_s = halted_samples[0].elapsed_s
+        halt_completion_elapsed_s = halted_samples[-1].elapsed_s
+        halt_latency_s = max(halt_detection_elapsed_s - requested_wallclock_s, 0.0)
+        halt_completion_latency_s = max(halt_completion_elapsed_s - requested_wallclock_s, 0.0)
+        freeze_capture_latency_s = max(halt_completion_elapsed_s - halt_detection_elapsed_s, 0.0)
     return {
         "source": samples[-1].source if samples else "unavailable",
         "sample_count": len(samples),
         "max_cadence_s": round(max_cadence_s, 6),
         "halted_by_meter": bool(halted_samples),
         "halt_latency_s": round(halt_latency_s, 6),
+        "halt_detection_elapsed_s": round(halt_detection_elapsed_s, 6),
+        "halt_completion_elapsed_s": round(halt_completion_elapsed_s, 6),
+        "halt_completion_latency_s": round(halt_completion_latency_s, 6),
+        "freeze_capture_latency_s": round(freeze_capture_latency_s, 6),
         "dcgm_available": any(sample.dcgm_available for sample in samples),
         "samples": [_resource_meter_sample_payload(sample) for sample in samples],
     }

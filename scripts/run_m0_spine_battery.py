@@ -1776,6 +1776,8 @@ def _battery_e_budget_halt(
             "spend_final_meter_max_cadence_s": spend_final["meter_max_cadence_s"],
             "spend_final_meter_halted_by_meter": spend_final["meter_halted_by_meter"],
             "spend_final_meter_halt_latency_s": spend_final["meter_halt_latency_s"],
+            "spend_final_meter_halt_completion_latency_s": spend_final["meter_halt_completion_latency_s"],
+            "spend_final_meter_freeze_capture_latency_s": spend_final["meter_freeze_capture_latency_s"],
             "spend_final_meter_dcgm_available": spend_final["meter_dcgm_available"],
             "spend_final_meter_gap_sample_count": spend_final["meter_gap_sample_count"],
         },
@@ -1879,6 +1881,8 @@ def _battery_partial_capture(
             "spend_final_meter_sample_count": spend_final["meter_sample_count"],
             "spend_final_meter_halted_by_meter": spend_final["meter_halted_by_meter"],
             "spend_final_meter_halt_latency_s": spend_final["meter_halt_latency_s"],
+            "spend_final_meter_halt_completion_latency_s": spend_final["meter_halt_completion_latency_s"],
+            "spend_final_meter_freeze_capture_latency_s": spend_final["meter_freeze_capture_latency_s"],
         },
     )
 
@@ -1927,6 +1931,7 @@ def _battery_halt_latency_trials(
     trials: int = HALT_LATENCY_TRIALS,
 ) -> None:
     latencies_s: list[float] = []
+    freeze_capture_latencies_s: list[float] = []
     max_cadences_s: list[float] = []
     sample_counts: list[int] = []
     launch_refs: list[str] = []
@@ -1981,6 +1986,7 @@ def _battery_halt_latency_trials(
             page_size=max(100, trials * 2),
         )
         latencies_s.append(spend_final["meter_halt_latency_s"])
+        freeze_capture_latencies_s.append(spend_final["meter_freeze_capture_latency_s"])
         max_cadences_s.append(spend_final["meter_max_cadence_s"])
         sample_counts.append(spend_final["meter_sample_count"])
         launch_refs.append(launch_provenance_ref)
@@ -1994,6 +2000,8 @@ def _battery_halt_latency_trials(
         {
             **summary,
             "latencies_s": [round(latency, 6) for latency in latencies_s],
+            "freeze_capture_latencies_s": [round(latency, 6) for latency in freeze_capture_latencies_s],
+            "max_freeze_capture_latency_s": round(max(freeze_capture_latencies_s), 6),
             "max_cadence_s": round(max(max_cadences_s), 6),
             "min_meter_sample_count": min(sample_counts),
             "max_meter_sample_count": max(sample_counts),
@@ -2001,6 +2009,34 @@ def _battery_halt_latency_trials(
             "spend_final_refs": spend_refs,
         },
     )
+
+
+def _recreate_s10_supervisor(
+    *,
+    docker: str,
+    compose_file: str,
+    env: dict[str, str],
+    s10_url: str,
+    health_token: str,
+) -> dict[str, Any]:
+    _run(
+        [
+            docker,
+            "compose",
+            "-f",
+            compose_file,
+            "up",
+            "-d",
+            "--no-deps",
+            "--force-recreate",
+            "--wait",
+            "s10-supervisor",
+        ],
+        env=env,
+        timeout=240,
+    )
+    _wait_health(f"{s10_url}/healthz", token=health_token)
+    return _get_json(f"{s10_url}/healthz", token=health_token)
 
 
 def _battery_non_injected_meter_gap(
@@ -2021,81 +2057,87 @@ def _battery_non_injected_meter_gap(
         "ARGUS_S10_METER_INTERVAL_S": "0.1",
         "ARGUS_S10_METER_GAP_HALT_S": "0.1",
     }
-    _run(
-        [
-            docker,
-            "compose",
-            "-f",
-            compose_file,
-            "up",
-            "-d",
-            "--no-deps",
-            "--force-recreate",
-            "--wait",
-            "s10-supervisor",
-        ],
-        env=probe_env,
-        timeout=240,
-    )
-    _wait_health(f"{s10_url}/healthz", token=health_token)
-    health = _get_json(f"{s10_url}/healthz", token=health_token)
-    if health.get("resource_meter") != "docker-api-cgroup":
-        raise AssertionError(f"S10 meter gap probe lost the Docker resource meter: {health}")
-    if (
-        abs(float(health.get("meter_interval_s", 999)) - 0.1) > 0.000001
-        or abs(float(health.get("meter_gap_halt_s", 999)) - 0.1) > 0.000001
-    ):
-        raise AssertionError(f"S10 meter gap probe did not activate the low-gap cadence: {health}")
+    restored_interval_s = float(compose_env.get("ARGUS_S10_METER_INTERVAL_S", "1.0"))
+    restored_gap_halt_s = float(compose_env.get("ARGUS_S10_METER_GAP_HALT_S", "5.0"))
+    health: dict[str, Any] = {}
+    try:
+        health = _recreate_s10_supervisor(
+            docker=docker,
+            compose_file=compose_file,
+            env=probe_env,
+            s10_url=s10_url,
+            health_token=health_token,
+        )
+        if health.get("resource_meter") != "docker-api-cgroup":
+            raise AssertionError(f"S10 meter gap probe lost the Docker resource meter: {health}")
+        if (
+            abs(float(health.get("meter_interval_s", 999)) - 0.1) > 0.000001
+            or abs(float(health.get("meter_gap_halt_s", 999)) - 0.1) > 0.000001
+        ):
+            raise AssertionError(f"S10 meter gap probe did not activate the low-gap cadence: {health}")
 
-    budget_json = _post_json(
-        f"{s10_url}/v1/budget-tokens",
-        {},
-        expected_status=201,
-        token=token,
-    )
-    scope_json = _post_json(
-        f"{s10_url}/v1/scope-tokens",
-        {},
-        expected_status=201,
-        token=token,
-    )
-    launch_body = _launch_request_json(
-        job_id="m0-meter-gap-job",
-        image=image,
-        budget=budget_json,
-        scope=scope_json,
-        args=("-c", "sleep 30"),
-        env={},
-        env_allowlist=(),
-        wallclock_s=5,
-    )
-    response = _post_json(
-        f"{s10_url}/v1/sandboxes:launch",
-        launch_body,
-        expected_status=201,
-        token=token,
-    )
-    handle = response.get("handle") or {}
-    if handle.get("state") != "TIMED_OUT" or response.get("timed_out") is not True:
-        raise AssertionError(f"meter gap probe did not fail closed through a timed-out sandbox: {response}")
-    stderr = str(response.get("stderr") or "")
-    if "meter_gap" not in stderr:
-        raise AssertionError(f"meter gap probe did not report meter_gap in stderr: {response}")
-    launch_provenance_ref = handle.get("launch_provenance_ref")
-    if not isinstance(launch_provenance_ref, str) or not launch_provenance_ref:
-        raise AssertionError(f"meter gap probe launch provenance missing: {response}")
-    _get_json(f"{s8_url}/v1/artifacts/{launch_provenance_ref}/record", token=read_token)
-    spend_final = _battery_spend_final(
-        s8_url=s8_url,
-        read_token=read_token,
-        job_id="m0-meter-gap-job",
-        launch_provenance_ref=launch_provenance_ref,
-        expected_state="TIMED_OUT",
-    )
-    if spend_final["meter_gap_sample_count"] < 1:
-        raise AssertionError(f"meter gap probe spend.final had no non-injected gap sample: {spend_final}")
-    if spend_final["meter_halted_by_meter"] is not True:
-        raise AssertionError(f"meter gap probe spend.final was not halted by the meter: {spend_final}")
+        budget_json = _post_json(
+            f"{s10_url}/v1/budget-tokens",
+            {},
+            expected_status=201,
+            token=token,
+        )
+        scope_json = _post_json(
+            f"{s10_url}/v1/scope-tokens",
+            {},
+            expected_status=201,
+            token=token,
+        )
+        launch_body = _launch_request_json(
+            job_id="m0-meter-gap-job",
+            image=image,
+            budget=budget_json,
+            scope=scope_json,
+            args=("-c", "sleep 30"),
+            env={},
+            env_allowlist=(),
+            wallclock_s=5,
+        )
+        response = _post_json(
+            f"{s10_url}/v1/sandboxes:launch",
+            launch_body,
+            expected_status=201,
+            token=token,
+        )
+        handle = response.get("handle") or {}
+        if handle.get("state") != "TIMED_OUT" or response.get("timed_out") is not True:
+            raise AssertionError(f"meter gap probe did not fail closed through a timed-out sandbox: {response}")
+        stderr = str(response.get("stderr") or "")
+        if "meter_gap" not in stderr:
+            raise AssertionError(f"meter gap probe did not report meter_gap in stderr: {response}")
+        launch_provenance_ref = handle.get("launch_provenance_ref")
+        if not isinstance(launch_provenance_ref, str) or not launch_provenance_ref:
+            raise AssertionError(f"meter gap probe launch provenance missing: {response}")
+        _get_json(f"{s8_url}/v1/artifacts/{launch_provenance_ref}/record", token=read_token)
+        spend_final = _battery_spend_final(
+            s8_url=s8_url,
+            read_token=read_token,
+            job_id="m0-meter-gap-job",
+            launch_provenance_ref=launch_provenance_ref,
+            expected_state="TIMED_OUT",
+        )
+        if spend_final["meter_gap_sample_count"] < 1:
+            raise AssertionError(f"meter gap probe spend.final had no non-injected gap sample: {spend_final}")
+        if spend_final["meter_halted_by_meter"] is not True:
+            raise AssertionError(f"meter gap probe spend.final was not halted by the meter: {spend_final}")
+    finally:
+        restored_health = _recreate_s10_supervisor(
+            docker=docker,
+            compose_file=compose_file,
+            env=compose_env,
+            s10_url=s10_url,
+            health_token=health_token,
+        )
+        if abs(float(restored_health.get("meter_interval_s", 999)) - restored_interval_s) > 0.000001:
+            raise AssertionError(f"S10 meter gap probe did not restore the default meter cadence: {restored_health}")
+        if abs(float(restored_health.get("meter_gap_halt_s", 999)) - restored_gap_halt_s) > 0.000001:
+            raise AssertionError(f"S10 meter gap probe did not restore the default meter gap threshold: {restored_health}")
+
     _record(
         evidence,
         "meter-gap",
@@ -2104,6 +2146,8 @@ def _battery_non_injected_meter_gap(
             "s10_resource_meter": health["resource_meter"],
             "s10_meter_interval_s": health["meter_interval_s"],
             "s10_meter_gap_halt_s": health["meter_gap_halt_s"],
+            "s10_meter_restored_interval_s": restored_health["meter_interval_s"],
+            "s10_meter_restored_gap_halt_s": restored_health["meter_gap_halt_s"],
             "launch_handle_state": handle["state"],
             "launch_timed_out": response["timed_out"],
             "launch_stderr": stderr,
@@ -2217,8 +2261,14 @@ def _battery_spend_final(
     if expected_state == "BUDGET_HALTED":
         if metering.get("halted_by_meter") is not True:
             raise AssertionError(f"spend.final budget halt missing meter halt evidence: {payload}")
-        if float(metering.get("halt_latency_s") or 999) > 2:
+        if "halt_latency_s" not in metering:
+            raise AssertionError(f"spend.final budget halt missing halt latency: {payload}")
+        if float(metering["halt_latency_s"]) > 2:
             raise AssertionError(f"spend.final budget halt latency exceeded S10 bound: {payload}")
+        if "freeze_capture_latency_s" not in metering:
+            raise AssertionError(f"spend.final budget halt missing freeze/capture latency: {payload}")
+        if float(metering["freeze_capture_latency_s"]) > 2:
+            raise AssertionError(f"spend.final freeze/capture latency exceeded S10 bound: {payload}")
     return {
         "artifact_ref": record["artifact_ref"],
         "final_state": payload["final_state"],
@@ -2228,6 +2278,10 @@ def _battery_spend_final(
         "meter_max_cadence_s": float(metering["max_cadence_s"]),
         "meter_halted_by_meter": bool(metering["halted_by_meter"]),
         "meter_halt_latency_s": float(metering["halt_latency_s"]),
+        "meter_halt_detection_elapsed_s": float(metering.get("halt_detection_elapsed_s", 0)),
+        "meter_halt_completion_elapsed_s": float(metering.get("halt_completion_elapsed_s", 0)),
+        "meter_halt_completion_latency_s": float(metering.get("halt_completion_latency_s", 0)),
+        "meter_freeze_capture_latency_s": float(metering.get("freeze_capture_latency_s", 0)),
         "meter_dcgm_available": bool(metering["dcgm_available"]),
         "meter_gap_sample_count": len(meter_gap_samples),
         "meter_gap_sources": meter_gap_sources,
