@@ -275,6 +275,7 @@ def main() -> int:
             "real Docker launch had no default route; S10 broker wrote model C4 record; S8 read, query, lineage, impact-set, reproducibility manifest/check, and audit-slice verification passed",
             {
                 "sandbox_stdout": launch_result["stdout"],
+                "launch_handle_state": launch_result["state"],
                 "launch_provenance_ref": launch_result["launch_provenance_ref"],
                 "spend_final_ref": spend_final["artifact_ref"],
                 "spend_final_price_table_version": spend_final["price_table_version"],
@@ -1264,6 +1265,8 @@ def _battery_e_budget_halt(
     if "budget.halt" not in events:
         raise AssertionError(f"budget halt event missing from deployed S10 response: {events}")
     handle = response.get("handle") or {}
+    if handle.get("state") != "BUDGET_HALTED":
+        raise AssertionError(f"budget halt response handle state was not BUDGET_HALTED: {response}")
     launch_provenance_ref = handle.get("launch_provenance_ref")
     if not isinstance(launch_provenance_ref, str) or not launch_provenance_ref:
         raise AssertionError("budget halt launch provenance missing")
@@ -1281,6 +1284,7 @@ def _battery_e_budget_halt(
         "sandbox ran past budget and was halted with audit and spend.final evidence",
         {
             "events": events,
+            "launch_handle_state": handle["state"],
             "spend_final_ref": spend_final["artifact_ref"],
             "spend_final_state": spend_final["final_state"],
             "spend_final_cost_usd_exact": spend_final["cost_usd_exact"],
@@ -1623,6 +1627,8 @@ def _run_no_network_launch(
     stdout = str(result.get("stdout", ""))
     if result.get("exit_code") != 0 or "no-default-route" not in stdout or "HIDDEN" in stdout:
         raise AssertionError(f"no-network sandbox launch failed: exit={result.get('exit_code')} stdout={stdout!r}")
+    if handle.get("state") != "SUCCEEDED":
+        raise AssertionError(f"no-network launch response handle state was not SUCCEEDED: {result}")
     if not handle.get("launch_provenance_ref"):
         raise AssertionError("launch provenance ref missing")
     payload = _get_json(f"{s8_url}/v1/artifacts/{handle['launch_provenance_ref']}/payload", token=read_token)
