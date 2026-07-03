@@ -47,6 +47,7 @@ AUTH_TOKEN = "test-runtime-token"
 S8_READ_TOKEN = "test-s8-read-token"
 S8_REPRO_WRITE_TOKEN = "test-s8-repro-write-token"
 S8_DATASET_WRITE_TOKEN = "test-s8-dataset-write-token"
+S8_VERIFIER_LABEL_READ_TOKEN = "test-s8-verifier-label-read-token"
 S8_BROKER_AUDIENCE_ONLY_READ_TOKEN = "test-s8-broker-audience-only-read-token"
 BOOTSTRAP_TOKEN = "test-bootstrap-token"
 IDENTITY_SIGNING_KEY = b"test-identity-signing-key"
@@ -707,6 +708,50 @@ class ArgusM0RuntimeServiceTests(unittest.TestCase):
             unauth_get_status, unauth_get_payload = app.http.handle(
                 JsonRequest(method="GET", path="/v1/datasets/ewpt-corpus", query={}, body=None)
             )
+            train_resolve_status, train_resolve_payload = app.http.handle(
+                JsonRequest(
+                    method="GET",
+                    path="/v1/datasets/ewpt-corpus/splits/train/resolve",
+                    query={"version": ["1.0.0"]},
+                    body=None,
+                    headers=_auth_headers(S8_READ_TOKEN),
+                )
+            )
+            blind_read_resolve_status, blind_read_resolve_payload = app.http.handle(
+                JsonRequest(
+                    method="GET",
+                    path="/v1/datasets/ewpt-corpus/splits/blind/resolve",
+                    query={"version": ["1.0.0"]},
+                    body=None,
+                    headers=_auth_headers(S8_READ_TOKEN),
+                )
+            )
+            blind_verifier_resolve_status, blind_verifier_resolve_payload = app.http.handle(
+                JsonRequest(
+                    method="GET",
+                    path="/v1/datasets/ewpt-corpus/splits/blind/resolve",
+                    query={"version": ["1.0.0"]},
+                    body=None,
+                    headers=_auth_headers(S8_VERIFIER_LABEL_READ_TOKEN),
+                )
+            )
+            write_only_resolve_status, write_only_resolve_payload = app.http.handle(
+                JsonRequest(
+                    method="GET",
+                    path="/v1/datasets/ewpt-corpus/splits/blind/resolve",
+                    query={"version": ["1.0.0"]},
+                    body=None,
+                    headers=_auth_headers(S8_REPRO_WRITE_TOKEN),
+                )
+            )
+            unauth_resolve_status, unauth_resolve_payload = app.http.handle(
+                JsonRequest(
+                    method="GET",
+                    path="/v1/datasets/ewpt-corpus/splits/blind/resolve",
+                    query={"version": ["1.0.0"]},
+                    body=None,
+                )
+            )
             conflict_body = {
                 **dataset_body,
                 "splits": [
@@ -746,6 +791,23 @@ class ArgusM0RuntimeServiceTests(unittest.TestCase):
             self.assertEqual(write_only_get_payload["error"], "CapabilityDenied")
             self.assertEqual(unauth_get_status, 401)
             self.assertEqual(unauth_get_payload["error"], "Unauthorized")
+            self.assertEqual(train_resolve_status, 200)
+            self.assertEqual(train_resolve_payload["feature_blob_ref"], "blake3:" + "1" * 64)
+            self.assertIsNone(train_resolve_payload["label_blob_ref"])
+            self.assertEqual(blind_read_resolve_status, 403)
+            self.assertEqual(blind_read_resolve_payload["category"], "SCOPE_DENIED")
+            self.assertNotIn("c4://labels/ewpt/blind", blind_read_resolve_payload["message"])
+            self.assertEqual(blind_verifier_resolve_status, 200)
+            self.assertEqual(blind_verifier_resolve_payload["feature_blob_ref"], "blake3:" + "2" * 64)
+            self.assertEqual(blind_verifier_resolve_payload["label_blob_ref"], "c4://labels/ewpt/blind")
+            self.assertEqual(
+                blind_verifier_resolve_payload["audit_event"]["requester_capabilities"],
+                ("s8.read", "s8.verifier-labels.read"),
+            )
+            self.assertEqual(write_only_resolve_status, 403)
+            self.assertEqual(write_only_resolve_payload["error"], "CapabilityDenied")
+            self.assertEqual(unauth_resolve_status, 401)
+            self.assertEqual(unauth_resolve_payload["error"], "Unauthorized")
             self.assertEqual(conflict_status, 400)
             self.assertIn(conflict_payload["error"], {"WriteOnceViolationError", "DatasetRegistryError"})
 
@@ -1816,6 +1878,14 @@ def _s8_runtime_auth() -> RuntimeAuth:
                 job_id="job-dataset-write",
                 root_request_id="root-dataset-write",
                 scopes=ScopeGrant(capabilities=("s8.dataset.write", "s8.read")),
+                budget_caps=BudgetCaps(max_compute_units=10, max_wallclock_s=30, max_cost_usd=5),
+                max_ttl_s=300,
+            ),
+            S8_VERIFIER_LABEL_READ_TOKEN: RuntimeIdentity(
+                caller_id="test-s8-verifier-label-read",
+                job_id="job-verifier-label-read",
+                root_request_id="root-verifier-label-read",
+                scopes=ScopeGrant(capabilities=("s8.read", "s8.verifier-labels.read")),
                 budget_caps=BudgetCaps(max_compute_units=10, max_wallclock_s=30, max_cost_usd=5),
                 max_ttl_s=300,
             ),

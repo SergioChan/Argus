@@ -110,7 +110,7 @@ def main() -> int:
         "s10_url": s10_url,
         "ports": ports,
         "persistence": "postgres-minio",
-        "auth_callers": ["read", "write", "dataset", "spine", "halt", "verify"],
+        "auth_callers": ["read", "write", "dataset", "verifier-label", "spine", "halt", "verify"],
     }
 
     try:
@@ -151,6 +151,7 @@ def main() -> int:
             dataset_scope_json=dataset_scope_json,
             dataset_token=auth_tokens["dataset"],
             read_token=auth_tokens["read"],
+            verifier_label_token=auth_tokens["verifier-label"],
             write_token=auth_tokens["write"],
         )
         verifier_scope_json = _mint_store_scope(s10_url=s10_url, token=auth_tokens["verify"])
@@ -403,6 +404,15 @@ def _m0_identity_requests() -> dict[str, dict[str, Any]]:
                 "broker_audiences": ["store"],
                 "capabilities": ["s8.read", "s8.dataset.write"],
                 "producer_subsystems": ["S8"],
+                "sandbox_risk_class": "standard",
+            },
+        },
+        "verifier-label": {
+            "caller_id": "m0-verifier-label-reader",
+            "job_id": "m0-verifier-label-reader-job",
+            "root_request_id": "m0-verifier-label-reader-root",
+            "scopes": {
+                "capabilities": ["s8.read", "s8.verifier-labels.read"],
                 "sandbox_risk_class": "standard",
             },
         },
@@ -812,6 +822,7 @@ def _battery_dataset_registry_service(
     dataset_scope_json: dict[str, Any],
     dataset_token: str,
     read_token: str,
+    verifier_label_token: str,
     write_token: str,
 ) -> None:
     dataset_id = "m0-dataset-registry"
@@ -886,6 +897,29 @@ def _battery_dataset_registry_service(
         expected_status=401,
         token=None,
     )
+    train_resolution = _get_json(
+        f"{s8_url}/v1/datasets/{dataset_id}/splits/train/resolve?version={parse.quote(version)}",
+        token=read_token,
+    )
+    blind_read_resolution = _get_json(
+        f"{s8_url}/v1/datasets/{dataset_id}/splits/blind/resolve?version={parse.quote(version)}",
+        expected_status=403,
+        token=read_token,
+    )
+    blind_verifier_resolution = _get_json(
+        f"{s8_url}/v1/datasets/{dataset_id}/splits/blind/resolve?version={parse.quote(version)}",
+        token=verifier_label_token,
+    )
+    write_token_resolution = _get_json(
+        f"{s8_url}/v1/datasets/{dataset_id}/splits/blind/resolve?version={parse.quote(version)}",
+        expected_status=403,
+        token=write_token,
+    )
+    unauth_resolution = _get_json(
+        f"{s8_url}/v1/datasets/{dataset_id}/splits/blind/resolve?version={parse.quote(version)}",
+        expected_status=401,
+        token=None,
+    )
     blind_split = next(split for split in latest["splits"] if split["split_id"] == "blind")
     masked_blind_split = "content_hash" not in blind_split and "label_seal_ref" not in blind_split
     provenance_ref = registered["provenance_ref"]["artifact_ref"]
@@ -902,10 +936,26 @@ def _battery_dataset_registry_service(
         )
     if unauth_get.get("error") != "Unauthorized":
         raise AssertionError(f"dataset registry unauthenticated read did not fail closed: {unauth_get}")
+    if train_resolution.get("feature_blob_ref") != "blake3:" + "a" * 64 or train_resolution.get("label_blob_ref") is not None:
+        raise AssertionError(f"agent-readable train split did not resolve as feature-only: {train_resolution}")
+    if (
+        blind_read_resolution.get("category") != "SCOPE_DENIED"
+        or "c4://labels/m0-dataset/blind" in blind_read_resolution.get("message", "")
+    ):
+        raise AssertionError(f"blind split read-token denial leaked or used wrong category: {blind_read_resolution}")
+    if (
+        blind_verifier_resolution.get("feature_blob_ref") != "blake3:" + "b" * 64
+        or blind_verifier_resolution.get("label_blob_ref") != "c4://labels/m0-dataset/blind"
+    ):
+        raise AssertionError(f"verifier-label token did not resolve blind label seal: {blind_verifier_resolution}")
+    if write_token_resolution.get("error") != "CapabilityDenied":
+        raise AssertionError(f"write token unexpectedly resolved blind split: {write_token_resolution}")
+    if unauth_resolution.get("error") != "Unauthorized":
+        raise AssertionError(f"unauthenticated split resolve did not fail closed: {unauth_resolution}")
     _record(
         evidence,
         "dataset-registry",
-        "S10 broker wrote a dataset C4 artifact and S8 dataset registry HTTP APIs registered, read, listed, and masked it",
+        "S10 broker wrote a dataset C4 artifact and S8 dataset registry HTTP APIs registered, read, listed, masked, and resolved splits through capability gates",
         {
             "dataset_id": dataset_id,
             "version": version,
@@ -916,6 +966,16 @@ def _battery_dataset_registry_service(
             "read_token_register_error": read_token_register["error"],
             "write_token_get_error": write_token_get["error"],
             "unauth_get_error": unauth_get["error"],
+            "train_resolve_feature_blob_ref": train_resolution["feature_blob_ref"],
+            "train_resolve_label_blob_ref": train_resolution["label_blob_ref"],
+            "blind_read_resolve_category": blind_read_resolution["category"],
+            "blind_read_resolve_message_leaked_label_ref": "c4://labels/m0-dataset/blind"
+            in blind_read_resolution.get("message", ""),
+            "blind_verifier_resolve_feature_blob_ref": blind_verifier_resolution["feature_blob_ref"],
+            "blind_verifier_resolve_label_blob_ref": blind_verifier_resolution["label_blob_ref"],
+            "blind_verifier_resolve_audit_event_id": blind_verifier_resolution["audit_event_id"],
+            "write_token_resolve_error": write_token_resolution["error"],
+            "unauth_resolve_error": unauth_resolution["error"],
         },
     )
 

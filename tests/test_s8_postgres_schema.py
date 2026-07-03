@@ -931,6 +931,25 @@ class S8PostgresSchemaTests(unittest.TestCase):
         )
         latest = store.get_dataset("runtime-corpus")
         versions = store.list_dataset_versions("runtime-corpus")
+        train_resolution = store.resolve_split(
+            dataset_id="runtime-corpus",
+            version="1.0.0",
+            split_id="train",
+            requester_capabilities=("s8.read",),
+        )
+        with self.assertRaises(Exception) as denied:
+            store.resolve_split(
+                dataset_id="runtime-corpus",
+                version="1.0.0",
+                split_id="blind",
+                requester_capabilities=("s8.read",),
+            )
+        verifier_resolution = store.resolve_split(
+            dataset_id="runtime-corpus",
+            version="1.0.0",
+            split_id="blind",
+            requester_capabilities=("s8.read", "s8.verifier-labels.read"),
+        )
 
         self.assertEqual(registered["provenance_ref"]["artifact_ref"], dataset_artifact.artifact_ref)
         self.assertEqual(latest["version"], "1.0.0")
@@ -940,6 +959,12 @@ class S8PostgresSchemaTests(unittest.TestCase):
         self.assertEqual(train["content_hash"], "blake3:" + "1" * 64)
         self.assertNotIn("content_hash", blind)
         self.assertNotIn("label_seal_ref", blind)
+        self.assertEqual(train_resolution["feature_blob_ref"], "blake3:" + "1" * 64)
+        self.assertIsNone(train_resolution["label_blob_ref"])
+        self.assertIn("SCOPE_DENIED", str(denied.exception))
+        self.assertNotIn("c4://labels/runtime/blind", str(denied.exception))
+        self.assertEqual(verifier_resolution["feature_blob_ref"], "blake3:" + "2" * 64)
+        self.assertEqual(verifier_resolution["label_blob_ref"], "c4://labels/runtime/blind")
 
     def test_postgres_store_delegates_commit_to_configured_ledger_writer(self) -> None:
         class RecordingLedgerWriter:

@@ -530,6 +530,26 @@ class PostgresArtifactStore:
                 cur.execute("SELECT version FROM s8.list_dataset_versions(%s) AS version;", (dataset_id,))
                 return tuple(str(row[0]) for row in cur.fetchall())
 
+    def resolve_split(
+        self,
+        *,
+        dataset_id: str,
+        split_id: str,
+        version: str | None = None,
+        requester_capabilities: tuple[str, ...] = (),
+    ) -> dict[str, Any]:
+        import psycopg
+
+        requester_scope = ",".join(requester_capabilities)
+        with psycopg.connect(self._dsn) as conn:
+            _set_role(conn, self._db_role)
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT s8.resolve_split(%s, %s, %s, %s);",
+                    (dataset_id, version, split_id, requester_scope),
+                )
+                return _jsonb_object(cur.fetchone()[0])
+
     def export_audit_slice(self, artifact_refs: tuple[str, ...]) -> dict[str, Any]:
         import psycopg
 

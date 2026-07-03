@@ -17,10 +17,18 @@ from argus_core import (
     FileSystemArtifactStore,
     Lineage,
     Producer,
+    S8ScopeDeniedError,
     canonical_json_bytes,
 )
 
-from .auth import RuntimeAuth, UnauthorizedError, health_token_from_env, require_static_bearer_token, runtime_auth_from_env
+from .auth import (
+    RuntimeAuth,
+    RuntimeIdentity,
+    UnauthorizedError,
+    health_token_from_env,
+    require_static_bearer_token,
+    runtime_auth_from_env,
+)
 from .http_json import JsonHttpApp, JsonRequest, serve_json_app
 
 
@@ -189,6 +197,33 @@ class S8WriterApp:
             versions = DatasetRegistry(artifact_store=self.store).list_versions(dataset_id)
         return {"dataset_id": dataset_id, "versions": list(versions)}
 
+    def resolve_dataset_split(
+        self,
+        dataset_id: str,
+        split_id: str,
+        *,
+        version: str | None,
+        identity: RuntimeIdentity,
+    ) -> dict[str, Any]:
+        self._refresh_store()
+        if hasattr(self.store, "resolve_split"):
+            return _dataset_split_resolution_wire_payload(
+                self.store.resolve_split(
+                    dataset_id=dataset_id,
+                    split_id=split_id,
+                    version=version,
+                    requester_capabilities=identity.scopes.capabilities,
+                )
+            )
+        return _dataset_split_resolution_wire_payload(
+            DatasetRegistry(artifact_store=self.store).resolve_split(
+                dataset_id=dataset_id,
+                version=version,
+                split_id=split_id,
+                scope_token=identity,
+            )
+        )
+
     def export_audit_slice(self, artifact_refs: tuple[str, ...]) -> dict[str, Any]:
         self._refresh_store()
         audit_slice = self.store.export_audit_slice(artifact_refs)
@@ -209,15 +244,24 @@ class S8WriterApp:
         return authorized, error_response
 
     def _authorize(self, request: JsonRequest, *, capability: str | None = None) -> tuple[bool, int, dict[str, Any] | None]:
+        identity, status, error_response = self._authorize_identity(request, capability=capability)
+        return identity is not None, status, error_response
+
+    def _authorize_identity(
+        self,
+        request: JsonRequest,
+        *,
+        capability: str | None = None,
+    ) -> tuple[RuntimeIdentity | None, int, dict[str, Any] | None]:
         try:
             if self.auth is None:
                 raise UnauthorizedError("runtime auth is not configured")
             identity = self.auth.authenticate(request)
         except UnauthorizedError as exc:
-            return False, 401, {"error": "Unauthorized", "message": str(exc)}
+            return None, 401, {"error": "Unauthorized", "message": str(exc)}
         if capability is not None and capability not in identity.scopes.capabilities:
-            return False, 403, {"error": "CapabilityDenied", "message": f"missing capability: {capability}"}
-        return True, 200, None
+            return None, 403, {"error": "CapabilityDenied", "message": f"missing capability: {capability}"}
+        return identity, 200, None
 
     def _authenticate_health(self, request: JsonRequest) -> tuple[bool, dict[str, Any] | None]:
         try:
@@ -400,8 +444,8 @@ class S8WriterApp:
 
         @self.http.prefix("GET", "/v1/datasets/")
         def get_dataset(request: JsonRequest) -> tuple[int, Any]:
-            authorized, status, error_response = self._authorize(request, capability=S8_READ_CAPABILITY)
-            if not authorized:
+            identity, status, error_response = self._authorize_identity(request, capability=S8_READ_CAPABILITY)
+            if identity is None:
                 return status, error_response
             suffix = request.path.removeprefix("/v1/datasets/")
             try:
@@ -410,10 +454,23 @@ class S8WriterApp:
                     if not dataset_id:
                         return 400, {"error": "dataset_id_required"}
                     return 200, self.list_dataset_versions(dataset_id)
+                split_route = _dataset_split_resolve_route(suffix)
+                if split_route is not None:
+                    dataset_id, split_id = split_route
+                    return 200, self.resolve_dataset_split(
+                        dataset_id,
+                        split_id,
+                        version=_query_str(request.query, "version"),
+                        identity=identity,
+                    )
                 if not suffix:
                     return 400, {"error": "dataset_id_required"}
                 return 200, self.get_dataset(suffix, version=_query_str(request.query, "version"))
+            except S8ScopeDeniedError as exc:
+                return 403, _scope_denied_payload(exc)
             except Exception as exc:
+                if _is_scope_denied_exception(exc):
+                    return 403, _scope_denied_payload(exc)
                 return 404, {"error": type(exc).__name__, "message": str(exc)}
 
 
@@ -551,6 +608,29 @@ def _dataset_wire_payload(value: Any) -> dict[str, Any]:
             normalized_provenance["artifact_ref"] = artifact_id
         payload["provenance_ref"] = normalized_provenance
     return payload
+
+
+def _dataset_split_resolution_wire_payload(value: Any) -> dict[str, Any]:
+    payload = _structured_payload(value)
+    if not isinstance(payload, dict):
+        raise TypeError(f"expected dataset split resolution object, got {type(payload).__name__}")
+    return payload
+
+
+def _dataset_split_resolve_route(suffix: str) -> tuple[str, str] | None:
+    parts = [part for part in suffix.split("/") if part]
+    if len(parts) == 4 and parts[1] == "splits" and parts[3] == "resolve":
+        return parts[0], parts[2]
+    return None
+
+
+def _is_scope_denied_exception(exc: Exception) -> bool:
+    return getattr(exc, "category", None) == "SCOPE_DENIED" or "SCOPE_DENIED" in str(exc)
+
+
+def _scope_denied_payload(exc: Exception) -> dict[str, str]:
+    message = str(exc).splitlines()[0]
+    return {"error": "ScopeDenied", "category": "SCOPE_DENIED", "message": message}
 
 
 def _structured_payload(value: Any) -> Any:
