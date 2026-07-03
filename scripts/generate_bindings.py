@@ -1713,6 +1713,9 @@ export function verifyReport(
   if (delegation !== undefined && delegation !== SIGNATURE_VERIFICATION_ABSTAIN) {{
     return invalid(delegation, keyId);
   }}
+  if (secretBytes(key.secret).length === 0) {{
+    return invalid("signature_invalid", keyId);
+  }}
   if (!constantTimeStringEqual(value, signatureValue(unsigned, key.secret))) {{
     return invalid("signature_invalid", keyId);
   }}
@@ -1912,7 +1915,10 @@ assert.equal(delegatedInvalid.valid, false);
 assert.equal(delegatedInvalid.error_code, "SIGNATURE_INVALID");
 
 class AbstainingTrustStore {{
-  constructor(private readonly delegation: SignatureVerificationDelegationResult) {{}}
+  constructor(
+    private readonly delegation: SignatureVerificationDelegationResult,
+    private readonly expectedSignature: unknown,
+  ) {{}}
 
   getKey(keyId: string): VerifierKey | undefined {{
     if (keyId !== "{C3_ARGUSVERIFY_KEY_ID}") {{
@@ -1928,15 +1934,29 @@ class AbstainingTrustStore {{
   }}): SignatureVerificationDelegationResult {{
     assert.equal(args.key_id, "{C3_ARGUSVERIFY_KEY_ID}");
     assert.equal((args.report_with_empty_signature.signature as Record<string, unknown>).value, "");
-    assert.equal(args.signature_value, (signed.signature as Record<string, unknown>).value);
+    assert.equal(args.signature_value, this.expectedSignature);
     return this.delegation;
   }}
 }}
 
 for (const delegation of [undefined, SIGNATURE_VERIFICATION_ABSTAIN]) {{
-  const abstained = verifyReport(signed, new AbstainingTrustStore(delegation));
+  const abstained = verifyReport(
+    signed,
+    new AbstainingTrustStore(delegation, (signed.signature as Record<string, unknown>).value),
+  );
   assert.equal(abstained.valid, false);
   assert.equal(abstained.error_code, "SIGNATURE_INVALID");
+
+  const emptySecretForgery = signReport(report, {{ keyId: "{C3_ARGUSVERIFY_KEY_ID}", secret: "" }});
+  const forgedAbstained = verifyReport(
+    emptySecretForgery,
+    new AbstainingTrustStore(
+      delegation,
+      (emptySecretForgery.signature as Record<string, unknown>).value,
+    ),
+  );
+  assert.equal(forgedAbstained.valid, false);
+  assert.equal(forgedAbstained.error_code, "SIGNATURE_INVALID");
 }}
 
 const unsigned = JSON.parse(JSON.stringify(signed)) as Record<string, unknown>;
@@ -2676,6 +2696,9 @@ pub fn verify_report(report: &Value, trust_store: &impl VerifierTrustStore) -> C
             return invalid(&reason, Some(key_id));
         }}
     }} else {{
+        if key.secret.is_empty() {{
+            return invalid("signature_invalid", Some(key_id));
+        }}
         let Ok(expected) = signature_value(&unsigned, &key.secret) else {{
             return invalid("signature_invalid", Some(key_id));
         }};
@@ -3027,6 +3050,17 @@ mod tests {{
         assert!(!invalid.valid);
         assert_eq!(invalid.reason.as_deref(), Some("signature_invalid"));
         assert_eq!(invalid.error_code.as_deref(), Some("SIGNATURE_INVALID"));
+
+        let empty_secret_forgery = sign_report(
+            &vector_report(),
+            "{C3_ARGUSVERIFY_KEY_ID}",
+            Vec::<u8>::new().as_slice(),
+        )
+        .expect("sign empty-secret forgery");
+        let forged_invalid = verify_report(&empty_secret_forgery, &trust_store);
+        assert!(!forged_invalid.valid);
+        assert_eq!(forged_invalid.reason.as_deref(), Some("signature_invalid"));
+        assert_eq!(forged_invalid.error_code.as_deref(), Some("SIGNATURE_INVALID"));
     }}
 }}
 '''

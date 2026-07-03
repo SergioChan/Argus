@@ -129,6 +129,9 @@ export function verifyReport(
   if (delegation !== undefined && delegation !== SIGNATURE_VERIFICATION_ABSTAIN) {
     return invalid(delegation, keyId);
   }
+  if (secretBytes(key.secret).length === 0) {
+    return invalid("signature_invalid", keyId);
+  }
   if (!constantTimeStringEqual(value, signatureValue(unsigned, key.secret))) {
     return invalid("signature_invalid", keyId);
   }

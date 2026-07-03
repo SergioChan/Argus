@@ -168,6 +168,8 @@ def verify_report(report: dict[str, Any], trust_store: VerifierTrustStore) -> C3
     if delegation not in (None, SIGNATURE_VERIFICATION_ABSTAIN):
         return _invalid(str(delegation), key_id=key_id)
     if delegation in (None, SIGNATURE_VERIFICATION_ABSTAIN):
+        if not key.secret:
+            return _invalid("signature_invalid", key_id=key_id)
         expected = C3ReportSigner._signature_value(unsigned, key.secret)
         if not hmac.compare_digest(value, expected):
             return _invalid("signature_invalid", key_id=key_id)

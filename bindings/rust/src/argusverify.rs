@@ -135,6 +135,9 @@ pub fn verify_report(report: &Value, trust_store: &impl VerifierTrustStore) -> C
             return invalid(&reason, Some(key_id));
         }
     } else {
+        if key.secret.is_empty() {
+            return invalid("signature_invalid", Some(key_id));
+        }
         let Ok(expected) = signature_value(&unsigned, &key.secret) else {
             return invalid("signature_invalid", Some(key_id));
         };
@@ -536,5 +539,16 @@ mod tests {
         assert!(!invalid.valid);
         assert_eq!(invalid.reason.as_deref(), Some("signature_invalid"));
         assert_eq!(invalid.error_code.as_deref(), Some("SIGNATURE_INVALID"));
+
+        let empty_secret_forgery = sign_report(
+            &vector_report(),
+            "s3-key",
+            Vec::<u8>::new().as_slice(),
+        )
+        .expect("sign empty-secret forgery");
+        let forged_invalid = verify_report(&empty_secret_forgery, &trust_store);
+        assert!(!forged_invalid.valid);
+        assert_eq!(forged_invalid.reason.as_deref(), Some("signature_invalid"));
+        assert_eq!(forged_invalid.error_code.as_deref(), Some("SIGNATURE_INVALID"));
     }
 }

@@ -183,6 +183,38 @@ class ArgusVerifyTests(unittest.TestCase):
                 self.assertEqual(verification.reason, "signature_invalid")
                 self.assertEqual(verification.error_code, "SIGNATURE_INVALID")
 
+    def test_secretless_delegating_trust_store_abstain_rejects_empty_secret_forgery(self) -> None:
+        forged = C3ReportSigner(key_id="s3-key", secret=b"").sign(VECTOR_REPORT)
+        case = self
+
+        class AbstainingTrustStore:
+            def __init__(self, delegation: str | None) -> None:
+                self._delegation = delegation
+
+            def get_key(self, key_id: str) -> VerifierKey | None:
+                if key_id != "s3-key":
+                    return None
+                return VerifierKey(key_id=key_id, secret=b"")
+
+            def verify_signature_value(
+                self,
+                *,
+                key_id: str,
+                report_with_empty_signature: dict[str, object],
+                signature_value: str,
+            ) -> str | None:
+                case.assertEqual(key_id, "s3-key")
+                case.assertEqual(report_with_empty_signature["signature"]["value"], "")
+                case.assertEqual(signature_value, forged["signature"]["value"])
+                return self._delegation
+
+        for delegation in (None, SIGNATURE_VERIFICATION_ABSTAIN):
+            with self.subTest(delegation=delegation):
+                verification = verify_report(forged, AbstainingTrustStore(delegation))
+                self.assertFalse(verification.valid)
+                self.assertEqual(verification.reason, "signature_invalid")
+                self.assertEqual(verification.error_code, "SIGNATURE_INVALID")
+
     def test_canonical_number_policy_matches_cross_language_boundaries(self) -> None:
         rendered = argusverify._canonical_json_text(
             {

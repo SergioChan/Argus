@@ -119,7 +119,10 @@ assert.equal(delegatedInvalid.valid, false);
 assert.equal(delegatedInvalid.error_code, "SIGNATURE_INVALID");
 
 class AbstainingTrustStore {
-  constructor(private readonly delegation: SignatureVerificationDelegationResult) {}
+  constructor(
+    private readonly delegation: SignatureVerificationDelegationResult,
+    private readonly expectedSignature: unknown,
+  ) {}
 
   getKey(keyId: string): VerifierKey | undefined {
     if (keyId !== "s3-key") {
@@ -135,15 +138,29 @@ class AbstainingTrustStore {
   }): SignatureVerificationDelegationResult {
     assert.equal(args.key_id, "s3-key");
     assert.equal((args.report_with_empty_signature.signature as Record<string, unknown>).value, "");
-    assert.equal(args.signature_value, (signed.signature as Record<string, unknown>).value);
+    assert.equal(args.signature_value, this.expectedSignature);
     return this.delegation;
   }
 }
 
 for (const delegation of [undefined, SIGNATURE_VERIFICATION_ABSTAIN]) {
-  const abstained = verifyReport(signed, new AbstainingTrustStore(delegation));
+  const abstained = verifyReport(
+    signed,
+    new AbstainingTrustStore(delegation, (signed.signature as Record<string, unknown>).value),
+  );
   assert.equal(abstained.valid, false);
   assert.equal(abstained.error_code, "SIGNATURE_INVALID");
+
+  const emptySecretForgery = signReport(report, { keyId: "s3-key", secret: "" });
+  const forgedAbstained = verifyReport(
+    emptySecretForgery,
+    new AbstainingTrustStore(
+      delegation,
+      (emptySecretForgery.signature as Record<string, unknown>).value,
+    ),
+  );
+  assert.equal(forgedAbstained.valid, false);
+  assert.equal(forgedAbstained.error_code, "SIGNATURE_INVALID");
 }
 
 const unsigned = JSON.parse(JSON.stringify(signed)) as Record<string, unknown>;
