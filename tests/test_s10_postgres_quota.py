@@ -193,10 +193,48 @@ class S10PostgresQuotaLedgerTests(unittest.TestCase):
         with self.assertRaisesRegex(BudgetExceededError, "budget is halted"):
             ledger.reserve(token.budget_id, BudgetUsage(wallclock_s=1))
 
-    def _psql(self, sql: str) -> subprocess.CompletedProcess[str]:
+    def test_quota_ledger_entries_are_db_append_only_even_for_owner(self) -> None:
+        token = self.tokens.mint_budget(
+            caps=BudgetCaps(max_gpu_seconds=100),
+            job_id="job-append-only",
+            root_request_id="root-append-only",
+        )
+        ledger = PostgresQuotaLedger(dsn=self._postgres_dsn())
+        ledger.register_budget(token)
+        ledger.reserve(token.budget_id, BudgetUsage(gpu_seconds=1))
+
+        update = self._psql(
+            f"""
+            UPDATE s10.quota_ledger_entry
+            SET entry_type = 'consume'
+            WHERE budget_id = '{token.budget_id}';
+            """,
+            check=False,
+        )
+        delete = self._psql(
+            f"""
+            DELETE FROM s10.quota_ledger_entry
+            WHERE budget_id = '{token.budget_id}';
+            """,
+            check=False,
+        )
+        truncate = self._psql("TRUNCATE s10.quota_ledger_entry;", check=False)
+
+        self.assertNotEqual(update.returncode, 0)
+        self.assertIn("append-only table quota_ledger_entry", update.stderr)
+        self.assertNotEqual(delete.returncode, 0)
+        self.assertIn("append-only table quota_ledger_entry", delete.stderr)
+        self.assertNotEqual(truncate.returncode, 0)
+        self.assertIn("append-only table quota_ledger_entry", truncate.stderr)
+        self.assertEqual(
+            self._psql("SELECT string_agg(entry_type, ',' ORDER BY sequence) FROM s10.quota_ledger_entry;").stdout.strip(),
+            "register,reserve",
+        )
+
+    def _psql(self, sql: str, *, check: bool = True) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
             self._psql_base() + ["-c", sql],
-            check=True,
+            check=check,
             text=True,
             capture_output=True,
         )

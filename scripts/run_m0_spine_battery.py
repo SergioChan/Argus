@@ -961,7 +961,7 @@ def _battery_real_persistence(
     _record(
         evidence,
         "persist",
-        "deployed S8 wrote C4 metadata to Postgres append-only ledger and payloads to MinIO with recomputable record hashes",
+        "deployed S8 wrote C4 metadata and S10 wrote quota history to Postgres append-only ledgers with MinIO payloads and recomputable record hashes",
         {
             "schema_migrations": migration_count,
             "s10_schema_migrations": s10_migration_count,
@@ -1120,6 +1120,32 @@ def _postgres_append_only_denials(dsn: str) -> dict[str, bool]:
             TRUNCATE s8.ledger_leaf;
             """,
             "permission denied",
+        ),
+        "s10_quota_update_denied": _postgres_statement_denied(
+            dsn,
+            """
+            UPDATE s10.quota_ledger_entry
+            SET entry_type = 'consume'
+            WHERE sequence = (
+                SELECT sequence FROM s10.quota_ledger_entry ORDER BY sequence LIMIT 1
+            );
+            """,
+            "append-only table quota_ledger_entry",
+        ),
+        "s10_quota_delete_denied": _postgres_statement_denied(
+            dsn,
+            """
+            DELETE FROM s10.quota_ledger_entry
+            WHERE sequence = (
+                SELECT sequence FROM s10.quota_ledger_entry ORDER BY sequence LIMIT 1
+            );
+            """,
+            "append-only table quota_ledger_entry",
+        ),
+        "s10_quota_truncate_denied": _postgres_statement_denied(
+            dsn,
+            "TRUNCATE s10.quota_ledger_entry;",
+            "append-only table quota_ledger_entry",
         ),
     }
 
