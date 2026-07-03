@@ -320,6 +320,7 @@ def _start_docker_postgres() -> dict[str, Any]:
         "host": "127.0.0.1",
         "port": port,
         "database": "postgres",
+        "user": "postgres",
     }
     deadline = time.monotonic() + 60
     last_error: Exception | None = None
@@ -472,9 +473,10 @@ def _apply_migrations(pg: dict[str, Any]) -> None:
 
 def _dsn(pg: dict[str, Any]) -> str:
     host = pg.get("socket_dir") or pg["host"]
+    user = f" user={pg['user']}" if pg.get("user") else ""
     if pg.get("port") is None:
-        return f"host={host} dbname={pg['database']}"
-    return f"host={host} port={pg['port']} dbname={pg['database']}"
+        return f"host={host} dbname={pg['database']}{user}"
+    return f"host={host} port={pg['port']} dbname={pg['database']}{user}"
 
 
 def _free_port() -> int:
