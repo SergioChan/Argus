@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 from typing import Any, Mapping
 
 from argusverify import C3ReportVerifier
 from .hashing import hash_json
+from .s8 import ArtifactRecord, InMemoryArtifactStore, Lineage, Producer
 
 
 ERROR_CATEGORIES = frozenset(
@@ -135,6 +136,11 @@ METHOD_TARGETS = {
 }
 
 
+S1_LIFECYCLE_LEDGER_KIND = "s1_lifecycle_event"
+S1_LIFECYCLE_LEDGER_CODE_REF = "argus-core:s1.lifecycle-store"
+S1_LIFECYCLE_LEDGER_ENVIRONMENT_DIGEST = "python:s1-lifecycle-store:v1"
+
+
 class S1Error(Exception):
     """Base class for S1 runtime failures."""
 
@@ -196,6 +202,7 @@ class LifecycleEvent:
     method: str
     trigger: str
     payload_hash: str
+    ledger_ref: str | None = None
 
 
 @dataclass(frozen=True)
@@ -273,13 +280,53 @@ def parse_job_envelope(payload: Mapping[str, Any]) -> JobEnvelope:
 
 
 class LifecycleStore:
-    """In-memory event-sourced lifecycle store."""
+    """In-memory event-sourced lifecycle store with optional C4 mirroring."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        artifact_store: InMemoryArtifactStore | None = None,
+        ledger_producer: Producer | None = None,
+        ledger_code_ref: str = S1_LIFECYCLE_LEDGER_CODE_REF,
+        ledger_environment_digest: str = S1_LIFECYCLE_LEDGER_ENVIRONMENT_DIGEST,
+    ) -> None:
         self._events: dict[str, list[LifecycleEvent]] = {}
         self._current: dict[str, JobCurrent] = {}
+        self._artifact_store = artifact_store
+        self._ledger_producer = ledger_producer or Producer(
+            subsystem="S1",
+            version="0.0.0",
+            actor_id="s1.lifecycle-store",
+        )
+        self._ledger_code_ref = ledger_code_ref
+        self._ledger_environment_digest = ledger_environment_digest
+
+    @classmethod
+    def from_event_log(
+        cls,
+        events_by_job: Mapping[str, tuple[LifecycleEvent, ...]],
+        *,
+        artifact_store: InMemoryArtifactStore | None = None,
+        ledger_producer: Producer | None = None,
+        ledger_code_ref: str = S1_LIFECYCLE_LEDGER_CODE_REF,
+        ledger_environment_digest: str = S1_LIFECYCLE_LEDGER_ENVIRONMENT_DIGEST,
+    ) -> "LifecycleStore":
+        store = cls(
+            artifact_store=artifact_store,
+            ledger_producer=ledger_producer,
+            ledger_code_ref=ledger_code_ref,
+            ledger_environment_digest=ledger_environment_digest,
+        )
+        for job_id, events in events_by_job.items():
+            store._events[job_id] = list(events)
+            store._current[job_id] = reduce_lifecycle(tuple(events), job_id=job_id)
+        return store
 
     def create_job(self, job_id: str) -> JobCurrent:
+        if job_id in self._current:
+            return self._current[job_id]
+        if job_id in self._events:
+            return self.rebuild_current(job_id)
         current = JobCurrent(job_id=job_id, state=LifecycleState.REGISTERED, last_sequence=0)
         self._events.setdefault(job_id, [])
         self._current[job_id] = current
@@ -312,11 +359,14 @@ class LifecycleStore:
             trigger=trigger,
             payload_hash=hash_json(payload or {}),
         )
+        event = self._mirror_event(event)
         self._events[job_id].append(event)
         self._current[job_id] = JobCurrent(job_id=job_id, state=to_state, last_sequence=event.sequence)
         return event
 
     def current(self, job_id: str) -> JobCurrent:
+        if job_id not in self._current and job_id in self._events:
+            return self.rebuild_current(job_id)
         return self._current[job_id]
 
     def events(self, job_id: str) -> tuple[LifecycleEvent, ...]:
@@ -324,6 +374,40 @@ class LifecycleStore:
 
     def replay(self, job_id: str) -> JobCurrent:
         return reduce_lifecycle(self.events(job_id), job_id=job_id)
+
+    def rebuild_current(self, job_id: str) -> JobCurrent:
+        current = self.replay(job_id)
+        self._current[job_id] = current
+        return current
+
+    def ledger_refs(self, job_id: str) -> tuple[str, ...]:
+        return tuple(event.ledger_ref for event in self.events(job_id) if event.ledger_ref is not None)
+
+    def ledger_records(self, job_id: str) -> tuple[ArtifactRecord, ...]:
+        if self._artifact_store is None:
+            return ()
+        return tuple(self._artifact_store.get_record(ref) for ref in self.ledger_refs(job_id))
+
+    def _mirror_event(self, event: LifecycleEvent) -> LifecycleEvent:
+        if self._artifact_store is None:
+            return event
+        record = self._artifact_store.create_artifact(
+            kind=S1_LIFECYCLE_LEDGER_KIND,
+            payload=_lifecycle_event_ledger_payload(event),
+            producer=self._producer_for_event(event),
+            lineage=Lineage(
+                input_refs=self.ledger_refs(event.job_id)[-1:],
+                code_ref=self._ledger_code_ref,
+                environment_digest=self._ledger_environment_digest,
+                job_id=event.job_id,
+            ),
+        )
+        return replace(event, ledger_ref=record.artifact_ref)
+
+    def _producer_for_event(self, event: LifecycleEvent) -> Producer:
+        if self._ledger_producer.job_id is not None:
+            return self._ledger_producer
+        return replace(self._ledger_producer, job_id=event.job_id)
 
     @staticmethod
     def _assert_legal_transition(from_state: LifecycleState, to_state: LifecycleState, method: str) -> None:
@@ -402,10 +486,47 @@ def reduce_lifecycle(events: tuple[LifecycleEvent, ...], *, job_id: str) -> JobC
     state = LifecycleState.REGISTERED
     sequence = 0
     for event in events:
+        if event.job_id != job_id:
+            raise LifecyclePolicyError(
+                ErrorEnvelope(
+                    code="LIFECYCLE_REPLAY_JOB_MISMATCH",
+                    category="POLICY",
+                    message=f"event for {event.job_id} cannot rebuild {job_id}",
+                )
+            )
+        if event.sequence != sequence + 1:
+            raise LifecyclePolicyError(
+                ErrorEnvelope(
+                    code="LIFECYCLE_REPLAY_SEQUENCE_GAP",
+                    category="POLICY",
+                    message=f"event sequence {event.sequence} does not follow {sequence}",
+                )
+            )
+        if event.from_state != state:
+            raise LifecyclePolicyError(
+                ErrorEnvelope(
+                    code="LIFECYCLE_REPLAY_STATE_DIVERGED",
+                    category="POLICY",
+                    message=f"event from_state {event.from_state.value} does not match replay state {state.value}",
+                )
+            )
         LifecycleStore._assert_legal_transition(state, event.to_state, event.method)
         state = event.to_state
         sequence = event.sequence
     return JobCurrent(job_id=job_id, state=state, last_sequence=sequence)
+
+
+def _lifecycle_event_ledger_payload(event: LifecycleEvent) -> dict[str, object]:
+    return {
+        "schema": "argus.s1.lifecycle_event.v1",
+        "job_id": event.job_id,
+        "sequence": event.sequence,
+        "from_state": event.from_state.value,
+        "to_state": event.to_state.value,
+        "method": event.method,
+        "trigger": event.trigger,
+        "payload_hash": event.payload_hash,
+    }
 
 
 def build_subagent_report(

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from dataclasses import replace
 import json
 from pathlib import Path
 import unittest
@@ -9,6 +10,7 @@ from argus_core import (
     C3ReportSigner,
     C3ReportVerifier,
     ExecContext,
+    InMemoryArtifactStore,
     InMemoryVerifierTrustStore,
     JobEnvelope,
     LEGAL_TRANSITIONS,
@@ -23,7 +25,7 @@ from argus_core import (
     default_accept,
     reduce_lifecycle,
 )
-from argus_core.s1 import METHOD_TARGETS, NON_TRANSITION_METHODS
+from argus_core.s1 import METHOD_TARGETS, NON_TRANSITION_METHODS, S1_LIFECYCLE_LEDGER_KIND
 
 
 class S1LifecycleStoreTests(unittest.TestCase):
@@ -121,6 +123,86 @@ class S1LifecycleStoreTests(unittest.TestCase):
 
         self.assertEqual(canonical_json_bytes(first.__dict__), canonical_json_bytes(second.__dict__))
         self.assertEqual(first, store.current("job-1"))
+
+    def test_lifecycle_events_are_mirrored_to_c4_ledger(self) -> None:
+        artifacts = InMemoryArtifactStore()
+        store = LifecycleStore(artifact_store=artifacts)
+        store.create_job("job-1")
+
+        accepted = store.apply_method("job-1", "accept", trigger="operator", payload={"ok": True})
+        planned = store.apply_method("job-1", "plan", trigger="runtime", payload={"step": "plan"})
+
+        self.assertEqual(store.ledger_refs("job-1"), (accepted.ledger_ref, planned.ledger_ref))
+        self.assertIsNotNone(accepted.ledger_ref)
+        self.assertIsNotNone(planned.ledger_ref)
+
+        accepted_record = artifacts.get_record(accepted.ledger_ref or "")
+        planned_record = artifacts.get_record(planned.ledger_ref or "")
+        accepted_payload = json.loads(artifacts.get_artifact(accepted.ledger_ref or "").decode("utf-8"))
+        planned_payload = json.loads(artifacts.get_artifact(planned.ledger_ref or "").decode("utf-8"))
+
+        self.assertEqual(accepted_record.kind, S1_LIFECYCLE_LEDGER_KIND)
+        self.assertEqual(planned_record.kind, S1_LIFECYCLE_LEDGER_KIND)
+        self.assertEqual(accepted_record.producer.subsystem, "S1")
+        self.assertEqual(accepted_record.producer.job_id, "job-1")
+        self.assertEqual(accepted_record.lineage.input_refs, ())
+        self.assertEqual(planned_record.lineage.input_refs, (accepted.ledger_ref,))
+        self.assertEqual(accepted_payload["schema"], "argus.s1.lifecycle_event.v1")
+        self.assertEqual(accepted_payload["from_state"], "REGISTERED")
+        self.assertEqual(accepted_payload["to_state"], "ACCEPTED")
+        self.assertEqual(accepted_payload["method"], "accept")
+        self.assertEqual(planned_payload["sequence"], 2)
+        self.assertEqual(planned_payload["payload_hash"], planned.payload_hash)
+        self.assertTrue(artifacts.verify_audit_chain().valid)
+
+    def test_job_current_is_rebuildable_from_event_log(self) -> None:
+        artifacts = InMemoryArtifactStore()
+        store = LifecycleStore(artifact_store=artifacts)
+        store.create_job("job-1")
+        for method in ("accept", "plan", "build"):
+            store.apply_method("job-1", method, payload={"method": method})
+
+        rebuilt = LifecycleStore.from_event_log(
+            {"job-1": store.events("job-1")},
+            artifact_store=artifacts,
+        )
+
+        self.assertEqual(rebuilt.current("job-1"), store.current("job-1"))
+        self.assertEqual(rebuilt.replay("job-1"), store.current("job-1"))
+        self.assertEqual(rebuilt.ledger_refs("job-1"), store.ledger_refs("job-1"))
+
+    def test_replay_rejects_tampered_event_log(self) -> None:
+        store = LifecycleStore()
+        store.create_job("job-1")
+        store.apply_method("job-1", "accept")
+        planned = store.apply_method("job-1", "plan")
+        events = store.events("job-1")
+
+        with self.assertRaises(LifecyclePolicyError) as sequence_error:
+            reduce_lifecycle((events[0], replace(planned, sequence=99)), job_id="job-1")
+        self.assertEqual(sequence_error.exception.envelope.code, "LIFECYCLE_REPLAY_SEQUENCE_GAP")
+
+        with self.assertRaises(LifecyclePolicyError) as state_error:
+            reduce_lifecycle((replace(events[0], from_state=LifecycleState.PLANNING),), job_id="job-1")
+        self.assertEqual(state_error.exception.envelope.code, "LIFECYCLE_REPLAY_STATE_DIVERGED")
+
+        with self.assertRaises(LifecyclePolicyError) as job_error:
+            reduce_lifecycle((replace(events[0], job_id="job-2"),), job_id="job-1")
+        self.assertEqual(job_error.exception.envelope.code, "LIFECYCLE_REPLAY_JOB_MISMATCH")
+
+    def test_ledger_mirror_failure_does_not_mutate_event_log_or_current(self) -> None:
+        class BrokenArtifactStore:
+            def create_artifact(self, **_kwargs: object) -> object:
+                raise RuntimeError("ledger mirror unavailable")
+
+        store = LifecycleStore(artifact_store=BrokenArtifactStore())  # type: ignore[arg-type]
+        store.create_job("job-1")
+
+        with self.assertRaises(RuntimeError):
+            store.apply_method("job-1", "accept")
+
+        self.assertEqual(store.current("job-1").state, LifecycleState.REGISTERED)
+        self.assertEqual(store.events("job-1"), ())
 
     @staticmethod
     def _c1_def_enum(def_name: str) -> set[str]:
