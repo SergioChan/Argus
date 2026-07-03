@@ -1840,6 +1840,40 @@ class ArgusM0RuntimeServiceTests(unittest.TestCase):
             self.assertIn("revoked", write_payload["message"])
             self.assertEqual(app.artifacts.record_count, 0)
 
+    def test_s10_revoke_budget_token_denies_sandbox_launch(self) -> None:
+        supervisor = _SuccessfulSupervisor()
+        app = S10SupervisorApp(
+            signing_key=b"test-key",
+            auth=_runtime_auth(),
+            docker_supervisor=supervisor,
+        )
+        launch = _launch_body(app)
+        revoke_status, revoke = app.http.handle(
+            JsonRequest(
+                method="POST",
+                path="/v1/tokens:revoke",
+                query={},
+                body={"token_type": "budget", "token": launch["budget_token"]},
+                headers=_auth_headers(),
+            )
+        )
+        launch_status, launch_payload = app.http.handle(
+            JsonRequest(
+                method="POST",
+                path="/v1/sandboxes:launch",
+                query={},
+                body=launch,
+                headers=_auth_headers(),
+            )
+        )
+
+        self.assertEqual(revoke_status, 200)
+        self.assertEqual(revoke["revoked_token_id"], launch["budget_token"]["budget_id"])  # type: ignore[index]
+        self.assertEqual(launch_status, 401)
+        self.assertEqual(launch_payload["error"], "TokenInvalidError")
+        self.assertIn("revoked", launch_payload["message"])
+        self.assertEqual(supervisor.calls, [])
+
     def test_s10_supervisor_service_mints_verifiable_tokens(self) -> None:
         app = S10SupervisorApp(signing_key=b"test-key")
 

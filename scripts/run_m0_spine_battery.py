@@ -52,6 +52,7 @@ DEFAULT_IMAGE = "busybox@sha256:73aaf090f3d85aa34ee199857f03fa3a95c8ede2ffd4cc2c
 M0_C3_VERIFIER_KEY_ID = "argus-m0-c3-verifier"
 HALT_LATENCY_TRIALS = 50
 HALT_LATENCY_LIMIT_S = 2.0
+TOKEN_REVOCATION_PROPAGATION_SLO_S = 2.0
 
 
 def main() -> int:
@@ -144,6 +145,12 @@ def main() -> int:
         _battery_direct_s8_write_denied(evidence, s8_url, token=auth_tokens["read"])
         _battery_forged_scope_token_denied(evidence, s10_url, write_scope_json, token=auth_tokens["write"])
         _battery_revoked_scope_token_denied(evidence, s10_url, token=auth_tokens["write"])
+        _battery_revoked_budget_token_denied(
+            evidence,
+            s10_url,
+            image=args.image,
+            token=auth_tokens["spine"],
+        )
         _battery_b_incomplete_lineage(evidence, s10_url, write_scope_json, token=auth_tokens["write"])
         _battery_c_write_once(evidence, s10_url, write_scope_json, token=auth_tokens["write"])
         dataset_scope_json = _mint_store_scope(s10_url=s10_url, token=auth_tokens["dataset"])
@@ -766,6 +773,7 @@ def _battery_revoked_scope_token_denied(
     token: str,
 ) -> None:
     scope_json = _mint_store_scope(s10_url=s10_url, token=token)
+    started = time.monotonic()
     revoke_response = _post_json(
         f"{s10_url}/v1/tokens:revoke",
         {"token_type": "scope", "token": scope_json},
@@ -784,17 +792,94 @@ def _battery_revoked_scope_token_denied(
         expected_status=401,
         token=token,
     )
+    denied_after_s = time.monotonic() - started
     if denied_response.get("error") != "TokenInvalidError":
         raise AssertionError(f"unexpected revoked-token denial error: {denied_response}")
+    if denied_after_s > TOKEN_REVOCATION_PROPAGATION_SLO_S:
+        raise AssertionError(
+            "revoked scope token was not denied within the propagation SLO: "
+            f"elapsed={denied_after_s:.6f}s slo={TOKEN_REVOCATION_PROPAGATION_SLO_S:.6f}s"
+        )
     _record(
         evidence,
         "scope-revoked",
-        "file-backed S10 revocation state denies a revoked scope token fail-closed",
+        "file-backed S10 revocation state denies a revoked scope token on the broker route within the SLO",
         {
+            "token_type": "scope",
             "revocation_store": revoke_response["revocation_store"],
             "revoked_token_id": revoke_response["revoked_token_id"],
             "denial_error": denied_response["error"],
             "denial_message": denied_response.get("message"),
+            "denied_after_s": round(denied_after_s, 6),
+            "propagation_slo_s": TOKEN_REVOCATION_PROPAGATION_SLO_S,
+            "route": "POST /v1/store/artifacts",
+        },
+    )
+
+
+def _battery_revoked_budget_token_denied(
+    evidence: dict[str, Any],
+    s10_url: str,
+    *,
+    image: str,
+    token: str,
+) -> None:
+    budget_json = _post_json(
+        f"{s10_url}/v1/budget-tokens",
+        {},
+        expected_status=201,
+        token=token,
+    )
+    scope_json = _post_json(
+        f"{s10_url}/v1/scope-tokens",
+        {},
+        expected_status=201,
+        token=token,
+    )
+    launch = _launch_request_json(
+        job_id="m0-spine-job",
+        image=image,
+        budget=budget_json,
+        scope=scope_json,
+        args=("-c", "echo should-not-run"),
+        env={},
+        env_allowlist=(),
+        wallclock_s=1,
+    )
+    started = time.monotonic()
+    revoke_response = _post_json(
+        f"{s10_url}/v1/tokens:revoke",
+        {"token_type": "budget", "token": budget_json},
+        expected_status=200,
+        token=token,
+    )
+    denied_response = _post_json(
+        f"{s10_url}/v1/sandboxes:launch",
+        launch,
+        expected_status=401,
+        token=token,
+    )
+    denied_after_s = time.monotonic() - started
+    if denied_response.get("error") != "TokenInvalidError":
+        raise AssertionError(f"unexpected revoked-budget denial error: {denied_response}")
+    if denied_after_s > TOKEN_REVOCATION_PROPAGATION_SLO_S:
+        raise AssertionError(
+            "revoked budget token was not denied within the propagation SLO: "
+            f"elapsed={denied_after_s:.6f}s slo={TOKEN_REVOCATION_PROPAGATION_SLO_S:.6f}s"
+        )
+    _record(
+        evidence,
+        "budget-revoked",
+        "file-backed S10 revocation state denies a revoked budget token on the launch route within the SLO",
+        {
+            "token_type": "budget",
+            "revocation_store": revoke_response["revocation_store"],
+            "revoked_token_id": revoke_response["revoked_token_id"],
+            "denial_error": denied_response["error"],
+            "denial_message": denied_response.get("message"),
+            "denied_after_s": round(denied_after_s, 6),
+            "propagation_slo_s": TOKEN_REVOCATION_PROPAGATION_SLO_S,
+            "route": "POST /v1/sandboxes:launch",
         },
     )
 

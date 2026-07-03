@@ -240,6 +240,60 @@ class S10TokenServiceTests(unittest.TestCase):
             self.assertEqual(offline.verify_scope(scope).reason, "revoked")
             self.assertEqual(reader_store.snapshot(), (scope.scope_id,))
 
+    def test_file_revocation_store_propagates_budget_and_scope_to_independent_verifiers(self) -> None:
+        now = 3_500
+        signer = Ed25519KmsTokenSigner(
+            signer_key_id="s10-token-root",
+            private_key_bytes=bytes.fromhex("33" * 32),
+        )
+        trust = TokenSignatureTrustStore(ed25519_public_keys={"s10-token-root": signer.public_key_bytes})
+        with tempfile.TemporaryDirectory() as tmp:
+            revocation_path = os.path.join(tmp, "token-revocations.jsonl")
+            issuer = InMemoryTokenService(
+                signer=signer,
+                verifier=trust,
+                revocation_store=FileTokenRevocationStore(revocation_path, now_fn=lambda: now),
+                now_fn=lambda: now,
+            )
+            service_view = InMemoryTokenService(
+                signer=signer,
+                verifier=trust,
+                revocation_store=FileTokenRevocationStore(revocation_path, now_fn=lambda: now),
+                now_fn=lambda: now,
+            )
+            offline_view = OfflineTokenVerifier(
+                verifier=trust,
+                revocation_store=FileTokenRevocationStore(revocation_path, now_fn=lambda: now),
+                now_fn=lambda: now,
+            )
+            budget = issuer.mint_budget(
+                caps=BudgetCaps(max_wallclock_s=30, max_cost_usd=1),
+                job_id="job-propagation",
+                root_request_id="root-propagation",
+            )
+            scope = issuer.mint_scope(
+                job_id="job-propagation",
+                scopes=ScopeGrant(broker_audiences=("store",), producer_subsystems=("S2",)),
+            )
+
+            self.assertTrue(service_view.verify_budget(budget).valid)
+            self.assertTrue(offline_view.verify_budget(budget).valid)
+            self.assertTrue(service_view.verify_scope(scope).valid)
+            self.assertTrue(offline_view.verify_scope(scope).valid)
+
+            issuer.revoke(budget.budget_id)
+            self.assertEqual(service_view.verify_budget(budget).reason, "revoked")
+            self.assertEqual(offline_view.verify_budget(budget).reason, "revoked")
+            self.assertTrue(service_view.verify_scope(scope).valid)
+
+            issuer.revoke(scope.scope_id)
+            self.assertEqual(service_view.verify_scope(scope).reason, "revoked")
+            self.assertEqual(offline_view.verify_scope(scope).reason, "revoked")
+            self.assertEqual(
+                FileTokenRevocationStore(revocation_path, now_fn=lambda: now).snapshot(),
+                tuple(sorted((budget.budget_id, scope.scope_id))),
+            )
+
 
 class S10QuotaLedgerTests(unittest.TestCase):
     def test_reserve_consume_release_keeps_remaining_exact(self) -> None:
