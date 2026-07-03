@@ -11,9 +11,10 @@ import shutil
 import socket
 import subprocess
 import time
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
+from decimal import Decimal
 from hashlib import sha256
-from typing import Any, Callable, Literal, NoReturn, Protocol
+from typing import Any, Callable, Literal, Mapping, NoReturn, Protocol
 from uuid import uuid4
 from weakref import ref
 
@@ -84,6 +85,10 @@ class PolicyBundleSignatureError(S10Error):
     """Raised when a policy bundle signature cannot be trusted."""
 
 
+class PriceTableSignatureError(S10Error):
+    """Raised when a signed price table cannot be trusted."""
+
+
 class SandboxRuntimeUnavailableError(S10Error):
     """Raised when the configured sandbox runtime cannot be invoked."""
 
@@ -104,6 +109,68 @@ class BudgetUsage:
     model_tokens: float = 0.0
     wallclock_s: float = 0.0
     cost_usd: float = 0.0
+
+
+@dataclass(frozen=True)
+class PriceTable:
+    price_table_version: str
+    usd_per_cpu_second: str
+    usd_per_gpu_second: Mapping[str, str] = field(default_factory=dict)
+    usd_per_1k_model_tokens: Mapping[str, str] = field(default_factory=dict)
+    issued_at: int = 0
+    expires_at: int = 0
+    signer_key_id: str = ""
+    signature: str = ""
+
+
+@dataclass(frozen=True)
+class PriceTableRollup:
+    usage: BudgetUsage
+    cost_usd_exact: str
+    price_table_hash: str
+    price_table_version: str
+    signer_key_id: str
+    gpu_model: str
+    model_id: str
+
+
+class PriceTableSigner:
+    kind = "hmac-sha256"
+
+    def __init__(self, *, signer_key_id: str, signing_key: bytes) -> None:
+        if not signer_key_id:
+            raise ValueError("price table signer_key_id is required")
+        if not signing_key:
+            raise ValueError("price table signing key is required")
+        self.signer_key_id = signer_key_id
+        self._signing_key = bytes(signing_key)
+
+    def sign(self, table: PriceTable) -> PriceTable:
+        unsigned = replace(table, signer_key_id=self.signer_key_id, signature="")
+        return replace(unsigned, signature=_price_table_signature(unsigned, self._signing_key))
+
+    def trust_store(self, *, now_fn: Callable[[], int] | None = None) -> "PriceTableTrustStore":
+        return PriceTableTrustStore({self.signer_key_id: self._signing_key}, now_fn=now_fn)
+
+
+class PriceTableTrustStore:
+    kind = "hmac-sha256"
+
+    def __init__(self, keys: Mapping[str, bytes], *, now_fn: Callable[[], int] | None = None) -> None:
+        self._keys = {key_id: bytes(secret) for key_id, secret in keys.items()}
+        self._now_fn = now_fn or (lambda: int(time.time()))
+
+    def verify(self, table: PriceTable) -> None:
+        if not table.signature.startswith(SIGNATURE_PREFIX):
+            raise PriceTableSignatureError("price table signature is missing or unsupported")
+        key = self._keys.get(table.signer_key_id)
+        if key is None:
+            raise PriceTableSignatureError("unknown price table signer")
+        if table.expires_at <= self._now_fn():
+            raise PriceTableSignatureError("price table is stale")
+        expected = _price_table_signature(replace(table, signature=""), key)
+        if not hmac.compare_digest(table.signature, expected):
+            raise PriceTableSignatureError("price table signature invalid")
 
 
 @dataclass(frozen=True)
@@ -481,6 +548,93 @@ def token_signature_payload(token: BudgetToken | ScopeToken) -> bytes:
     payload = asdict(token)
     payload["signature"] = ""
     return canonical_json_bytes(payload)
+
+
+def price_table_signature_payload(table: PriceTable) -> bytes:
+    return canonical_json_bytes(_price_table_payload(replace(table, signature="")))
+
+
+def price_table_content_hash(table: PriceTable) -> str:
+    return hash_json(_price_table_payload(table))
+
+
+def roll_up_price_table_usage(
+    usage: BudgetUsage,
+    table: PriceTable,
+    *,
+    gpu_model: str = "default",
+    model_id: str = "default",
+) -> PriceTableRollup:
+    cost = _price_table_cost_usd(usage, table, gpu_model=gpu_model, model_id=model_id)
+    exact = _decimal_wire(cost)
+    priced_usage = replace(usage, cost_usd=float(cost))
+    return PriceTableRollup(
+        usage=priced_usage,
+        cost_usd_exact=exact,
+        price_table_hash=price_table_content_hash(table),
+        price_table_version=table.price_table_version,
+        signer_key_id=table.signer_key_id,
+        gpu_model=gpu_model,
+        model_id=model_id,
+    )
+
+
+def _price_table_signature(table: PriceTable, signing_key: bytes) -> str:
+    digest = hmac.new(signing_key, price_table_signature_payload(table), sha256).hexdigest()
+    return f"{SIGNATURE_PREFIX}{digest}"
+
+
+def _price_table_payload(table: PriceTable) -> dict[str, Any]:
+    return {
+        "price_table_version": table.price_table_version,
+        "usd_per_cpu_second": _decimal_wire(_decimal(table.usd_per_cpu_second)),
+        "usd_per_gpu_second": {
+            key: _decimal_wire(_decimal(value)) for key, value in sorted(table.usd_per_gpu_second.items())
+        },
+        "usd_per_1k_model_tokens": {
+            key: _decimal_wire(_decimal(value)) for key, value in sorted(table.usd_per_1k_model_tokens.items())
+        },
+        "issued_at": int(table.issued_at),
+        "expires_at": int(table.expires_at),
+        "signer_key_id": table.signer_key_id,
+        "signature": table.signature,
+    }
+
+
+def _price_table_cost_usd(
+    usage: BudgetUsage,
+    table: PriceTable,
+    *,
+    gpu_model: str,
+    model_id: str,
+) -> Decimal:
+    cpu_cost = _decimal(usage.compute_units) * _decimal(table.usd_per_cpu_second)
+    gpu_rate = _price_table_rate(table.usd_per_gpu_second, gpu_model, "gpu", usage.gpu_seconds)
+    token_rate = _price_table_rate(table.usd_per_1k_model_tokens, model_id, "model tokens", usage.model_tokens)
+    gpu_cost = _decimal(usage.gpu_seconds) * gpu_rate
+    token_cost = (_decimal(usage.model_tokens) / Decimal("1000")) * token_rate
+    return cpu_cost + gpu_cost + token_cost
+
+
+def _price_table_rate(rates: Mapping[str, str], key: str, dimension: str, amount: float) -> Decimal:
+    if key in rates:
+        return _decimal(rates[key])
+    if "default" in rates:
+        return _decimal(rates["default"])
+    if amount > 0:
+        raise PriceTableSignatureError(f"price table missing {dimension} rate for {key}")
+    return Decimal("0")
+
+
+def _decimal(value: Decimal | int | float | str) -> Decimal:
+    return value if isinstance(value, Decimal) else Decimal(str(value))
+
+
+def _decimal_wire(value: Decimal) -> str:
+    normalized = value.normalize()
+    if normalized == normalized.to_integral():
+        return format(normalized.quantize(Decimal("1")), "f")
+    return format(normalized, "f")
 
 
 class InMemoryTokenRevocationStore:
@@ -1918,9 +2072,15 @@ class DockerSandboxOrchestrator(InMemorySandboxOrchestrator):
         policy_service: InMemoryPolicyService | None = None,
         artifact_store: InMemoryArtifactStore | None = None,
         supervisor: DockerSandboxSupervisor | None = None,
+        price_table: PriceTable | None = None,
+        price_table_trust_store: PriceTableTrustStore | None = None,
+        price_table_gpu_model: str = "default",
+        price_table_model_id: str = "default",
     ) -> None:
         if artifact_store is None:
             raise PolicyDeniedError("artifact_store is required for Docker launch provenance")
+        if price_table is not None and price_table_trust_store is None:
+            raise PriceTableSignatureError("price table trust store is required")
         super().__init__(
             token_service=token_service,
             quota_ledger=quota_ledger,
@@ -1930,6 +2090,10 @@ class DockerSandboxOrchestrator(InMemorySandboxOrchestrator):
             artifact_store=artifact_store,
         )
         self._supervisor = supervisor or DockerSandboxSupervisor()
+        self._price_table = price_table
+        self._price_table_trust_store = price_table_trust_store
+        self._price_table_gpu_model = price_table_gpu_model
+        self._price_table_model_id = price_table_model_id
 
     def launch_and_wait(self, request: LaunchRequest) -> SandboxExecutionResult:
         handle = super().launch(request)
@@ -1949,6 +2113,12 @@ class DockerSandboxOrchestrator(InMemorySandboxOrchestrator):
             self._record_runtime_failure(handle, request, reserved_usage, exc)
             raise
 
+        try:
+            price_rollup = self._roll_up_spend(result.budget_usage)
+        except PriceTableSignatureError as exc:
+            self._record_runtime_failure(handle, request, reserved_usage, exc)
+            raise
+        result = replace(result, budget_usage=price_rollup.usage)
         final_state = _final_sandbox_state(result)
         final_handle = replace(handle, state=final_state)
         self._handles[handle.sandbox_id] = final_handle
@@ -1976,6 +2146,12 @@ class DockerSandboxOrchestrator(InMemorySandboxOrchestrator):
                     "usage": asdict(result.budget_usage),
                 },
             )
+            self._emit_spend_final(
+                request=request,
+                handle=halted_handle,
+                usage=result.budget_usage,
+                price_rollup=price_rollup,
+            )
             raise
         self._audit_ledger.append(
             "budget.consume",
@@ -1986,7 +2162,109 @@ class DockerSandboxOrchestrator(InMemorySandboxOrchestrator):
             },
         )
         self._release_runtime_reservation(request, reserved_usage)
+        self._emit_spend_final(
+            request=request,
+            handle=final_handle,
+            usage=result.budget_usage,
+            price_rollup=price_rollup,
+        )
         return replace(result, handle=final_handle)
+
+    @property
+    def price_table_version(self) -> str | None:
+        return self._price_table.price_table_version if self._price_table is not None else None
+
+    @property
+    def price_table_signer_key_id(self) -> str | None:
+        return self._price_table.signer_key_id if self._price_table is not None else None
+
+    def _roll_up_spend(self, usage: BudgetUsage) -> PriceTableRollup:
+        if self._price_table is None:
+            exact = _decimal_wire(_decimal(usage.cost_usd))
+            return PriceTableRollup(
+                usage=usage,
+                cost_usd_exact=exact,
+                price_table_hash="",
+                price_table_version="unconfigured",
+                signer_key_id="unconfigured",
+                gpu_model=self._price_table_gpu_model,
+                model_id=self._price_table_model_id,
+            )
+        assert self._price_table_trust_store is not None
+        self._price_table_trust_store.verify(self._price_table)
+        return roll_up_price_table_usage(
+            usage,
+            self._price_table,
+            gpu_model=self._price_table_gpu_model,
+            model_id=self._price_table_model_id,
+        )
+
+    def _emit_spend_final(
+        self,
+        *,
+        request: LaunchRequest,
+        handle: SandboxHandle,
+        usage: BudgetUsage,
+        price_rollup: PriceTableRollup,
+    ) -> str | None:
+        if self._artifact_store is None:
+            return None
+        input_refs = (handle.launch_provenance_ref,) if handle.launch_provenance_ref else ()
+        price_table_payload = None
+        if self._price_table is not None:
+            price_table_payload = {
+                **_price_table_payload(self._price_table),
+                "content_hash": price_rollup.price_table_hash,
+            }
+        payload = {
+            "schema": "argus.s10.spend.final.v1",
+            "job_id": request.job_id,
+            "sandbox_id": handle.sandbox_id,
+            "budget_id": request.budget_token.budget_id,
+            "budget_epoch": request.budget_token.budget_epoch,
+            "final_state": handle.state,
+            "usage": asdict(usage),
+            "usd_rollup": {
+                "cost_usd": usage.cost_usd,
+                "cost_usd_exact": price_rollup.cost_usd_exact,
+                "formula": "cpu_seconds*usd_per_cpu_second + gpu_seconds*usd_per_gpu_second + model_tokens/1000*usd_per_1k_model_tokens",
+                "gpu_model": price_rollup.gpu_model,
+                "model_id": price_rollup.model_id,
+                "source": "signed_price_table" if self._price_table is not None else "runtime_usage",
+            },
+            "price_table": price_table_payload,
+        }
+        environment_digest = hash_json(
+            {
+                "kind": "argus.s10.spend.final.env.v1",
+                "launch_provenance_ref": handle.launch_provenance_ref,
+                "price_table_hash": price_rollup.price_table_hash,
+                "price_table_version": price_rollup.price_table_version,
+            }
+        )
+        record = self._artifact_store.create_artifact(
+            kind="spend.final",
+            payload=payload,
+            producer=Producer(subsystem="S10", version=handle.policy_bundle_version, job_id=request.job_id),
+            lineage=Lineage(
+                input_refs=input_refs,
+                code_ref="argus:s10/quota-cost",
+                environment_digest=environment_digest,
+                seeds=(request.trace_id,),
+                job_id=request.job_id,
+            ),
+        )
+        self._audit_ledger.append(
+            "spend.final",
+            {
+                "sandbox_id": handle.sandbox_id,
+                "budget_id": request.budget_token.budget_id,
+                "artifact_ref": record.artifact_ref,
+                "price_table_version": price_rollup.price_table_version,
+                "cost_usd_exact": price_rollup.cost_usd_exact,
+            },
+        )
+        return record.artifact_ref
 
     def _release_runtime_reservation(self, request: LaunchRequest, reserved_usage: BudgetUsage) -> None:
         self._quota_ledger.release(request.budget_token.budget_id, reserved_usage)

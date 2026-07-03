@@ -35,6 +35,10 @@ from argus_core import (
     PolicyBundleSignatureError,
     PolicyBundleSigner,
     PolicyDeniedError,
+    PriceTable,
+    PriceTableSignatureError,
+    PriceTableSigner,
+    PriceTableTrustStore,
     Producer,
     ResourceCeilings,
     SandboxExecutionResult,
@@ -262,6 +266,56 @@ class S10QuotaLedgerTests(unittest.TestCase):
 
         with self.assertRaises(BudgetExceededError):
             ledger.reserve(token.budget_id, BudgetUsage(gpu_seconds=61))
+
+
+class S10PriceTableTests(unittest.TestCase):
+    def test_signed_price_table_rollup_matches_exact_formula(self) -> None:
+        signer = PriceTableSigner(signer_key_id="price-root", signing_key=b"price-secret")
+        table = signer.sign(
+            PriceTable(
+                price_table_version="1.2.3",
+                usd_per_cpu_second="0.01",
+                usd_per_gpu_second={"default": "0.2"},
+                usd_per_1k_model_tokens={"default": "0.4"},
+                issued_at=900,
+                expires_at=1_100,
+            )
+        )
+        trust = signer.trust_store(now_fn=lambda: 1_000)
+
+        trust.verify(table)
+        rollup = s10_module.roll_up_price_table_usage(
+            BudgetUsage(compute_units=2, gpu_seconds=3, model_tokens=500, wallclock_s=9),
+            table,
+        )
+
+        self.assertEqual(rollup.cost_usd_exact, "0.82")
+        self.assertEqual(rollup.usage.cost_usd, 0.82)
+        self.assertEqual(rollup.price_table_version, "1.2.3")
+        self.assertTrue(rollup.price_table_hash.startswith("blake3:"))
+
+    def test_price_table_rejects_tampered_stale_unsigned_and_missing_rates(self) -> None:
+        signer = PriceTableSigner(signer_key_id="price-root", signing_key=b"price-secret")
+        table = signer.sign(
+            PriceTable(
+                price_table_version="1.2.3",
+                usd_per_cpu_second="0.01",
+                usd_per_gpu_second={},
+                usd_per_1k_model_tokens={},
+                issued_at=900,
+                expires_at=1_100,
+            )
+        )
+        trust = PriceTableTrustStore({"price-root": b"price-secret"}, now_fn=lambda: 1_000)
+
+        with self.assertRaisesRegex(PriceTableSignatureError, "signature invalid"):
+            trust.verify(replace(table, usd_per_cpu_second="0.02"))
+        with self.assertRaisesRegex(PriceTableSignatureError, "stale"):
+            PriceTableTrustStore({"price-root": b"price-secret"}, now_fn=lambda: 1_101).verify(table)
+        with self.assertRaisesRegex(PriceTableSignatureError, "missing or unsupported"):
+            trust.verify(replace(table, signature=""))
+        with self.assertRaisesRegex(PriceTableSignatureError, "missing gpu rate"):
+            s10_module.roll_up_price_table_usage(BudgetUsage(gpu_seconds=1), table, gpu_model="a100")
 
 
 class S10PolicyAndEgressTests(unittest.TestCase):
@@ -1150,8 +1204,8 @@ class S10DockerOrchestratorTests(unittest.TestCase):
         self.assertEqual(quota_state.reserved, BudgetUsage())
         self.assertGreater(quota_state.actual.wallclock_s, 0)
         self.assertEqual(
-            [event.event_type for event in self.audit.events()[-5:]],
-            ["sandbox.launched", "sandbox.started", "sandbox.exited", "budget.consume", "budget.release"],
+            [event.event_type for event in self.audit.events()[-6:]],
+            ["sandbox.launched", "sandbox.started", "sandbox.exited", "budget.consume", "budget.release", "spend.final"],
         )
 
     def test_timeout_launch_records_timed_out_state(self) -> None:
@@ -1166,8 +1220,8 @@ class S10DockerOrchestratorTests(unittest.TestCase):
         self.assertEqual(quota_state.reserved, BudgetUsage())
         self.assertGreater(quota_state.actual.wallclock_s, 0)
         self.assertEqual(
-            [event.event_type for event in self.audit.events()[-5:]],
-            ["sandbox.launched", "sandbox.started", "sandbox.timeout", "budget.consume", "budget.release"],
+            [event.event_type for event in self.audit.events()[-6:]],
+            ["sandbox.launched", "sandbox.started", "sandbox.timeout", "budget.consume", "budget.release", "spend.final"],
         )
 
     def test_runtime_budget_exceed_halts_and_releases_reservation(self) -> None:
@@ -1352,6 +1406,74 @@ class S10DockerOrchestratorFailureTests(unittest.TestCase):
                     ["sandbox.launched", "sandbox.started", "budget.release", "sandbox.runtime_failed"],
                 )
                 self.assertEqual(audit.events()[-1].payload["error_type"], type(exc).__name__)
+
+    def test_docker_orchestrator_emits_spend_final_with_signed_price_table(self) -> None:
+        artifacts = InMemoryArtifactStore()
+        table, trust = self._signed_price_table(cpu_rate="0.1")
+        orchestrator = DockerSandboxOrchestrator(
+            token_service=self.tokens,
+            quota_ledger=InMemoryQuotaLedger(),
+            audit_ledger=InMemoryAuditLedger(),
+            policy_bundle=self.bundle,
+            artifact_store=artifacts,
+            supervisor=_FixedUsageSupervisor(BudgetUsage(compute_units=2, wallclock_s=1)),
+            price_table=table,
+            price_table_trust_store=trust,
+        )
+        request = self._launch_request()
+
+        result = orchestrator.launch_and_wait(request)
+
+        self.assertEqual(result.budget_usage.cost_usd, 0.2)
+        spend_records = artifacts.query_artifacts({"kind": "spend.final"})
+        self.assertEqual(len(spend_records), 1)
+        payload = json.loads(artifacts.get_artifact(spend_records[0].artifact_ref).decode("utf-8"))
+        self.assertEqual(payload["final_state"], "SUCCEEDED")
+        self.assertEqual(payload["usd_rollup"]["source"], "signed_price_table")
+        self.assertEqual(payload["usd_rollup"]["cost_usd_exact"], "0.2")
+        self.assertEqual(payload["price_table"]["price_table_version"], "1.0.0")
+        self.assertTrue(payload["price_table"]["signature"].startswith("hmac-sha256:"))
+        self.assertEqual(spend_records[0].lineage.input_refs, (result.handle.launch_provenance_ref,))
+        self.assertIn("spend.final", [event.event_type for event in orchestrator._audit_ledger.events()])
+
+    def test_docker_orchestrator_emits_spend_final_for_budget_halt(self) -> None:
+        artifacts = InMemoryArtifactStore()
+        table, trust = self._signed_price_table(cpu_rate="0.1")
+        orchestrator = DockerSandboxOrchestrator(
+            token_service=self.tokens,
+            quota_ledger=InMemoryQuotaLedger(),
+            audit_ledger=InMemoryAuditLedger(),
+            policy_bundle=self.bundle,
+            artifact_store=artifacts,
+            supervisor=_FixedUsageSupervisor(BudgetUsage(compute_units=20, wallclock_s=1)),
+            price_table=table,
+            price_table_trust_store=trust,
+        )
+
+        with self.assertRaises(BudgetExceededError):
+            orchestrator.launch_and_wait(self._launch_request())
+
+        spend_records = artifacts.query_artifacts({"kind": "spend.final"})
+        self.assertEqual(len(spend_records), 1)
+        payload = json.loads(artifacts.get_artifact(spend_records[0].artifact_ref).decode("utf-8"))
+        self.assertEqual(payload["final_state"], "BUDGET_HALTED")
+        self.assertEqual(payload["usd_rollup"]["cost_usd_exact"], "2")
+        self.assertEqual(payload["usage"]["cost_usd"], 2.0)
+
+    @staticmethod
+    def _signed_price_table(*, cpu_rate: str) -> tuple[PriceTable, PriceTableTrustStore]:
+        signer = PriceTableSigner(signer_key_id="price-root", signing_key=b"price-secret")
+        table = signer.sign(
+            PriceTable(
+                price_table_version="1.0.0",
+                usd_per_cpu_second=cpu_rate,
+                usd_per_gpu_second={"default": "0"},
+                usd_per_1k_model_tokens={"default": "0"},
+                issued_at=900,
+                expires_at=1_100,
+            )
+        )
+        return table, signer.trust_store(now_fn=lambda: 1_000)
 
     def _launch_request(self) -> LaunchRequest:
         budget = self.tokens.mint_budget(

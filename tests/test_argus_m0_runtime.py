@@ -21,6 +21,7 @@ from argus_core import (
     FileSystemArtifactStore,
     InMemoryS10KmsCheckpointSigner,
     Lineage,
+    PriceTableSignatureError,
     Producer,
     SandboxExecutionResult,
     ScopeGrant,
@@ -49,6 +50,7 @@ BROKER_WRITE_KEY = b"test-s8-broker-write-key"
 POLICY_SIGNING_KEY = "test-s10-policy-signing-key"
 CHECKPOINT_SIGNING_KEY = "test-s10-checkpoint-signing-key"
 CHECKPOINT_SIGNER_AUTH_TOKEN = "test-checkpoint-signer-token"
+PRICE_TABLE_SIGNING_KEY = "test-s10-price-table-signing-key"
 TOKEN_ED25519_PRIVATE_KEY_HEX = "1111111111111111111111111111111111111111111111111111111111111111"
 TOKEN_ED25519_PUBLIC_KEY_HEX = "d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737"
 C3_VERIFIER_KEYS_JSON = json.dumps(
@@ -763,6 +765,10 @@ class ArgusM0RuntimeServiceTests(unittest.TestCase):
         provenance = app.artifacts.get_record(payload["handle"]["launch_provenance_ref"])
         self.assertEqual(provenance.producer.subsystem, "S10")
         self.assertEqual(provenance.producer.job_id, "job-auth")
+        spend_records = app.artifacts.query_artifacts({"kind": "spend.final", "job_id": "job-auth"})
+        self.assertEqual(len(spend_records), 1)
+        spend_payload = json.loads(app.artifacts.get_artifact(spend_records[0].artifact_ref).decode("utf-8"))
+        self.assertEqual(spend_payload["final_state"], "SUCCEEDED")
         self.assertIn("sandbox.started", [event.event_type for event in app.audit.events()])
 
     def test_s10_http_launch_rejects_identity_bound_job_override(self) -> None:
@@ -805,6 +811,11 @@ class ArgusM0RuntimeServiceTests(unittest.TestCase):
         self.assertEqual(payload["handle"]["state"], "BUDGET_HALTED")
         self.assertIsNotNone(payload["handle"]["launch_provenance_ref"])
         self.assertIn("budget.halt", payload["audit_events"])
+        self.assertIn("spend.final", payload["audit_events"])
+        spend_records = app.artifacts.query_artifacts({"kind": "spend.final", "job_id": "job-auth"})
+        self.assertEqual(len(spend_records), 1)
+        spend_payload = json.loads(app.artifacts.get_artifact(spend_records[0].artifact_ref).decode("utf-8"))
+        self.assertEqual(spend_payload["final_state"], "BUDGET_HALTED")
 
     def test_s10_runtime_identity_mint_policy_rejects_overrides_unknown_callers_and_ttl_widening(self) -> None:
         app = S10SupervisorApp(
@@ -915,6 +926,8 @@ class ArgusM0RuntimeServiceTests(unittest.TestCase):
         self.assertEqual(payload["token_signer"], "local-hmac")
         self.assertEqual(payload["token_signature_algorithm"], "hmac-sha256")
         self.assertEqual(payload["quota_ledger"], "memory")
+        self.assertEqual(payload["price_table"], "unconfigured")
+        self.assertEqual(payload["price_table_signer_key_id"], "unconfigured")
 
     def test_s10_env_build_can_use_ed25519_token_signer_and_public_verifier(self) -> None:
         base_env = {
@@ -964,6 +977,7 @@ class ArgusM0RuntimeServiceTests(unittest.TestCase):
         self.assertEqual(health["token_verifier"], "offline-ed25519-public")
         self.assertEqual(health["token_revocation_store"], "file")
         self.assertEqual(health["quota_ledger"], "memory")
+        self.assertEqual(health["price_table"], "unconfigured")
         self.assertEqual(runtime_status, 201)
         self.assertEqual(budget_status, 201)
         self.assertEqual(budget["signer_key_id"], "argus-m0-token-root")
@@ -975,6 +989,40 @@ class ArgusM0RuntimeServiceTests(unittest.TestCase):
             clear=True,
         ):
             with self.assertRaisesRegex(RuntimeError, "does not match private key"):
+                build_s10_app_from_env()
+
+    def test_s10_env_build_activates_signed_price_table_and_rejects_stale_table(self) -> None:
+        base_env = {
+            "ARGUS_S10_SIGNING_KEY": "test-s10-signing-key",
+            "ARGUS_RUNTIME_BOOTSTRAP_TOKEN": BOOTSTRAP_TOKEN,
+            "ARGUS_RUNTIME_IDENTITY_SIGNING_KEY": IDENTITY_SIGNING_KEY.decode("utf-8"),
+            "ARGUS_RUNTIME_IDENTITY_MINT_POLICY_JSON": _runtime_identity_mint_policy_json(),
+            "ARGUS_M0_HEALTH_TOKEN": HEALTH_TOKEN,
+            "ARGUS_S10_POLICY_SIGNING_KEY": POLICY_SIGNING_KEY,
+            "ARGUS_S10_CHECKPOINT_SIGNING_KEY": CHECKPOINT_SIGNING_KEY,
+            "ARGUS_S10_CHECKPOINT_SIGNER_AUTH_TOKEN": CHECKPOINT_SIGNER_AUTH_TOKEN,
+            "ARGUS_S10_PRICE_TABLE_SIGNER_KEY_ID": "argus-m0-price-table",
+            "ARGUS_S10_PRICE_TABLE_SIGNING_KEY": PRICE_TABLE_SIGNING_KEY,
+            "ARGUS_S10_PRICE_TABLE_VERSION": "0.1.0",
+            "ARGUS_S10_PRICE_TABLE_ISSUED_AT": "1",
+            "ARGUS_S10_PRICE_TABLE_USD_PER_CPU_SECOND": "0.002",
+            "ARGUS_S10_PRICE_TABLE_USD_PER_GPU_SECOND": "0",
+            "ARGUS_S10_PRICE_TABLE_USD_PER_1K_MODEL_TOKENS": "0.004",
+        }
+        with patch.dict(os.environ, {**base_env, "ARGUS_S10_PRICE_TABLE_EXPIRES_AT": "4102444800"}, clear=True):
+            app = build_s10_app_from_env()
+            status, health = app.http.handle(
+                JsonRequest(method="GET", path="/healthz", query={}, body=None, headers=_auth_headers(HEALTH_TOKEN))
+            )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(health["price_table"], "0.1.0")
+        self.assertEqual(health["price_table_signer_key_id"], "argus-m0-price-table")
+        self.assertIsNotNone(app.price_table)
+        self.assertTrue(app.price_table.signature.startswith("hmac-sha256:"))
+
+        with patch.dict(os.environ, {**base_env, "ARGUS_S10_PRICE_TABLE_EXPIRES_AT": "2"}, clear=True):
+            with self.assertRaisesRegex(PriceTableSignatureError, "price table is stale"):
                 build_s10_app_from_env()
 
     def test_s10_env_build_requires_checkpoint_signer_material_and_auth_token(self) -> None:
@@ -1270,6 +1318,9 @@ class ArgusM0ComposeTests(unittest.TestCase):
                 "ARGUS_S8_BROKER_WRITE_KEY": BROKER_WRITE_KEY.decode("utf-8"),
                 "ARGUS_S10_CHECKPOINT_SIGNING_KEY": CHECKPOINT_SIGNING_KEY,
                 "ARGUS_S10_CHECKPOINT_SIGNER_AUTH_TOKEN": CHECKPOINT_SIGNER_AUTH_TOKEN,
+                "ARGUS_S10_PRICE_TABLE_SIGNING_KEY": PRICE_TABLE_SIGNING_KEY,
+                "ARGUS_S10_PRICE_TABLE_ISSUED_AT": "1",
+                "ARGUS_S10_PRICE_TABLE_EXPIRES_AT": "4102444800",
                 "ARGUS_S8_C3_VERIFIER_KEYS_JSON": C3_VERIFIER_KEYS_JSON,
             },
         )
@@ -1356,6 +1407,29 @@ class ArgusM0ComposeTests(unittest.TestCase):
         )
         self.assertEqual(services["s10-supervisor"]["environment"]["ARGUS_S10_APPLY_MIGRATIONS"], "1")
         self.assertEqual(services["s10-supervisor"]["environment"]["ARGUS_S10_MIGRATIONS_DIR"], "/app/db/s10")
+        self.assertEqual(
+            services["s10-supervisor"]["environment"]["ARGUS_S10_PRICE_TABLE_SIGNER_KEY_ID"],
+            "argus-m0-price-table",
+        )
+        self.assertEqual(
+            services["s10-supervisor"]["environment"]["ARGUS_S10_PRICE_TABLE_SIGNING_KEY"],
+            PRICE_TABLE_SIGNING_KEY,
+        )
+        self.assertEqual(services["s10-supervisor"]["environment"]["ARGUS_S10_PRICE_TABLE_VERSION"], "0.1.0")
+        self.assertIn("ARGUS_S10_PRICE_TABLE_ISSUED_AT", services["s10-supervisor"]["environment"])
+        self.assertIn("ARGUS_S10_PRICE_TABLE_EXPIRES_AT", services["s10-supervisor"]["environment"])
+        self.assertEqual(
+            services["s10-supervisor"]["environment"]["ARGUS_S10_PRICE_TABLE_USD_PER_CPU_SECOND"],
+            "0.002",
+        )
+        self.assertEqual(
+            services["s10-supervisor"]["environment"]["ARGUS_S10_PRICE_TABLE_USD_PER_GPU_SECOND"],
+            "0",
+        )
+        self.assertEqual(
+            services["s10-supervisor"]["environment"]["ARGUS_S10_PRICE_TABLE_USD_PER_1K_MODEL_TOKENS"],
+            "0.004",
+        )
         self.assertEqual(services["s10-supervisor"]["environment"]["ARGUS_S10_POLICY_SIGNING_KEY"], POLICY_SIGNING_KEY)
         self.assertEqual(
             services["s10-supervisor"]["environment"]["ARGUS_S10_CHECKPOINT_SIGNER_KEY_ID"],

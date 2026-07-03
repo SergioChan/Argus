@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 from contextlib import closing
 from dataclasses import asdict, replace
+from decimal import Decimal
 from hashlib import sha256
 import hmac
 from io import BytesIO
@@ -69,6 +70,7 @@ def main() -> int:
         "results": [],
     }
     runtime_secrets = _m0_runtime_secrets()
+    price_table_now = int(time.time())
     ports = {
         "ARGUS_M0_POSTGRES_PORT": str(_free_port()),
         "ARGUS_M0_MINIO_PORT": str(_free_port()),
@@ -88,6 +90,9 @@ def main() -> int:
         "ARGUS_S10_POLICY_SIGNING_KEY": runtime_secrets["s10_policy_signing_key"],
         "ARGUS_S10_CHECKPOINT_SIGNING_KEY": runtime_secrets["s10_checkpoint_signing_key"],
         "ARGUS_S10_CHECKPOINT_SIGNER_AUTH_TOKEN": runtime_secrets["s10_checkpoint_signer_auth_token"],
+        "ARGUS_S10_PRICE_TABLE_SIGNING_KEY": runtime_secrets["s10_price_table_signing_key"],
+        "ARGUS_S10_PRICE_TABLE_ISSUED_AT": str(price_table_now - 60),
+        "ARGUS_S10_PRICE_TABLE_EXPIRES_AT": str(price_table_now + 86_400),
         "ARGUS_S8_BROKER_WRITE_KEY": runtime_secrets["s8_broker_write_key"],
         "ARGUS_S8_C3_VERIFIER_KEYS_JSON": json.dumps(
             {M0_C3_VERIFIER_KEY_ID: runtime_secrets["c3_verifier_signing_key"]},
@@ -181,6 +186,13 @@ def main() -> int:
             s8_url=s8_url,
             read_token=auth_tokens["read"],
         )
+        spend_final = _battery_spend_final(
+            s8_url=s8_url,
+            read_token=auth_tokens["read"],
+            job_id="m0-spine-job",
+            launch_provenance_ref=launch_result["launch_provenance_ref"],
+            expected_state="SUCCEEDED",
+        )
         model_record = _post_json(
             f"{s10_url}/v1/store/artifacts",
             {
@@ -264,6 +276,9 @@ def main() -> int:
             {
                 "sandbox_stdout": launch_result["stdout"],
                 "launch_provenance_ref": launch_result["launch_provenance_ref"],
+                "spend_final_ref": spend_final["artifact_ref"],
+                "spend_final_price_table_version": spend_final["price_table_version"],
+                "spend_final_cost_usd_exact": spend_final["cost_usd_exact"],
                 "model_ref": model_record["artifact_ref"],
                 "impact_refs": sorted(impact_refs),
                 "query_refs": sorted(query_refs),
@@ -335,6 +350,7 @@ def _m0_runtime_secrets() -> dict[str, str]:
         "s10_policy_signing_key": f"argus-s10-policy-key-{uuid4().hex}",
         "s10_checkpoint_signing_key": f"argus-s10-checkpoint-key-{uuid4().hex}",
         "s10_checkpoint_signer_auth_token": f"argus-s10-checkpoint-signer-{uuid4().hex}",
+        "s10_price_table_signing_key": f"argus-s10-price-table-key-{uuid4().hex}",
         "s8_broker_write_key": f"argus-s8-broker-key-{uuid4().hex}",
         "c3_verifier_signing_key": f"argus-c3-verifier-key-{uuid4().hex}",
     }
@@ -512,6 +528,10 @@ def _battery_runtime_auth_required(
         raise AssertionError(f"S10 did not activate file-backed token revocation state: {s10_health}")
     if s10_health.get("quota_ledger") != "postgres":
         raise AssertionError(f"S10 did not activate the Postgres quota ledger: {s10_health}")
+    if s10_health.get("price_table") != "0.1.0":
+        raise AssertionError(f"S10 did not activate the signed M0 price table: {s10_health}")
+    if s10_health.get("price_table_signer_key_id") != "argus-m0-price-table":
+        raise AssertionError(f"S10 did not report the M0 price table signer: {s10_health}")
     _record(
         evidence,
         "auth",
@@ -530,6 +550,8 @@ def _battery_runtime_auth_required(
             "s10_token_verifier": s10_health["token_verifier"],
             "s10_token_revocation_store": s10_health["token_revocation_store"],
             "s10_quota_ledger": s10_health["quota_ledger"],
+            "s10_price_table": s10_health["price_table"],
+            "s10_price_table_signer_key_id": s10_health["price_table_signer_key_id"],
         },
     )
     return str(s10_health["checkpoint_signer"])
@@ -961,6 +983,13 @@ def _s8_checkpoint_signature(
     return "hmac-sha256:" + hmac.new(signing_key, payload.encode("utf-8"), sha256).hexdigest()
 
 
+def _decimal_wire(value: Decimal) -> str:
+    normalized = value.normalize()
+    if normalized == normalized.to_integral():
+        return format(normalized.quantize(Decimal("1")), "f")
+    return format(normalized, "f")
+
+
 def _postgres_record_hashes_match_refreshed_records(
     rows: list[tuple[str, str]],
     *,
@@ -1201,7 +1230,83 @@ def _battery_e_budget_halt(
     if not isinstance(launch_provenance_ref, str) or not launch_provenance_ref:
         raise AssertionError("budget halt launch provenance missing")
     _get_json(f"{s8_url}/v1/artifacts/{launch_provenance_ref}/record", token=read_token)
-    _record(evidence, "e", "sandbox ran past budget and was halted with audit evidence", {"events": events})
+    spend_final = _battery_spend_final(
+        s8_url=s8_url,
+        read_token=read_token,
+        job_id="m0-budget-halt-job",
+        launch_provenance_ref=launch_provenance_ref,
+        expected_state="BUDGET_HALTED",
+    )
+    _record(
+        evidence,
+        "e",
+        "sandbox ran past budget and was halted with audit and spend.final evidence",
+        {
+            "events": events,
+            "spend_final_ref": spend_final["artifact_ref"],
+            "spend_final_state": spend_final["final_state"],
+            "spend_final_cost_usd_exact": spend_final["cost_usd_exact"],
+        },
+    )
+
+
+def _battery_spend_final(
+    *,
+    s8_url: str,
+    read_token: str,
+    job_id: str,
+    launch_provenance_ref: str,
+    expected_state: str,
+) -> dict[str, Any]:
+    query = _get_json(
+        f"{s8_url}/v1/artifacts?kind=spend.final&job_id={parse.quote(job_id, safe='')}&page_size=20",
+        token=read_token,
+    )
+    matching_records = [
+        record
+        for record in query["records"]
+        if launch_provenance_ref in (record.get("lineage", {}).get("input_refs") or [])
+    ]
+    if len(matching_records) != 1:
+        raise AssertionError(f"expected one spend.final record for {job_id}, found {matching_records}")
+    record = matching_records[0]
+    payload = _get_json(f"{s8_url}/v1/artifacts/{record['artifact_ref']}/payload", token=read_token)
+    price_table = payload.get("price_table") or {}
+    usage = payload.get("usage") or {}
+    rollup = payload.get("usd_rollup") or {}
+    if payload.get("schema") != "argus.s10.spend.final.v1":
+        raise AssertionError(f"unexpected spend.final schema: {payload}")
+    if payload.get("final_state") != expected_state:
+        raise AssertionError(f"unexpected spend.final state: {payload}")
+    if price_table.get("price_table_version") != "0.1.0":
+        raise AssertionError(f"spend.final missing signed price table version: {payload}")
+    if price_table.get("signer_key_id") != "argus-m0-price-table":
+        raise AssertionError(f"spend.final missing price table signer: {payload}")
+    if not str(price_table.get("signature", "")).startswith("hmac-sha256:"):
+        raise AssertionError(f"spend.final price table signature missing: {payload}")
+    if rollup.get("source") != "signed_price_table":
+        raise AssertionError(f"spend.final did not use signed price table source: {payload}")
+    expected_cost = (
+        Decimal(str(usage.get("compute_units", 0))) * Decimal(str(price_table["usd_per_cpu_second"]))
+        + Decimal(str(usage.get("gpu_seconds", 0)))
+        * Decimal(str((price_table.get("usd_per_gpu_second") or {}).get("default", "0")))
+        + Decimal(str(usage.get("model_tokens", 0)))
+        / Decimal("1000")
+        * Decimal(str((price_table.get("usd_per_1k_model_tokens") or {}).get("default", "0")))
+    )
+    expected_cost_exact = _decimal_wire(expected_cost)
+    if rollup.get("cost_usd_exact") != expected_cost_exact:
+        raise AssertionError(
+            f"spend.final USD roll-up mismatch: expected={expected_cost_exact} payload={payload}"
+        )
+    if usage.get("cost_usd") != rollup.get("cost_usd"):
+        raise AssertionError(f"spend.final usage cost did not match roll-up float view: {payload}")
+    return {
+        "artifact_ref": record["artifact_ref"],
+        "final_state": payload["final_state"],
+        "price_table_version": price_table["price_table_version"],
+        "cost_usd_exact": expected_cost_exact,
+    }
 
 
 def _battery_g_argusverify(evidence: dict[str, Any]) -> None:

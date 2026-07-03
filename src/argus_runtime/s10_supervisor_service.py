@@ -36,6 +36,10 @@ from argus_core import (
     PolicyBundleSigner,
     PolicyDeniedError,
     Producer,
+    PriceTable,
+    PriceTableSignatureError,
+    PriceTableSigner,
+    PriceTableTrustStore,
     ResourceCeilings,
     SandboxRuntimeUnavailableError,
     ScopeDeniedError,
@@ -118,6 +122,8 @@ class S10SupervisorApp:
         checkpoint_signer: InMemoryS10KmsCheckpointSigner | None = None,
         checkpoint_signer_auth_token: str | None = None,
         docker_supervisor: DockerSandboxSupervisor | None = None,
+        price_table: PriceTable | None = None,
+        price_table_trust_store: PriceTableTrustStore | None = None,
     ) -> None:
         self.tokens = token_service or InMemoryTokenService(signing_key=signing_key)
         self.quota = quota_ledger or InMemoryQuotaLedger()
@@ -132,6 +138,8 @@ class S10SupervisorApp:
         self.checkpoint_signer = checkpoint_signer
         self._checkpoint_signer_auth_token = checkpoint_signer_auth_token
         self._docker_supervisor = docker_supervisor
+        self.price_table = price_table
+        self.price_table_trust_store = price_table_trust_store
         self.broker = StoreWriterBroker(
             token_service=self.tokens,
             artifact_store=self.artifacts,
@@ -277,6 +285,8 @@ class S10SupervisorApp:
             policy_service=self.policy_service,
             artifact_store=self.artifacts,
             supervisor=self._docker_supervisor,
+            price_table=self.price_table,
+            price_table_trust_store=self.price_table_trust_store,
         )
 
     def _refresh_artifacts(self) -> None:
@@ -315,6 +325,8 @@ class S10SupervisorApp:
                 "token_verifier": self.tokens.verifier_kind,
                 "token_revocation_store": self.tokens.revocation_store_kind,
                 "quota_ledger": getattr(self.quota, "kind", type(self.quota).__name__),
+                "price_table": self._docker_orchestrator.price_table_version or "unconfigured",
+                "price_table_signer_key_id": self._docker_orchestrator.price_table_signer_key_id or "unconfigured",
                 "audit_events": len(self.audit.events()),
             }
 
@@ -433,7 +445,13 @@ class S10SupervisorApp:
                 return 401, {"error": "Unauthorized", "message": str(exc)}
             except TokenInvalidError as exc:
                 return 401, {"error": type(exc).__name__, "message": str(exc)}
-            except (BudgetExceededError, PermissionError, PolicyDeniedError, ScopeDeniedError) as exc:
+            except (
+                BudgetExceededError,
+                PermissionError,
+                PolicyDeniedError,
+                PriceTableSignatureError,
+                ScopeDeniedError,
+            ) as exc:
                 return 403, self._launch_error_payload(exc, launch)
             except SandboxRuntimeUnavailableError as exc:
                 return 503, self._launch_error_payload(exc, launch)
@@ -468,6 +486,7 @@ class S10SupervisorApp:
 def build_app_from_env() -> S10SupervisorApp:
     token_service = _token_service_from_env()
     quota_ledger = _quota_ledger_from_env()
+    price_table, price_table_trust_store = _price_table_from_env()
     s8_broker_url = os.environ.get("ARGUS_S8_BROKER_URL")
     s8_broker_key = os.environ.get("ARGUS_S8_BROKER_WRITE_KEY")
     mint_policy = _runtime_identity_mint_policy_from_env()
@@ -491,6 +510,8 @@ def build_app_from_env() -> S10SupervisorApp:
             policy_service=policy_service,
             checkpoint_signer=checkpoint_signer,
             checkpoint_signer_auth_token=checkpoint_signer_auth_token,
+            price_table=price_table,
+            price_table_trust_store=price_table_trust_store,
         )
     data_dir = os.environ.get("ARGUS_S8_DATA_DIR")
     if data_dir:
@@ -505,6 +526,8 @@ def build_app_from_env() -> S10SupervisorApp:
             policy_service=policy_service,
             checkpoint_signer=checkpoint_signer,
             checkpoint_signer_auth_token=checkpoint_signer_auth_token,
+            price_table=price_table,
+            price_table_trust_store=price_table_trust_store,
         )
     return S10SupervisorApp(
         token_service=token_service,
@@ -515,6 +538,8 @@ def build_app_from_env() -> S10SupervisorApp:
         policy_service=policy_service,
         checkpoint_signer=checkpoint_signer,
         checkpoint_signer_auth_token=checkpoint_signer_auth_token,
+        price_table=price_table,
+        price_table_trust_store=price_table_trust_store,
     )
 
 
@@ -577,6 +602,39 @@ def _quota_ledger_from_env() -> Any:
     from .s10_quota_persistence import build_postgres_quota_ledger_from_env
 
     return build_postgres_quota_ledger_from_env(dict(os.environ))
+
+
+def _price_table_from_env() -> tuple[PriceTable | None, PriceTableTrustStore | None]:
+    key_file = os.environ.get("ARGUS_S10_PRICE_TABLE_SIGNING_KEY_FILE")
+    signing_key_value = os.environ.get("ARGUS_S10_PRICE_TABLE_SIGNING_KEY")
+    if not key_file and not signing_key_value:
+        return None, None
+    if key_file:
+        signing_key = Path(key_file).read_bytes()
+    else:
+        assert signing_key_value is not None
+        signing_key = signing_key_value.encode("utf-8")
+    expires_at = os.environ.get("ARGUS_S10_PRICE_TABLE_EXPIRES_AT")
+    if not expires_at:
+        raise RuntimeError("ARGUS_S10_PRICE_TABLE_EXPIRES_AT is required when price table signing is configured")
+    signer = PriceTableSigner(
+        signer_key_id=os.environ.get("ARGUS_S10_PRICE_TABLE_SIGNER_KEY_ID", "argus-m0-price-table"),
+        signing_key=signing_key,
+    )
+    table = PriceTable(
+        price_table_version=os.environ.get("ARGUS_S10_PRICE_TABLE_VERSION", "0.1.0"),
+        usd_per_cpu_second=os.environ.get("ARGUS_S10_PRICE_TABLE_USD_PER_CPU_SECOND", "0"),
+        usd_per_gpu_second={"default": os.environ.get("ARGUS_S10_PRICE_TABLE_USD_PER_GPU_SECOND", "0")},
+        usd_per_1k_model_tokens={
+            "default": os.environ.get("ARGUS_S10_PRICE_TABLE_USD_PER_1K_MODEL_TOKENS", "0")
+        },
+        issued_at=int(os.environ.get("ARGUS_S10_PRICE_TABLE_ISSUED_AT", "0")),
+        expires_at=int(expires_at),
+    )
+    signed = signer.sign(table)
+    trust_store = signer.trust_store()
+    trust_store.verify(signed)
+    return signed, trust_store
 
 
 def _read_hex_secret(*, value_name: str, file_name: str, expected_bytes: int) -> bytes:
