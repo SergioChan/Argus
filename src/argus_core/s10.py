@@ -31,6 +31,7 @@ from .s8 import ArtifactRecord, InMemoryArtifactStore, Lineage, Producer
 SIGNATURE_PREFIX = "hmac-sha256:"
 TOKEN_ED25519_SIGNATURE_PREFIX = "ed25519:"
 DOCKER_SANDBOX_USER = "65532:65532"
+PARTIAL_RESULT_LOG_CAPTURE_LIMIT_BYTES = 64 * 1024
 SECRET_VALUE_PATTERNS = (
     re.compile(r"-----BEGIN [A-Z ]+PRIVATE KEY-----"),
     re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
@@ -376,6 +377,8 @@ class SandboxPartialResult:
     stdout_bytes: int
     stderr_bytes: int
     capture_error: str | None = None
+    log_capture_limit_bytes: int = PARTIAL_RESULT_LOG_CAPTURE_LIMIT_BYTES
+    logs_truncated: bool = False
 
 
 @dataclass(frozen=True)
@@ -388,6 +391,16 @@ class SandboxExecutionResult:
     duration_s: float
     budget_usage: BudgetUsage
     partial_result: SandboxPartialResult | None = None
+
+
+@dataclass(frozen=True)
+class _DockerLogCapture:
+    stdout: str
+    stderr: str
+    stdout_bytes: int
+    stderr_bytes: int
+    log_capture_limit_bytes: int
+    truncated: bool
 
 
 @dataclass(frozen=True)
@@ -2116,7 +2129,8 @@ class DockerSandboxSupervisor:
                 runtime_halt_probe=runtime_halt_probe,
             )
             if partial_result is None:
-                stdout, stderr = self._docker_api_logs(container_id)
+                log_capture = self._docker_api_logs(container_id)
+                stdout, stderr = log_capture.stdout, log_capture.stderr
             else:
                 stdout, stderr = partial_result.stdout, partial_result.stderr
             duration_s = time.monotonic() - started_at
@@ -2285,8 +2299,12 @@ class DockerSandboxSupervisor:
         terminate_succeeded = False
         stdout = ""
         stderr = ""
+        stdout_bytes = 0
+        stderr_bytes = 0
         logs_captured = False
         capture_error: str | None = None
+        log_capture_limit_bytes = PARTIAL_RESULT_LOG_CAPTURE_LIMIT_BYTES
+        logs_truncated = False
 
         try:
             self._docker_api_request("POST", f"/containers/{container_id}/pause", expected=(204,), timeout=2)
@@ -2295,8 +2313,13 @@ class DockerSandboxSupervisor:
             capture_error = f"freeze_failed:{type(exc).__name__}:{exc}"
 
         try:
-            stdout, stderr = self._docker_api_logs(container_id)
+            log_capture = self._docker_api_logs(container_id)
+            stdout, stderr = log_capture.stdout, log_capture.stderr
+            stdout_bytes = log_capture.stdout_bytes
+            stderr_bytes = log_capture.stderr_bytes
             logs_captured = True
+            logs_truncated = log_capture.truncated
+            log_capture_limit_bytes = log_capture.log_capture_limit_bytes
         except (SandboxRuntimeUnavailableError, TimeoutError) as exc:
             message = f"capture_failed:{type(exc).__name__}:{exc}"
             capture_error = message if capture_error is None else f"{capture_error};{message}"
@@ -2339,9 +2362,11 @@ class DockerSandboxSupervisor:
             captured_after_freeze=freeze_succeeded and logs_captured,
             freeze_succeeded=freeze_succeeded,
             terminate_succeeded=terminate_succeeded,
-            stdout_bytes=len(stdout.encode("utf-8")),
-            stderr_bytes=len(stderr.encode("utf-8")),
+            stdout_bytes=stdout_bytes,
+            stderr_bytes=stderr_bytes,
             capture_error=capture_error,
+            log_capture_limit_bytes=log_capture_limit_bytes,
+            logs_truncated=logs_truncated,
         )
         return None, True, f"argus meter halted container: {reason}", final_usage, partial_result
 
@@ -2396,14 +2421,23 @@ class DockerSandboxSupervisor:
             compute_units=max(cgroup_cpu_seconds, conservative_usage.compute_units),
         )
 
-    def _docker_api_logs(self, container_id: str) -> tuple[str, str]:
-        raw = self._docker_api_request_bytes(
+    def _docker_api_logs(self, container_id: str) -> _DockerLogCapture:
+        raw, truncated = self._docker_api_request_bytes_limited(
             "GET",
             f"/containers/{container_id}/logs?stdout=1&stderr=1",
             expected=(200,),
+            timeout=1,
+            max_bytes=PARTIAL_RESULT_LOG_CAPTURE_LIMIT_BYTES,
         )
         stdout, stderr = _split_docker_log_stream(raw)
-        return stdout.decode("utf-8", errors="replace"), stderr.decode("utf-8", errors="replace")
+        return _DockerLogCapture(
+            stdout=stdout.decode("utf-8", errors="replace"),
+            stderr=stderr.decode("utf-8", errors="replace"),
+            stdout_bytes=len(stdout),
+            stderr_bytes=len(stderr),
+            log_capture_limit_bytes=PARTIAL_RESULT_LOG_CAPTURE_LIMIT_BYTES,
+            truncated=truncated,
+        )
 
     def _docker_api_request(
         self,
@@ -2428,10 +2462,33 @@ class DockerSandboxSupervisor:
         expected: tuple[int, ...],
         timeout: float = 10,
     ) -> bytes:
+        payload, _ = self._docker_api_request_bytes_limited(
+            method,
+            path,
+            body,
+            expected=expected,
+            timeout=timeout,
+            max_bytes=None,
+        )
+        return payload
+
+    def _docker_api_request_bytes_limited(
+        self,
+        method: str,
+        path: str,
+        body: dict[str, Any] | None = None,
+        *,
+        expected: tuple[int, ...],
+        timeout: float = 10,
+        max_bytes: int | None,
+    ) -> tuple[bytes, bool]:
         encoded = None if body is None else json.dumps(body, sort_keys=True).encode("utf-8")
         if self._docker_socket_path is None:
             raise SandboxRuntimeUnavailableError("docker API socket is unavailable")
         connection = _UnixSocketHTTPConnection(self._docker_socket_path, timeout=timeout)
+        response: http_client.HTTPResponse | None = None
+        payload = b""
+        truncated = False
         try:
             connection.request(
                 method,
@@ -2440,17 +2497,28 @@ class DockerSandboxSupervisor:
                 headers={"Content-Type": "application/json"} if encoded is not None else {},
             )
             response = connection.getresponse()
-            payload = response.read()
+            if max_bytes is None:
+                payload = response.read()
+            else:
+                if max_bytes < 1:
+                    raise ValueError("max_bytes must be positive")
+                payload, truncated = _read_http_response_bounded(
+                    response,
+                    connection,
+                    max_bytes=max_bytes,
+                )
         except socket.timeout as exc:
             raise TimeoutError("docker API request timed out") from exc
         except OSError as exc:
             raise SandboxRuntimeUnavailableError("docker runtime is unavailable") from exc
         finally:
             connection.close()
+        if response is None:
+            raise SandboxRuntimeUnavailableError("docker API returned no response")
         if response.status not in expected:
             message = payload.decode("utf-8", errors="replace")
             raise SandboxRuntimeUnavailableError(f"docker API {method} {path} returned {response.status}: {message}")
-        return payload
+        return payload, truncated
 
 
 class _UnixSocketHTTPConnection(http_client.HTTPConnection):
@@ -2469,21 +2537,64 @@ def _split_docker_log_stream(raw: bytes) -> tuple[bytes, bytes]:
     stdout = bytearray()
     stderr = bytearray()
     index = 0
+    parsed_frames = False
     while index + 8 <= len(raw):
         stream_type = raw[index]
         size = int.from_bytes(raw[index + 4 : index + 8], "big")
         index += 8
-        if index + size > len(raw):
-            return raw, b""
-        chunk = raw[index : index + size]
-        index += size
+        available = min(size, len(raw) - index)
+        chunk = raw[index : index + available]
+        index += available
+        parsed_frames = True
         if stream_type == 2:
             stderr.extend(chunk)
         else:
             stdout.extend(chunk)
+        if available < size:
+            return bytes(stdout), bytes(stderr)
     if index != len(raw):
+        if parsed_frames:
+            return bytes(stdout), bytes(stderr)
         return raw, b""
     return bytes(stdout), bytes(stderr)
+
+
+def _read_http_response_bounded(
+    response: http_client.HTTPResponse,
+    connection: http_client.HTTPConnection,
+    *,
+    max_bytes: int,
+) -> tuple[bytes, bool]:
+    payload = bytearray()
+    truncated = False
+    while len(payload) <= max_bytes:
+        remaining = max_bytes + 1 - len(payload)
+        if remaining <= 0:
+            break
+        sock = connection.sock
+        previous_timeout = sock.gettimeout() if sock is not None else None
+        if sock is not None:
+            sock.settimeout(0.5 if not payload else 0.02)
+        try:
+            chunk = response.read1(min(8192, remaining))
+        except socket.timeout as exc:
+            if not payload:
+                break
+            truncated = True
+            break
+        finally:
+            if sock is not None:
+                sock.settimeout(previous_timeout)
+        if not chunk:
+            break
+        payload.extend(chunk)
+        if len(payload) > max_bytes:
+            truncated = True
+            break
+    if len(payload) > max_bytes:
+        truncated = True
+        del payload[max_bytes:]
+    return bytes(payload), truncated
 
 
 class InMemorySandboxOrchestrator:
@@ -2974,6 +3085,8 @@ class DockerSandboxOrchestrator(InMemorySandboxOrchestrator):
             "stderr": partial.stderr,
             "stdout_bytes": partial.stdout_bytes,
             "stderr_bytes": partial.stderr_bytes,
+            "log_capture_limit_bytes": partial.log_capture_limit_bytes,
+            "logs_truncated": partial.logs_truncated,
             "captured_after_freeze": partial.captured_after_freeze,
             "freeze_succeeded": partial.freeze_succeeded,
             "terminate_succeeded": partial.terminate_succeeded,
@@ -3008,6 +3121,8 @@ class DockerSandboxOrchestrator(InMemorySandboxOrchestrator):
                 "artifact_ref": record.artifact_ref,
                 "stdout_bytes": partial.stdout_bytes,
                 "stderr_bytes": partial.stderr_bytes,
+                "log_capture_limit_bytes": partial.log_capture_limit_bytes,
+                "logs_truncated": partial.logs_truncated,
                 "captured_after_freeze": partial.captured_after_freeze,
             },
         )

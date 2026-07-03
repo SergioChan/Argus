@@ -126,7 +126,7 @@ const policyBundle = {
   "signature": "hmac-sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
 };
 
-assert.equal(C10_SCHEMA_SHA256, "sha256:61dda2851700abab797a02893b5fd9095f9d8d2d35c72df4063fb4642a659b3f");
+assert.equal(C10_SCHEMA_SHA256, "sha256:db625d81a53c1427ff934239e77cdc44057c2a6a907dc9f30189e37ababa8546");
 assert.doesNotThrow(() => assertLaunchRequest(launchRequest));
 assert.doesNotThrow(() => assertBudgetToken(launchRequest.budget_token));
 assert.doesNotThrow(() => assertScopeToken(launchRequest.scope_token));

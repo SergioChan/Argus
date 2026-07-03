@@ -2152,6 +2152,10 @@ def _battery_partial_capture(
         raise AssertionError(f"partial result did not record freeze+terminate success: {partial_payload}")
     if partial_payload.get("capture_error") is not None:
         raise AssertionError(f"partial result capture_error was not empty: {partial_payload}")
+    if partial_payload.get("logs_truncated") is not False:
+        raise AssertionError(f"partial result unexpectedly truncated normal probe logs: {partial_payload}")
+    if int(partial_payload.get("log_capture_limit_bytes") or 0) < 65536:
+        raise AssertionError(f"partial result log capture limit was missing or too low: {partial_payload}")
     _record(
         evidence,
         "partial-capture",
@@ -2165,6 +2169,8 @@ def _battery_partial_capture(
             "partial_result_ref": partial_ref,
             "partial_result_reason": partial_payload["reason"],
             "partial_result_stdout_bytes": partial_payload["stdout_bytes"],
+            "partial_result_log_capture_limit_bytes": partial_payload["log_capture_limit_bytes"],
+            "partial_result_logs_truncated": partial_payload["logs_truncated"],
             "partial_result_captured_after_freeze": partial_payload["captured_after_freeze"],
             "partial_result_freeze_succeeded": partial_payload["freeze_succeeded"],
             "partial_result_terminate_succeeded": partial_payload["terminate_succeeded"],

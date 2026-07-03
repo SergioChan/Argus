@@ -342,8 +342,8 @@
       "properties": {
         "handle": { "$ref": "#/$defs/SandboxHandle" },
         "exit_code": { "type": ["integer", "null"] },
-        "stdout": { "type": "string" },
-        "stderr": { "type": "string" },
+        "stdout": { "type": "string", "maxLength": 65536 },
+        "stderr": { "type": "string", "maxLength": 65536 },
         "timed_out": { "type": "boolean" },
         "duration_s": { "type": "number", "minimum": 0 },
         "budget_usage": { "$ref": "#/$defs/BudgetUsage" },
@@ -366,6 +366,8 @@
         "terminate_succeeded",
         "stdout_bytes",
         "stderr_bytes",
+        "log_capture_limit_bytes",
+        "logs_truncated",
         "capture_error"
       ],
       "additionalProperties": false,
@@ -378,6 +380,8 @@
         "terminate_succeeded": { "type": "boolean" },
         "stdout_bytes": { "type": "integer", "minimum": 0 },
         "stderr_bytes": { "type": "integer", "minimum": 0 },
+        "log_capture_limit_bytes": { "type": "integer", "minimum": 1 },
+        "logs_truncated": { "type": "boolean" },
         "capture_error": { "type": ["string", "null"], "minLength": 1 }
       }
     },

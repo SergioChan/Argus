@@ -989,13 +989,15 @@ class SandboxPartialResult(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     reason: str = Field(min_length=1)
-    stdout: str
-    stderr: str
+    stdout: str = Field(max_length=65536)
+    stderr: str = Field(max_length=65536)
     captured_after_freeze: bool
     freeze_succeeded: bool
     terminate_succeeded: bool
     stdout_bytes: int = Field(ge=0)
     stderr_bytes: int = Field(ge=0)
+    log_capture_limit_bytes: int = Field(ge=1)
+    logs_truncated: bool
     capture_error: str | None
 
 
@@ -1211,6 +1213,8 @@ export interface SandboxPartialResult {{
   terminate_succeeded: boolean;
   stdout_bytes: number;
   stderr_bytes: number;
+  log_capture_limit_bytes: number;
+  logs_truncated: boolean;
   capture_error: string | null;
 }}
 
@@ -2460,6 +2464,8 @@ pub struct SandboxPartialResult {{
     pub terminate_succeeded: bool,
     pub stdout_bytes: u64,
     pub stderr_bytes: u64,
+    pub log_capture_limit_bytes: u64,
+    pub logs_truncated: bool,
     pub capture_error: Option<String>,
 }}
 

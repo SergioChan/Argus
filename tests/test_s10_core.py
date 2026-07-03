@@ -1239,6 +1239,19 @@ class S10ResourceMeterGapTests(unittest.TestCase):
         self.assertIn("token_revoked", samples[0].breached_dimensions)
         self.assertIn("budget_token", samples[0].breached_dimensions)
 
+    def test_partial_log_capture_is_byte_bounded_and_marks_truncation(self) -> None:
+        supervisor = _CappedLogDockerApiSupervisor()
+
+        capture = supervisor._docker_api_logs("container-large-log")
+
+        self.assertEqual(supervisor.requested_max_bytes, s10_module.PARTIAL_RESULT_LOG_CAPTURE_LIMIT_BYTES)
+        self.assertLessEqual(supervisor.requested_timeout, 1)
+        self.assertEqual(supervisor.requested_path, "/containers/container-large-log/logs?stdout=1&stderr=1")
+        self.assertTrue(capture.truncated)
+        self.assertEqual(capture.log_capture_limit_bytes, s10_module.PARTIAL_RESULT_LOG_CAPTURE_LIMIT_BYTES)
+        self.assertLessEqual(capture.stdout_bytes + capture.stderr_bytes, s10_module.PARTIAL_RESULT_LOG_CAPTURE_LIMIT_BYTES)
+        self.assertTrue(capture.stdout.startswith("x"))
+
     def test_metering_payload_splits_halt_detection_from_cleanup_latency(self) -> None:
         samples = (
             s10_module.ResourceMeterSample(
@@ -1702,6 +1715,8 @@ class S10DockerOrchestratorTests(unittest.TestCase):
         self.assertEqual(partial_payload["schema"], "argus.s10.partial_result.v1")
         self.assertEqual(partial_payload["reason"], "wallclock_timeout")
         self.assertIn("partial-before-timeout", partial_payload["stdout"])
+        self.assertEqual(partial_payload["log_capture_limit_bytes"], s10_module.PARTIAL_RESULT_LOG_CAPTURE_LIMIT_BYTES)
+        self.assertFalse(partial_payload["logs_truncated"])
         self.assertTrue(partial_payload["captured_after_freeze"])
         self.assertTrue(partial_payload["freeze_succeeded"])
         self.assertTrue(partial_payload["terminate_succeeded"])
@@ -2155,6 +2170,34 @@ class _FakeClock:
         self.current += max(float(seconds), 0.0) + 0.25
 
 
+class _CappedLogDockerApiSupervisor(DockerSandboxSupervisor):
+    def __init__(self) -> None:
+        super().__init__()
+        self.requested_max_bytes: int | None = None
+        self.requested_timeout: float | None = None
+        self.requested_path = ""
+
+    def _docker_api_request_bytes_limited(  # type: ignore[override]
+        self,
+        method: str,
+        path: str,
+        body=None,
+        *,
+        expected,
+        timeout: float = 10,
+        max_bytes: int | None,
+    ) -> tuple[bytes, bool]:
+        self.requested_max_bytes = max_bytes
+        self.requested_timeout = timeout
+        self.requested_path = path
+        if method != "GET":
+            raise AssertionError(f"unexpected method: {method}")
+        if max_bytes is None:
+            raise AssertionError("partial log capture must pass a byte limit")
+        raw = _docker_log_frame(1, b"x" * (max_bytes + 512))
+        return raw[:max_bytes], True
+
+
 class _GapStallDockerApiSupervisor(DockerSandboxSupervisor):
     def __init__(self, *, meter_interval_s: float, meter_gap_halt_s: float) -> None:
         super().__init__(meter_interval_s=meter_interval_s, meter_gap_halt_s=meter_gap_halt_s)
@@ -2184,9 +2227,17 @@ class _GapStallDockerApiSupervisor(DockerSandboxSupervisor):
             return {}
         raise AssertionError(f"unexpected docker API request during gap test: {method} {path}")
 
-    def _docker_api_logs(self, container_id: str) -> tuple[str, str]:  # type: ignore[override]
+    def _docker_api_logs(self, container_id: str) -> s10_module._DockerLogCapture:  # type: ignore[override]
         self.assert_pause_order()
-        return "partial-gap\n", ""
+        stdout = "partial-gap\n"
+        return s10_module._DockerLogCapture(
+            stdout=stdout,
+            stderr="",
+            stdout_bytes=len(stdout.encode("utf-8")),
+            stderr_bytes=0,
+            log_capture_limit_bytes=s10_module.PARTIAL_RESULT_LOG_CAPTURE_LIMIT_BYTES,
+            truncated=False,
+        )
 
     def assert_pause_order(self) -> None:
         if not self.paused:
@@ -2245,10 +2296,18 @@ class _GpuBudgetBreachDockerApiSupervisor(DockerSandboxSupervisor):
             return {}
         raise AssertionError(f"unexpected docker API request during GPU budget test: {method} {path}")
 
-    def _docker_api_logs(self, container_id: str) -> tuple[str, str]:  # type: ignore[override]
+    def _docker_api_logs(self, container_id: str) -> s10_module._DockerLogCapture:  # type: ignore[override]
         if not self.paused:
             raise AssertionError("logs were captured before pause")
-        return "partial-gpu\n", ""
+        stdout = "partial-gpu\n"
+        return s10_module._DockerLogCapture(
+            stdout=stdout,
+            stderr="",
+            stdout_bytes=len(stdout.encode("utf-8")),
+            stderr_bytes=0,
+            log_capture_limit_bytes=s10_module.PARTIAL_RESULT_LOG_CAPTURE_LIMIT_BYTES,
+            truncated=False,
+        )
 
     def _docker_api_resource_sample(  # type: ignore[override]
         self,
@@ -2303,10 +2362,18 @@ class _RuntimeHaltDockerApiSupervisor(DockerSandboxSupervisor):
             return {}
         raise AssertionError(f"unexpected docker API request during runtime halt test: {method} {path}")
 
-    def _docker_api_logs(self, container_id: str) -> tuple[str, str]:  # type: ignore[override]
+    def _docker_api_logs(self, container_id: str) -> s10_module._DockerLogCapture:  # type: ignore[override]
         if not self.paused:
             raise AssertionError("logs were captured before pause")
-        return "partial-revoked\n", ""
+        stdout = "partial-revoked\n"
+        return s10_module._DockerLogCapture(
+            stdout=stdout,
+            stderr="",
+            stdout_bytes=len(stdout.encode("utf-8")),
+            stderr_bytes=0,
+            log_capture_limit_bytes=s10_module.PARTIAL_RESULT_LOG_CAPTURE_LIMIT_BYTES,
+            truncated=False,
+        )
 
     def _docker_api_resource_sample(  # type: ignore[override]
         self,
@@ -2487,6 +2554,10 @@ class _RaisingSupervisor:
         meter_sample_sink=None,
     ) -> SandboxExecutionResult:
         raise self._exc
+
+
+def _docker_log_frame(stream_type: int, payload: bytes) -> bytes:
+    return bytes((stream_type, 0, 0, 0)) + len(payload).to_bytes(4, "big") + payload
 
 
 if __name__ == "__main__":
