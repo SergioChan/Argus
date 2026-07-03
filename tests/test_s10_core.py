@@ -1185,6 +1185,60 @@ class S10ResourceMeterGapTests(unittest.TestCase):
         self.assertTrue(any(sample.halted for sample in samples))
         self.assertTrue(all(not sample.dcgm_available for sample in samples))
 
+    def test_runtime_halt_probe_terminates_running_container_for_revoked_token(self) -> None:
+        tokens = InMemoryTokenService(signing_key=b"test-key", now_fn=lambda: 1_000)
+        request = LaunchRequest(
+            job_id="job-revoked",
+            subagent_id="subagent-revoked",
+            trace_id="trace-revoked",
+            budget_token=tokens.mint_budget(
+                caps=BudgetCaps(max_compute_units=100, max_wallclock_s=10, max_cost_usd=10),
+                job_id="job-revoked",
+                root_request_id="root-revoked",
+            ),
+            scope_token=tokens.mint_scope(job_id="job-revoked", scopes=ScopeGrant()),
+            image="registry.local/argus@sha256:" + "b" * 64,
+            entrypoint=("/bin/sh",),
+            args=("-c", "sleep 30"),
+            env={},
+            env_allowlist=(),
+            requested_envelope=LaunchEnvelope(
+                cpu_m=500,
+                mem_bytes=64 * 1024 * 1024,
+                gpu_count=0,
+                wallclock_s=10,
+                scratch_bytes=1024 * 1024,
+                pids=16,
+                estimated_cost_usd=0.01,
+            ),
+        )
+        supervisor = _RuntimeHaltDockerApiSupervisor()
+        samples: list[s10_module.ResourceMeterSample] = []
+
+        exit_code, timed_out, stderr, usage, partial_result = supervisor._wait_for_container_with_meter(
+            container_id="container-revoked",
+            request=request,
+            started_at=s10_module.time.monotonic(),
+            meter_sample_sink=samples.append,
+            runtime_halt_probe=lambda: ("token_revoked", ("token_revoked", "budget_token")),
+        )
+
+        self.assertIsNone(exit_code)
+        self.assertTrue(timed_out)
+        self.assertEqual(stderr, "argus meter halted container: token_revoked")
+        self.assertIsNotNone(partial_result)
+        assert partial_result is not None
+        self.assertEqual(partial_result.reason, "token_revoked")
+        self.assertEqual(partial_result.stdout, "partial-revoked\n")
+        self.assertTrue(partial_result.captured_after_freeze)
+        self.assertTrue(supervisor.paused)
+        self.assertTrue(supervisor.unpaused)
+        self.assertTrue(supervisor.killed)
+        self.assertGreaterEqual(usage.wallclock_s, 0)
+        self.assertTrue(any(sample.halted for sample in samples))
+        self.assertIn("token_revoked", samples[0].breached_dimensions)
+        self.assertIn("budget_token", samples[0].breached_dimensions)
+
     def test_metering_payload_splits_halt_detection_from_cleanup_latency(self) -> None:
         samples = (
             s10_module.ResourceMeterSample(
@@ -1970,6 +2024,40 @@ class S10DockerOrchestratorFailureTests(unittest.TestCase):
         self.assertGreater(payload["metering"]["samples"][-1]["conservative_gap_s"], 0)
         self.assertIn("meter_gap", payload["metering"]["samples"][-1]["breached_dimensions"])
 
+    def test_docker_orchestrator_halts_in_flight_revoked_token_with_audit(self) -> None:
+        artifacts = InMemoryArtifactStore()
+        audit = InMemoryAuditLedger()
+        orchestrator = DockerSandboxOrchestrator(
+            token_service=self.tokens,
+            quota_ledger=InMemoryQuotaLedger(),
+            audit_ledger=audit,
+            policy_bundle=self.bundle,
+            artifact_store=artifacts,
+            supervisor=_RevokingRuntimeHaltSupervisor(self.tokens),
+        )
+        request = self._launch_request()
+
+        result = orchestrator.launch_and_wait(request)
+
+        self.assertEqual(result.handle.state, "TIMED_OUT")
+        self.assertTrue(result.timed_out)
+        self.assertEqual(result.stderr, "argus meter halted container: token_revoked")
+        event_types = [event.event_type for event in audit.events()]
+        self.assertIn("meter.halt", event_types)
+        self.assertIn("token.revocation_halt", event_types)
+        self.assertIn("sandbox.timeout", event_types)
+        token_halt = next(event for event in audit.events() if event.event_type == "token.revocation_halt")
+        self.assertEqual(token_halt.payload["budget_id"], request.budget_token.budget_id)
+        self.assertEqual(token_halt.payload["scope_id"], request.scope_token.scope_id)
+
+        spend_records = artifacts.query_artifacts({"kind": "spend.final"})
+        self.assertEqual(len(spend_records), 1)
+        payload = json.loads(artifacts.get_artifact(spend_records[0].artifact_ref).decode("utf-8"))
+        self.assertEqual(payload["final_state"], "TIMED_OUT")
+        self.assertTrue(payload["metering"]["halted_by_meter"])
+        self.assertIn("token_revoked", payload["metering"]["samples"][0]["breached_dimensions"])
+        self.assertTrue(payload["partial_result_captured"])
+
     @staticmethod
     def _signed_price_table(*, cpu_rate: str) -> tuple[PriceTable, PriceTableTrustStore]:
         signer = PriceTableSigner(signer_key_id="price-root", signing_key=b"price-secret")
@@ -2186,6 +2274,52 @@ class _GpuBudgetBreachDockerApiSupervisor(DockerSandboxSupervisor):
         )
 
 
+class _RuntimeHaltDockerApiSupervisor(DockerSandboxSupervisor):
+    def __init__(self) -> None:
+        super().__init__(meter_interval_s=0.1)
+        self.paused = False
+        self.unpaused = False
+        self.killed = False
+
+    def _docker_api_request(  # type: ignore[override]
+        self,
+        method: str,
+        path: str,
+        body=None,
+        *,
+        expected,
+        timeout: float = 10,
+    ):
+        if path.endswith("/json"):
+            return {"State": {"Running": True}}
+        if path.endswith("/pause"):
+            self.paused = True
+            return {}
+        if path.endswith("/unpause"):
+            self.unpaused = True
+            return {}
+        if path.endswith("/kill"):
+            self.killed = True
+            return {}
+        raise AssertionError(f"unexpected docker API request during runtime halt test: {method} {path}")
+
+    def _docker_api_logs(self, container_id: str) -> tuple[str, str]:  # type: ignore[override]
+        if not self.paused:
+            raise AssertionError("logs were captured before pause")
+        return "partial-revoked\n", ""
+
+    def _docker_api_resource_sample(  # type: ignore[override]
+        self,
+        *,
+        container_id: str,
+        envelope: LaunchEnvelope,
+        started_at: float,
+        sample_seq: int,
+        previous_sample_at: float | None,
+    ) -> s10_module.ResourceMeterSample:
+        raise AssertionError("runtime halt should be checked before another cgroup sample")
+
+
 class _InjectedMeterGapSupervisor:
     def run(
         self,
@@ -2238,6 +2372,59 @@ class _InjectedMeterGapSupervisor:
             timed_out=True,
             duration_s=0.4,
             budget_usage=usage,
+        )
+
+
+class _RevokingRuntimeHaltSupervisor:
+    def __init__(self, tokens: InMemoryTokenService) -> None:
+        self._tokens = tokens
+
+    def run(
+        self,
+        *,
+        handle: SandboxHandle,
+        request: LaunchRequest,
+        materialized_env: dict[str, str],
+        meter_sample_sink=None,
+        runtime_halt_probe=None,
+    ) -> SandboxExecutionResult:
+        self._tokens.revoke(request.budget_token.budget_id)
+        runtime_halt = runtime_halt_probe() if runtime_halt_probe is not None else None
+        if runtime_halt is None:
+            raise AssertionError("runtime halt probe did not observe the revoked budget token")
+        reason, dimensions = runtime_halt
+        usage = BudgetUsage(wallclock_s=0.2)
+        if meter_sample_sink is not None:
+            meter_sample_sink(
+                s10_module.ResourceMeterSample(
+                    sample_seq=1,
+                    elapsed_s=0.2,
+                    cadence_s=0.0,
+                    usage=usage,
+                    source="runtime-token-verifier",
+                    breached_dimensions=dimensions,
+                    halted=True,
+                )
+            )
+        partial_result = s10_module.SandboxPartialResult(
+            reason=reason,
+            stdout="partial-revoked\n",
+            stderr="",
+            captured_after_freeze=True,
+            freeze_succeeded=True,
+            terminate_succeeded=True,
+            stdout_bytes=len("partial-revoked\n".encode("utf-8")),
+            stderr_bytes=0,
+        )
+        return SandboxExecutionResult(
+            handle=handle,
+            exit_code=None,
+            stdout=partial_result.stdout,
+            stderr=f"argus meter halted container: {reason}",
+            timed_out=True,
+            duration_s=0.2,
+            budget_usage=usage,
+            partial_result=partial_result,
         )
 
 

@@ -1318,6 +1318,11 @@ def _budget_usage_breach_dimensions(caps: BudgetCaps, usage: BudgetUsage) -> tup
     return tuple(breached)
 
 
+def _token_runtime_halt(*, reason: str | None, token_dimension: str) -> tuple[str, tuple[str, ...]]:
+    halt_reason = "token_revoked" if reason == "revoked" else "token_invalid"
+    return halt_reason, (halt_reason, token_dimension)
+
+
 def _merge_breach_dimensions(*groups: Iterable[str]) -> tuple[str, ...]:
     merged: list[str] = []
     for group in groups:
@@ -1959,6 +1964,7 @@ class DockerSandboxSupervisor:
         request: LaunchRequest,
         materialized_env: dict[str, str],
         meter_sample_sink: Callable[[ResourceMeterSample], None] | None = None,
+        runtime_halt_probe: Callable[[], tuple[str, tuple[str, ...]] | None] | None = None,
     ) -> SandboxExecutionResult:
         if not _is_digest_pinned_image(request.image):
             raise PolicyDeniedError("image must be digest-pinned")
@@ -1971,6 +1977,7 @@ class DockerSandboxSupervisor:
                     request=request,
                     materialized_env=materialized_env,
                     meter_sample_sink=meter_sample_sink,
+                    runtime_halt_probe=runtime_halt_probe,
                 )
             except SandboxRuntimeUnavailableError:
                 if shutil.which(self._docker_bin) is None and "/" not in self._docker_bin:
@@ -2064,6 +2071,7 @@ class DockerSandboxSupervisor:
         request: LaunchRequest,
         materialized_env: dict[str, str],
         meter_sample_sink: Callable[[ResourceMeterSample], None] | None = None,
+        runtime_halt_probe: Callable[[], tuple[str, tuple[str, ...]] | None] | None = None,
     ) -> SandboxExecutionResult:
         container_name = f"argus-{handle.sandbox_id.replace('-', '')[:24]}"
         envelope = request.requested_envelope
@@ -2105,6 +2113,7 @@ class DockerSandboxSupervisor:
                 request=request,
                 started_at=started_at,
                 meter_sample_sink=meter_sample_sink,
+                runtime_halt_probe=runtime_halt_probe,
             )
             if partial_result is None:
                 stdout, stderr = self._docker_api_logs(container_id)
@@ -2134,6 +2143,7 @@ class DockerSandboxSupervisor:
         request: LaunchRequest,
         started_at: float,
         meter_sample_sink: Callable[[ResourceMeterSample], None] | None,
+        runtime_halt_probe: Callable[[], tuple[str, tuple[str, ...]] | None] | None = None,
     ) -> tuple[int | None, bool, str, BudgetUsage, SandboxPartialResult | None]:
         envelope = request.requested_envelope
         sample_seq = 0
@@ -2197,6 +2207,31 @@ class DockerSandboxSupervisor:
                         )
                     )
                 return int(container_state.get("ExitCode", 1)), False, "", usage, None
+
+            runtime_halt = runtime_halt_probe() if runtime_halt_probe is not None else None
+            if runtime_halt is not None:
+                reason, dimensions = runtime_halt
+                sample_seq += 1
+                sample = ResourceMeterSample(
+                    sample_seq=sample_seq,
+                    elapsed_s=elapsed_s,
+                    cadence_s=0.0 if last_sample_at is None else max(now - last_sample_at, 0.0),
+                    usage=_runtime_budget_usage(envelope, elapsed_s),
+                    source="runtime-token-verifier",
+                    **self._gpu_telemetry_sample_fields(),
+                    breached_dimensions=dimensions or (reason,),
+                    halted=True,
+                )
+                emit(sample)
+                return self._kill_metered_container(
+                    container_id=container_id,
+                    request=request,
+                    started_at=started_at,
+                    reason=reason,
+                    last_sample=sample,
+                    sample_seq=sample_seq,
+                    meter_sample_sink=meter_sample_sink,
+                )
 
             if now >= next_sample_at:
                 sample_seq += 1
@@ -2644,9 +2679,10 @@ class DockerSandboxOrchestrator(InMemorySandboxOrchestrator):
         reserved_usage = request.requested_envelope.budget_usage()
         meter_samples: list[ResourceMeterSample] = []
         meter_halt_recorded = False
+        token_revocation_halt_recorded = False
 
         def record_meter_sample(sample: ResourceMeterSample) -> None:
-            nonlocal meter_halt_recorded
+            nonlocal meter_halt_recorded, token_revocation_halt_recorded
             meter_samples.append(sample)
             payload = {
                 "sandbox_id": handle.sandbox_id,
@@ -2659,6 +2695,22 @@ class DockerSandboxOrchestrator(InMemorySandboxOrchestrator):
             if sample.halted and not meter_halt_recorded:
                 meter_halt_recorded = True
                 self._audit_ledger.append("meter.halt", payload)
+            if (
+                sample.halted
+                and "token_revoked" in sample.breached_dimensions
+                and not token_revocation_halt_recorded
+            ):
+                token_revocation_halt_recorded = True
+                self._audit_ledger.append(
+                    "token.revocation_halt",
+                    {
+                        "sandbox_id": handle.sandbox_id,
+                        "job_id": request.job_id,
+                        "budget_id": request.budget_token.budget_id,
+                        "scope_id": request.scope_token.scope_id,
+                        "breached_dimensions": list(sample.breached_dimensions),
+                    },
+                )
 
         self._audit_ledger.append(
             "sandbox.started",
@@ -2671,15 +2723,33 @@ class DockerSandboxOrchestrator(InMemorySandboxOrchestrator):
                     request=request,
                     materialized_env=materialized_env,
                     meter_sample_sink=record_meter_sample,
+                    runtime_halt_probe=self._runtime_halt_probe(request),
                 )
             except TypeError as exc:
-                if "meter_sample_sink" not in str(exc):
+                if "runtime_halt_probe" in str(exc):
+                    try:
+                        result = self._supervisor.run(
+                            handle=handle,
+                            request=request,
+                            materialized_env=materialized_env,
+                            meter_sample_sink=record_meter_sample,
+                        )
+                    except TypeError as meter_exc:
+                        if "meter_sample_sink" not in str(meter_exc):
+                            raise
+                        result = self._supervisor.run(
+                            handle=handle,
+                            request=request,
+                            materialized_env=materialized_env,
+                        )
+                elif "meter_sample_sink" in str(exc):
+                    result = self._supervisor.run(
+                        handle=handle,
+                        request=request,
+                        materialized_env=materialized_env,
+                    )
+                else:
                     raise
-                result = self._supervisor.run(
-                    handle=handle,
-                    request=request,
-                    materialized_env=materialized_env,
-                )
         except Exception as exc:
             self._record_runtime_failure(handle, request, reserved_usage, exc)
             raise
@@ -2749,6 +2819,24 @@ class DockerSandboxOrchestrator(InMemorySandboxOrchestrator):
             partial_result_ref=partial_result_ref,
         )
         return replace(result, handle=final_handle)
+
+    def _runtime_halt_probe(self, request: LaunchRequest) -> Callable[[], tuple[str, tuple[str, ...]] | None]:
+        def probe() -> tuple[str, tuple[str, ...]] | None:
+            budget_verification = self._token_service.verify_budget(request.budget_token)
+            if not budget_verification.valid:
+                return _token_runtime_halt(
+                    reason=budget_verification.reason,
+                    token_dimension="budget_token",
+                )
+            scope_verification = self._token_service.verify_scope(request.scope_token)
+            if not scope_verification.valid:
+                return _token_runtime_halt(
+                    reason=scope_verification.reason,
+                    token_dimension="scope_token",
+                )
+            return None
+
+        return probe
 
     @property
     def price_table_version(self) -> str | None:

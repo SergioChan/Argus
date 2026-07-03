@@ -18,6 +18,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import threading
 import time
 from typing import Any
 from urllib import error, parse, request
@@ -150,6 +151,14 @@ def main() -> int:
             s10_url,
             image=args.image,
             token=auth_tokens["spine"],
+        )
+        _battery_revoked_inflight_sandbox_halted(
+            evidence,
+            s10_url,
+            s8_url=s8_url,
+            image=args.image,
+            token=auth_tokens["spine"],
+            read_token=auth_tokens["read"],
         )
         _battery_b_incomplete_lineage(evidence, s10_url, write_scope_json, token=auth_tokens["write"])
         _battery_c_write_once(evidence, s10_url, write_scope_json, token=auth_tokens["write"])
@@ -880,6 +889,124 @@ def _battery_revoked_budget_token_denied(
             "denied_after_s": round(denied_after_s, 6),
             "propagation_slo_s": TOKEN_REVOCATION_PROPAGATION_SLO_S,
             "route": "POST /v1/sandboxes:launch",
+        },
+    )
+
+
+def _battery_revoked_inflight_sandbox_halted(
+    evidence: dict[str, Any],
+    s10_url: str,
+    *,
+    s8_url: str,
+    image: str,
+    token: str,
+    read_token: str,
+) -> None:
+    budget_json = _post_json(
+        f"{s10_url}/v1/budget-tokens",
+        {},
+        expected_status=201,
+        token=token,
+    )
+    scope_json = _post_json(
+        f"{s10_url}/v1/scope-tokens",
+        {},
+        expected_status=201,
+        token=token,
+    )
+    launch = _launch_request_json(
+        job_id="m0-spine-job",
+        image=image,
+        budget=budget_json,
+        scope=scope_json,
+        args=("-c", "while true; do echo in-flight-before-revoke; sleep 0.2; done"),
+        env={},
+        env_allowlist=(),
+        wallclock_s=10,
+    )
+    launch_result: dict[str, Any] = {}
+    launch_error: list[BaseException] = []
+
+    def launch_in_background() -> None:
+        try:
+            launch_result.update(
+                _post_json(
+                    f"{s10_url}/v1/sandboxes:launch",
+                    launch,
+                    expected_status=201,
+                    token=token,
+                    timeout=20,
+                )
+            )
+        except BaseException as exc:  # pragma: no cover - surfaced in caller thread
+            launch_error.append(exc)
+
+    thread = threading.Thread(target=launch_in_background, daemon=True)
+    thread.start()
+    time.sleep(1.0)
+    started = time.monotonic()
+    revoke_response = _post_json(
+        f"{s10_url}/v1/tokens:revoke",
+        {"token_type": "budget", "token": budget_json},
+        expected_status=200,
+        token=token,
+    )
+    thread.join(timeout=TOKEN_REVOCATION_PROPAGATION_SLO_S + 8.0)
+    halted_after_revoke_s = time.monotonic() - started
+    if thread.is_alive():
+        raise AssertionError(
+            "in-flight sandbox did not halt after budget token revocation within the propagation window"
+        )
+    if launch_error:
+        raise AssertionError("in-flight revoked launch request failed unexpectedly") from launch_error[0]
+    if halted_after_revoke_s > TOKEN_REVOCATION_PROPAGATION_SLO_S:
+        raise AssertionError(
+            "in-flight revoked sandbox halt exceeded the propagation SLO: "
+            f"elapsed={halted_after_revoke_s:.6f}s slo={TOKEN_REVOCATION_PROPAGATION_SLO_S:.6f}s"
+        )
+    handle = launch_result.get("handle") or {}
+    events = launch_result.get("audit_events") or []
+    stderr = str(launch_result.get("stderr") or "")
+    if handle.get("state") != "TIMED_OUT" or launch_result.get("timed_out") is not True:
+        raise AssertionError(f"in-flight revoked sandbox did not return TIMED_OUT: {launch_result}")
+    if "token_revoked" not in stderr:
+        raise AssertionError(f"in-flight revoked sandbox stderr did not identify token_revoked: {launch_result}")
+    if "token.revocation_halt" not in events or "meter.halt" not in events:
+        raise AssertionError(f"in-flight revoked sandbox missing revocation halt audit events: {launch_result}")
+    launch_provenance_ref = handle.get("launch_provenance_ref")
+    if not isinstance(launch_provenance_ref, str) or not launch_provenance_ref:
+        raise AssertionError(f"in-flight revoked sandbox missing launch provenance: {launch_result}")
+    spend_final = _battery_spend_final(
+        s8_url=s8_url,
+        read_token=read_token,
+        job_id="m0-spine-job",
+        launch_provenance_ref=launch_provenance_ref,
+        expected_state="TIMED_OUT",
+    )
+    if "token_revoked" not in spend_final["meter_breached_dimensions"]:
+        raise AssertionError(f"spend.final missing token_revoked metering dimension: {spend_final}")
+    if spend_final["meter_halted_by_meter"] is not True:
+        raise AssertionError(f"spend.final did not mark the token revocation halt as metered: {spend_final}")
+    _record(
+        evidence,
+        "inflight-revoked",
+        "deployed S10 halts an in-flight sandbox after budget token revocation and records revocation audit evidence",
+        {
+            "token_type": "budget",
+            "revocation_store": revoke_response["revocation_store"],
+            "revoked_token_id": revoke_response["revoked_token_id"],
+            "halted_after_revoke_s": round(halted_after_revoke_s, 6),
+            "propagation_slo_s": TOKEN_REVOCATION_PROPAGATION_SLO_S,
+            "launch_handle_state": handle["state"],
+            "launch_timed_out": launch_result["timed_out"],
+            "launch_stderr": stderr,
+            "audit_events": events,
+            "launch_provenance_ref": launch_provenance_ref,
+            "spend_final_ref": spend_final["artifact_ref"],
+            "spend_final_state": spend_final["final_state"],
+            "spend_final_meter_halted_by_meter": spend_final["meter_halted_by_meter"],
+            "spend_final_meter_breached_dimensions": spend_final["meter_breached_dimensions"],
+            "spend_final_partial_result_captured": spend_final["partial_result_captured"],
         },
     )
 
@@ -2342,6 +2469,14 @@ def _battery_spend_final(
         (float(sample.get("conservative_gap_s") or 0) for sample in meter_gap_samples),
         default=0.0,
     )
+    meter_breached_dimensions = sorted(
+        {
+            str(dimension)
+            for sample in meter_samples
+            if isinstance(sample, dict)
+            for dimension in (sample.get("breached_dimensions") or [])
+        }
+    )
     if payload.get("schema") != "argus.s10.spend.final.v1":
         raise AssertionError(f"unexpected spend.final schema: {payload}")
     if payload.get("final_state") != expected_state:
@@ -2414,6 +2549,7 @@ def _battery_spend_final(
         "meter_mig_enabled": bool(metering["mig_enabled"]),
         "meter_mig_instance_count": int(metering["mig_instance_count"]),
         "meter_gpu_telemetry_source": str(metering.get("gpu_telemetry_source") or "unavailable"),
+        "meter_breached_dimensions": meter_breached_dimensions,
         "meter_gap_sample_count": len(meter_gap_samples),
         "meter_gap_sources": meter_gap_sources,
         "meter_gap_max_conservative_gap_s": meter_gap_max_conservative_gap_s,
@@ -2732,15 +2868,26 @@ def _post_json(
     expected_status: int,
     token: str | None = None,
     headers: dict[str, str] | None = None,
+    timeout: float = 10,
 ) -> dict[str, Any]:
     encoded = json.dumps(body, sort_keys=True).encode("utf-8")
     request_headers = {"Content-Type": "application/json", **_auth_headers(token), **(headers or {})}
     req = request.Request(url, data=encoded, method="POST", headers=request_headers)
-    return _open_json(req, expected_status=expected_status)
+    return _open_json(req, expected_status=expected_status, timeout=timeout)
 
 
-def _get_json(url: str, *, token: str | None = None, expected_status: int = 200) -> dict[str, Any]:
-    return _open_json(request.Request(url, method="GET", headers=_auth_headers(token)), expected_status=expected_status)
+def _get_json(
+    url: str,
+    *,
+    token: str | None = None,
+    expected_status: int = 200,
+    timeout: float = 10,
+) -> dict[str, Any]:
+    return _open_json(
+        request.Request(url, method="GET", headers=_auth_headers(token)),
+        expected_status=expected_status,
+        timeout=timeout,
+    )
 
 
 def _auth_headers(token: str | None) -> dict[str, str]:
@@ -2768,9 +2915,9 @@ def _artifact_record_from_json(value: dict[str, Any]) -> ArtifactRecord:
     )
 
 
-def _open_json(req: request.Request, *, expected_status: int) -> dict[str, Any]:
+def _open_json(req: request.Request, *, expected_status: int, timeout: float = 10) -> dict[str, Any]:
     try:
-        with request.urlopen(req, timeout=10) as response:
+        with request.urlopen(req, timeout=timeout) as response:
             payload = json.loads(response.read().decode("utf-8"))
             status = response.status
     except error.HTTPError as exc:
