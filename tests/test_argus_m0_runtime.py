@@ -662,10 +662,50 @@ class ArgusM0RuntimeServiceTests(unittest.TestCase):
                     headers=_auth_headers(),
                 )
             )
+            status_zero_status, status_zero_payload = app.http.handle(
+                JsonRequest(
+                    method="GET",
+                    path=f"/v1/reproducibility-status/{chained_payload['artifact_ref']}",
+                    query={},
+                    body=None,
+                    headers=_auth_headers(),
+                )
+            )
+            unauth_status_status, unauth_status_payload = app.http.handle(
+                JsonRequest(
+                    method="GET",
+                    path=f"/v1/reproducibility-status/{chained_payload['artifact_ref']}",
+                    query={},
+                    body=None,
+                )
+            )
+            write_only_status_status, write_only_status_payload = app.http.handle(
+                JsonRequest(
+                    method="GET",
+                    path=f"/v1/reproducibility-status/{chained_payload['artifact_ref']}",
+                    query={},
+                    body=None,
+                    headers=_auth_headers(S8_REPRO_WRITE_TOKEN),
+                )
+            )
+            missing_status_status, missing_status_payload = app.http.handle(
+                JsonRequest(
+                    method="GET",
+                    path="/v1/reproducibility-status/c4://artifact/missing",
+                    query={},
+                    body=None,
+                    headers=_auth_headers(),
+                )
+            )
             check_body = {
                 "artifact_ref": chained_payload["artifact_ref"],
                 "rerun_payload": {"weights": [2]},
                 "tolerance_id": "m0-hash-equal",
+            }
+            fail_check_body = {
+                "artifact_ref": chained_payload["artifact_ref"],
+                "rerun_payload": {"weights": [3]},
+                "tolerance_id": "m0-hash-equal-fail",
             }
             check_status, check_payload = app.http.handle(
                 JsonRequest(
@@ -673,6 +713,15 @@ class ArgusM0RuntimeServiceTests(unittest.TestCase):
                     path="/v1/reproducibility-checks",
                     query={},
                     body=check_body,
+                    headers=_auth_headers(),
+                )
+            )
+            fail_check_status, fail_check_payload = app.http.handle(
+                JsonRequest(
+                    method="POST",
+                    path="/v1/reproducibility-checks",
+                    query={},
+                    body=fail_check_body,
                     headers=_auth_headers(),
                 )
             )
@@ -807,10 +856,28 @@ class ArgusM0RuntimeServiceTests(unittest.TestCase):
             self.assertEqual(unauth_manifest_payload["error"], "Unauthorized")
             self.assertEqual(missing_manifest_status, 404)
             self.assertEqual(missing_manifest_payload["error"], "KeyError")
+            self.assertEqual(status_zero_status, 200)
+            self.assertFalse(status_zero_payload["non_promotable"])
+            self.assertEqual(status_zero_payload["check_count"], 0)
+            self.assertEqual(status_zero_payload["failed_check_count"], 0)
+            self.assertEqual(unauth_status_status, 401)
+            self.assertEqual(unauth_status_payload["error"], "Unauthorized")
+            self.assertEqual(write_only_status_status, 403)
+            self.assertEqual(write_only_status_payload["error"], "CapabilityDenied")
+            self.assertEqual(missing_status_status, 404)
+            self.assertEqual(missing_status_payload["error"], "KeyError")
             self.assertEqual(check_status, 201)
             self.assertEqual(check_payload["artifact_ref"], chained_payload["artifact_ref"])
             self.assertEqual(check_payload["verdict"], "PASS")
             self.assertEqual(check_payload["comparator_id"], "hash_equal")
+            self.assertFalse(check_payload["non_promotable"])
+            self.assertEqual(check_payload["status"]["check_count"], 1)
+            self.assertEqual(check_payload["status"]["failed_check_count"], 0)
+            self.assertEqual(fail_check_status, 201)
+            self.assertEqual(fail_check_payload["verdict"], "FAIL")
+            self.assertTrue(fail_check_payload["non_reproducible"])
+            self.assertTrue(fail_check_payload["non_promotable"])
+            self.assertEqual(fail_check_payload["status"]["failed_check_count"], 1)
             self.assertEqual(unauth_check_status, 401)
             self.assertEqual(unauth_check_payload["error"], "Unauthorized")
             self.assertEqual(read_only_check_status, 403)

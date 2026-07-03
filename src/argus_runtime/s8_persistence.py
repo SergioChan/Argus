@@ -29,6 +29,7 @@ from argus_core import (
     Producer,
     ReproducibilityCheck,
     ReproducibilityManifest,
+    ReproducibilityStatus,
     SCRATCH_BUCKET,
     S8ScopeDeniedError,
     S10VerifierKeyMetadata,
@@ -482,6 +483,27 @@ class PostgresArtifactStore:
         )
         self._commit_reproducibility_check(check)
         return check
+
+    def get_reproducibility_status(self, artifact_ref: str) -> ReproducibilityStatus:
+        import psycopg
+
+        with psycopg.connect(self._dsn) as conn:
+            _set_role(conn, self._db_role)
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT s8.get_reproducibility_status(%s);
+                    """,
+                    (artifact_ref,),
+                )
+                row = cur.fetchone()
+        payload = row[0] if row is not None else None
+        if payload is None:
+            raise KeyError(artifact_ref)
+        return _reproducibility_status_from_payload(payload)
+
+    def is_non_reproducible(self, artifact_ref: str) -> bool:
+        return self.get_reproducibility_status(artifact_ref).non_reproducible
 
     def register_dataset(
         self,
@@ -1211,6 +1233,26 @@ def _audit_verification(
         "reason": reason,
         "checkpoint_sequence": checkpoint_sequence,
     }
+
+
+def _reproducibility_status_from_payload(payload: Any) -> ReproducibilityStatus:
+    if isinstance(payload, str):
+        payload = json.loads(payload)
+    if not isinstance(payload, dict):
+        raise RuntimeError("S8 reproducibility status returned a non-object payload")
+    artifact_ref = payload.get("artifact_ref") or payload.get("artifact_id")
+    if not isinstance(artifact_ref, str) or not artifact_ref:
+        raise RuntimeError("S8 reproducibility status is missing artifact_ref")
+    non_reproducible = bool(payload.get("non_reproducible", False))
+    return ReproducibilityStatus(
+        artifact_ref=artifact_ref,
+        non_reproducible=non_reproducible,
+        non_promotable=bool(payload.get("non_promotable", non_reproducible)),
+        check_count=int(payload.get("check_count", 0)),
+        failed_check_count=int(payload.get("failed_check_count", 0)),
+        latest_check_id=payload.get("latest_check_id") if isinstance(payload.get("latest_check_id"), str) else None,
+        latest_verdict=payload.get("latest_verdict") if isinstance(payload.get("latest_verdict"), str) else None,
+    )
 
 
 def _next_audit_root(previous_root: str, record_hash: str, sequence: int) -> str:

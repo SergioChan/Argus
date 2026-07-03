@@ -137,19 +137,28 @@ class S8WriterApp:
         self._refresh_store()
         return asdict(self.store.get_reproducibility_manifest(ref))
 
+    def get_reproducibility_status(self, ref: str) -> dict[str, Any]:
+        self._refresh_store()
+        return asdict(self.store.get_reproducibility_status(ref))
+
     def record_reproducibility_check(self, body: dict[str, Any]) -> dict[str, Any]:
         self._refresh_store()
-        return asdict(
-            self.store.record_reproducibility_check(
-                _required_str(body, "artifact_ref"),
-                rerun_payload=body.get("rerun_payload"),
-                rerun_content_hash=body.get("rerun_content_hash")
-                if isinstance(body.get("rerun_content_hash"), str)
-                else None,
-                comparator_id=body.get("comparator_id") if isinstance(body.get("comparator_id"), str) else None,
-                tolerance_id=body.get("tolerance_id") if isinstance(body.get("tolerance_id"), str) else None,
-            )
+        artifact_ref = _required_str(body, "artifact_ref")
+        check = self.store.record_reproducibility_check(
+            artifact_ref,
+            rerun_payload=body.get("rerun_payload"),
+            rerun_content_hash=body.get("rerun_content_hash")
+            if isinstance(body.get("rerun_content_hash"), str)
+            else None,
+            comparator_id=body.get("comparator_id") if isinstance(body.get("comparator_id"), str) else None,
+            tolerance_id=body.get("tolerance_id") if isinstance(body.get("tolerance_id"), str) else None,
         )
+        status = self.store.get_reproducibility_status(artifact_ref)
+        payload = asdict(check)
+        payload["non_reproducible"] = status.non_reproducible
+        payload["non_promotable"] = status.non_promotable
+        payload["status"] = asdict(status)
+        return payload
 
     def register_dataset(self, body: dict[str, Any]) -> dict[str, Any]:
         self._refresh_store()
@@ -425,6 +434,17 @@ class S8WriterApp:
             artifact_ref = request.path.removeprefix("/v1/reproducibility-manifest/")
             try:
                 return 200, self.get_reproducibility_manifest(artifact_ref)
+            except Exception as exc:
+                return 404, {"error": type(exc).__name__, "message": str(exc)}
+
+        @self.http.prefix("GET", "/v1/reproducibility-status/")
+        def reproducibility_status(request: JsonRequest) -> tuple[int, Any]:
+            authorized, status, error_response = self._authorize(request, capability=S8_READ_CAPABILITY)
+            if not authorized:
+                return status, error_response
+            artifact_ref = request.path.removeprefix("/v1/reproducibility-status/")
+            try:
+                return 200, self.get_reproducibility_status(artifact_ref)
             except Exception as exc:
                 return 404, {"error": type(exc).__name__, "message": str(exc)}
 

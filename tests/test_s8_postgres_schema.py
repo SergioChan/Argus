@@ -1024,7 +1024,8 @@ class S8PostgresSchemaTests(unittest.TestCase):
             )
 
     def test_postgres_store_reproducibility_manifest_and_checks_use_pg_append_only(self) -> None:
-        store = self._postgres_store()
+        object_store = InMemoryObjectStore()
+        store = self._postgres_store(object_store=object_store)
         payload = {
             "metric": 1.0,
             "nondeterminism_tolerance": {
@@ -1055,9 +1056,20 @@ class S8PostgresSchemaTests(unittest.TestCase):
             rerun_payload={**payload, "metric": 1.08},
             tolerance_id="metric-abs-0.1",
         )
+        failed = store.record_reproducibility_check(
+            record.artifact_ref,
+            rerun_payload={**payload, "metric": 1.25},
+            tolerance_id="metric-abs-0.1",
+        )
+        status = store.get_reproducibility_status(record.artifact_ref)
+        restarted_status = self._postgres_store(object_store=object_store).get_reproducibility_status(
+            record.artifact_ref
+        )
         persisted = self._psql(
             f"""
-            SELECT count(*) || '|' || count(DISTINCT check_id) || '|' || max(verdict) || '|' || max(tolerance_id)
+            SELECT count(*) || '|' || count(DISTINCT check_id) || '|' ||
+                   count(*) FILTER (WHERE verdict = 'FAIL') || '|' ||
+                   bool_or(verdict = 'FAIL') || '|' || max(tolerance_id)
             FROM s8.reproducibility_check
             WHERE artifact_id = {_sql_literal(record.artifact_ref)};
             """
@@ -1070,7 +1082,16 @@ class S8PostgresSchemaTests(unittest.TestCase):
         self.assertEqual(first.comparator_id, "numeric_abs_tolerance")
         self.assertEqual(first.check_id, second.check_id)
         self.assertNotEqual(first.check_id, third.check_id)
-        self.assertEqual(persisted.stdout.strip(), "2|2|PASS|metric-abs-0.1")
+        self.assertEqual(failed.verdict, "FAIL")
+        self.assertTrue(store.is_non_reproducible(record.artifact_ref))
+        self.assertTrue(status.non_reproducible)
+        self.assertTrue(status.non_promotable)
+        self.assertEqual(status.check_count, 3)
+        self.assertEqual(status.failed_check_count, 1)
+        self.assertEqual(status.latest_check_id, failed.check_id)
+        self.assertEqual(status.latest_verdict, "FAIL")
+        self.assertEqual(restarted_status, status)
+        self.assertEqual(persisted.stdout.strip(), "3|3|1|true|metric-abs-0.1")
 
     def test_postgres_store_exports_and_verifies_audit_slice(self) -> None:
         store = self._postgres_store()
@@ -2122,6 +2143,52 @@ class S8PostgresSchemaTests(unittest.TestCase):
             );
             """
         )
+        status_after_pass = self._psql(
+            """
+            SET ROLE argus_s8_reader;
+            WITH status AS (
+                SELECT s8.get_reproducibility_status('c4://artifact/model') AS payload
+            )
+            SELECT (payload->>'non_reproducible') || '|' ||
+                   (payload->>'non_promotable') || '|' ||
+                   (payload->>'check_count') || '|' ||
+                   (payload->>'failed_check_count') || '|' ||
+                   (payload->>'latest_verdict')
+            FROM status;
+            """
+        )
+        fail = self._psql(
+            """
+            SET ROLE argus_s8_ledger_writer;
+            SELECT s8.record_reproducibility_check(
+                's8-check-2',
+                'c4://artifact/model',
+                'blake3:rerun-fail',
+                'FAIL',
+                'numeric_abs_tolerance'
+            );
+            """
+        )
+        status_after_fail = self._psql(
+            """
+            SET ROLE argus_s8_reader;
+            WITH status AS (
+                SELECT s8.get_reproducibility_status('c4://artifact/model') AS payload
+            )
+            SELECT (payload->>'non_reproducible') || '|' ||
+                   (payload->>'non_promotable') || '|' ||
+                   (payload->>'check_count') || '|' ||
+                   (payload->>'failed_check_count') || '|' ||
+                   (payload->>'latest_verdict')
+            FROM status;
+            """
+        )
+        missing_status = self._psql(
+            """
+            SET ROLE argus_s8_reader;
+            SELECT s8.get_reproducibility_status('c4://artifact/missing') IS NULL;
+            """
+        )
         conflict = self._psql(
             """
             SET ROLE argus_s8_ledger_writer;
@@ -2185,6 +2252,10 @@ class S8PostgresSchemaTests(unittest.TestCase):
         self.assertEqual(manifest.stdout.strip(), "blake3:1|model")
         self.assertEqual(first.stdout.strip(), "t")
         self.assertEqual(second.stdout.strip(), "f")
+        self.assertEqual(status_after_pass.stdout.strip(), "false|false|1|0|PASS")
+        self.assertEqual(fail.stdout.strip(), "t")
+        self.assertEqual(status_after_fail.stdout.strip(), "true|true|2|1|FAIL")
+        self.assertEqual(missing_status.stdout.strip(), "t")
         self.assertNotEqual(conflict.returncode, 0)
         self.assertIn("already exists with different payload", conflict.stderr)
         self.assertNotEqual(direct_insert.returncode, 0)
@@ -2192,7 +2263,7 @@ class S8PostgresSchemaTests(unittest.TestCase):
         self.assertEqual(reader_manifest.stdout.strip(), "model")
         self.assertNotEqual(reader_record_denied.returncode, 0)
         self.assertIn("permission denied", reader_record_denied.stderr)
-        self.assertEqual(check_count.stdout.strip(), "1")
+        self.assertEqual(check_count.stdout.strip(), "2")
         self.assertEqual(final_hash.stdout.strip(), original_hash.stdout.strip())
 
     @staticmethod

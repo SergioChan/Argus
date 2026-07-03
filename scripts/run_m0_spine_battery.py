@@ -244,6 +244,10 @@ def main() -> int:
             token=auth_tokens["spine"],
         )
         fetched = _get_json(f"{s8_url}/v1/artifacts/{model_record['artifact_ref']}/record", token=auth_tokens["read"])
+        original_payload = _get_json(
+            f"{s8_url}/v1/artifacts/{model_record['artifact_ref']}/payload",
+            token=auth_tokens["read"],
+        )
         lineage = _get_json(
             f"{s8_url}/v1/lineage/{model_record['artifact_ref']}?direction=ancestors",
             token=auth_tokens["read"],
@@ -269,6 +273,25 @@ def main() -> int:
             },
             expected_status=201,
             token=auth_tokens["write"],
+        )
+        reproducibility_fail = _post_json(
+            f"{s8_url}/v1/reproducibility-checks",
+            {
+                "artifact_ref": model_record["artifact_ref"],
+                "rerun_payload": {"weights": [9, 9, 9], "source": "m0-spine"},
+                "tolerance_id": "m0-spine-hash-equal-fail",
+            },
+            expected_status=201,
+            token=auth_tokens["write"],
+        )
+        reproducibility_status = _get_json(
+            f"{s8_url}/v1/reproducibility-status/{parse.quote(model_record['artifact_ref'], safe='')}",
+            token=auth_tokens["read"],
+        )
+        refetched = _get_json(f"{s8_url}/v1/artifacts/{model_record['artifact_ref']}/record", token=auth_tokens["read"])
+        post_check_payload = _get_json(
+            f"{s8_url}/v1/artifacts/{model_record['artifact_ref']}/payload",
+            token=auth_tokens["read"],
         )
         audit_slice = _get_json(
             f"{s8_url}/v1/audit-slice?artifact_ref={parse.quote(model_record['artifact_ref'], safe='')}",
@@ -323,6 +346,22 @@ def main() -> int:
             raise AssertionError("reproducibility manifest did not preserve seed material")
         if reproducibility_check["verdict"] != "PASS" or reproducibility_check["comparator_id"] != "hash_equal":
             raise AssertionError("deployed reproducibility check did not record hash_equal PASS")
+        if reproducibility_fail["verdict"] != "FAIL" or reproducibility_fail["comparator_id"] != "hash_equal":
+            raise AssertionError("deployed reproducibility check did not record hash_equal FAIL")
+        if not reproducibility_fail.get("non_promotable") or not reproducibility_fail.get("non_reproducible"):
+            raise AssertionError(f"failed deployed reproducibility check was not non-promotable: {reproducibility_fail}")
+        if not reproducibility_status.get("non_promotable") or not reproducibility_status.get("non_reproducible"):
+            raise AssertionError(f"deployed reproducibility status was not non-promotable: {reproducibility_status}")
+        if int(reproducibility_status.get("check_count") or 0) < 2:
+            raise AssertionError(f"deployed reproducibility status did not retain PASS and FAIL checks: {reproducibility_status}")
+        if int(reproducibility_status.get("failed_check_count") or 0) < 1:
+            raise AssertionError(f"deployed reproducibility status did not retain failed check count: {reproducibility_status}")
+        if refetched["content_hash"] != fetched["content_hash"]:
+            raise AssertionError("failed reproducibility check mutated original artifact record content_hash")
+        if refetched["lineage"] != fetched["lineage"]:
+            raise AssertionError("failed reproducibility check mutated original artifact lineage")
+        if post_check_payload != original_payload:
+            raise AssertionError("failed reproducibility check mutated original artifact payload")
         if not audit_slice["verification"]["valid"]:
             raise AssertionError("deployed audit slice did not verify")
         audit_leaf_refs = {leaf["artifact_id"] for leaf in audit_slice["audit_slice"]["leaves"]}
@@ -369,6 +408,16 @@ def main() -> int:
                 "query_refs": sorted(query_refs),
                 "reproducibility_check_id": reproducibility_check["check_id"],
                 "reproducibility_verdict": reproducibility_check["verdict"],
+                "reproducibility_fail_check_id": reproducibility_fail["check_id"],
+                "reproducibility_fail_verdict": reproducibility_fail["verdict"],
+                "reproducibility_non_reproducible": reproducibility_status["non_reproducible"],
+                "reproducibility_non_promotable": reproducibility_status["non_promotable"],
+                "reproducibility_check_count": reproducibility_status["check_count"],
+                "reproducibility_failed_check_count": reproducibility_status["failed_check_count"],
+                "reproducibility_original_content_hash": fetched["content_hash"],
+                "reproducibility_post_check_content_hash": refetched["content_hash"],
+                "reproducibility_original_record_unchanged": refetched == fetched,
+                "reproducibility_original_payload_unchanged": post_check_payload == original_payload,
                 "audit_leaf_refs": sorted(audit_leaf_refs),
                 "audit_multi_page1_refs": audit_page1_refs,
                 "audit_multi_page2_refs": audit_page2_refs,
@@ -1031,6 +1080,11 @@ def _battery_s8_capability_scopes(
         expected_status=403,
         token=write_token,
     )
+    write_repro_status = _get_json(
+        f"{s8_url}/v1/reproducibility-status/{protected_ref}",
+        expected_status=403,
+        token=write_token,
+    )
     unauth_record = _get_json(
         f"{s8_url}/v1/artifacts/{protected_ref}/record",
         expected_status=401,
@@ -1046,7 +1100,7 @@ def _battery_s8_capability_scopes(
         expected_status=403,
         token=read_token,
     )
-    capability_errors = (write_query, write_record, write_payload, read_write)
+    capability_errors = (write_query, write_record, write_payload, write_repro_status, read_write)
     if any(error.get("error") != "CapabilityDenied" for error in capability_errors):
         raise AssertionError(f"S8 capability gates did not fail closed: {capability_errors}")
     if unauth_record.get("error") != "Unauthorized":
@@ -1054,12 +1108,13 @@ def _battery_s8_capability_scopes(
     _record(
         evidence,
         "s8-capability",
-        "S8 HTTP query, record, payload, and reproducibility-write routes enforce capabilities before store access",
+        "S8 HTTP query, record, payload, reproducibility-status, and reproducibility-write routes enforce capabilities before store access",
         {
             "read_query_records": len(read_query["records"]),
             "write_token_query_error": write_query["error"],
             "write_token_record_error": write_record["error"],
             "write_token_payload_error": write_payload["error"],
+            "write_token_repro_status_error": write_repro_status["error"],
             "unauth_record_error": unauth_record["error"],
             "read_token_repro_write_error": read_write["error"],
         },

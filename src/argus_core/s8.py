@@ -251,6 +251,17 @@ class ReproducibilityCheck:
     reason: str | None = None
 
 
+@dataclass(frozen=True)
+class ReproducibilityStatus:
+    artifact_ref: str
+    non_reproducible: bool
+    non_promotable: bool
+    check_count: int
+    failed_check_count: int
+    latest_check_id: str | None = None
+    latest_verdict: str | None = None
+
+
 ReproducibilityComparator = Callable[..., tuple[bool, float | None, str | None]]
 
 
@@ -938,8 +949,24 @@ class InMemoryArtifactStore:
     def reproducibility_checks(self, artifact_ref: str) -> tuple[ReproducibilityCheck, ...]:
         return tuple(check for check in self._reproducibility_checks if check.artifact_ref == artifact_ref)
 
+    def get_reproducibility_status(self, artifact_ref: str) -> ReproducibilityStatus:
+        self.get_record(artifact_ref)
+        checks = self.reproducibility_checks(artifact_ref)
+        failed_check_count = sum(1 for check in checks if check.verdict == "FAIL")
+        non_reproducible = artifact_ref in self._non_reproducible_artifacts or failed_check_count > 0
+        latest = checks[-1] if checks else None
+        return ReproducibilityStatus(
+            artifact_ref=artifact_ref,
+            non_reproducible=non_reproducible,
+            non_promotable=non_reproducible,
+            check_count=len(checks),
+            failed_check_count=failed_check_count,
+            latest_check_id=latest.check_id if latest is not None else None,
+            latest_verdict=latest.verdict if latest is not None else None,
+        )
+
     def is_non_reproducible(self, artifact_ref: str) -> bool:
-        return artifact_ref in self._non_reproducible_artifacts
+        return self.get_reproducibility_status(artifact_ref).non_reproducible
 
     def export_audit_slice(
         self,

@@ -63,6 +63,13 @@ class S8ReproducibilityTests(unittest.TestCase):
         self.assertEqual(self.store.get_artifact(record.artifact_ref), original_bytes)
         self.assertEqual(len(self.store), original_count)
         self.assertFalse(self.store.is_non_reproducible(record.artifact_ref))
+        status = self.store.get_reproducibility_status(record.artifact_ref)
+        self.assertFalse(status.non_reproducible)
+        self.assertFalse(status.non_promotable)
+        self.assertEqual(status.check_count, 1)
+        self.assertEqual(status.failed_check_count, 0)
+        self.assertEqual(status.latest_check_id, check.check_id)
+        self.assertEqual(status.latest_verdict, "PASS")
 
     def test_rederivation_outside_tolerance_records_fail_and_flags_artifact(self) -> None:
         record = self.store.create_artifact(
@@ -82,6 +89,13 @@ class S8ReproducibilityTests(unittest.TestCase):
         self.assertAlmostEqual(check.divergence or 0.0, 0.25)
         self.assertTrue(self.store.is_non_reproducible(record.artifact_ref))
         self.assertEqual(len(self.store.reproducibility_checks(record.artifact_ref)), 1)
+        status = self.store.get_reproducibility_status(record.artifact_ref)
+        self.assertTrue(status.non_reproducible)
+        self.assertTrue(status.non_promotable)
+        self.assertEqual(status.check_count, 1)
+        self.assertEqual(status.failed_check_count, 1)
+        self.assertEqual(status.latest_check_id, check.check_id)
+        self.assertEqual(status.latest_verdict, "FAIL")
 
     def test_check_id_is_content_addressed_not_sequence_addressed(self) -> None:
         record = self.store.create_artifact(
@@ -145,6 +159,11 @@ class S8ReproducibilityTests(unittest.TestCase):
         self.assertEqual(mismatch.verdict, "FAIL")
         self.assertEqual(external.verdict, "PASS")
         self.assertEqual(external.comparator_id, "accept_declared_external")
+        status = self.store.get_reproducibility_status(deterministic.artifact_ref)
+        self.assertTrue(status.non_promotable)
+        self.assertEqual(status.check_count, 3)
+        self.assertEqual(status.failed_check_count, 1)
+        self.assertEqual(status.latest_check_id, external.check_id)
 
     @staticmethod
     def _payload(*, metric: float) -> dict[str, object]:
