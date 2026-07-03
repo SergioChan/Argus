@@ -550,14 +550,23 @@ class PostgresArtifactStore:
                 )
                 return _jsonb_object(cur.fetchone()[0])
 
-    def export_audit_slice(self, artifact_refs: tuple[str, ...]) -> dict[str, Any]:
+    def export_audit_slice(
+        self,
+        artifact_refs: tuple[str, ...],
+        *,
+        page_size: int | None = None,
+        page_token: int | None = None,
+    ) -> dict[str, Any]:
         import psycopg
 
         refs = list(artifact_refs) if artifact_refs else None
         with psycopg.connect(self._dsn) as conn:
             _set_role(conn, self._db_role)
             with conn.cursor() as cur:
-                cur.execute("SELECT s8.export_audit_slice(%s::text[]);", (refs,))
+                cur.execute(
+                    "SELECT s8.export_audit_slice(%s::text[], %s::integer, %s::integer);",
+                    (refs, page_size, page_token),
+                )
                 return _jsonb_object(cur.fetchone()[0])
 
     def verify_audit_slice(self, audit_slice: dict[str, Any]) -> dict[str, Any]:

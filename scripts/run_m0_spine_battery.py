@@ -255,6 +255,34 @@ def main() -> int:
             f"{s8_url}/v1/audit-slice?artifact_ref={parse.quote(model_record['artifact_ref'], safe='')}",
             token=auth_tokens["read"],
         )
+        audit_page1 = _get_json(
+            f"{s8_url}/v1/audit-slice?"
+            + parse.urlencode(
+                [
+                    ("artifact_ref", launch_result["launch_provenance_ref"]),
+                    ("artifact_ref", model_record["artifact_ref"]),
+                    ("page_size", "1"),
+                ]
+            ),
+            token=auth_tokens["read"],
+        )
+        audit_write_denial = _get_json(
+            f"{s8_url}/v1/audit-slice?artifact_ref={parse.quote(model_record['artifact_ref'], safe='')}",
+            expected_status=403,
+            token=auth_tokens["write"],
+        )
+        audit_page2 = _get_json(
+            f"{s8_url}/v1/audit-slice?"
+            + parse.urlencode(
+                [
+                    ("artifact_ref", launch_result["launch_provenance_ref"]),
+                    ("artifact_ref", model_record["artifact_ref"]),
+                    ("page_size", "1"),
+                    ("page_token", str(audit_page1["next_page_token"])),
+                ]
+            ),
+            token=auth_tokens["read"],
+        )
         ancestor_refs = {node["artifact_ref"] for node in lineage["nodes"]}
         impact_refs = {record["artifact_ref"] for record in impact["records"]}
         query_refs = {record["artifact_ref"] for record in query["records"]}
@@ -281,6 +309,20 @@ def main() -> int:
         audit_leaf_refs = {leaf["artifact_id"] for leaf in audit_slice["audit_slice"]["leaves"]}
         if model_record["artifact_ref"] not in audit_leaf_refs:
             raise AssertionError("deployed audit slice did not include broker-written model leaf")
+        audit_page1_refs = [leaf["artifact_id"] for leaf in audit_page1["audit_slice"]["leaves"]]
+        audit_page2_refs = [leaf["artifact_id"] for leaf in audit_page2["audit_slice"]["leaves"]]
+        if audit_page1["next_page_token"] != 1:
+            raise AssertionError(f"deployed audit slice did not return the first pagination token: {audit_page1}")
+        if audit_page2["next_page_token"] is not None:
+            raise AssertionError(f"deployed audit slice final page returned an unexpected token: {audit_page2}")
+        if audit_page1_refs != [launch_result["launch_provenance_ref"]]:
+            raise AssertionError(f"first audit export page did not contain launch provenance: {audit_page1}")
+        if audit_page2_refs != [model_record["artifact_ref"]]:
+            raise AssertionError(f"second audit export page did not contain broker-written model: {audit_page2}")
+        if not audit_page1["verification"]["valid"] or not audit_page2["verification"]["valid"]:
+            raise AssertionError(f"deployed paged audit slices did not verify: {audit_page1} {audit_page2}")
+        if audit_write_denial.get("error") != "CapabilityDenied":
+            raise AssertionError(f"write token was not denied by deployed audit export route: {audit_write_denial}")
         if not audit_slice["audit_slice"]["merkle_checkpoints"][0]["signature"].startswith("hmac-sha256:"):
             raise AssertionError("deployed audit slice did not include signed checkpoint")
         _record(
@@ -303,6 +345,11 @@ def main() -> int:
                 "reproducibility_check_id": reproducibility_check["check_id"],
                 "reproducibility_verdict": reproducibility_check["verdict"],
                 "audit_leaf_refs": sorted(audit_leaf_refs),
+                "audit_multi_page1_refs": audit_page1_refs,
+                "audit_multi_page2_refs": audit_page2_refs,
+                "audit_multi_page1_next_page_token": audit_page1["next_page_token"],
+                "audit_multi_page2_next_page_token": audit_page2["next_page_token"],
+                "audit_write_token_error": audit_write_denial["error"],
                 "audit_checkpoint_sequence": audit_slice["audit_slice"]["merkle_checkpoints"][0]["sequence"],
             },
         )

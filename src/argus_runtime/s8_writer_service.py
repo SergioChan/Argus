@@ -224,13 +224,25 @@ class S8WriterApp:
             )
         )
 
-    def export_audit_slice(self, artifact_refs: tuple[str, ...]) -> dict[str, Any]:
+    def export_audit_slice(
+        self,
+        artifact_refs: tuple[str, ...],
+        *,
+        page_size: int | None = None,
+        page_token: int | None = None,
+    ) -> dict[str, Any]:
         self._refresh_store()
-        audit_slice = self.store.export_audit_slice(artifact_refs)
+        audit_slice = self.store.export_audit_slice(
+            artifact_refs,
+            page_size=page_size,
+            page_token=page_token,
+        )
         verification = self.store.verify_audit_slice(audit_slice)
+        audit_slice_payload = _audit_slice_wire_payload(audit_slice)
         return {
-            "audit_slice": _audit_slice_wire_payload(audit_slice),
+            "audit_slice": audit_slice_payload,
             "verification": _structured_payload(verification),
+            "next_page_token": audit_slice_payload.get("next_page_token"),
         }
 
     def _refresh_store(self) -> None:
@@ -397,7 +409,11 @@ class S8WriterApp:
             if not artifact_refs:
                 return 400, {"error": "artifact_ref_required"}
             try:
-                return 200, self.export_audit_slice(artifact_refs)
+                return 200, self.export_audit_slice(
+                    artifact_refs,
+                    page_size=_query_int(request.query, "page_size"),
+                    page_token=_query_int(request.query, "page_token"),
+                )
             except Exception as exc:
                 return 400, {"error": type(exc).__name__, "message": str(exc)}
 
@@ -681,6 +697,7 @@ def _audit_slice_wire_payload(value: Any) -> dict[str, Any]:
             }
             for proof in payload["inclusion_proofs"]
         ],
+        "next_page_token": payload.get("next_page_token"),
     }
 
 

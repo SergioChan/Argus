@@ -541,6 +541,52 @@ class ArgusM0RuntimeServiceTests(unittest.TestCase):
                     headers=_auth_headers(),
                 )
             )
+            multi_audit_page1_status, multi_audit_page1_payload = app.http.handle(
+                JsonRequest(
+                    method="GET",
+                    path="/v1/audit-slice",
+                    query={
+                        "artifact_ref": [external.artifact_ref, chained_payload["artifact_ref"]],
+                        "page_size": ["1"],
+                    },
+                    body=None,
+                    headers=_auth_headers(),
+                )
+            )
+            multi_audit_page2_status, multi_audit_page2_payload = app.http.handle(
+                JsonRequest(
+                    method="GET",
+                    path="/v1/audit-slice",
+                    query={
+                        "artifact_ref": [external.artifact_ref, chained_payload["artifact_ref"]],
+                        "page_size": ["1"],
+                        "page_token": [str(multi_audit_page1_payload["next_page_token"])],
+                    },
+                    body=None,
+                    headers=_auth_headers(),
+                )
+            )
+            write_only_audit_status, write_only_audit_payload = app.http.handle(
+                JsonRequest(
+                    method="GET",
+                    path="/v1/audit-slice",
+                    query={"artifact_ref": [chained_payload["artifact_ref"]]},
+                    body=None,
+                    headers=_auth_headers(S8_REPRO_WRITE_TOKEN),
+                )
+            )
+            bad_audit_page_status, bad_audit_page_payload = app.http.handle(
+                JsonRequest(
+                    method="GET",
+                    path="/v1/audit-slice",
+                    query={
+                        "artifact_ref": [chained_payload["artifact_ref"]],
+                        "page_size": ["0"],
+                    },
+                    body=None,
+                    headers=_auth_headers(),
+                )
+            )
             unauth_audit_status, unauth_audit_payload = app.http.handle(
                 JsonRequest(
                     method="GET",
@@ -615,6 +661,24 @@ class ArgusM0RuntimeServiceTests(unittest.TestCase):
                 audit_payload["audit_slice"]["inclusion_proofs"][0]["artifact_id"],
                 chained_payload["artifact_ref"],
             )
+            self.assertEqual(multi_audit_page1_status, 200)
+            self.assertTrue(multi_audit_page1_payload["verification"]["valid"])
+            self.assertEqual(multi_audit_page1_payload["next_page_token"], 1)
+            self.assertEqual(
+                [leaf["artifact_id"] for leaf in multi_audit_page1_payload["audit_slice"]["leaves"]],
+                [external.artifact_ref],
+            )
+            self.assertEqual(multi_audit_page2_status, 200)
+            self.assertTrue(multi_audit_page2_payload["verification"]["valid"])
+            self.assertIsNone(multi_audit_page2_payload["next_page_token"])
+            self.assertEqual(
+                [leaf["artifact_id"] for leaf in multi_audit_page2_payload["audit_slice"]["leaves"]],
+                [chained_payload["artifact_ref"]],
+            )
+            self.assertEqual(write_only_audit_status, 403)
+            self.assertEqual(write_only_audit_payload["error"], "CapabilityDenied")
+            self.assertEqual(bad_audit_page_status, 400)
+            self.assertEqual(bad_audit_page_payload["error"], "ValueError")
             self.assertEqual(unauth_audit_status, 401)
             self.assertEqual(unauth_audit_payload["error"], "Unauthorized")
             self.assertEqual(missing_audit_ref_status, 400)

@@ -463,6 +463,15 @@ class InMemoryArtifactStoreTests(unittest.TestCase):
         )
 
         audit_slice = self.store.export_audit_slice((dataset.artifact_ref,))
+        first_page = self.store.export_audit_slice(
+            (source.artifact_ref, dataset.artifact_ref, model.artifact_ref),
+            page_size=2,
+        )
+        second_page = self.store.export_audit_slice(
+            (source.artifact_ref, dataset.artifact_ref, model.artifact_ref),
+            page_size=2,
+            page_token=first_page.next_page_token,
+        )
 
         self.assertEqual(audit_slice.checkpoint.sequence, 3)
         self.assertEqual(tuple(leaf.artifact_ref for leaf in audit_slice.leaves), (dataset.artifact_ref,))
@@ -470,7 +479,15 @@ class InMemoryArtifactStoreTests(unittest.TestCase):
         self.assertEqual(audit_slice.inclusion_proofs[0].sequence, 2)
         self.assertEqual(tuple(step.artifact_ref for step in audit_slice.inclusion_proofs[0].steps), (model.artifact_ref,))
         self.assertTrue(self.store.verify_audit_slice(audit_slice).valid)
+        self.assertEqual(tuple(leaf.artifact_ref for leaf in first_page.leaves), (source.artifact_ref, dataset.artifact_ref))
+        self.assertEqual(first_page.next_page_token, 2)
+        self.assertEqual(tuple(leaf.artifact_ref for leaf in second_page.leaves), (model.artifact_ref,))
+        self.assertIsNone(second_page.next_page_token)
+        self.assertTrue(self.store.verify_audit_slice(first_page).valid)
+        self.assertTrue(self.store.verify_audit_slice(second_page).valid)
         self.assertTrue(self.store.verify_audit_chain().valid)
+        with self.assertRaisesRegex(KeyError, "audit export missing ledger leaves"):
+            self.store.export_audit_slice(("c4://artifact/missing",))
 
         tampered_step = replace(audit_slice.inclusion_proofs[0].steps[0], record_hash="blake3:" + ("f" * 64))
         tampered_proof = replace(audit_slice.inclusion_proofs[0], steps=(tampered_step,))

@@ -218,6 +218,7 @@ class AuditSlice:
     leaves: tuple[AuditLeaf, ...]
     checkpoint: AuditCheckpoint
     inclusion_proofs: tuple[AuditInclusionProof, ...] = ()
+    next_page_token: int | None = None
 
 
 @dataclass(frozen=True)
@@ -940,13 +941,36 @@ class InMemoryArtifactStore:
     def is_non_reproducible(self, artifact_ref: str) -> bool:
         return artifact_ref in self._non_reproducible_artifacts
 
-    def export_audit_slice(self, artifact_refs: tuple[str, ...]) -> AuditSlice:
+    def export_audit_slice(
+        self,
+        artifact_refs: tuple[str, ...],
+        *,
+        page_size: int | None = None,
+        page_token: int | None = None,
+    ) -> AuditSlice:
         wanted = set(artifact_refs)
-        leaves = tuple(leaf for leaf in self._audit_leaves if leaf.artifact_ref in wanted)
+        existing_refs = {leaf.artifact_ref for leaf in self._audit_leaves}
+        missing_refs = sorted(wanted - existing_refs)
+        if missing_refs:
+            raise KeyError(f"audit export missing ledger leaves for {missing_refs}")
+        offset = page_token or 0
+        if offset < 0:
+            raise ValueError("page_token must be non-negative")
+        if page_size is not None and page_size <= 0:
+            raise ValueError("page_size must be positive")
+        matched_leaves = tuple(leaf for leaf in self._audit_leaves if leaf.artifact_ref in wanted)
+        if page_size is None:
+            leaves = matched_leaves[offset:]
+            next_page_token = None
+        else:
+            leaves = matched_leaves[offset : offset + page_size]
+            next_offset = offset + page_size
+            next_page_token = next_offset if next_offset < len(matched_leaves) else None
         return AuditSlice(
             leaves=leaves,
             checkpoint=self._latest_checkpoint(),
             inclusion_proofs=tuple(self._audit_inclusion_proof(leaf) for leaf in leaves),
+            next_page_token=next_page_token,
         )
 
     def verify_audit_slice(self, audit_slice: AuditSlice) -> AuditVerification:

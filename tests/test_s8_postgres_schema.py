@@ -1093,14 +1093,30 @@ class S8PostgresSchemaTests(unittest.TestCase):
         )
 
         audit_slice = store.export_audit_slice((model.artifact_ref,))
+        first_page = store.export_audit_slice((dataset.artifact_ref, model.artifact_ref), page_size=1)
+        second_page = store.export_audit_slice(
+            (dataset.artifact_ref, model.artifact_ref),
+            page_size=1,
+            page_token=first_page["next_page_token"],
+        )
         slice_verification = store.verify_audit_slice(audit_slice)
+        first_page_verification = store.verify_audit_slice(first_page)
+        second_page_verification = store.verify_audit_slice(second_page)
         chain_verification = store.verify_audit_chain()
 
         self.assertEqual(audit_slice["leaves"][0]["artifact_id"], model.artifact_ref)
+        self.assertEqual(first_page["leaves"][0]["artifact_id"], dataset.artifact_ref)
+        self.assertEqual(first_page["next_page_token"], 1)
+        self.assertEqual(second_page["leaves"][0]["artifact_id"], model.artifact_ref)
+        self.assertIsNone(second_page["next_page_token"])
         self.assertEqual(audit_slice["merkle_checkpoints"][0]["sequence"], 2)
         self.assertEqual(audit_slice["inclusion_proofs"][0]["artifact_id"], model.artifact_ref)
         self.assertTrue(slice_verification["valid"])
+        self.assertTrue(first_page_verification["valid"])
+        self.assertTrue(second_page_verification["valid"])
         self.assertTrue(chain_verification["valid"])
+        with self.assertRaisesRegex(Exception, "audit export missing ledger leaves"):
+            store.export_audit_slice(("c4://artifact/missing",))
 
         tampered_root = "blake3:" + ("f" * 64)
         self._psql(
@@ -1959,7 +1975,17 @@ class S8PostgresSchemaTests(unittest.TestCase):
             SELECT s8.export_audit_slice(ARRAY['c4://artifact/dataset']::text[]);
             """
         )
+        paged_export_result = self._psql(
+            """
+            SELECT s8.export_audit_slice(
+                ARRAY['c4://artifact/source', 'c4://artifact/dataset', 'c4://artifact/model']::text[],
+                2,
+                0
+            );
+            """
+        )
         audit_slice = json.loads(export_result.stdout)
+        paged_audit_slice = json.loads(paged_export_result.stdout)
         proof = audit_slice["inclusion_proofs"][0]
         removed_verifiers = self._psql(
             """
@@ -1988,6 +2014,11 @@ class S8PostgresSchemaTests(unittest.TestCase):
         )
 
         self.assertEqual(audit_slice["records"][0]["artifact_id"], "c4://artifact/dataset")
+        self.assertEqual(
+            [record["artifact_id"] for record in paged_audit_slice["records"]],
+            ["c4://artifact/source", "c4://artifact/dataset"],
+        )
+        self.assertEqual(paged_audit_slice["next_page_token"], 2)
         self.assertEqual(audit_slice["leaves"][0]["sequence"], 2)
         self.assertEqual(audit_slice["merkle_checkpoints"][0]["sequence"], 3)
         self.assertEqual(proof["sequence"], 2)
