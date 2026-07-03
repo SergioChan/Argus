@@ -61,7 +61,20 @@ C3_ARGUSVERIFY_VECTOR_REPORT = {
     "aggregate": {"passed": True, "score": 1.0},
     "claim_tier": "recapitulated-known",
     "claim_tier_is_candidate": False,
-    "perturbation_pairs": [],
+    "perturbation_pairs": [
+        {
+            "perturbation_id": "must-react-1",
+            "kind": "must_react",
+            "verdict": "pass",
+            "amplitude_linearity": {"slope": 1.0, "intercept": 0.0},
+        },
+        {
+            "perturbation_id": "must-not-react-1",
+            "kind": "must_not_react",
+            "verdict": "pass",
+            "observed_degradation": {"signal": 0.0},
+        },
+    ],
     "insensitivity_flags": [],
     "challenger_panel": {"challenger_ids": ["challenger-a", "challenger-b"], "min_required": 2},
     "independence_attestation_debate": {

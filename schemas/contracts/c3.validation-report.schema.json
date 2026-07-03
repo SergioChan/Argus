@@ -6,7 +6,7 @@
   "x-argus-contract": {
     "id": "C3",
     "owner": "S3",
-    "version": "1.1.0"
+    "version": "2.0.0"
   },
   "oneOf": [
     { "$ref": "#/$defs/VerificationRequest" },
@@ -145,7 +145,18 @@
     },
     "ValidationReport": {
       "type": "object",
-      "required": ["report_id", "profile_ref", "frozen_pipeline_ref", "checks", "aggregate", "claim_tier", "signature"],
+      "required": [
+        "report_id",
+        "profile_ref",
+        "frozen_pipeline_ref",
+        "checks",
+        "aggregate",
+        "claim_tier",
+        "signature",
+        "perturbation_pairs",
+        "insensitivity_flags",
+        "referee"
+      ],
       "additionalProperties": false,
       "properties": {
         "report_id": { "$ref": "#/$defs/Uuid" },
@@ -177,6 +188,7 @@
         "perturbation_pairs": {
           "type": "array",
           "default": [],
+          "minItems": 2,
           "items": { "$ref": "#/$defs/PerturbationResult" }
         },
         "insensitivity_flags": {

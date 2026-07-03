@@ -27,7 +27,7 @@ EXPECTED_CONTRACT_CONSUMERS = {
 EXPECTED_CONTRACT_VERSIONS = {
     "C1": "1.0.0",
     "C2": "1.0.0",
-    "C3": "1.1.0",
+    "C3": "2.0.0",
     "C4": "1.0.0",
     "C5": "1.0.0",
     "C6": "1.0.0",
@@ -41,6 +41,12 @@ C3_V11_FIELDS = {
     "independence_attestation_debate",
     "referee",
     "debate_ref",
+}
+
+C3_V2_REQUIRED_FIELDS = {
+    "perturbation_pairs",
+    "insensitivity_flags",
+    "referee",
 }
 
 C1_REQUIRED_DEFS = {
@@ -167,6 +173,10 @@ def validate_contract_schema(entry: dict) -> None:
         missing = sorted(C3_V11_FIELDS - properties)
         if missing:
             fail(f"C3 ValidationReport missing v1.1 fields: {missing}")
+        required = set(report.get("required", []))
+        missing_required = sorted(C3_V2_REQUIRED_FIELDS - required)
+        if missing_required:
+            fail(f"C3 ValidationReport missing v2 required fields: {missing_required}")
         missing_defaults = sorted(
             field
             for field in C3_V11_FIELDS

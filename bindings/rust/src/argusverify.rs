@@ -362,7 +362,25 @@ mod tests {
             },
             "claim_tier": "recapitulated-known",
             "claim_tier_is_candidate": false,
-            "perturbation_pairs": [],
+            "perturbation_pairs": [
+                        {
+                                    "perturbation_id": "must-react-1",
+                                    "kind": "must_react",
+                                    "verdict": "pass",
+                                    "amplitude_linearity": {
+                                                "slope": 1.0,
+                                                "intercept": 0.0
+                                    }
+                        },
+                        {
+                                    "perturbation_id": "must-not-react-1",
+                                    "kind": "must_not_react",
+                                    "verdict": "pass",
+                                    "observed_degradation": {
+                                                "signal": 0.0
+                                    }
+                        }
+            ],
             "insensitivity_flags": [],
             "challenger_panel": {
                         "challenger_ids": [
@@ -397,7 +415,7 @@ mod tests {
             "s3-secret".as_bytes(),
         )
         .expect("sign vector");
-        assert_eq!(signed["signature"]["value"], "hmac-sha256:49bb4f2abf5cf349d510031b6838e527f663c7b7c844cccf2487609c1da9cc54");
+        assert_eq!(signed["signature"]["value"], "hmac-sha256:197f5355e398e83ce6c2927c9b1c3579396676349f930714d1bce228f3f6eb83");
 
         let valid = verify_report(&signed, &trust_store);
         assert!(valid.valid);

@@ -29,6 +29,11 @@ C3_V11_FIELDS = {
     "referee",
     "debate_ref",
 }
+C3_V2_REQUIRED_FIELDS = {
+    "perturbation_pairs",
+    "insensitivity_flags",
+    "referee",
+}
 
 
 class C3ContractSchemaTests(unittest.TestCase):
@@ -39,30 +44,36 @@ class C3ContractSchemaTests(unittest.TestCase):
         Draft202012Validator.check_schema(cls.schema)
         cls.validator = Draft202012Validator(cls.schema)
 
-    def test_schema_is_canonical_c3_v1_1(self) -> None:
+    def test_schema_is_canonical_c3_v2(self) -> None:
         metadata = self.schema["x-argus-contract"]
         report = self.schema["$defs"]["ValidationReport"]
 
-        self.assertEqual(metadata, {"id": "C3", "owner": "S3", "version": "1.1.0"})
+        self.assertEqual(metadata, {"id": "C3", "owner": "S3", "version": "2.0.0"})
         self.assertTrue(C3_V11_FIELDS <= set(report["properties"]))
-        self.assertFalse(C3_V11_FIELDS & set(report["required"]))
+        self.assertTrue(C3_V2_REQUIRED_FIELDS <= set(report["required"]))
+        self.assertEqual(report["properties"]["perturbation_pairs"]["minItems"], 2)
         for field in C3_V11_FIELDS:
             self.assertIn("default", report["properties"][field])
 
     def test_example_validation_report_validates(self) -> None:
         self._assert_valid(self.example)
 
-    def test_v1_0_shape_report_still_validates_under_v1_1_schema(self) -> None:
+    def test_v1_0_shape_report_is_rejected_by_v2_schema(self) -> None:
         payload = dict(self.example)
         for field in C3_V11_FIELDS:
             payload.pop(field)
 
-        self._assert_valid(payload)
+        errors = sorted(self.validator.iter_errors(payload), key=lambda error: list(error.path))
+        messages = [message for error in errors for message in self._error_messages(error)]
+
+        self.assertIn("'perturbation_pairs' is a required property", messages)
+        self.assertIn("'insensitivity_flags' is a required property", messages)
+        self.assertIn("'referee' is a required property", messages)
 
     def test_generated_python_binding_points_to_exact_c3_schema_digest(self) -> None:
         contract = CONTRACT_BY_ID["C3"]
 
-        self.assertEqual(contract.version, "1.1.0")
+        self.assertEqual(contract.version, "2.0.0")
         self.assertEqual(contract.schema, "c3.validation-report.schema.json")
         self.assertEqual(contract.schema_sha256, self._schema_sha256(self.schema))
 
@@ -82,6 +93,13 @@ class C3ContractSchemaTests(unittest.TestCase):
     def _assert_valid(self, payload: dict) -> None:
         errors = sorted(self.validator.iter_errors(payload), key=lambda error: list(error.path))
         self.assertEqual(errors, [], msg=[error.message for error in errors])
+
+    @staticmethod
+    def _error_messages(error: object) -> list[str]:
+        messages = [error.message]
+        for child in getattr(error, "context", ()):
+            messages.extend(C3ContractSchemaTests._error_messages(child))
+        return messages
 
     @staticmethod
     def _schema_sha256(schema: dict) -> str:

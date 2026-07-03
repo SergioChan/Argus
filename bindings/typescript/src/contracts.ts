@@ -73,7 +73,7 @@ export const contracts = [
     "id": "C3",
     "name": "Verifier Interface and Validation Report",
     "owner": "S3",
-    "version": "1.1.0",
+    "version": "2.0.0",
     "schema": "c3.validation-report.schema.json",
     "consumers": [
       "S1",
@@ -86,7 +86,7 @@ export const contracts = [
       "S11",
       "S12"
     ],
-    "schema_sha256": "sha256:e0c8cd14a6bf287c75c5fb5999b425b76e020569ef47da4a0991043737bfd123"
+    "schema_sha256": "sha256:ffcf9e88f2d4f2d481cca9cd4e4abca740e6ee519c0b7f5aec1abccc70a88769"
   },
   {
     "id": "C4",

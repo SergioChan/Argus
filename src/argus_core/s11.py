@@ -5,10 +5,13 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass, replace
 from decimal import Decimal
+from functools import lru_cache
 from html import escape
 import json
+from pathlib import Path
 from typing import Any
 
+from jsonschema import Draft202012Validator
 from argusverify import C3ReportVerifier
 from .hashing import hash_json
 from .s8 import ArtifactRecord, InMemoryArtifactStore, Lineage, LineageEdge, LineageGraph, Producer
@@ -223,6 +226,7 @@ def verify_observatory_v0(
     report_verifier: C3ReportVerifier,
 ) -> ObservatoryVerification:
     failures: list[str] = []
+    failures.extend(_c3_validation_report_schema_failures(report_payload))
     signature = report_verifier.verify(report_payload)
     if not signature.valid:
         failures.append(f"signature verification failed: {signature.reason or signature.error_code or 'unknown'}")
@@ -259,6 +263,40 @@ def verify_observatory_v0(
     for check_name in OBSERVATORY_SIX_CHECKS:
         if check_name not in checks:
             failures.append(f"missing six-check verdict: {check_name}")
+            continue
+        status = _string_field(checks[check_name], "status")
+        if status != "PASS":
+            failures.append(f"six-check verdict is not PASS: {check_name}={status or '<missing>'}")
+
+    perturbation_pairs = _sequence_field(report_payload, "perturbation_pairs")
+    if not perturbation_pairs:
+        failures.append("validation report perturbation_pairs is empty or missing")
+    else:
+        seen_perturbation_kinds: set[str] = set()
+        for index, pair in enumerate(perturbation_pairs):
+            if not isinstance(pair, Mapping):
+                failures.append(f"perturbation pair {index} is not an object")
+                continue
+            kind = _string_field(pair, "kind")
+            verdict = _string_field(pair, "verdict")
+            if kind:
+                seen_perturbation_kinds.add(kind)
+            if verdict != "pass":
+                identifier = _string_field(pair, "perturbation_id") or str(index)
+                failures.append(f"perturbation pair verdict is not pass: {identifier}={verdict or '<missing>'}")
+        for required_kind in ("must_react", "must_not_react"):
+            if required_kind not in seen_perturbation_kinds:
+                failures.append(f"missing perturbation kind: {required_kind}")
+
+    insensitivity_flags = _sequence_field(report_payload, "insensitivity_flags")
+    if insensitivity_flags:
+        failures.append("validation report has insensitivity flags")
+
+    referee = report_payload.get("referee")
+    if not isinstance(referee, Mapping):
+        failures.append("validation report referee block is missing")
+    elif referee.get("distinct_from_proponent") is not True:
+        failures.append("validation report referee.distinct_from_proponent is not true")
 
     profile_ref = _string_field(report_payload, "profile_ref")
     pipeline_ref = _string_field(report_payload, "frozen_pipeline_ref")
@@ -298,6 +336,36 @@ def verify_observatory_v0(
         subject_ref=lineage.subject_ref,
         report_ref=lineage.report_ref,
     )
+
+
+def _c3_validation_report_schema_failures(report_payload: Mapping[str, Any]) -> tuple[str, ...]:
+    validator = _c3_validation_report_validator()
+    errors = sorted(validator.iter_errors(report_payload), key=lambda error: list(error.path))
+    return tuple(
+        f"validation report schema violation at {_json_path(error.path)}: {error.message}" for error in errors
+    )
+
+
+@lru_cache(maxsize=1)
+def _c3_validation_report_validator() -> Draft202012Validator:
+    schema_path = Path(__file__).resolve().parents[2] / "schemas" / "contracts" / "c3.validation-report.schema.json"
+    with schema_path.open(encoding="utf-8") as handle:
+        c3_schema = json.load(handle)
+    report_schema = dict(c3_schema["$defs"]["ValidationReport"])
+    report_schema["$schema"] = c3_schema["$schema"]
+    report_schema["$id"] = c3_schema["$id"] + "#/$defs/ValidationReport"
+    report_schema["$defs"] = c3_schema["$defs"]
+    return Draft202012Validator(report_schema)
+
+
+def _json_path(path: Any) -> str:
+    parts = ["$"]
+    for part in path:
+        if isinstance(part, int):
+            parts.append(f"[{part}]")
+        else:
+            parts.append(f".{part}")
+    return "".join(parts)
 
 
 def observatory_lineage_bundle_from_json(payload: Mapping[str, Any]) -> ObservatoryLineageBundle:

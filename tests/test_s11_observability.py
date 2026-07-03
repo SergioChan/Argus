@@ -8,6 +8,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+from typing import Callable
 import unittest
 
 from argus_core import (
@@ -120,6 +121,113 @@ class S11ObservatoryV0Tests(unittest.TestCase):
         self.assertIn("subject validation_report_ref mismatch", result.html)
         self.assertIn('data-verdict="FAIL"', result.html)
 
+    def test_referee_must_be_present_and_distinct_for_verified_banner(self) -> None:
+        missing = _observatory_fixture(report_mutator=lambda report: report.pop("referee"))
+        non_distinct = _observatory_fixture(
+            report_mutator=lambda report: report["referee"].update({"distinct_from_proponent": False})
+        )
+
+        missing_result = render_observatory_v0_html(
+            report_payload=missing["report"],
+            lineage=missing["lineage"],
+            report_verifier=missing["verifier"],
+        )
+        non_distinct_result = render_observatory_v0_html(
+            report_payload=non_distinct["report"],
+            lineage=non_distinct["lineage"],
+            report_verifier=non_distinct["verifier"],
+        )
+
+        self.assertFalse(missing_result.verification.trusted)
+        self.assertIn(
+            "validation report schema violation at $: 'referee' is a required property",
+            missing_result.verification.failures,
+        )
+        self.assertIn("validation report referee block is missing", missing_result.verification.failures)
+        self.assertIn('data-verdict="FAIL"', missing_result.html)
+        self.assertFalse(non_distinct_result.verification.trusted)
+        self.assertIn(
+            "validation report schema violation at $.referee.distinct_from_proponent: True was expected",
+            non_distinct_result.verification.failures,
+        )
+        self.assertIn(
+            "validation report referee.distinct_from_proponent is not true",
+            non_distinct_result.verification.failures,
+        )
+        self.assertIn('data-verdict="FAIL"', non_distinct_result.html)
+
+    def test_every_displayed_check_must_pass_for_verified_banner(self) -> None:
+        fixture = _observatory_fixture(report_mutator=lambda report: report["checks"][0].update({"status": "FAIL"}))
+
+        result = render_observatory_v0_html(
+            report_payload=fixture["report"],
+            lineage=fixture["lineage"],
+            report_verifier=fixture["verifier"],
+        )
+
+        self.assertFalse(result.verification.trusted)
+        self.assertIn("six-check verdict is not PASS: INJECTION=FAIL", result.html)
+        self.assertIn('data-verdict="FAIL"', result.html)
+
+    def test_perturbation_pairs_must_be_present_bidirectional_and_pass(self) -> None:
+        missing = _observatory_fixture(report_mutator=lambda report: report.pop("perturbation_pairs"))
+        failing = _observatory_fixture(
+            report_mutator=lambda report: report["perturbation_pairs"][1].update({"verdict": "fail"})
+        )
+        one_sided = _observatory_fixture(
+            report_mutator=lambda report: report.update({"perturbation_pairs": report["perturbation_pairs"][:1]})
+        )
+
+        missing_result = render_observatory_v0_html(
+            report_payload=missing["report"],
+            lineage=missing["lineage"],
+            report_verifier=missing["verifier"],
+        )
+        failing_result = render_observatory_v0_html(
+            report_payload=failing["report"],
+            lineage=failing["lineage"],
+            report_verifier=failing["verifier"],
+        )
+        one_sided_result = render_observatory_v0_html(
+            report_payload=one_sided["report"],
+            lineage=one_sided["lineage"],
+            report_verifier=one_sided["verifier"],
+        )
+
+        self.assertFalse(missing_result.verification.trusted)
+        self.assertIn(
+            "validation report schema violation at $: 'perturbation_pairs' is a required property",
+            missing_result.verification.failures,
+        )
+        self.assertIn(
+            "validation report perturbation_pairs is empty or missing",
+            missing_result.verification.failures,
+        )
+        self.assertFalse(failing_result.verification.trusted)
+        self.assertIn(
+            "perturbation pair verdict is not pass: must-not-react-1=fail",
+            failing_result.verification.failures,
+        )
+        self.assertFalse(one_sided_result.verification.trusted)
+        self.assertIn("missing perturbation kind: must_not_react", one_sided_result.verification.failures)
+
+    def test_insensitivity_flags_block_verified_banner(self) -> None:
+        fixture = _observatory_fixture(
+            report_mutator=lambda report: report["insensitivity_flags"].append(
+                {"perturbation_id": "must-react-1", "reason": "invariant under planted signal", "severity": "fail"}
+            )
+        )
+
+        result = render_observatory_v0_html(
+            report_payload=fixture["report"],
+            lineage=fixture["lineage"],
+            report_verifier=fixture["verifier"],
+        )
+
+        self.assertFalse(result.verification.trusted)
+        self.assertIn("validation report has insensitivity flags", result.html)
+        self.assertIn('data-verdict="FAIL"', result.html)
+
     def test_cli_writes_html_and_returns_nonzero_for_tamper(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
@@ -176,6 +284,43 @@ class S11ObservatoryV0Tests(unittest.TestCase):
             self.assertNotEqual(fail.returncode, 0)
             self.assertIn("FAIL", fail.stderr)
             self.assertIn('data-verdict="FAIL"', fail_out_path.read_text(encoding="utf-8"))
+
+    def test_cli_returns_nonzero_for_signed_semantic_failures(self) -> None:
+        fixture = _observatory_fixture(
+            report_mutator=lambda report: report["referee"].update({"distinct_from_proponent": False})
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            report_path = tmp_path / "report.json"
+            lineage_path = tmp_path / "lineage.json"
+            trust_path = tmp_path / "trust.json"
+            out_path = tmp_path / "observatory.html"
+            report_path.write_text(json.dumps(fixture["report"]), encoding="utf-8")
+            lineage_path.write_text(json.dumps(_lineage_bundle_payload(fixture["lineage"])), encoding="utf-8")
+            trust_path.write_text(json.dumps({"keys": [{"key_id": "s3-key", "secret": "s3-secret"}]}), encoding="utf-8")
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(ROOT / "scripts" / "render_observatory_v0.py"),
+                    "--report",
+                    str(report_path),
+                    "--lineage",
+                    str(lineage_path),
+                    "--trust-store",
+                    str(trust_path),
+                    "--out",
+                    str(out_path),
+                ],
+                check=False,
+                text=True,
+                capture_output=True,
+            )
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("FAIL", result.stderr)
+            self.assertIn("referee.distinct_from_proponent", out_path.read_text(encoding="utf-8"))
+            self.assertIn('data-verdict="FAIL"', out_path.read_text(encoding="utf-8"))
 
 
 class S11TelemetryAndKpiTests(unittest.TestCase):
@@ -542,7 +687,7 @@ class S11EvalHarnessTests(unittest.TestCase):
         self.assertEqual(digest.quarantined_jobs, ("job-a", "job-b"))
 
 
-def _observatory_fixture() -> dict[str, object]:
+def _observatory_fixture(*, report_mutator: Callable[[dict[str, object]], None] | None = None) -> dict[str, object]:
     trust_store = InMemoryVerifierTrustStore()
     trust_store.register_key("s3-key", b"s3-secret")
     verifier = C3ReportVerifier(trust_store)
@@ -562,7 +707,10 @@ def _observatory_fixture() -> dict[str, object]:
         producer=Producer(subsystem="S2", version="0.0.0"),
         lineage=Lineage(input_refs=(), code_ref="git:s2-pipeline", environment_digest="oci:s2-pipeline"),
     )
-    report = signer.sign(_observatory_report(profile_ref=profile.artifact_ref, pipeline_ref=pipeline.artifact_ref))
+    report_payload = _observatory_report(profile_ref=profile.artifact_ref, pipeline_ref=pipeline.artifact_ref)
+    if report_mutator is not None:
+        report_mutator(report_payload)
+    report = signer.sign(report_payload)
     report_record = store.create_artifact(
         kind="report",
         payload=report,
