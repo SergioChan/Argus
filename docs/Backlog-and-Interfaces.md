@@ -365,7 +365,7 @@ Grouped by subsystem for readability; the id namespace is globally unique. Every
 | S10-T03 | Policy Service + pure decide() function | L | S10-T01 | Policy Service API, PolicyBundle model | TC07/17 pass; bundle signature verified; decide deterministic across machines |
 | S10-T04 | Quota/Cost Service: reserve->consume->release ledger | L | S10-T01, S10-T02 | Quota Service API, C2 budget | TC10/11/34 pass; no negative remaining under concurrency; USD matches price table |
 | S10-T04b | Flagship-HPC cost ceiling guard | S | S10-T03, S10-T04 | Quota Service API, PolicyBundle model | TC18 passes; over-ceiling envelope denied pre-launch (non-goal enforced) |
-| S10-T05 | Node Supervisor daemon (lifecycle + kill switch) | XL | S10-T01 | Orchestrator-Supervisor internal API | TC13 freeze-before-terminate passes; supervisor unreachable from sandbox |
+| S10-T05 | Node Supervisor daemon (timeout cleanup + sandbox isolation) | XL | S10-T01 | Orchestrator-Supervisor internal API | M0 timeout-triggered kill/remove cleanup passes; supervisor unreachable from sandbox; freeze/capture lifecycle remains S10-T11 |
 | S10-T06 | gVisor runtime class integration | L | S10-T05, S10-T03 | LaunchRequest->pod spec | TC02 seccomp, TC01 ro trust mounts pass under gVisor |
 | S10-T07 | Firecracker microVM runtime class | XL | S10-T05, S10-T03 | LaunchRequest->pod spec, PolicyBundle risk_to_runtime | TC29 federated parity passes on Firecracker; runtime chosen by risk_class |
 | S10-T08 | Sandbox Orchestrator admission+launch | L | S10-T02, S10-T03, S10-T04, S10-T05, S10-T06 | Orchestrator API, C4 launch-provenance | TC11/30 pass; pure-decision + side-effect split; fail-closed on verify failure |
