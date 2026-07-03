@@ -347,6 +347,19 @@ class SandboxHandle:
 
 
 @dataclass(frozen=True)
+class SandboxPartialResult:
+    reason: str
+    stdout: str
+    stderr: str
+    captured_after_freeze: bool
+    freeze_succeeded: bool
+    terminate_succeeded: bool
+    stdout_bytes: int
+    stderr_bytes: int
+    capture_error: str | None = None
+
+
+@dataclass(frozen=True)
 class SandboxExecutionResult:
     handle: SandboxHandle
     exit_code: int | None
@@ -355,6 +368,7 @@ class SandboxExecutionResult:
     timed_out: bool
     duration_s: float
     budget_usage: BudgetUsage
+    partial_result: SandboxPartialResult | None = None
 
 
 @dataclass(frozen=True)
@@ -1927,13 +1941,16 @@ class DockerSandboxSupervisor:
             if not container_id:
                 raise SandboxRuntimeUnavailableError("docker runtime did not return a container id")
             self._docker_api_request("POST", f"/containers/{container_id}/start", expected=(204, 304))
-            exit_code, timed_out, runtime_stderr, budget_usage = self._wait_for_container_with_meter(
+            exit_code, timed_out, runtime_stderr, budget_usage, partial_result = self._wait_for_container_with_meter(
                 container_id=container_id,
                 request=request,
                 started_at=started_at,
                 meter_sample_sink=meter_sample_sink,
             )
-            stdout, stderr = self._docker_api_logs(container_id)
+            if partial_result is None:
+                stdout, stderr = self._docker_api_logs(container_id)
+            else:
+                stdout, stderr = partial_result.stdout, partial_result.stderr
             duration_s = time.monotonic() - started_at
             if runtime_stderr:
                 stderr = (stderr + ("\n" if stderr else "") + runtime_stderr).strip()
@@ -1945,6 +1962,7 @@ class DockerSandboxSupervisor:
                 timed_out=timed_out,
                 duration_s=duration_s,
                 budget_usage=_max_budget_usage(budget_usage, _runtime_budget_usage(envelope, duration_s)),
+                partial_result=partial_result,
             )
         finally:
             if container_id:
@@ -1957,7 +1975,7 @@ class DockerSandboxSupervisor:
         request: LaunchRequest,
         started_at: float,
         meter_sample_sink: Callable[[ResourceMeterSample], None] | None,
-    ) -> tuple[int | None, bool, str, BudgetUsage]:
+    ) -> tuple[int | None, bool, str, BudgetUsage, SandboxPartialResult | None]:
         envelope = request.requested_envelope
         sample_seq = 0
         last_sample_at: float | None = None
@@ -2017,7 +2035,7 @@ class DockerSandboxSupervisor:
                             source="docker-api-cgroup-final",
                         )
                     )
-                return int(container_state.get("ExitCode", 1)), False, "", usage
+                return int(container_state.get("ExitCode", 1)), False, "", usage, None
 
             if now >= next_sample_at:
                 sample_seq += 1
@@ -2066,8 +2084,41 @@ class DockerSandboxSupervisor:
         last_sample: ResourceMeterSample,
         sample_seq: int,
         meter_sample_sink: Callable[[ResourceMeterSample], None] | None,
-    ) -> tuple[int | None, bool, str, BudgetUsage]:
-        self._docker_api_request("POST", f"/containers/{container_id}/kill", expected=(204, 304, 404, 409))
+    ) -> tuple[int | None, bool, str, BudgetUsage, SandboxPartialResult]:
+        freeze_succeeded = False
+        terminate_succeeded = False
+        stdout = ""
+        stderr = ""
+        logs_captured = False
+        capture_error: str | None = None
+
+        try:
+            self._docker_api_request("POST", f"/containers/{container_id}/pause", expected=(204,), timeout=2)
+            freeze_succeeded = True
+        except (SandboxRuntimeUnavailableError, TimeoutError) as exc:
+            capture_error = f"freeze_failed:{type(exc).__name__}:{exc}"
+
+        try:
+            stdout, stderr = self._docker_api_logs(container_id)
+            logs_captured = True
+        except (SandboxRuntimeUnavailableError, TimeoutError) as exc:
+            message = f"capture_failed:{type(exc).__name__}:{exc}"
+            capture_error = message if capture_error is None else f"{capture_error};{message}"
+
+        if freeze_succeeded:
+            try:
+                self._docker_api_request("POST", f"/containers/{container_id}/unpause", expected=(204,), timeout=2)
+            except (SandboxRuntimeUnavailableError, TimeoutError) as exc:
+                message = f"unpause_failed:{type(exc).__name__}:{exc}"
+                capture_error = message if capture_error is None else f"{capture_error};{message}"
+
+        try:
+            self._docker_api_request("POST", f"/containers/{container_id}/kill", expected=(204, 304, 404, 409), timeout=2)
+            terminate_succeeded = True
+        except (SandboxRuntimeUnavailableError, TimeoutError) as exc:
+            message = f"terminate_failed:{type(exc).__name__}:{exc}"
+            capture_error = message if capture_error is None else f"{capture_error};{message}"
+
         duration_s = time.monotonic() - started_at
         final_usage = _max_budget_usage(last_sample.usage, _runtime_budget_usage(request.requested_envelope, duration_s))
         final_breach_dimensions = _budget_usage_breach_dimensions(request.budget_token.caps, final_usage)
@@ -2085,7 +2136,18 @@ class DockerSandboxSupervisor:
         )
         if meter_sample_sink is not None:
             meter_sample_sink(final_sample)
-        return None, True, f"argus meter halted container: {reason}", final_usage
+        partial_result = SandboxPartialResult(
+            reason=reason,
+            stdout=stdout,
+            stderr=stderr,
+            captured_after_freeze=freeze_succeeded and logs_captured,
+            freeze_succeeded=freeze_succeeded,
+            terminate_succeeded=terminate_succeeded,
+            stdout_bytes=len(stdout.encode("utf-8")),
+            stderr_bytes=len(stderr.encode("utf-8")),
+            capture_error=capture_error,
+        )
+        return None, True, f"argus meter halted container: {reason}", final_usage, partial_result
 
     def _docker_api_resource_sample(
         self,
@@ -2471,6 +2533,11 @@ class DockerSandboxOrchestrator(InMemorySandboxOrchestrator):
         final_state = _final_sandbox_state(result)
         final_handle = replace(handle, state=final_state)
         self._handles[handle.sandbox_id] = final_handle
+        partial_result_ref = self._emit_partial_result(
+            request=request,
+            handle=final_handle,
+            result=result,
+        )
         event_type = "sandbox.timeout" if result.timed_out else "sandbox.exited"
         self._audit_ledger.append(
             event_type,
@@ -2501,6 +2568,7 @@ class DockerSandboxOrchestrator(InMemorySandboxOrchestrator):
                 usage=result.budget_usage,
                 price_rollup=price_rollup,
                 meter_samples=tuple(meter_samples),
+                partial_result_ref=partial_result_ref,
             )
             raise
         self._audit_ledger.append(
@@ -2518,6 +2586,7 @@ class DockerSandboxOrchestrator(InMemorySandboxOrchestrator):
             usage=result.budget_usage,
             price_rollup=price_rollup,
             meter_samples=tuple(meter_samples),
+            partial_result_ref=partial_result_ref,
         )
         return replace(result, handle=final_handle)
 
@@ -2558,10 +2627,13 @@ class DockerSandboxOrchestrator(InMemorySandboxOrchestrator):
         usage: BudgetUsage,
         price_rollup: PriceTableRollup,
         meter_samples: tuple[ResourceMeterSample, ...] = (),
+        partial_result_ref: str | None = None,
     ) -> str | None:
         if self._artifact_store is None:
             return None
-        input_refs = (handle.launch_provenance_ref,) if handle.launch_provenance_ref else ()
+        input_refs = tuple(
+            ref for ref in (handle.launch_provenance_ref, partial_result_ref) if isinstance(ref, str) and ref
+        )
         price_table_payload = None
         if self._price_table is not None:
             price_table_payload = {
@@ -2576,6 +2648,8 @@ class DockerSandboxOrchestrator(InMemorySandboxOrchestrator):
             "budget_epoch": request.budget_token.budget_epoch,
             "final_state": handle.state,
             "usage": asdict(usage),
+            "partial_result_captured": partial_result_ref is not None,
+            "partial_result_ref": partial_result_ref,
             "usd_rollup": {
                 "cost_usd": usage.cost_usd,
                 "cost_usd_exact": price_rollup.cost_usd_exact,
@@ -2594,6 +2668,7 @@ class DockerSandboxOrchestrator(InMemorySandboxOrchestrator):
             {
                 "kind": "argus.s10.spend.final.env.v1",
                 "launch_provenance_ref": handle.launch_provenance_ref,
+                "partial_result_ref": partial_result_ref,
                 "price_table_hash": price_rollup.price_table_hash,
                 "price_table_version": price_rollup.price_table_version,
             }
@@ -2618,6 +2693,83 @@ class DockerSandboxOrchestrator(InMemorySandboxOrchestrator):
                 "artifact_ref": record.artifact_ref,
                 "price_table_version": price_rollup.price_table_version,
                 "cost_usd_exact": price_rollup.cost_usd_exact,
+            },
+        )
+        return record.artifact_ref
+
+    def _emit_partial_result(
+        self,
+        *,
+        request: LaunchRequest,
+        handle: SandboxHandle,
+        result: SandboxExecutionResult,
+    ) -> str | None:
+        if self._artifact_store is None or result.partial_result is None:
+            return None
+        partial = result.partial_result
+        freeze_payload = {
+            "sandbox_id": handle.sandbox_id,
+            "job_id": request.job_id,
+            "reason": partial.reason,
+            "freeze_succeeded": partial.freeze_succeeded,
+        }
+        self._audit_ledger.append("sandbox.freeze", freeze_payload)
+        payload = {
+            "schema": "argus.s10.partial_result.v1",
+            "job_id": request.job_id,
+            "sandbox_id": handle.sandbox_id,
+            "budget_id": request.budget_token.budget_id,
+            "budget_epoch": request.budget_token.budget_epoch,
+            "reason": partial.reason,
+            "final_state": handle.state,
+            "stdout": partial.stdout,
+            "stderr": partial.stderr,
+            "stdout_bytes": partial.stdout_bytes,
+            "stderr_bytes": partial.stderr_bytes,
+            "captured_after_freeze": partial.captured_after_freeze,
+            "freeze_succeeded": partial.freeze_succeeded,
+            "terminate_succeeded": partial.terminate_succeeded,
+            "capture_error": partial.capture_error,
+        }
+        environment_digest = hash_json(
+            {
+                "kind": "argus.s10.partial_result.env.v1",
+                "launch_provenance_ref": handle.launch_provenance_ref,
+                "reason": partial.reason,
+                "image": request.image,
+            }
+        )
+        input_refs = (handle.launch_provenance_ref,) if handle.launch_provenance_ref else ()
+        record = self._artifact_store.create_artifact(
+            kind="sandbox.partial_result",
+            payload=payload,
+            producer=Producer(subsystem="S10", version=handle.policy_bundle_version, job_id=request.job_id),
+            lineage=Lineage(
+                input_refs=input_refs,
+                code_ref=request.image,
+                environment_digest=environment_digest,
+                seeds=(request.trace_id,),
+                job_id=request.job_id,
+            ),
+        )
+        self._audit_ledger.append(
+            "sandbox.partial_result",
+            {
+                "sandbox_id": handle.sandbox_id,
+                "job_id": request.job_id,
+                "artifact_ref": record.artifact_ref,
+                "stdout_bytes": partial.stdout_bytes,
+                "stderr_bytes": partial.stderr_bytes,
+                "captured_after_freeze": partial.captured_after_freeze,
+            },
+        )
+        self._audit_ledger.append(
+            "sandbox.terminate",
+            {
+                "sandbox_id": handle.sandbox_id,
+                "job_id": request.job_id,
+                "reason": partial.reason,
+                "terminate_succeeded": partial.terminate_succeeded,
             },
         )
         return record.artifact_ref

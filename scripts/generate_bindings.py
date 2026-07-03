@@ -278,6 +278,7 @@ def render_python_init() -> str:
             "    S8CheckpointSignature,",
             "    SandboxExecutionResult,",
             "    SandboxHandle,",
+            "    SandboxPartialResult,",
             "    ScopeGrant,",
             "    ScopeToken,",
             "    StoreBrokerHandle,",
@@ -314,6 +315,7 @@ def render_python_init() -> str:
             '    "S8CheckpointSignature",',
             '    "SandboxExecutionResult",',
             '    "SandboxHandle",',
+            '    "SandboxPartialResult",',
             '    "ScopeGrant",',
             '    "ScopeToken",',
             '    "StoreBrokerHandle",',
@@ -983,6 +985,20 @@ class SandboxHandle(BaseModel):
     launch_provenance_ref: ArtifactRef | None
 
 
+class SandboxPartialResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    reason: str = Field(min_length=1)
+    stdout: str
+    stderr: str
+    captured_after_freeze: bool
+    freeze_succeeded: bool
+    terminate_succeeded: bool
+    stdout_bytes: int = Field(ge=0)
+    stderr_bytes: int = Field(ge=0)
+    capture_error: str | None
+
+
 class SandboxExecutionResult(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -993,6 +1009,7 @@ class SandboxExecutionResult(BaseModel):
     timed_out: bool
     duration_s: float = Field(ge=0)
     budget_usage: BudgetUsage
+    partial_result: SandboxPartialResult | None
 
 
 class QuotaState(BaseModel):
@@ -1185,6 +1202,18 @@ export interface SandboxHandle {{
   launch_provenance_ref: string | null;
 }}
 
+export interface SandboxPartialResult {{
+  reason: string;
+  stdout: string;
+  stderr: string;
+  captured_after_freeze: boolean;
+  freeze_succeeded: boolean;
+  terminate_succeeded: boolean;
+  stdout_bytes: number;
+  stderr_bytes: number;
+  capture_error: string | null;
+}}
+
 export interface SandboxExecutionResult {{
   handle: SandboxHandle;
   exit_code: number | null;
@@ -1193,6 +1222,7 @@ export interface SandboxExecutionResult {{
   timed_out: boolean;
   duration_s: number;
   budget_usage: BudgetUsage;
+  partial_result: SandboxPartialResult | null;
 }}
 
 export interface QuotaState {{
@@ -2033,7 +2063,7 @@ def render_rust_lib(items: list[dict]) -> str:
             "pub use c4::{ArtifactRecord, ClaimTier, Lineage, Producer, RetentionPolicy, C4_SCHEMA_SHA256};",
             "pub use hash::{hash_blob, hash_blob_stream, hash_bytes, BlobHasher, HashBlob, HashBlobError, BLAKE3_PREFIX, CANON_VERSION};",
             "pub use ledger::{ArtifactRecordDraft, MerkleCheckpoint, PostgresLedgerWriter};",
-            "pub use s10::{AuditEvent, BudgetCaps, BudgetToken, BudgetUsage, EgressDecision, EgressRule, LaunchEnvelope, LaunchRequest, PolicyBundle, PolicyVerdict, QuotaState, ResourceCeilings, S8CheckpointSignature, SandboxExecutionResult, SandboxHandle, ScopeGrant, ScopeToken, StoreBrokerHandle, C10_SCHEMA_SHA256};",
+            "pub use s10::{AuditEvent, BudgetCaps, BudgetToken, BudgetUsage, EgressDecision, EgressRule, LaunchEnvelope, LaunchRequest, PolicyBundle, PolicyVerdict, QuotaState, ResourceCeilings, S8CheckpointSignature, SandboxExecutionResult, SandboxHandle, SandboxPartialResult, ScopeGrant, ScopeToken, StoreBrokerHandle, C10_SCHEMA_SHA256};",
             "",
             "#[derive(Debug, Clone, Copy, PartialEq, Eq)]",
             "pub struct Contract {",
@@ -2421,6 +2451,19 @@ pub struct SandboxHandle {{
 }}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SandboxPartialResult {{
+    pub reason: String,
+    pub stdout: String,
+    pub stderr: String,
+    pub captured_after_freeze: bool,
+    pub freeze_succeeded: bool,
+    pub terminate_succeeded: bool,
+    pub stdout_bytes: u64,
+    pub stderr_bytes: u64,
+    pub capture_error: Option<String>,
+}}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SandboxExecutionResult {{
     pub handle: SandboxHandle,
     pub exit_code: Option<i32>,
@@ -2429,6 +2472,7 @@ pub struct SandboxExecutionResult {{
     pub timed_out: bool,
     pub duration_s: f64,
     pub budget_usage: BudgetUsage,
+    pub partial_result: Option<SandboxPartialResult>,
 }}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

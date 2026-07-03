@@ -36,6 +36,7 @@ from argus_contracts import (  # noqa: E402
     S8CheckpointSignature,
     SandboxExecutionResult,
     SandboxHandle,
+    SandboxPartialResult,
     ScopeGrant,
     ScopeToken,
     StoreBrokerHandle,
@@ -65,6 +66,7 @@ C10_RUNTIME_FIELD_GUARDS = (
     ("S8CheckpointSignature", runtime_s10.S8CheckpointSignature, S8CheckpointSignature),
     ("SandboxExecutionResult", runtime_s10.SandboxExecutionResult, SandboxExecutionResult),
     ("SandboxHandle", runtime_s10.SandboxHandle, SandboxHandle),
+    ("SandboxPartialResult", runtime_s10.SandboxPartialResult, SandboxPartialResult),
     ("ScopeGrant", runtime_s10.ScopeGrant, ScopeGrant),
     ("ScopeToken", runtime_s10.ScopeToken, ScopeToken),
     ("StoreBrokerHandle", runtime_s10.StoreBrokerHandle, StoreBrokerHandle),
@@ -231,6 +233,10 @@ def _schema_wire_type(
         if definition.get("type") == "object":
             return f"object:{definition_name}"
         return _schema_wire_type(definition, definitions)
+    for union_key in ("anyOf", "oneOf"):
+        union_items = schema_fragment.get(union_key)
+        if isinstance(union_items, list):
+            return "|".join(sorted(_schema_wire_type(item, definitions) for item in union_items))
 
     raw_type = schema_fragment.get("type")
     if isinstance(raw_type, list):

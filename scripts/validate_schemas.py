@@ -89,6 +89,7 @@ C10_REQUIRED_DEFS = {
     "S8CheckpointSignature",
     "SandboxExecutionResult",
     "SandboxHandle",
+    "SandboxPartialResult",
     "ScopeGrant",
     "ScopeToken",
     "StoreBrokerHandle",

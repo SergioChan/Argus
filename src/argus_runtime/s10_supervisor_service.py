@@ -251,7 +251,9 @@ class S10SupervisorApp:
         _require_launch_identity_binding(identity, launch)
         self._refresh_artifacts()
         result = self._docker_orchestrator.launch_and_wait(launch)
-        return asdict(result)
+        payload = asdict(result)
+        payload["audit_events"] = self._recent_audit_event_types()
+        return payload
 
     def revoke_token_for_identity(self, identity: RuntimeIdentity, body: dict[str, Any]) -> dict[str, Any]:
         _require_runtime_identity(identity)
@@ -538,8 +540,11 @@ class S10SupervisorApp:
             "error": type(exc).__name__,
             "message": str(exc),
             "handle": handle,
-            "audit_events": [event.event_type for event in self.audit.events()[-10:]],
+            "audit_events": self._recent_audit_event_types(),
         }
+
+    def _recent_audit_event_types(self, *, limit: int = 12) -> list[str]:
+        return [event.event_type for event in self.audit.events()[-limit:]]
 
 
 def build_app_from_env() -> S10SupervisorApp:

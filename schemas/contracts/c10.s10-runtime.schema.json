@@ -15,6 +15,7 @@
     { "$ref": "#/$defs/LaunchRequest" },
     { "$ref": "#/$defs/PolicyVerdict" },
     { "$ref": "#/$defs/SandboxHandle" },
+    { "$ref": "#/$defs/SandboxPartialResult" },
     { "$ref": "#/$defs/SandboxExecutionResult" },
     { "$ref": "#/$defs/QuotaState" },
     { "$ref": "#/$defs/AuditEvent" },
@@ -336,7 +337,7 @@
     },
     "SandboxExecutionResult": {
       "type": "object",
-      "required": ["handle", "exit_code", "stdout", "stderr", "timed_out", "duration_s", "budget_usage"],
+      "required": ["handle", "exit_code", "stdout", "stderr", "timed_out", "duration_s", "budget_usage", "partial_result"],
       "additionalProperties": false,
       "properties": {
         "handle": { "$ref": "#/$defs/SandboxHandle" },
@@ -345,7 +346,39 @@
         "stderr": { "type": "string" },
         "timed_out": { "type": "boolean" },
         "duration_s": { "type": "number", "minimum": 0 },
-        "budget_usage": { "$ref": "#/$defs/BudgetUsage" }
+        "budget_usage": { "$ref": "#/$defs/BudgetUsage" },
+        "partial_result": {
+          "anyOf": [
+            { "$ref": "#/$defs/SandboxPartialResult" },
+            { "type": "null" }
+          ]
+        }
+      }
+    },
+    "SandboxPartialResult": {
+      "type": "object",
+      "required": [
+        "reason",
+        "stdout",
+        "stderr",
+        "captured_after_freeze",
+        "freeze_succeeded",
+        "terminate_succeeded",
+        "stdout_bytes",
+        "stderr_bytes",
+        "capture_error"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "reason": { "type": "string", "minLength": 1 },
+        "stdout": { "type": "string" },
+        "stderr": { "type": "string" },
+        "captured_after_freeze": { "type": "boolean" },
+        "freeze_succeeded": { "type": "boolean" },
+        "terminate_succeeded": { "type": "boolean" },
+        "stdout_bytes": { "type": "integer", "minimum": 0 },
+        "stderr_bytes": { "type": "integer", "minimum": 0 },
+        "capture_error": { "type": ["string", "null"], "minLength": 1 }
       }
     },
     "QuotaState": {

@@ -18,7 +18,7 @@ class Contract:
 
 CONTRACTS: tuple[Contract, ...] = (
     Contract(id="C1", name="Subagent Contract", owner="S1", version="1.0.0", schema="c1.subagent.schema.json", schema_sha256="sha256:bec647eec1f70625af766a1dd67f6bf81990d80d1b414b4c74f4254ca62ff7ab", consumers=["S2", "S3", "S4", "S5", "S11", "S12"]),
-    Contract(id="C10", name="S10 Runtime Wire Models", owner="S10", version="4.0.0", schema="c10.s10-runtime.schema.json", schema_sha256="sha256:80d5dcfbd1305026be71eb306f465e3119d725528008f61aa7e086503a6eb4b1", consumers=["S1", "S2", "S3", "S4", "S5", "S6", "S7", "S8", "S9", "S11", "S12"]),
+    Contract(id="C10", name="S10 Runtime Wire Models", owner="S10", version="4.0.0", schema="c10.s10-runtime.schema.json", schema_sha256="sha256:61dda2851700abab797a02893b5fd9095f9d8d2d35c72df4063fb4642a659b3f", consumers=["S1", "S2", "S3", "S4", "S5", "S6", "S7", "S8", "S9", "S11", "S12"]),
     Contract(id="C2", name="Task Job Envelope", owner="S5", version="1.0.0", schema="c2.job-envelope.schema.json", schema_sha256="sha256:62695e9f6e4cda8ab9f9089d595f36ca3cf395e0f40100be35938a838b334360", consumers=["S1", "S2", "S3", "S4", "S7", "S9", "S10", "S11", "S12"]),
     Contract(id="C3", name="Verifier Interface and Validation Report", owner="S3", version="1.1.0", schema="c3.validation-report.schema.json", schema_sha256="sha256:e0c8cd14a6bf287c75c5fb5999b425b76e020569ef47da4a0991043737bfd123", consumers=["S1", "S2", "S4", "S5", "S7", "S8", "S9", "S11", "S12"]),
     Contract(id="C4", name="Artifact and Provenance Record", owner="S8", version="1.0.0", schema="c4.artifact-record.schema.json", schema_sha256="sha256:32d5caf1f5f57b4c1da2eb7dc81e31f7423c834f6945e3839ffc6356fc4d35de", consumers=["S1", "S2", "S3", "S4", "S5", "S6", "S7", "S9", "S10", "S11", "S12"]),

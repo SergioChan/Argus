@@ -365,6 +365,14 @@ def main() -> int:
             token=auth_tokens["halt"],
             read_token=auth_tokens["read"],
         )
+        _battery_partial_capture(
+            evidence,
+            s10_url,
+            args.image,
+            s8_url,
+            token=auth_tokens["partial-capture"],
+            read_token=auth_tokens["read"],
+        )
         _battery_halt_latency_trials(
             evidence,
             s10_url,
@@ -516,6 +524,13 @@ def _m0_identity_requests() -> dict[str, dict[str, Any]]:
             "caller_id": "m0-meter-gap",
             "job_id": "m0-meter-gap-job",
             "root_request_id": "m0-meter-gap-root",
+            "budget_caps": {"max_compute_units": 10, "max_wallclock_s": 10, "max_cost_usd": 5},
+            "scopes": {"sandbox_risk_class": "standard"},
+        },
+        "partial-capture": {
+            "caller_id": "m0-partial-capture",
+            "job_id": "m0-partial-capture-job",
+            "root_request_id": "m0-partial-capture-root",
             "budget_caps": {"max_compute_units": 10, "max_wallclock_s": 10, "max_cost_usd": 5},
             "scopes": {"sandbox_risk_class": "standard"},
         },
@@ -1767,6 +1782,107 @@ def _battery_e_budget_halt(
     )
 
 
+def _battery_partial_capture(
+    evidence: dict[str, Any],
+    s10_url: str,
+    image: str,
+    s8_url: str,
+    *,
+    token: str,
+    read_token: str,
+) -> None:
+    budget_json = _post_json(
+        f"{s10_url}/v1/budget-tokens",
+        {},
+        expected_status=201,
+        token=token,
+    )
+    scope_json = _post_json(
+        f"{s10_url}/v1/scope-tokens",
+        {},
+        expected_status=201,
+        token=token,
+    )
+    launch_body = _launch_request_json(
+        job_id="m0-partial-capture-job",
+        image=image,
+        budget=budget_json,
+        scope=scope_json,
+        args=("-c", "printf 'partial-before-halt\\n'; sleep 5"),
+        env={},
+        env_allowlist=(),
+        wallclock_s=1,
+    )
+    response = _post_json(
+        f"{s10_url}/v1/sandboxes:launch",
+        launch_body,
+        expected_status=201,
+        token=token,
+    )
+    handle = response.get("handle") or {}
+    if handle.get("state") != "TIMED_OUT" or response.get("timed_out") is not True:
+        raise AssertionError(f"partial capture probe did not return a timed-out sandbox: {response}")
+    stdout = str(response.get("stdout") or "")
+    if "partial-before-halt" not in stdout:
+        raise AssertionError(f"partial capture probe did not surface pre-halt stdout: {response}")
+    events = response.get("audit_events") or []
+    expected_order = ["sandbox.freeze", "sandbox.partial_result", "sandbox.terminate", "sandbox.timeout"]
+    event_positions = [events.index(name) for name in expected_order if name in events]
+    if len(event_positions) != len(expected_order) or event_positions != sorted(event_positions):
+        raise AssertionError(f"partial capture audit events were missing or out of order: {events}")
+    launch_provenance_ref = handle.get("launch_provenance_ref")
+    if not isinstance(launch_provenance_ref, str) or not launch_provenance_ref:
+        raise AssertionError(f"partial capture launch provenance missing: {response}")
+    _get_json(f"{s8_url}/v1/artifacts/{launch_provenance_ref}/record", token=read_token)
+    spend_final = _battery_spend_final(
+        s8_url=s8_url,
+        read_token=read_token,
+        job_id="m0-partial-capture-job",
+        launch_provenance_ref=launch_provenance_ref,
+        expected_state="TIMED_OUT",
+    )
+    partial_ref = spend_final["partial_result_ref"]
+    if not isinstance(partial_ref, str) or not partial_ref:
+        raise AssertionError(f"partial capture spend.final did not carry partial_result_ref: {spend_final}")
+    partial_payload = _get_json(f"{s8_url}/v1/artifacts/{partial_ref}/payload", token=read_token)
+    if partial_payload.get("schema") != "argus.s10.partial_result.v1":
+        raise AssertionError(f"unexpected partial result schema: {partial_payload}")
+    if partial_payload.get("reason") != "wallclock_timeout":
+        raise AssertionError(f"unexpected partial result reason: {partial_payload}")
+    if "partial-before-halt" not in str(partial_payload.get("stdout") or ""):
+        raise AssertionError(f"partial result did not preserve stdout: {partial_payload}")
+    if partial_payload.get("captured_after_freeze") is not True:
+        raise AssertionError(f"partial result was not captured after freeze: {partial_payload}")
+    if partial_payload.get("freeze_succeeded") is not True or partial_payload.get("terminate_succeeded") is not True:
+        raise AssertionError(f"partial result did not record freeze+terminate success: {partial_payload}")
+    if partial_payload.get("capture_error") is not None:
+        raise AssertionError(f"partial result capture_error was not empty: {partial_payload}")
+    _record(
+        evidence,
+        "partial-capture",
+        "deployed S10 real Docker mid-flight halt froze the sandbox, captured partial stdout as C4, terminated, and linked spend.final lineage",
+        {
+            "events": events,
+            "launch_handle_state": handle["state"],
+            "launch_timed_out": response["timed_out"],
+            "launch_stdout": stdout,
+            "launch_provenance_ref": launch_provenance_ref,
+            "partial_result_ref": partial_ref,
+            "partial_result_reason": partial_payload["reason"],
+            "partial_result_stdout_bytes": partial_payload["stdout_bytes"],
+            "partial_result_captured_after_freeze": partial_payload["captured_after_freeze"],
+            "partial_result_freeze_succeeded": partial_payload["freeze_succeeded"],
+            "partial_result_terminate_succeeded": partial_payload["terminate_succeeded"],
+            "spend_final_ref": spend_final["artifact_ref"],
+            "spend_final_partial_result_captured": spend_final["partial_result_captured"],
+            "spend_final_state": spend_final["final_state"],
+            "spend_final_meter_sample_count": spend_final["meter_sample_count"],
+            "spend_final_meter_halted_by_meter": spend_final["meter_halted_by_meter"],
+            "spend_final_meter_halt_latency_s": spend_final["meter_halt_latency_s"],
+        },
+    )
+
+
 def _nearest_rank_percentile(values: list[float], percentile: float) -> float:
     if not values:
         raise AssertionError("percentile requires at least one value")
@@ -2027,11 +2143,23 @@ def _battery_spend_final(
         raise AssertionError(f"expected one spend.final record for {job_id}, found {matching_records}")
     record = matching_records[0]
     payload = _get_json(f"{s8_url}/v1/artifacts/{record['artifact_ref']}/payload", token=read_token)
+    input_refs = record.get("lineage", {}).get("input_refs") or []
     price_table = payload.get("price_table") or {}
     usage = payload.get("usage") or {}
     rollup = payload.get("usd_rollup") or {}
     metering = payload.get("metering") or {}
     meter_samples = metering.get("samples") or []
+    partial_result_ref = payload.get("partial_result_ref")
+    partial_result_captured = bool(payload.get("partial_result_captured"))
+    if partial_result_ref:
+        if not isinstance(partial_result_ref, str):
+            raise AssertionError(f"spend.final partial_result_ref must be a string: {payload}")
+        if partial_result_captured is not True:
+            raise AssertionError(f"spend.final partial_result_captured was false despite ref: {payload}")
+        if partial_result_ref not in input_refs:
+            raise AssertionError(f"spend.final lineage did not include partial_result_ref: {record}")
+    elif partial_result_captured:
+        raise AssertionError(f"spend.final claimed partial capture without a ref: {payload}")
     if not isinstance(meter_samples, list):
         raise AssertionError(f"spend.final metering samples must be a list: {payload}")
     meter_gap_samples = [
@@ -2104,6 +2232,8 @@ def _battery_spend_final(
         "meter_gap_sample_count": len(meter_gap_samples),
         "meter_gap_sources": meter_gap_sources,
         "meter_gap_max_conservative_gap_s": meter_gap_max_conservative_gap_s,
+        "partial_result_ref": partial_result_ref,
+        "partial_result_captured": partial_result_captured,
     }
 
 

@@ -97,6 +97,11 @@ class ArgusM0RuntimeServiceTests(unittest.TestCase):
         self.assertEqual(requests["halt-latency"]["job_id"], "m0-halt-latency-job")
         self.assertEqual(policy["m0-halt-latency"]["job_id"], "m0-halt-latency-job")
         self.assertEqual(policy["m0-halt-latency"]["budget_caps"]["max_wallclock_s"], 1)
+        self.assertIn("partial-capture", requests)
+        self.assertEqual(requests["partial-capture"]["caller_id"], "m0-partial-capture")
+        self.assertEqual(requests["partial-capture"]["job_id"], "m0-partial-capture-job")
+        self.assertEqual(policy["m0-partial-capture"]["job_id"], "m0-partial-capture-job")
+        self.assertEqual(policy["m0-partial-capture"]["budget_caps"]["max_wallclock_s"], 10)
 
     def test_s8_writer_service_commits_and_replays_c4_records(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1187,6 +1192,8 @@ class ArgusM0RuntimeServiceTests(unittest.TestCase):
         self.assertEqual(payload["handle"]["job_id"], "job-auth")
         self.assertIsNotNone(payload["handle"]["launch_provenance_ref"])
         self.assertIn("no-default-route", payload["stdout"])
+        self.assertIn("sandbox.exited", payload["audit_events"])
+        self.assertIn("spend.final", payload["audit_events"])
         self.assertEqual(supervisor.calls[0]["materialized_env"], {"VISIBLE": "ok"})
         provenance = app.artifacts.get_record(payload["handle"]["launch_provenance_ref"])
         self.assertEqual(provenance.producer.subsystem, "S10")

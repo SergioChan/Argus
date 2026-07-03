@@ -1007,7 +1007,7 @@ class S10ResourceMeterGapTests(unittest.TestCase):
         s10_module.time.monotonic = clock.monotonic  # type: ignore[assignment]
         s10_module.time.sleep = clock.sleep_with_injected_stall  # type: ignore[assignment]
         try:
-            exit_code, timed_out, stderr, usage = supervisor._wait_for_container_with_meter(
+            exit_code, timed_out, stderr, usage, partial_result = supervisor._wait_for_container_with_meter(
                 container_id="container-gap",
                 request=request,
                 started_at=0.0,
@@ -1020,7 +1020,14 @@ class S10ResourceMeterGapTests(unittest.TestCase):
         self.assertIsNone(exit_code)
         self.assertTrue(timed_out)
         self.assertEqual(stderr, "argus meter halted container: meter_gap")
+        self.assertTrue(supervisor.paused)
+        self.assertTrue(supervisor.unpaused)
         self.assertTrue(supervisor.killed)
+        self.assertIsNotNone(partial_result)
+        assert partial_result is not None
+        self.assertEqual(partial_result.reason, "meter_gap")
+        self.assertTrue(partial_result.captured_after_freeze)
+        self.assertEqual(partial_result.stdout, "partial-gap\n")
         self.assertGreater(usage.wallclock_s, 0)
         self.assertGreaterEqual(len(samples), 3)
         gap_samples = [sample for sample in samples if sample.conservative_gap_s > 0]
@@ -1336,13 +1343,20 @@ class S10DockerOrchestratorTests(unittest.TestCase):
         self.assertLessEqual(spend_payload["metering"]["max_cadence_s"], 5)
         self.assertFalse(spend_payload["metering"]["dcgm_available"])
 
-    def test_timeout_launch_records_timed_out_state(self) -> None:
-        request = self._launch_request(args=("-c", "sleep 5"), env={}, env_allowlist=(), wallclock_s=1)
+    def test_timeout_launch_records_timed_out_state_and_partial_result(self) -> None:
+        request = self._launch_request(
+            args=("-c", "printf 'partial-before-timeout\\n'; sleep 5"),
+            env={},
+            env_allowlist=(),
+            wallclock_s=1,
+        )
 
         result = self.orchestrator.launch_and_wait(request)
 
         self.assertEqual(result.handle.state, "TIMED_OUT")
         self.assertTrue(result.timed_out)
+        self.assertIsNotNone(result.partial_result)
+        self.assertIn("partial-before-timeout", result.stdout)
         self.assertEqual(self.orchestrator.get(result.handle.sandbox_id).state, "TIMED_OUT")
         quota_state = self.quota.state(request.budget_token.budget_id)
         self.assertEqual(quota_state.reserved, BudgetUsage())
@@ -1350,13 +1364,32 @@ class S10DockerOrchestratorTests(unittest.TestCase):
         event_types = [event.event_type for event in self.audit.events()]
         self.assertIn("meter.sample", event_types)
         self.assertIn("meter.halt", event_types)
+        self.assertIn("sandbox.freeze", event_types)
+        self.assertIn("sandbox.partial_result", event_types)
+        self.assertIn("sandbox.terminate", event_types)
         self.assertIn("sandbox.timeout", event_types)
+        self.assertLess(event_types.index("sandbox.freeze"), event_types.index("sandbox.partial_result"))
+        self.assertLess(event_types.index("sandbox.partial_result"), event_types.index("sandbox.terminate"))
+        self.assertLess(event_types.index("sandbox.terminate"), event_types.index("sandbox.timeout"))
         self.assertEqual(event_types[-3:], ["budget.consume", "budget.release", "spend.final"])
+        partial_records = self.artifacts.query_artifacts({"kind": "sandbox.partial_result"})
+        self.assertEqual(len(partial_records), 1)
+        partial_payload = json.loads(self.artifacts.get_artifact(partial_records[0].artifact_ref).decode("utf-8"))
+        self.assertEqual(partial_payload["schema"], "argus.s10.partial_result.v1")
+        self.assertEqual(partial_payload["reason"], "wallclock_timeout")
+        self.assertIn("partial-before-timeout", partial_payload["stdout"])
+        self.assertTrue(partial_payload["captured_after_freeze"])
+        self.assertTrue(partial_payload["freeze_succeeded"])
+        self.assertTrue(partial_payload["terminate_succeeded"])
+        self.assertIsNone(partial_payload["capture_error"])
         spend_records = self.artifacts.query_artifacts({"kind": "spend.final"})
         spend_payload = json.loads(self.artifacts.get_artifact(spend_records[-1].artifact_ref).decode("utf-8"))
         self.assertGreaterEqual(spend_payload["metering"]["sample_count"], 1)
         self.assertTrue(spend_payload["metering"]["halted_by_meter"])
         self.assertLessEqual(spend_payload["metering"]["halt_latency_s"], 2)
+        self.assertTrue(spend_payload["partial_result_captured"])
+        self.assertEqual(spend_payload["partial_result_ref"], partial_records[0].artifact_ref)
+        self.assertIn(partial_records[0].artifact_ref, spend_records[-1].lineage.input_refs)
 
     def test_runtime_budget_exceed_halts_and_releases_reservation(self) -> None:
         over_budget_usage = BudgetUsage(compute_units=11, wallclock_s=11)
@@ -1600,6 +1633,44 @@ class S10DockerOrchestratorFailureTests(unittest.TestCase):
         self.assertEqual(payload["usage"]["cost_usd"], 2.0)
         self.assertEqual(payload["metering"]["sample_count"], 1)
 
+    def test_docker_orchestrator_links_partial_result_for_budget_halt(self) -> None:
+        artifacts = InMemoryArtifactStore()
+        audit = InMemoryAuditLedger()
+        table, trust = self._signed_price_table(cpu_rate="0.1")
+        orchestrator = DockerSandboxOrchestrator(
+            token_service=self.tokens,
+            quota_ledger=InMemoryQuotaLedger(),
+            audit_ledger=audit,
+            policy_bundle=self.bundle,
+            artifact_store=artifacts,
+            supervisor=_PartialResultSupervisor(BudgetUsage(compute_units=20, wallclock_s=1)),
+            price_table=table,
+            price_table_trust_store=trust,
+        )
+
+        with self.assertRaises(BudgetExceededError):
+            orchestrator.launch_and_wait(self._launch_request())
+
+        event_types = [event.event_type for event in audit.events()]
+        self.assertLess(event_types.index("sandbox.freeze"), event_types.index("sandbox.partial_result"))
+        self.assertLess(event_types.index("sandbox.partial_result"), event_types.index("sandbox.terminate"))
+        self.assertLess(event_types.index("sandbox.terminate"), event_types.index("sandbox.timeout"))
+        self.assertLess(event_types.index("sandbox.timeout"), event_types.index("budget.halt"))
+        partial_records = artifacts.query_artifacts({"kind": "sandbox.partial_result"})
+        self.assertEqual(len(partial_records), 1)
+        partial_payload = json.loads(artifacts.get_artifact(partial_records[0].artifact_ref).decode("utf-8"))
+        self.assertEqual(partial_payload["schema"], "argus.s10.partial_result.v1")
+        self.assertEqual(partial_payload["reason"], "budget_caps")
+        self.assertEqual(partial_payload["stdout"], "partial-budget\n")
+        self.assertTrue(partial_payload["captured_after_freeze"])
+        spend_records = artifacts.query_artifacts({"kind": "spend.final"})
+        self.assertEqual(len(spend_records), 1)
+        spend_payload = json.loads(artifacts.get_artifact(spend_records[0].artifact_ref).decode("utf-8"))
+        self.assertEqual(spend_payload["final_state"], "BUDGET_HALTED")
+        self.assertTrue(spend_payload["partial_result_captured"])
+        self.assertEqual(spend_payload["partial_result_ref"], partial_records[0].artifact_ref)
+        self.assertIn(partial_records[0].artifact_ref, spend_records[0].lineage.input_refs)
+
     def test_docker_orchestrator_persists_meter_gap_halt_in_audit_and_spend_final(self) -> None:
         artifacts = InMemoryArtifactStore()
         audit = InMemoryAuditLedger()
@@ -1729,6 +1800,8 @@ class _FakeClock:
 class _GapStallDockerApiSupervisor(DockerSandboxSupervisor):
     def __init__(self, *, meter_interval_s: float, meter_gap_halt_s: float) -> None:
         super().__init__(meter_interval_s=meter_interval_s, meter_gap_halt_s=meter_gap_halt_s)
+        self.paused = False
+        self.unpaused = False
         self.killed = False
 
     def _docker_api_request(  # type: ignore[override]
@@ -1742,10 +1815,24 @@ class _GapStallDockerApiSupervisor(DockerSandboxSupervisor):
     ):
         if path.endswith("/json"):
             return {"State": {"Running": True}}
+        if path.endswith("/pause"):
+            self.paused = True
+            return {}
+        if path.endswith("/unpause"):
+            self.unpaused = True
+            return {}
         if path.endswith("/kill"):
             self.killed = True
             return {}
         raise AssertionError(f"unexpected docker API request during gap test: {method} {path}")
+
+    def _docker_api_logs(self, container_id: str) -> tuple[str, str]:  # type: ignore[override]
+        self.assert_pause_order()
+        return "partial-gap\n", ""
+
+    def assert_pause_order(self) -> None:
+        if not self.paused:
+            raise AssertionError("logs were captured before pause")
 
     def _docker_api_resource_sample(  # type: ignore[override]
         self,
@@ -1820,6 +1907,52 @@ class _InjectedMeterGapSupervisor:
             timed_out=True,
             duration_s=0.4,
             budget_usage=usage,
+        )
+
+
+class _PartialResultSupervisor:
+    def __init__(self, budget_usage: BudgetUsage) -> None:
+        self._budget_usage = budget_usage
+
+    def run(
+        self,
+        *,
+        handle: SandboxHandle,
+        request: LaunchRequest,
+        materialized_env: dict[str, str],
+        meter_sample_sink=None,
+    ) -> SandboxExecutionResult:
+        if meter_sample_sink is not None:
+            meter_sample_sink(
+                s10_module.ResourceMeterSample(
+                    sample_seq=1,
+                    elapsed_s=self._budget_usage.wallclock_s,
+                    cadence_s=0.0,
+                    usage=self._budget_usage,
+                    source="test-fixed-usage",
+                    breached_dimensions=("compute_units",),
+                    halted=True,
+                )
+            )
+        partial_result = s10_module.SandboxPartialResult(
+            reason="budget_caps",
+            stdout="partial-budget\n",
+            stderr="",
+            captured_after_freeze=True,
+            freeze_succeeded=True,
+            terminate_succeeded=True,
+            stdout_bytes=len("partial-budget\n".encode("utf-8")),
+            stderr_bytes=0,
+        )
+        return SandboxExecutionResult(
+            handle=handle,
+            exit_code=None,
+            stdout=partial_result.stdout,
+            stderr="argus meter halted container: budget_caps",
+            timed_out=True,
+            duration_s=self._budget_usage.wallclock_s,
+            budget_usage=self._budget_usage,
+            partial_result=partial_result,
         )
 
 
