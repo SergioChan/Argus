@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import json
+from pathlib import Path
 import unittest
 
 from argus_core import (
@@ -9,19 +11,42 @@ from argus_core import (
     ExecContext,
     InMemoryVerifierTrustStore,
     JobEnvelope,
+    LEGAL_TRANSITIONS,
     LifecyclePolicyError,
     LifecycleState,
     LifecycleStore,
     SubagentDescriptor,
     SubagentRuntime,
+    TERMINAL_STATES,
     build_subagent_report,
     canonical_json_bytes,
     default_accept,
     reduce_lifecycle,
 )
+from argus_core.s1 import METHOD_TARGETS, NON_TRANSITION_METHODS
 
 
 class S1LifecycleStoreTests(unittest.TestCase):
+    def test_lifecycle_state_table_matches_c1_schema(self) -> None:
+        schema_states = self._c1_def_enum("LifecycleState")
+        runtime_states = {state.value for state in LifecycleState}
+
+        self.assertEqual(runtime_states, schema_states)
+        self.assertEqual(set(LEGAL_TRANSITIONS), set(LifecycleState))
+        for from_state, to_states in LEGAL_TRANSITIONS.items():
+            self.assertIsInstance(from_state, LifecycleState)
+            self.assertTrue(to_states <= set(LifecycleState))
+        for terminal_state in TERMINAL_STATES:
+            self.assertEqual(LEGAL_TRANSITIONS[terminal_state], frozenset())
+
+    def test_lifecycle_method_table_matches_c1_schema(self) -> None:
+        schema_methods = self._c1_def_enum("LifecycleMethod")
+
+        self.assertEqual(set(METHOD_TARGETS) | set(NON_TRANSITION_METHODS), schema_methods)
+        self.assertEqual(NON_TRANSITION_METHODS, {"register", "heartbeat"})
+        for target_state in METHOD_TARGETS.values():
+            self.assertIsInstance(target_state, LifecycleState)
+
     def test_legal_transition_appends_event(self) -> None:
         store = LifecycleStore()
         store.create_job("job-1")
@@ -45,6 +70,45 @@ class S1LifecycleStoreTests(unittest.TestCase):
         self.assertEqual(store.current("job-1").state, LifecycleState.REGISTERED)
         self.assertEqual(len(store.events("job-1")), 0)
 
+    def test_cancel_transition_reaches_cancelled_without_claiming_cooperative_cancel(self) -> None:
+        store = LifecycleStore()
+        store.create_job("job-1")
+        store.apply_method("job-1", "accept")
+        store.apply_method("job-1", "plan")
+
+        event = store.apply_method("job-1", "cancel", trigger="cancel", payload={"reason": "operator"})
+
+        self.assertEqual(event.from_state, LifecycleState.PLANNING)
+        self.assertEqual(event.to_state, LifecycleState.CANCELLED)
+        self.assertEqual(store.current("job-1").state, LifecycleState.CANCELLED)
+        with self.assertRaises(LifecyclePolicyError) as raised:
+            store.apply_method("job-1", "build")
+        self.assertEqual(raised.exception.envelope.category, "POLICY")
+
+    def test_terminal_states_reject_all_transition_methods_without_new_events(self) -> None:
+        paths = {
+            LifecycleState.REPORTED: ("accept", "plan", "build", "validate", "report"),
+            LifecycleState.FAILED: ("accept", "fail"),
+            LifecycleState.REJECTED: ("refuse",),
+            LifecycleState.CANCELLED: ("accept", "cancel"),
+            LifecycleState.QUARANTINED: ("accept", "quarantine"),
+        }
+        for terminal_state, setup_methods in paths.items():
+            with self.subTest(terminal_state=terminal_state.value):
+                store = LifecycleStore()
+                store.create_job("job-1")
+                for method in setup_methods:
+                    store.apply_method("job-1", method)
+                event_count = len(store.events("job-1"))
+                self.assertEqual(store.current("job-1").state, terminal_state)
+
+                for method in METHOD_TARGETS:
+                    with self.subTest(method=method):
+                        with self.assertRaises(LifecyclePolicyError):
+                            store.apply_method("job-1", method)
+                        self.assertEqual(len(store.events("job-1")), event_count)
+                        self.assertEqual(store.current("job-1").state, terminal_state)
+
     def test_replay_is_deterministic(self) -> None:
         store = LifecycleStore()
         store.create_job("job-1")
@@ -57,6 +121,12 @@ class S1LifecycleStoreTests(unittest.TestCase):
 
         self.assertEqual(canonical_json_bytes(first.__dict__), canonical_json_bytes(second.__dict__))
         self.assertEqual(first, store.current("job-1"))
+
+    @staticmethod
+    def _c1_def_enum(def_name: str) -> set[str]:
+        schema_path = Path(__file__).resolve().parents[1] / "schemas/contracts/c1.subagent.schema.json"
+        schema = json.loads(schema_path.read_text())
+        return set(schema["$defs"][def_name]["enum"])
 
 
 class S1TierRelayTests(unittest.TestCase):

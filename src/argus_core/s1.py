@@ -82,6 +82,7 @@ class LifecycleState(str, Enum):
     REPORTED = "REPORTED"
     FAILED = "FAILED"
     REJECTED = "REJECTED"
+    CANCELLED = "CANCELLED"
     QUARANTINED = "QUARANTINED"
 
 
@@ -90,6 +91,7 @@ TERMINAL_STATES = frozenset(
         LifecycleState.REPORTED,
         LifecycleState.FAILED,
         LifecycleState.REJECTED,
+        LifecycleState.CANCELLED,
         LifecycleState.QUARANTINED,
     }
 )
@@ -97,15 +99,27 @@ TERMINAL_STATES = frozenset(
 
 LEGAL_TRANSITIONS: dict[LifecycleState, frozenset[LifecycleState]] = {
     LifecycleState.REGISTERED: frozenset({LifecycleState.ACCEPTED, LifecycleState.REJECTED}),
-    LifecycleState.ACCEPTED: frozenset({LifecycleState.PLANNING, LifecycleState.FAILED, LifecycleState.QUARANTINED}),
-    LifecycleState.PLANNING: frozenset({LifecycleState.BUILDING, LifecycleState.FAILED, LifecycleState.QUARANTINED}),
-    LifecycleState.BUILDING: frozenset({LifecycleState.VALIDATING, LifecycleState.FAILED, LifecycleState.QUARANTINED}),
-    LifecycleState.VALIDATING: frozenset({LifecycleState.REPORTED, LifecycleState.FAILED, LifecycleState.QUARANTINED}),
+    LifecycleState.ACCEPTED: frozenset(
+        {LifecycleState.PLANNING, LifecycleState.FAILED, LifecycleState.CANCELLED, LifecycleState.QUARANTINED}
+    ),
+    LifecycleState.PLANNING: frozenset(
+        {LifecycleState.BUILDING, LifecycleState.FAILED, LifecycleState.CANCELLED, LifecycleState.QUARANTINED}
+    ),
+    LifecycleState.BUILDING: frozenset(
+        {LifecycleState.VALIDATING, LifecycleState.FAILED, LifecycleState.CANCELLED, LifecycleState.QUARANTINED}
+    ),
+    LifecycleState.VALIDATING: frozenset(
+        {LifecycleState.REPORTED, LifecycleState.FAILED, LifecycleState.CANCELLED, LifecycleState.QUARANTINED}
+    ),
     LifecycleState.REPORTED: frozenset(),
     LifecycleState.FAILED: frozenset(),
     LifecycleState.REJECTED: frozenset(),
+    LifecycleState.CANCELLED: frozenset(),
     LifecycleState.QUARANTINED: frozenset(),
 }
+
+
+NON_TRANSITION_METHODS = frozenset({"register", "heartbeat"})
 
 
 METHOD_TARGETS = {
@@ -115,6 +129,7 @@ METHOD_TARGETS = {
     "build": LifecycleState.BUILDING,
     "validate": LifecycleState.VALIDATING,
     "report": LifecycleState.REPORTED,
+    "cancel": LifecycleState.CANCELLED,
     "fail": LifecycleState.FAILED,
     "quarantine": LifecycleState.QUARANTINED,
 }
