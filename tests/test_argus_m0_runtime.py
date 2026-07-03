@@ -17,16 +17,19 @@ from argus_core import (
     ArtifactRecord,
     BudgetCaps,
     BudgetUsage,
+    C3ReportSigner,
     DockerSandboxSupervisor,
     BudgetToken,
     FileSystemArtifactStore,
     InMemoryS10KmsCheckpointSigner,
+    InMemoryS10KmsVerifierKeyProvider,
     Lineage,
     PriceTableSignatureError,
     Producer,
     SandboxExecutionResult,
     ScopeGrant,
     ScopeToken,
+    SIGNATURE_VERIFICATION_ACCEPTED,
 )
 from argus_core import canonical_json_bytes
 from argus_runtime.auth import RuntimeAuth, RuntimeIdentity
@@ -52,10 +55,11 @@ BROKER_WRITE_KEY = b"test-s8-broker-write-key"
 POLICY_SIGNING_KEY = "test-s10-policy-signing-key"
 CHECKPOINT_SIGNING_KEY = "test-s10-checkpoint-signing-key"
 CHECKPOINT_SIGNER_AUTH_TOKEN = "test-checkpoint-signer-token"
+S10_VERIFIER_KEY_AUTH_TOKEN = "test-verifier-key-token"
 PRICE_TABLE_SIGNING_KEY = "test-s10-price-table-signing-key"
 TOKEN_ED25519_PRIVATE_KEY_HEX = "1111111111111111111111111111111111111111111111111111111111111111"
 TOKEN_ED25519_PUBLIC_KEY_HEX = "d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737"
-C3_VERIFIER_KEYS_JSON = json.dumps(
+S10_C3_VERIFIER_KEYS_JSON = json.dumps(
     {"argus-m0-c3-verifier": "test-c3-verifier-key"},
     separators=(",", ":"),
     sort_keys=True,
@@ -820,6 +824,7 @@ class ArgusM0RuntimeServiceTests(unittest.TestCase):
             self.assertEqual(s8_health_payload["status"], "ok")
             self.assertEqual(s8_health_payload["ledger_writer"], "filesystem")
             self.assertEqual(s8_health_payload["report_verifier"], "unconfigured")
+            self.assertEqual(s8_health_payload["report_verifier_trust_store"], "unconfigured")
             self.assertEqual(s10_no_auth_status, 401)
             self.assertEqual(s10_no_auth_payload["error"], "Unauthorized")
             self.assertEqual(s10_bootstrap_status, 401)
@@ -836,6 +841,81 @@ class ArgusM0RuntimeServiceTests(unittest.TestCase):
             self.assertEqual(s10_mint_with_health_payload["error"], "Unauthorized")
             self.assertEqual(s8_write_with_health_status, 401)
             self.assertEqual(s8_write_with_health_payload["error"], "Unauthorized")
+
+    def test_s10_verifier_key_routes_require_internal_token_and_hide_secrets(self) -> None:
+        provider = InMemoryS10KmsVerifierKeyProvider()
+        provider.register_verifier_key("s3-key", b"s3-secret")
+        app = S10SupervisorApp(
+            signing_key=b"test-key",
+            verifier_key_provider=provider,
+            verifier_key_auth_token=S10_VERIFIER_KEY_AUTH_TOKEN,
+            health_token=HEALTH_TOKEN,
+        )
+        signed_report = C3ReportSigner(key_id="s3-key", secret=b"s3-secret").sign(_signed_report_payload())
+        unsigned = json.loads(json.dumps(signed_report))
+        unsigned["signature"]["value"] = ""
+
+        no_auth_status, no_auth_payload = app.http.handle(
+            JsonRequest(method="GET", path="/v1/internal/verifier-keys", query={}, body=None)
+        )
+        health_token_status, health_token_payload = app.http.handle(
+            JsonRequest(
+                method="GET",
+                path="/v1/internal/verifier-keys",
+                query={},
+                body=None,
+                headers=_auth_headers(HEALTH_TOKEN),
+            )
+        )
+        snapshot_status, snapshot = app.http.handle(
+            JsonRequest(
+                method="GET",
+                path="/v1/internal/verifier-keys",
+                query={},
+                body=None,
+                headers=_auth_headers(S10_VERIFIER_KEY_AUTH_TOKEN),
+            )
+        )
+        accepted_status, accepted = app.http.handle(
+            JsonRequest(
+                method="POST",
+                path="/v1/internal/verifier-keys:verify",
+                query={},
+                body={
+                    "key_id": "s3-key",
+                    "report_with_empty_signature": unsigned,
+                    "signature_value": signed_report["signature"]["value"],
+                },
+                headers=_auth_headers(S10_VERIFIER_KEY_AUTH_TOKEN),
+            )
+        )
+        invalid_status, invalid = app.http.handle(
+            JsonRequest(
+                method="POST",
+                path="/v1/internal/verifier-keys:verify",
+                query={},
+                body={
+                    "key_id": "s3-key",
+                    "report_with_empty_signature": unsigned,
+                    "signature_value": "hmac-sha256:" + "0" * 64,
+                },
+                headers=_auth_headers(S10_VERIFIER_KEY_AUTH_TOKEN),
+            )
+        )
+
+        self.assertEqual(no_auth_status, 401)
+        self.assertEqual(no_auth_payload["error"], "Unauthorized")
+        self.assertEqual(health_token_status, 401)
+        self.assertEqual(health_token_payload["error"], "Unauthorized")
+        self.assertEqual(snapshot_status, 200)
+        self.assertEqual(snapshot["provider"], "s10-kms")
+        self.assertEqual(snapshot["epoch"], provider.epoch)
+        self.assertEqual(snapshot["keys"], [{"epoch": provider.epoch, "key_id": "s3-key", "revoked": False}])
+        self.assertNotIn("secret", snapshot["keys"][0])
+        self.assertEqual(accepted_status, 200)
+        self.assertEqual(accepted["result"], SIGNATURE_VERIFICATION_ACCEPTED)
+        self.assertEqual(invalid_status, 200)
+        self.assertEqual(invalid["result"], "signature_invalid")
 
     def test_s10_http_mint_binds_tokens_to_authenticated_identity(self) -> None:
         app = S10SupervisorApp(signing_key=b"test-key", auth=_runtime_auth())
@@ -1525,7 +1605,8 @@ class ArgusM0ComposeTests(unittest.TestCase):
                 "ARGUS_S10_PRICE_TABLE_SIGNING_KEY": PRICE_TABLE_SIGNING_KEY,
                 "ARGUS_S10_PRICE_TABLE_ISSUED_AT": "1",
                 "ARGUS_S10_PRICE_TABLE_EXPIRES_AT": "4102444800",
-                "ARGUS_S8_C3_VERIFIER_KEYS_JSON": C3_VERIFIER_KEYS_JSON,
+                "ARGUS_S10_C3_VERIFIER_KEYS_JSON": S10_C3_VERIFIER_KEYS_JSON,
+                "ARGUS_S10_VERIFIER_KEY_AUTH_TOKEN": S10_VERIFIER_KEY_AUTH_TOKEN,
             },
         )
         if config.returncode != 0:
@@ -1564,7 +1645,19 @@ class ArgusM0ComposeTests(unittest.TestCase):
         self.assertNotIn("ARGUS_S8_CHECKPOINT_SIGNING_KEY", services["s8-writer"]["environment"])
         self.assertNotIn("ARGUS_S8_CHECKPOINT_SIGNER_KEY_ID", services["s8-writer"]["environment"])
         self.assertEqual(services["s8-writer"]["environment"]["ARGUS_S8_REQUIRE_REPORT_VERIFIER"], "1")
-        self.assertEqual(services["s8-writer"]["environment"]["ARGUS_S8_C3_VERIFIER_KEYS_JSON"], C3_VERIFIER_KEYS_JSON)
+        self.assertNotIn("ARGUS_S8_C3_VERIFIER_KEYS_JSON", services["s8-writer"]["environment"])
+        self.assertEqual(
+            services["s8-writer"]["environment"]["ARGUS_S8_S10_VERIFIER_KEYS_URL"],
+            "http://s10-supervisor:8080/v1/internal/verifier-keys",
+        )
+        self.assertEqual(
+            services["s8-writer"]["environment"]["ARGUS_S8_S10_VERIFIER_KEY_AUTH_TOKEN"],
+            S10_VERIFIER_KEY_AUTH_TOKEN,
+        )
+        self.assertEqual(
+            services["s8-writer"]["environment"]["ARGUS_S8_ALLOW_INSECURE_VERIFIER_KEY_STORE"],
+            "1",
+        )
         self.assertEqual(services["s8-writer"]["environment"]["ARGUS_S8_MINIO_ENDPOINT"], "minio:9000")
         self.assertEqual(services["s8-writer"]["environment"]["ARGUS_S8_MINIO_BUCKET"], "argus-s8-objects")
         self.assertNotIn("ARGUS_S8_DATA_DIR", services["s8-writer"]["environment"])
@@ -1646,6 +1739,14 @@ class ArgusM0ComposeTests(unittest.TestCase):
         self.assertEqual(
             services["s10-supervisor"]["environment"]["ARGUS_S10_CHECKPOINT_SIGNER_AUTH_TOKEN"],
             CHECKPOINT_SIGNER_AUTH_TOKEN,
+        )
+        self.assertEqual(
+            services["s10-supervisor"]["environment"]["ARGUS_S10_C3_VERIFIER_KEYS_JSON"],
+            S10_C3_VERIFIER_KEYS_JSON,
+        )
+        self.assertEqual(
+            services["s10-supervisor"]["environment"]["ARGUS_S10_VERIFIER_KEY_AUTH_TOKEN"],
+            S10_VERIFIER_KEY_AUTH_TOKEN,
         )
         s10_volumes = services["s10-supervisor"].get("volumes", [])
         self.assertEqual(
@@ -1755,6 +1856,23 @@ def _runtime_identity_mint_policy_json() -> str:
         separators=(",", ":"),
         sort_keys=True,
     )
+
+
+def _signed_report_payload() -> dict[str, object]:
+    return {
+        "report_id": "vr-runtime-test",
+        "profile_ref": "c4://profile/runtime-test/v1",
+        "frozen_pipeline_ref": "c4://pipeline/runtime-test/baseline",
+        "checks": [{"check": "INJECTION", "status": "PASS"}],
+        "aggregate": {"passed": True, "score": 0.99},
+        "claim_tier": "recapitulated-known",
+        "claim_tier_is_candidate": False,
+        "signature": {
+            "algorithm": "placeholder",
+            "key_id": "placeholder",
+            "value": "placeholder",
+        },
+    }
 
 
 class _SuccessfulSupervisor(DockerSandboxSupervisor):

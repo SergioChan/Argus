@@ -253,6 +253,11 @@ class S8WriterApp:
                 "ledger_writer": getattr(self.store, "ledger_writer_kind", "filesystem"),
                 "checkpoint_signer": getattr(self.store, "checkpoint_signer_kind", "unconfigured"),
                 "report_verifier": getattr(self.store, "report_verifier_kind", "unconfigured"),
+                "report_verifier_trust_store": getattr(
+                    self.store,
+                    "report_verifier_trust_store_kind",
+                    "unconfigured",
+                ),
             }
 
         @self.http.route("POST", "/v1/artifacts")

@@ -12,6 +12,8 @@ from pathlib import Path
 import shlex
 import subprocess
 from typing import Any
+from urllib import error as urlerror
+from urllib import request as urlrequest
 
 from argusverify import C3ReportVerifier, InMemoryVerifierTrustStore
 
@@ -28,6 +30,8 @@ from argus_core import (
     ReproducibilityCheck,
     ReproducibilityManifest,
     SCRATCH_BUCKET,
+    S10VerifierKeyMetadata,
+    S10VerifierTrustStoreClient,
     WRITE_ONCE_BUCKET,
     hash_bytes,
     hash_json,
@@ -224,6 +228,95 @@ class SubprocessRustLedgerWriter:
         return result
 
 
+class HttpS10VerifierKeyProvider:
+    """HTTP client for S10-owned verifier-key metadata and signature verification."""
+
+    def __init__(
+        self,
+        *,
+        endpoint_url: str,
+        auth_token: str,
+        allow_insecure_verifier_key_store: bool = False,
+        timeout_s: float = 5.0,
+    ) -> None:
+        if not auth_token:
+            raise RuntimeError("ARGUS_S8_S10_VERIFIER_KEY_AUTH_TOKEN is required")
+        self._endpoint_url = endpoint_url.rstrip("/")
+        self._auth_token = auth_token
+        self._timeout_s = timeout_s
+        self.kind = _s10_verifier_key_store_kind(
+            self._endpoint_url,
+            allow_insecure_verifier_key_store=allow_insecure_verifier_key_store,
+        )
+
+    def snapshot(self) -> tuple[int, tuple[S10VerifierKeyMetadata, ...]]:
+        payload = self._request_json("GET", self._endpoint_url)
+        keys = payload.get("keys")
+        if not isinstance(keys, list):
+            raise RuntimeError("S10 verifier key snapshot did not return a keys list")
+        metadata: list[S10VerifierKeyMetadata] = []
+        for item in keys:
+            if not isinstance(item, dict):
+                raise RuntimeError("S10 verifier key snapshot returned a non-object key entry")
+            if "secret" in item:
+                raise RuntimeError("S10 verifier key snapshot exposed secret material")
+            key_id = item.get("key_id")
+            if not isinstance(key_id, str) or not key_id:
+                raise RuntimeError("S10 verifier key snapshot returned a key without key_id")
+            metadata.append(
+                S10VerifierKeyMetadata(
+                    key_id=key_id,
+                    revoked=bool(item.get("revoked", False)),
+                    epoch=int(item.get("epoch", 0)),
+                )
+            )
+        return int(payload.get("epoch", 0)), tuple(metadata)
+
+    def verify_signature_value(
+        self,
+        *,
+        key_id: str,
+        report_with_empty_signature: dict[str, Any],
+        signature_value: str,
+    ) -> str | None:
+        payload = self._request_json(
+            "POST",
+            f"{self._endpoint_url}:verify",
+            {
+                "key_id": key_id,
+                "report_with_empty_signature": report_with_empty_signature,
+                "signature_value": signature_value,
+            },
+        )
+        result = payload.get("result")
+        if not isinstance(result, str) or not result:
+            raise RuntimeError("S10 verifier key verify endpoint returned an invalid result")
+        return result
+
+    def _request_json(self, method: str, url: str, body: dict[str, Any] | None = None) -> dict[str, Any]:
+        encoded = None if body is None else json.dumps(body, separators=(",", ":"), sort_keys=True).encode("utf-8")
+        http_request = urlrequest.Request(
+            url,
+            data=encoded,
+            method=method,
+            headers={
+                "Authorization": f"Bearer {self._auth_token}",
+                "Content-Type": "application/json",
+            },
+        )
+        try:
+            with urlrequest.urlopen(http_request, timeout=self._timeout_s) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+        except urlerror.HTTPError as exc:
+            message = exc.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"S10 verifier key endpoint rejected the request: {exc.code} {message}") from exc
+        except urlerror.URLError as exc:
+            raise RuntimeError(f"S10 verifier key endpoint is unavailable: {exc.reason}") from exc
+        if not isinstance(payload, dict):
+            raise RuntimeError("S10 verifier key endpoint returned a non-object response")
+        return payload
+
+
 class PostgresArtifactStore:
     """C4 store that writes payload bytes to MinIO and the append-only ledger to PostgreSQL."""
 
@@ -248,6 +341,9 @@ class PostgresArtifactStore:
         self.ledger_writer_kind = getattr(ledger_writer, "ledger_writer_kind", "rust-subprocess")
         self.checkpoint_signer_kind = getattr(ledger_writer, "checkpoint_signer_kind", "unconfigured")
         self.report_verifier_kind = "argusverify" if report_verifier is not None else "unconfigured"
+        self.report_verifier_trust_store_kind = (
+            getattr(report_verifier, "trust_store_kind", "unconfigured") if report_verifier is not None else "unconfigured"
+        )
         self._snapshot = self._snapshot_store()
         self.refresh()
 
@@ -812,11 +908,23 @@ def build_postgres_minio_store_from_env(env: dict[str, str]) -> PostgresArtifact
 
 
 def report_verifier_from_env(env: dict[str, str]) -> C3ReportVerifier | None:
+    s10_keys_url = env.get("ARGUS_S8_S10_VERIFIER_KEYS_URL")
     raw_keys = env.get("ARGUS_S8_C3_VERIFIER_KEYS_JSON")
     required = env.get("ARGUS_S8_REQUIRE_REPORT_VERIFIER", "0") == "1"
+    if s10_keys_url:
+        provider = HttpS10VerifierKeyProvider(
+            endpoint_url=s10_keys_url,
+            auth_token=_required_env(env, "ARGUS_S8_S10_VERIFIER_KEY_AUTH_TOKEN"),
+            allow_insecure_verifier_key_store=_env_flag(env.get("ARGUS_S8_ALLOW_INSECURE_VERIFIER_KEY_STORE")),
+        )
+        verifier = C3ReportVerifier(S10VerifierTrustStoreClient(provider))
+        setattr(verifier, "trust_store_kind", provider.kind)
+        return verifier
     if not raw_keys:
         if required:
-            raise RuntimeError("ARGUS_S8_C3_VERIFIER_KEYS_JSON is required")
+            raise RuntimeError(
+                "ARGUS_S8_S10_VERIFIER_KEYS_URL or ARGUS_S8_C3_VERIFIER_KEYS_JSON is required"
+            )
         return None
     try:
         parsed = json.loads(raw_keys)
@@ -830,7 +938,9 @@ def report_verifier_from_env(env: dict[str, str]) -> C3ReportVerifier | None:
         trust_store.register_key(key_id, secret.encode("utf-8"))
         if key.get("revoked"):
             trust_store.revoke_key(key_id)
-    return C3ReportVerifier(trust_store)
+    verifier = C3ReportVerifier(trust_store)
+    setattr(verifier, "trust_store_kind", "in-memory-static")
+    return verifier
 
 
 def _verifier_key_items(value: Any) -> list[dict[str, Any]]:
@@ -897,6 +1007,21 @@ def _checkpoint_signer_kind(url: str, *, allow_insecure_checkpoint_signer: bool)
     raise RuntimeError(
         "ARGUS_S8_CHECKPOINT_SIGNER_URL must use https://, or http:// only with "
         "ARGUS_S8_ALLOW_INSECURE_CHECKPOINT_SIGNER=1 for local M0"
+    )
+
+
+def _s10_verifier_key_store_kind(url: str, *, allow_insecure_verifier_key_store: bool) -> str:
+    if url.startswith("http://"):
+        if allow_insecure_verifier_key_store:
+            return "s10-http-insecure-local"
+        raise RuntimeError(
+            "ARGUS_S8_ALLOW_INSECURE_VERIFIER_KEY_STORE=1 is required for http:// verifier key URLs"
+        )
+    if url.startswith("https://"):
+        return "s10-http"
+    raise RuntimeError(
+        "ARGUS_S8_S10_VERIFIER_KEYS_URL must use https://, or http:// only with "
+        "ARGUS_S8_ALLOW_INSECURE_VERIFIER_KEY_STORE=1 for local M0"
     )
 
 

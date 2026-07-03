@@ -40,6 +40,7 @@ from argus_core import (
     Producer,
     ResourceCeilings,
     ScopeGrant,
+    SIGNATURE_VERIFICATION_ACCEPTED,
     hash_json,
     s8_checkpoint_signature_payload,
 )
@@ -90,15 +91,16 @@ def main() -> int:
         "ARGUS_S10_POLICY_SIGNING_KEY": runtime_secrets["s10_policy_signing_key"],
         "ARGUS_S10_CHECKPOINT_SIGNING_KEY": runtime_secrets["s10_checkpoint_signing_key"],
         "ARGUS_S10_CHECKPOINT_SIGNER_AUTH_TOKEN": runtime_secrets["s10_checkpoint_signer_auth_token"],
-        "ARGUS_S10_PRICE_TABLE_SIGNING_KEY": runtime_secrets["s10_price_table_signing_key"],
-        "ARGUS_S10_PRICE_TABLE_ISSUED_AT": str(price_table_now - 60),
-        "ARGUS_S10_PRICE_TABLE_EXPIRES_AT": str(price_table_now + 86_400),
-        "ARGUS_S8_BROKER_WRITE_KEY": runtime_secrets["s8_broker_write_key"],
-        "ARGUS_S8_C3_VERIFIER_KEYS_JSON": json.dumps(
+        "ARGUS_S10_VERIFIER_KEY_AUTH_TOKEN": runtime_secrets["s10_verifier_key_auth_token"],
+        "ARGUS_S10_C3_VERIFIER_KEYS_JSON": json.dumps(
             {M0_C3_VERIFIER_KEY_ID: runtime_secrets["c3_verifier_signing_key"]},
             separators=(",", ":"),
             sort_keys=True,
         ),
+        "ARGUS_S10_PRICE_TABLE_SIGNING_KEY": runtime_secrets["s10_price_table_signing_key"],
+        "ARGUS_S10_PRICE_TABLE_ISSUED_AT": str(price_table_now - 60),
+        "ARGUS_S10_PRICE_TABLE_EXPIRES_AT": str(price_table_now + 86_400),
+        "ARGUS_S8_BROKER_WRITE_KEY": runtime_secrets["s8_broker_write_key"],
     }
     s8_url = f"http://127.0.0.1:{ports['ARGUS_M0_S8_PORT']}"
     s10_url = f"http://127.0.0.1:{ports['ARGUS_M0_S10_PORT']}"
@@ -160,6 +162,7 @@ def main() -> int:
             model_scope_json=write_scope_json,
             model_token=auth_tokens["write"],
             verifier_signing_key=runtime_secrets["c3_verifier_signing_key"].encode("utf-8"),
+            verifier_key_auth_token=runtime_secrets["s10_verifier_key_auth_token"],
         )
         _battery_signed_policy_service(
             evidence,
@@ -364,6 +367,7 @@ def _m0_runtime_secrets() -> dict[str, str]:
         "s10_policy_signing_key": f"argus-s10-policy-key-{uuid4().hex}",
         "s10_checkpoint_signing_key": f"argus-s10-checkpoint-key-{uuid4().hex}",
         "s10_checkpoint_signer_auth_token": f"argus-s10-checkpoint-signer-{uuid4().hex}",
+        "s10_verifier_key_auth_token": f"argus-s10-verifier-key-{uuid4().hex}",
         "s10_price_table_signing_key": f"argus-s10-price-table-key-{uuid4().hex}",
         "s8_broker_write_key": f"argus-s8-broker-key-{uuid4().hex}",
         "c3_verifier_signing_key": f"argus-c3-verifier-key-{uuid4().hex}",
@@ -541,8 +545,12 @@ def _battery_runtime_auth_required(
         raise AssertionError(f"S8 did not declare the local checkpoint signer transport policy: {s8_health}")
     if s8_health.get("report_verifier") != "argusverify":
         raise AssertionError(f"S8 did not activate the C3 report verifier: {s8_health}")
+    if s8_health.get("report_verifier_trust_store") != "s10-http-insecure-local":
+        raise AssertionError(f"S8 did not use the S10 HTTP verifier-key trust store: {s8_health}")
     if s10_health.get("checkpoint_signer") != "s10-kms":
         raise AssertionError(f"S10 did not activate the KMS checkpoint signer: {s10_health}")
+    if s10_health.get("verifier_key_provider") != "s10-kms":
+        raise AssertionError(f"S10 did not activate the KMS verifier-key provider: {s10_health}")
     if s10_health.get("token_signer") != "s10-kms-ed25519":
         raise AssertionError(f"S10 did not activate the Ed25519 KMS token signer: {s10_health}")
     if s10_health.get("token_signature_algorithm") != "ed25519":
@@ -574,8 +582,11 @@ def _battery_runtime_auth_required(
             "s8_checkpoint_signer": s8_health["checkpoint_signer"],
             "s8_checkpoint_signer_transport_policy": "explicit-local-insecure-override",
             "s8_report_verifier": s8_health["report_verifier"],
+            "s8_report_verifier_trust_store": s8_health["report_verifier_trust_store"],
             "s10_health": s10_health["status"],
             "s10_checkpoint_signer": s10_health["checkpoint_signer"],
+            "s10_verifier_key_provider": s10_health["verifier_key_provider"],
+            "s10_verifier_key_epoch": s10_health["verifier_key_epoch"],
             "s10_token_signer": s10_health["token_signer"],
             "s10_token_signature_algorithm": s10_health["token_signature_algorithm"],
             "s10_token_verifier": s10_health["token_verifier"],
@@ -918,14 +929,22 @@ def _battery_deployed_report_verifier(
     model_scope_json: dict[str, Any],
     model_token: str,
     verifier_signing_key: bytes,
+    verifier_key_auth_token: str,
 ) -> None:
     signer = C3ReportSigner(key_id=M0_C3_VERIFIER_KEY_ID, secret=verifier_signing_key)
+    signed_report = signer.sign(_m0_validation_report(claim_tier="recapitulated-known"))
+    _battery_s10_verifier_key_store(
+        evidence,
+        s10_url=s10_url,
+        signed_report=signed_report,
+        verifier_key_auth_token=verifier_key_auth_token,
+    )
     report_record = _post_json(
         f"{s10_url}/v1/store/artifacts",
         {
             "scope_token": verifier_scope_json,
             "kind": "report",
-            "payload": signer.sign(_m0_validation_report(claim_tier="recapitulated-known")),
+            "payload": signed_report,
             "producer": {"subsystem": "S3", "version": "0.0.0"},
             "lineage": {"input_refs": [], "code_ref": "git:m0-verifier", "environment_digest": "oci:m0-verifier"},
         },
@@ -992,6 +1011,83 @@ def _battery_deployed_report_verifier(
             "claim_tier": promoted["claim_tier"],
             "tampered_report_rejected": tampered_rejected["message"],
             "tier_mismatch_rejected": mismatch_rejected["message"],
+        },
+    )
+
+
+def _battery_s10_verifier_key_store(
+    evidence: dict[str, Any],
+    *,
+    s10_url: str,
+    signed_report: dict[str, Any],
+    verifier_key_auth_token: str,
+) -> None:
+    unauth = _get_json(f"{s10_url}/v1/internal/verifier-keys", expected_status=401)
+    snapshot = _get_json(
+        f"{s10_url}/v1/internal/verifier-keys",
+        expected_status=200,
+        token=verifier_key_auth_token,
+    )
+    keys = snapshot.get("keys")
+    if not isinstance(keys, list):
+        raise AssertionError(f"S10 verifier key snapshot did not return keys: {snapshot}")
+    key_ids = {key.get("key_id") for key in keys if isinstance(key, dict)}
+    if M0_C3_VERIFIER_KEY_ID not in key_ids:
+        raise AssertionError(f"S10 verifier key snapshot missing M0 key: {snapshot}")
+    if any(isinstance(key, dict) and "secret" in key for key in keys):
+        raise AssertionError(f"S10 verifier key snapshot exposed secret material: {snapshot}")
+    unsigned = json.loads(json.dumps(signed_report))
+    unsigned["signature"]["value"] = ""
+    signature_value = signed_report["signature"]["value"]
+    accepted = _post_json(
+        f"{s10_url}/v1/internal/verifier-keys:verify",
+        {
+            "key_id": M0_C3_VERIFIER_KEY_ID,
+            "report_with_empty_signature": unsigned,
+            "signature_value": signature_value,
+        },
+        expected_status=200,
+        token=verifier_key_auth_token,
+    )
+    bad_signature = _post_json(
+        f"{s10_url}/v1/internal/verifier-keys:verify",
+        {
+            "key_id": M0_C3_VERIFIER_KEY_ID,
+            "report_with_empty_signature": unsigned,
+            "signature_value": "hmac-sha256:" + "0" * 64,
+        },
+        expected_status=200,
+        token=verifier_key_auth_token,
+    )
+    unknown_key = _post_json(
+        f"{s10_url}/v1/internal/verifier-keys:verify",
+        {
+            "key_id": "unknown-verifier",
+            "report_with_empty_signature": unsigned,
+            "signature_value": signature_value,
+        },
+        expected_status=200,
+        token=verifier_key_auth_token,
+    )
+    if accepted.get("result") != SIGNATURE_VERIFICATION_ACCEPTED:
+        raise AssertionError(f"S10 verifier key store did not accept a valid signature: {accepted}")
+    if bad_signature.get("result") != "signature_invalid":
+        raise AssertionError(f"S10 verifier key store did not reject a bad signature: {bad_signature}")
+    if unknown_key.get("result") != "unknown_key":
+        raise AssertionError(f"S10 verifier key store did not reject an unknown key: {unknown_key}")
+    _record(
+        evidence,
+        "verifier-key-store",
+        "S10 verifier-key store exposes metadata-only snapshots and performs signature verification",
+        {
+            "provider": snapshot["provider"],
+            "epoch": snapshot["epoch"],
+            "key_ids": sorted(key_ids),
+            "secret_exposed": False,
+            "unauth_error": unauth["error"],
+            "valid_result": accepted["result"],
+            "bad_signature_result": bad_signature["result"],
+            "unknown_key_result": unknown_key["result"],
         },
     )
 

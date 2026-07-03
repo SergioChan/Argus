@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import socket
+from threading import Thread
+import time
 import unittest
+from urllib import request as urlrequest
 
 from argus_core import (
     C3ReportSigner,
@@ -13,6 +17,12 @@ from argus_core import (
     S10VerifierTrustStoreClient,
     SignatureInvalidError,
 )
+from argus_runtime.http_json import serve_json_app
+from argus_runtime.s10_supervisor_service import S10SupervisorApp
+from argus_runtime.s8_persistence import report_verifier_from_env
+
+
+S10_VERIFIER_KEY_AUTH_TOKEN = "test-s10-verifier-key-token"
 
 
 class S8S10TrustStoreIntegrationTests(unittest.TestCase):
@@ -99,6 +109,50 @@ class S8S10TrustStoreIntegrationTests(unittest.TestCase):
         )
         self.assertTrue(rotated.artifact_ref.startswith("c4://artifact/"))
 
+    def test_s8_report_verifier_from_env_uses_http_s10_provider_without_static_secret(self) -> None:
+        provider = InMemoryS10KmsVerifierKeyProvider()
+        provider.register_verifier_key("http-s3-key", b"http-s3-secret")
+        endpoint_url = _start_s10_verifier_key_server(provider)
+        verifier = report_verifier_from_env(
+            {
+                "ARGUS_S8_REQUIRE_REPORT_VERIFIER": "1",
+                "ARGUS_S8_S10_VERIFIER_KEYS_URL": endpoint_url,
+                "ARGUS_S8_S10_VERIFIER_KEY_AUTH_TOKEN": S10_VERIFIER_KEY_AUTH_TOKEN,
+                "ARGUS_S8_ALLOW_INSECURE_VERIFIER_KEY_STORE": "1",
+            }
+        )
+        store = InMemoryArtifactStore(report_verifier=verifier)
+        signer = C3ReportSigner(key_id="http-s3-key", secret=b"http-s3-secret")
+
+        accepted = store.create_artifact(
+            kind="report",
+            payload=signer.sign(self._report()),
+            producer=self.report_producer,
+            lineage=self.report_lineage,
+        )
+        provider.revoke_verifier_key("http-s3-key")
+
+        self.assertEqual(getattr(verifier, "trust_store_kind"), "s10-http-insecure-local")
+        self.assertTrue(accepted.artifact_ref.startswith("c4://artifact/"))
+        with self.assertRaises(SignatureInvalidError) as revoked:
+            store.create_artifact(
+                kind="report",
+                payload=signer.sign(self._report()),
+                producer=self.report_producer,
+                lineage=self.report_lineage,
+            )
+        self.assertEqual(revoked.exception.reason, "revoked_key")
+
+    def test_s8_report_verifier_rejects_http_s10_provider_without_local_override(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "ARGUS_S8_ALLOW_INSECURE_VERIFIER_KEY_STORE=1"):
+            report_verifier_from_env(
+                {
+                    "ARGUS_S8_REQUIRE_REPORT_VERIFIER": "1",
+                    "ARGUS_S8_S10_VERIFIER_KEYS_URL": "http://127.0.0.1:1/v1/internal/verifier-keys",
+                    "ARGUS_S8_S10_VERIFIER_KEY_AUTH_TOKEN": S10_VERIFIER_KEY_AUTH_TOKEN,
+                }
+            )
+
     @staticmethod
     def _report() -> dict[str, object]:
         return deepcopy(
@@ -124,6 +178,38 @@ class S8S10TrustStoreIntegrationTests(unittest.TestCase):
                 },
             }
         )
+
+
+def _start_s10_verifier_key_server(provider: InMemoryS10KmsVerifierKeyProvider) -> str:
+    port = _free_port()
+    app = S10SupervisorApp(
+        signing_key=b"test-key",
+        verifier_key_provider=provider,
+        verifier_key_auth_token=S10_VERIFIER_KEY_AUTH_TOKEN,
+    )
+    thread = Thread(target=serve_json_app, kwargs={"app": app.http, "host": "127.0.0.1", "port": port}, daemon=True)
+    thread.start()
+    endpoint_url = f"http://127.0.0.1:{port}/v1/internal/verifier-keys"
+    deadline = time.time() + 5
+    while True:
+        http_request = urlrequest.Request(
+            endpoint_url,
+            headers={"Authorization": f"Bearer {S10_VERIFIER_KEY_AUTH_TOKEN}"},
+        )
+        try:
+            with urlrequest.urlopen(http_request, timeout=1) as response:
+                if response.status == 200:
+                    return endpoint_url
+        except OSError:
+            if time.time() >= deadline:
+                raise
+            time.sleep(0.05)
+
+
+def _free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
 
 
 if __name__ == "__main__":

@@ -27,6 +27,7 @@ from argus_core import (
     InMemoryPolicyBundleTrustStore,
     InMemoryPolicyService,
     InMemoryS10KmsCheckpointSigner,
+    InMemoryS10KmsVerifierKeyProvider,
     InMemoryQuotaLedger,
     InMemoryTokenService,
     LaunchEnvelope,
@@ -121,6 +122,8 @@ class S10SupervisorApp:
         quota_ledger: Any | None = None,
         checkpoint_signer: InMemoryS10KmsCheckpointSigner | None = None,
         checkpoint_signer_auth_token: str | None = None,
+        verifier_key_provider: InMemoryS10KmsVerifierKeyProvider | None = None,
+        verifier_key_auth_token: str | None = None,
         docker_supervisor: DockerSandboxSupervisor | None = None,
         price_table: PriceTable | None = None,
         price_table_trust_store: PriceTableTrustStore | None = None,
@@ -137,6 +140,8 @@ class S10SupervisorApp:
         self.policy = self.policy_service.active_bundle
         self.checkpoint_signer = checkpoint_signer
         self._checkpoint_signer_auth_token = checkpoint_signer_auth_token
+        self.verifier_key_provider = verifier_key_provider
+        self._verifier_key_auth_token = verifier_key_auth_token
         self._docker_supervisor = docker_supervisor or DockerSandboxSupervisor()
         self.price_table = price_table
         self.price_table_trust_store = price_table_trust_store
@@ -320,6 +325,8 @@ class S10SupervisorApp:
                 "policy_bundle_version": self.policy.bundle_version,
                 "policy_signer_key_id": self.policy.signer_key_id,
                 "checkpoint_signer": self.checkpoint_signer.kind if self.checkpoint_signer is not None else "unconfigured",
+                "verifier_key_provider": "s10-kms" if self.verifier_key_provider is not None else "unconfigured",
+                "verifier_key_epoch": self.verifier_key_provider.epoch if self.verifier_key_provider is not None else None,
                 "token_signer": self.tokens.signer_kind,
                 "token_signature_algorithm": self.tokens.signature_algorithm,
                 "token_verifier": self.tokens.verifier_kind,
@@ -401,6 +408,46 @@ class S10SupervisorApp:
             except Exception as exc:
                 return 400, {"error": type(exc).__name__, "message": str(exc)}
 
+        @self.http.route("GET", "/v1/internal/verifier-keys")
+        def verifier_key_snapshot(request: JsonRequest) -> tuple[int, Any]:
+            try:
+                self._authenticate_verifier_key_store(request)
+                if self.verifier_key_provider is None:
+                    raise PermissionError("verifier key provider is not configured")
+                epoch, keys = self.verifier_key_provider.snapshot()
+                return 200, {
+                    "provider": "s10-kms",
+                    "epoch": epoch,
+                    "keys": [asdict(key) for key in keys],
+                }
+            except UnauthorizedError as exc:
+                return 401, {"error": "Unauthorized", "message": str(exc)}
+            except PermissionError as exc:
+                return 403, {"error": type(exc).__name__, "message": str(exc)}
+            except Exception as exc:
+                return 400, {"error": type(exc).__name__, "message": str(exc)}
+
+        @self.http.route("POST", "/v1/internal/verifier-keys:verify")
+        def verifier_key_verify(request: JsonRequest) -> tuple[int, Any]:
+            try:
+                self._authenticate_verifier_key_store(request)
+                if self.verifier_key_provider is None:
+                    raise PermissionError("verifier key provider is not configured")
+                if not isinstance(request.body, dict):
+                    return 400, {"error": "json_object_required"}
+                result = self.verifier_key_provider.verify_signature_value(
+                    key_id=_required_str(request.body, "key_id"),
+                    report_with_empty_signature=_required_dict(request.body, "report_with_empty_signature"),
+                    signature_value=_required_str(request.body, "signature_value"),
+                )
+                return 200, {"result": result or "signature_abstain"}
+            except UnauthorizedError as exc:
+                return 401, {"error": "Unauthorized", "message": str(exc)}
+            except PermissionError as exc:
+                return 403, {"error": type(exc).__name__, "message": str(exc)}
+            except Exception as exc:
+                return 400, {"error": type(exc).__name__, "message": str(exc)}
+
         @self.http.route("POST", "/v1/store/artifacts")
         def store_artifact(request: JsonRequest) -> tuple[int, Any]:
             try:
@@ -468,6 +515,13 @@ class S10SupervisorApp:
             purpose="checkpoint signer",
         )
 
+    def _authenticate_verifier_key_store(self, request: JsonRequest) -> None:
+        require_static_bearer_token(
+            request,
+            expected_token=self._verifier_key_auth_token,
+            purpose="verifier key store",
+        )
+
     def _launch_error_payload(self, exc: Exception, launch: LaunchRequest | None) -> dict[str, Any]:
         handle = None
         if launch is not None:
@@ -497,6 +551,10 @@ def build_app_from_env() -> S10SupervisorApp:
     policy_service = _policy_service_from_env()
     checkpoint_signer = _checkpoint_signer_from_env()
     checkpoint_signer_auth_token = _required_env("ARGUS_S10_CHECKPOINT_SIGNER_AUTH_TOKEN")
+    verifier_key_provider = _verifier_key_provider_from_env()
+    verifier_key_auth_token = os.environ.get("ARGUS_S10_VERIFIER_KEY_AUTH_TOKEN")
+    if verifier_key_provider is not None and not verifier_key_auth_token:
+        raise RuntimeError("ARGUS_S10_VERIFIER_KEY_AUTH_TOKEN is required when verifier keys are configured")
     if s8_broker_url:
         if not s8_broker_key:
             raise RuntimeError("ARGUS_S8_BROKER_WRITE_KEY is required when ARGUS_S8_BROKER_URL is configured")
@@ -513,6 +571,8 @@ def build_app_from_env() -> S10SupervisorApp:
             policy_service=policy_service,
             checkpoint_signer=checkpoint_signer,
             checkpoint_signer_auth_token=checkpoint_signer_auth_token,
+            verifier_key_provider=verifier_key_provider,
+            verifier_key_auth_token=verifier_key_auth_token,
             price_table=price_table,
             price_table_trust_store=price_table_trust_store,
         )
@@ -529,6 +589,8 @@ def build_app_from_env() -> S10SupervisorApp:
             policy_service=policy_service,
             checkpoint_signer=checkpoint_signer,
             checkpoint_signer_auth_token=checkpoint_signer_auth_token,
+            verifier_key_provider=verifier_key_provider,
+            verifier_key_auth_token=verifier_key_auth_token,
             price_table=price_table,
             price_table_trust_store=price_table_trust_store,
         )
@@ -541,6 +603,8 @@ def build_app_from_env() -> S10SupervisorApp:
         policy_service=policy_service,
         checkpoint_signer=checkpoint_signer,
         checkpoint_signer_auth_token=checkpoint_signer_auth_token,
+        verifier_key_provider=verifier_key_provider,
+        verifier_key_auth_token=verifier_key_auth_token,
         price_table=price_table,
         price_table_trust_store=price_table_trust_store,
     )
@@ -718,6 +782,45 @@ def _checkpoint_signer_from_env() -> InMemoryS10KmsCheckpointSigner:
         signer_key_id=os.environ.get("ARGUS_S10_CHECKPOINT_SIGNER_KEY_ID", "argus-m0-s8-checkpoint"),
         signing_key=signing_key,
     )
+
+
+def _verifier_key_provider_from_env() -> InMemoryS10KmsVerifierKeyProvider | None:
+    raw_keys = os.environ.get("ARGUS_S10_C3_VERIFIER_KEYS_JSON")
+    if not raw_keys:
+        return None
+    try:
+        parsed = json.loads(raw_keys)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("ARGUS_S10_C3_VERIFIER_KEYS_JSON must be valid JSON") from exc
+    provider = InMemoryS10KmsVerifierKeyProvider()
+    for key in _verifier_key_items(parsed, env_name="ARGUS_S10_C3_VERIFIER_KEYS_JSON"):
+        provider.register_verifier_key(key["key_id"], key["secret"].encode("utf-8"))
+        if key.get("revoked"):
+            provider.revoke_verifier_key(key["key_id"])
+    return provider
+
+
+def _verifier_key_items(value: Any, *, env_name: str) -> list[dict[str, Any]]:
+    if isinstance(value, dict):
+        if all(isinstance(secret, str) for secret in value.values()):
+            return [{"key_id": str(key_id), "secret": secret} for key_id, secret in value.items()]
+        keys = value.get("keys")
+        if isinstance(keys, list):
+            value = keys
+    if not isinstance(value, list):
+        raise RuntimeError(f"{env_name} must be an object map or a list of key objects")
+    items: list[dict[str, Any]] = []
+    for item in value:
+        if not isinstance(item, dict):
+            raise RuntimeError("verifier key entries must be objects")
+        key_id = item.get("key_id")
+        secret = item.get("secret")
+        if not isinstance(key_id, str) or not key_id:
+            raise RuntimeError("verifier key entry key_id is required")
+        if not isinstance(secret, str) or not secret:
+            raise RuntimeError("verifier key entry secret is required")
+        items.append({"key_id": key_id, "secret": secret, "revoked": bool(item.get("revoked", False))})
+    return items
 
 
 class S8BrokeredArtifactStoreClient:

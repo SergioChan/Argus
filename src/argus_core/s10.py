@@ -408,6 +408,22 @@ class _S10VerifierKeyMaterial:
     epoch: int
 
 
+class S10VerifierKeyProvider(Protocol):
+    """S10-owned verifier-key provider surface exposed to read-only trust-store clients."""
+
+    def snapshot(self) -> tuple[int, tuple[S10VerifierKeyMetadata, ...]]:
+        ...
+
+    def verify_signature_value(
+        self,
+        *,
+        key_id: str,
+        report_with_empty_signature: dict[str, Any],
+        signature_value: str,
+    ) -> str | None:
+        ...
+
+
 class InMemoryS10KmsVerifierKeyProvider:
     """S10-owned verifier-key provider that exposes metadata snapshots and KMS-style verification."""
 
@@ -510,7 +526,7 @@ class InMemoryS10KmsCheckpointSigner:
 class S10VerifierTrustStoreClient:
     """Read-only S8/S3 trust-store client backed by an S10 KMS verifier-key provider."""
 
-    def __init__(self, provider: InMemoryS10KmsVerifierKeyProvider) -> None:
+    def __init__(self, provider: S10VerifierKeyProvider) -> None:
         self._provider = provider
         self._epoch = -1
         self._keys: dict[str, VerifierKey] = {}
