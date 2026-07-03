@@ -114,12 +114,13 @@ class S10SupervisorApp:
         runtime_identity_mint_policy: RuntimeIdentityMintPolicy | None = None,
         health_token: str | None = None,
         policy_service: InMemoryPolicyService | None = None,
+        quota_ledger: Any | None = None,
         checkpoint_signer: InMemoryS10KmsCheckpointSigner | None = None,
         checkpoint_signer_auth_token: str | None = None,
         docker_supervisor: DockerSandboxSupervisor | None = None,
     ) -> None:
         self.tokens = token_service or InMemoryTokenService(signing_key=signing_key)
-        self.quota = InMemoryQuotaLedger()
+        self.quota = quota_ledger or InMemoryQuotaLedger()
         self.audit = InMemoryAuditLedger()
         self.artifacts = artifact_store or InMemoryArtifactStore()
         self._artifact_store_path = Path(artifact_store_path) if artifact_store_path is not None else None
@@ -313,6 +314,7 @@ class S10SupervisorApp:
                 "token_signature_algorithm": self.tokens.signature_algorithm,
                 "token_verifier": self.tokens.verifier_kind,
                 "token_revocation_store": self.tokens.revocation_store_kind,
+                "quota_ledger": getattr(self.quota, "kind", type(self.quota).__name__),
                 "audit_events": len(self.audit.events()),
             }
 
@@ -465,6 +467,7 @@ class S10SupervisorApp:
 
 def build_app_from_env() -> S10SupervisorApp:
     token_service = _token_service_from_env()
+    quota_ledger = _quota_ledger_from_env()
     s8_broker_url = os.environ.get("ARGUS_S8_BROKER_URL")
     s8_broker_key = os.environ.get("ARGUS_S8_BROKER_WRITE_KEY")
     mint_policy = _runtime_identity_mint_policy_from_env()
@@ -477,6 +480,7 @@ def build_app_from_env() -> S10SupervisorApp:
             raise RuntimeError("ARGUS_S8_BROKER_WRITE_KEY is required when ARGUS_S8_BROKER_URL is configured")
         return S10SupervisorApp(
             token_service=token_service,
+            quota_ledger=quota_ledger,
             artifact_store=S8BrokeredArtifactStoreClient(
                 endpoint_url=s8_broker_url,
                 broker_write_key=s8_broker_key.encode("utf-8"),
@@ -492,6 +496,7 @@ def build_app_from_env() -> S10SupervisorApp:
     if data_dir:
         return S10SupervisorApp(
             token_service=token_service,
+            quota_ledger=quota_ledger,
             artifact_store=FileSystemArtifactStore(data_dir),
             artifact_store_path=data_dir,
             auth=runtime_auth_from_env(),
@@ -503,6 +508,7 @@ def build_app_from_env() -> S10SupervisorApp:
         )
     return S10SupervisorApp(
         token_service=token_service,
+        quota_ledger=quota_ledger,
         auth=runtime_auth_from_env(),
         runtime_identity_mint_policy=mint_policy,
         health_token=health_token,
@@ -563,6 +569,14 @@ def _token_revocation_store_from_env() -> FileTokenRevocationStore | None:
     if not path:
         return None
     return FileTokenRevocationStore(path)
+
+
+def _quota_ledger_from_env() -> Any:
+    if not os.environ.get("ARGUS_S10_QUOTA_POSTGRES_DSN"):
+        return InMemoryQuotaLedger()
+    from .s10_quota_persistence import build_postgres_quota_ledger_from_env
+
+    return build_postgres_quota_ledger_from_env(dict(os.environ))
 
 
 def _read_hex_secret(*, value_name: str, file_name: str, expected_bytes: int) -> bytes:

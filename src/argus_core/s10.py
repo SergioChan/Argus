@@ -13,7 +13,7 @@ import subprocess
 import time
 from dataclasses import asdict, dataclass, replace
 from hashlib import sha256
-from typing import Any, Callable, Literal, NoReturn
+from typing import Any, Callable, Literal, NoReturn, Protocol
 from uuid import uuid4
 from weakref import ref
 
@@ -172,6 +172,22 @@ class QuotaState:
     reserved: BudgetUsage
     actual: BudgetUsage
     halted: bool = False
+
+
+class QuotaLedger(Protocol):
+    kind: str
+
+    def register_budget(self, token: BudgetToken) -> None: ...
+
+    def reserve(self, budget_id: str, usage: BudgetUsage) -> None: ...
+
+    def consume(self, budget_id: str, usage: BudgetUsage) -> None: ...
+
+    def release(self, budget_id: str, usage: BudgetUsage | None = None) -> None: ...
+
+    def remaining(self, budget_id: str) -> BudgetUsage: ...
+
+    def state(self, budget_id: str) -> QuotaState: ...
 
 
 @dataclass(frozen=True)
@@ -899,6 +915,8 @@ class InMemoryTokenService:
 
 class InMemoryQuotaLedger:
     """Reserve, consume, and release budget dimensions without negative remaining."""
+
+    kind = "memory"
 
     def __init__(self) -> None:
         self._states: dict[str, QuotaState] = {}
@@ -1743,7 +1761,7 @@ class InMemorySandboxOrchestrator:
         self,
         *,
         token_service: InMemoryTokenService,
-        quota_ledger: InMemoryQuotaLedger,
+        quota_ledger: QuotaLedger,
         audit_ledger: InMemoryAuditLedger,
         policy_bundle: PolicyBundle | None = None,
         policy_service: InMemoryPolicyService | None = None,
@@ -1894,7 +1912,7 @@ class DockerSandboxOrchestrator(InMemorySandboxOrchestrator):
         self,
         *,
         token_service: InMemoryTokenService,
-        quota_ledger: InMemoryQuotaLedger,
+        quota_ledger: QuotaLedger,
         audit_ledger: InMemoryAuditLedger,
         policy_bundle: PolicyBundle | None = None,
         policy_service: InMemoryPolicyService | None = None,

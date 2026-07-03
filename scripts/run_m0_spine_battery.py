@@ -510,6 +510,8 @@ def _battery_runtime_auth_required(
         raise AssertionError(f"S10 did not activate public-key offline token verification: {s10_health}")
     if s10_health.get("token_revocation_store") != "file":
         raise AssertionError(f"S10 did not activate file-backed token revocation state: {s10_health}")
+    if s10_health.get("quota_ledger") != "postgres":
+        raise AssertionError(f"S10 did not activate the Postgres quota ledger: {s10_health}")
     _record(
         evidence,
         "auth",
@@ -527,6 +529,7 @@ def _battery_runtime_auth_required(
             "s10_token_signature_algorithm": s10_health["token_signature_algorithm"],
             "s10_token_verifier": s10_health["token_verifier"],
             "s10_token_revocation_store": s10_health["token_revocation_store"],
+            "s10_quota_ledger": s10_health["quota_ledger"],
         },
     )
     return str(s10_health["checkpoint_signer"])
@@ -816,6 +819,34 @@ def _battery_real_persistence(
         with conn.cursor() as cur:
             cur.execute("SELECT count(*) FROM s8.schema_migration;")
             migration_count = int(cur.fetchone()[0])
+            cur.execute("SELECT count(*) FROM s10.schema_migration;")
+            s10_migration_count = int(cur.fetchone()[0])
+            cur.execute("SELECT count(*) FROM s10.quota_ledger_entry;")
+            s10_quota_ledger_entries = int(cur.fetchone()[0])
+            cur.execute("SELECT count(*) FROM s10.quota_budget WHERE halted;")
+            s10_quota_halted_budgets = int(cur.fetchone()[0])
+            cur.execute(
+                """
+                SELECT COALESCE(bool_and(
+                    ((remaining_after->>'compute_units')::double precision >= 0)
+                    AND ((remaining_after->>'gpu_seconds')::double precision >= 0)
+                    AND ((remaining_after->>'model_tokens')::double precision >= 0)
+                    AND ((remaining_after->>'wallclock_s')::double precision >= 0)
+                    AND ((remaining_after->>'cost_usd')::double precision >= 0)
+                ), false)
+                FROM s10.quota_ledger_entry;
+                """
+            )
+            s10_quota_remaining_non_negative = bool(cur.fetchone()[0])
+            cur.execute(
+                """
+                SELECT entry_type
+                FROM s10.quota_ledger_entry
+                GROUP BY entry_type
+                ORDER BY entry_type;
+                """
+            )
+            s10_quota_entry_types = [str(row[0]) for row in cur.fetchall()]
             cur.execute("SELECT count(*) FROM s8.artifact_record;")
             record_count = int(cur.fetchone()[0])
             cur.execute("SELECT count(*) FROM s8.ledger_leaf;")
@@ -874,6 +905,11 @@ def _battery_real_persistence(
         or object_count < 2
         or not all(append_only_denials.values())
         or not record_hashes_match
+        or s10_migration_count < 1
+        or s10_quota_ledger_entries < 4
+        or s10_quota_halted_budgets < 1
+        or not s10_quota_remaining_non_negative
+        or not {"register", "reserve", "consume", "release", "halt"}.issubset(s10_quota_entry_types)
     ):
         raise AssertionError(
             "Postgres/MinIO persistence did not record expected deployed S8 artifacts: "
@@ -881,7 +917,11 @@ def _battery_real_persistence(
             f"checkpoints={checkpoint_count} checkpoint_sequence={checkpoint_sequence} "
             f"checkpoint_signer={checkpoint_signer_key_id} checkpoint_signature_valid={checkpoint_signature_valid} "
             f"objects={object_count} append_only_denials={append_only_denials} "
-            f"record_hashes_match_refreshed_records={record_hashes_match}"
+            f"record_hashes_match_refreshed_records={record_hashes_match} "
+            f"s10_migrations={s10_migration_count} s10_quota_entries={s10_quota_ledger_entries} "
+            f"s10_quota_halted_budgets={s10_quota_halted_budgets} "
+            f"s10_quota_remaining_non_negative={s10_quota_remaining_non_negative} "
+            f"s10_quota_entry_types={s10_quota_entry_types}"
         )
     audit_root_tamper_denial = _postgres_audit_root_tamper_denial(dsn, s8_url=s8_url, token=token)
     _record(
@@ -890,6 +930,11 @@ def _battery_real_persistence(
         "deployed S8 wrote C4 metadata to Postgres append-only ledger and payloads to MinIO with recomputable record hashes",
         {
             "schema_migrations": migration_count,
+            "s10_schema_migrations": s10_migration_count,
+            "s10_quota_ledger_entries": s10_quota_ledger_entries,
+            "s10_quota_halted_budgets": s10_quota_halted_budgets,
+            "s10_quota_remaining_non_negative": s10_quota_remaining_non_negative,
+            "s10_quota_entry_types": s10_quota_entry_types,
             "artifact_records": record_count,
             "ledger_leaves": leaf_count,
             "merkle_checkpoints": checkpoint_count,

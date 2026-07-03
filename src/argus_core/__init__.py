@@ -222,6 +222,8 @@ from .s10 import (
     PolicyBundleVerification,
     PolicyDeniedError,
     PolicyVerdict,
+    QuotaLedger,
+    QuotaState,
     ResourceCeilings,
     S8CheckpointSignature,
     S10Error,

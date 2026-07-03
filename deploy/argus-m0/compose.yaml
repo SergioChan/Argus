@@ -93,6 +93,9 @@ services:
       ARGUS_S10_CHECKPOINT_SIGNER_KEY_ID: argus-m0-s8-checkpoint
       ARGUS_S10_CHECKPOINT_SIGNING_KEY: ${ARGUS_S10_CHECKPOINT_SIGNING_KEY:?ARGUS_S10_CHECKPOINT_SIGNING_KEY is required}
       ARGUS_S10_CHECKPOINT_SIGNER_AUTH_TOKEN: ${ARGUS_S10_CHECKPOINT_SIGNER_AUTH_TOKEN:?ARGUS_S10_CHECKPOINT_SIGNER_AUTH_TOKEN is required}
+      ARGUS_S10_QUOTA_POSTGRES_DSN: postgresql://argus:argus-dev-password@postgres:5432/argus
+      ARGUS_S10_APPLY_MIGRATIONS: "1"
+      ARGUS_S10_MIGRATIONS_DIR: /app/db/s10
       ARGUS_RUNTIME_BOOTSTRAP_TOKEN: ${ARGUS_RUNTIME_BOOTSTRAP_TOKEN:?ARGUS_RUNTIME_BOOTSTRAP_TOKEN is required}
       ARGUS_RUNTIME_IDENTITY_SIGNING_KEY: ${ARGUS_RUNTIME_IDENTITY_SIGNING_KEY:?ARGUS_RUNTIME_IDENTITY_SIGNING_KEY is required}
       ARGUS_RUNTIME_IDENTITY_MINT_POLICY_JSON: ${ARGUS_RUNTIME_IDENTITY_MINT_POLICY_JSON:?ARGUS_RUNTIME_IDENTITY_MINT_POLICY_JSON is required}
@@ -105,6 +108,8 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
       - s10-token-state:/var/lib/argus/s10
     depends_on:
+      postgres:
+        condition: service_healthy
       s8-writer:
         condition: service_healthy
     healthcheck:

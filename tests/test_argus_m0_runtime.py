@@ -638,6 +638,7 @@ class ArgusM0RuntimeServiceTests(unittest.TestCase):
             self.assertEqual(s10_bootstrap_payload["error"], "Unauthorized")
             self.assertEqual(s10_health_status, 200)
             self.assertEqual(s10_health_payload["status"], "ok")
+            self.assertEqual(s10_health_payload["quota_ledger"], "memory")
             self.assertEqual(s10_scope_status, 401)
             self.assertEqual(s10_scope_payload["error"], "Unauthorized")
             self.assertEqual(s10_mint_with_health_status, 401)
@@ -913,6 +914,7 @@ class ArgusM0RuntimeServiceTests(unittest.TestCase):
         self.assertEqual(payload["checkpoint_signer"], "s10-kms")
         self.assertEqual(payload["token_signer"], "local-hmac")
         self.assertEqual(payload["token_signature_algorithm"], "hmac-sha256")
+        self.assertEqual(payload["quota_ledger"], "memory")
 
     def test_s10_env_build_can_use_ed25519_token_signer_and_public_verifier(self) -> None:
         base_env = {
@@ -961,6 +963,7 @@ class ArgusM0RuntimeServiceTests(unittest.TestCase):
         self.assertEqual(health["token_signature_algorithm"], "ed25519")
         self.assertEqual(health["token_verifier"], "offline-ed25519-public")
         self.assertEqual(health["token_revocation_store"], "file")
+        self.assertEqual(health["quota_ledger"], "memory")
         self.assertEqual(runtime_status, 201)
         self.assertEqual(budget_status, 201)
         self.assertEqual(budget["signer_key_id"], "argus-m0-token-root")
@@ -1347,6 +1350,12 @@ class ArgusM0ComposeTests(unittest.TestCase):
             services["s10-supervisor"]["environment"]["ARGUS_S10_TOKEN_REVOCATION_STORE_PATH"],
             "/var/lib/argus/s10/token-revocations.jsonl",
         )
+        self.assertEqual(
+            services["s10-supervisor"]["environment"]["ARGUS_S10_QUOTA_POSTGRES_DSN"],
+            "postgresql://argus:argus-dev-password@postgres:5432/argus",
+        )
+        self.assertEqual(services["s10-supervisor"]["environment"]["ARGUS_S10_APPLY_MIGRATIONS"], "1")
+        self.assertEqual(services["s10-supervisor"]["environment"]["ARGUS_S10_MIGRATIONS_DIR"], "/app/db/s10")
         self.assertEqual(services["s10-supervisor"]["environment"]["ARGUS_S10_POLICY_SIGNING_KEY"], POLICY_SIGNING_KEY)
         self.assertEqual(
             services["s10-supervisor"]["environment"]["ARGUS_S10_CHECKPOINT_SIGNER_KEY_ID"],
@@ -1366,6 +1375,7 @@ class ArgusM0ComposeTests(unittest.TestCase):
             ["/var/lib/argus/s10", "/var/run/docker.sock"],
         )
         self.assertEqual(s10_volumes[0]["source"], "/var/run/docker.sock")
+        self.assertIn("postgres", services["s10-supervisor"]["depends_on"])
         self.assertNotIn("s8-data", rendered["volumes"])
         self.assertIn("postgres-data", rendered["volumes"])
         self.assertIn("minio-data", rendered["volumes"])
