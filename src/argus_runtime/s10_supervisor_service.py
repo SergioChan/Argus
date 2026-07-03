@@ -6,6 +6,7 @@ from dataclasses import asdict, dataclass
 from hashlib import sha256
 import hmac
 import json
+import math
 import os
 from pathlib import Path
 from typing import Any
@@ -336,6 +337,7 @@ class S10SupervisorApp:
                 "price_table_signer_key_id": self._docker_orchestrator.price_table_signer_key_id or "unconfigured",
                 "resource_meter": self._docker_supervisor.resource_meter_kind,
                 "meter_interval_s": self._docker_supervisor.meter_interval_s,
+                "meter_gap_halt_s": self._docker_supervisor.meter_gap_halt_s,
                 "dcgm_available": self._docker_supervisor.dcgm_available,
                 "audit_events": len(self.audit.events()),
             }
@@ -544,6 +546,7 @@ def build_app_from_env() -> S10SupervisorApp:
     token_service = _token_service_from_env()
     quota_ledger = _quota_ledger_from_env()
     price_table, price_table_trust_store = _price_table_from_env()
+    docker_supervisor = _docker_supervisor_from_env()
     s8_broker_url = os.environ.get("ARGUS_S8_BROKER_URL")
     s8_broker_key = os.environ.get("ARGUS_S8_BROKER_WRITE_KEY")
     mint_policy = _runtime_identity_mint_policy_from_env()
@@ -573,6 +576,7 @@ def build_app_from_env() -> S10SupervisorApp:
             checkpoint_signer_auth_token=checkpoint_signer_auth_token,
             verifier_key_provider=verifier_key_provider,
             verifier_key_auth_token=verifier_key_auth_token,
+            docker_supervisor=docker_supervisor,
             price_table=price_table,
             price_table_trust_store=price_table_trust_store,
         )
@@ -591,6 +595,7 @@ def build_app_from_env() -> S10SupervisorApp:
             checkpoint_signer_auth_token=checkpoint_signer_auth_token,
             verifier_key_provider=verifier_key_provider,
             verifier_key_auth_token=verifier_key_auth_token,
+            docker_supervisor=docker_supervisor,
             price_table=price_table,
             price_table_trust_store=price_table_trust_store,
         )
@@ -605,6 +610,7 @@ def build_app_from_env() -> S10SupervisorApp:
         checkpoint_signer_auth_token=checkpoint_signer_auth_token,
         verifier_key_provider=verifier_key_provider,
         verifier_key_auth_token=verifier_key_auth_token,
+        docker_supervisor=docker_supervisor,
         price_table=price_table,
         price_table_trust_store=price_table_trust_store,
     )
@@ -661,6 +667,26 @@ def _token_revocation_store_from_env() -> FileTokenRevocationStore | None:
     if not path:
         return None
     return FileTokenRevocationStore(path)
+
+
+def _docker_supervisor_from_env() -> DockerSandboxSupervisor:
+    return DockerSandboxSupervisor(
+        meter_interval_s=_positive_float_env("ARGUS_S10_METER_INTERVAL_S", 1.0),
+        meter_gap_halt_s=_positive_float_env("ARGUS_S10_METER_GAP_HALT_S", 5.0),
+    )
+
+
+def _positive_float_env(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise RuntimeError(f"{name} must be a positive finite float") from exc
+    if not math.isfinite(value) or value <= 0:
+        raise RuntimeError(f"{name} must be a positive finite float")
+    return value
 
 
 def _quota_ledger_from_env() -> Any:

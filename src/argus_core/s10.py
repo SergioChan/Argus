@@ -1772,6 +1772,10 @@ class DockerSandboxSupervisor:
         return self._meter_interval_s
 
     @property
+    def meter_gap_halt_s(self) -> float:
+        return self._meter_gap_halt_s
+
+    @property
     def dcgm_available(self) -> bool:
         return False
 

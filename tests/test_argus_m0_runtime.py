@@ -960,6 +960,7 @@ class ArgusM0RuntimeServiceTests(unittest.TestCase):
             self.assertEqual(s10_health_payload["quota_ledger"], "memory")
             self.assertEqual(s10_health_payload["resource_meter"], "docker-api-cgroup")
             self.assertLessEqual(s10_health_payload["meter_interval_s"], 5)
+            self.assertGreaterEqual(s10_health_payload["meter_gap_halt_s"], s10_health_payload["meter_interval_s"])
             self.assertFalse(s10_health_payload["dcgm_available"])
             self.assertEqual(s10_scope_status, 401)
             self.assertEqual(s10_scope_payload["error"], "Unauthorized")
@@ -1331,7 +1332,44 @@ class ArgusM0RuntimeServiceTests(unittest.TestCase):
         self.assertEqual(payload["price_table_signer_key_id"], "unconfigured")
         self.assertEqual(payload["resource_meter"], "docker-api-cgroup")
         self.assertLessEqual(payload["meter_interval_s"], 5)
+        self.assertGreaterEqual(payload["meter_gap_halt_s"], payload["meter_interval_s"])
         self.assertFalse(payload["dcgm_available"])
+
+    def test_s10_env_build_uses_meter_gap_config_and_rejects_invalid_values(self) -> None:
+        base_env = {
+            "ARGUS_S10_SIGNING_KEY": "test-s10-signing-key",
+            "ARGUS_RUNTIME_BOOTSTRAP_TOKEN": BOOTSTRAP_TOKEN,
+            "ARGUS_RUNTIME_IDENTITY_SIGNING_KEY": IDENTITY_SIGNING_KEY.decode("utf-8"),
+            "ARGUS_RUNTIME_IDENTITY_MINT_POLICY_JSON": _runtime_identity_mint_policy_json(),
+            "ARGUS_M0_HEALTH_TOKEN": HEALTH_TOKEN,
+            "ARGUS_S10_POLICY_SIGNING_KEY": POLICY_SIGNING_KEY,
+            "ARGUS_S10_CHECKPOINT_SIGNING_KEY": CHECKPOINT_SIGNING_KEY,
+            "ARGUS_S10_CHECKPOINT_SIGNER_AUTH_TOKEN": CHECKPOINT_SIGNER_AUTH_TOKEN,
+        }
+        with patch.dict(
+            os.environ,
+            {
+                **base_env,
+                "ARGUS_S10_METER_INTERVAL_S": "0.25",
+                "ARGUS_S10_METER_GAP_HALT_S": "0.75",
+            },
+            clear=True,
+        ):
+            app = build_s10_app_from_env()
+            status, payload = app.http.handle(
+                JsonRequest(method="GET", path="/healthz", query={}, body=None, headers=_auth_headers(HEALTH_TOKEN))
+            )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["meter_interval_s"], 0.25)
+        self.assertEqual(payload["meter_gap_halt_s"], 0.75)
+
+        with patch.dict(os.environ, {**base_env, "ARGUS_S10_METER_INTERVAL_S": "0"}, clear=True):
+            with self.assertRaisesRegex(RuntimeError, "ARGUS_S10_METER_INTERVAL_S"):
+                build_s10_app_from_env()
+        with patch.dict(os.environ, {**base_env, "ARGUS_S10_METER_GAP_HALT_S": "not-a-number"}, clear=True):
+            with self.assertRaisesRegex(RuntimeError, "ARGUS_S10_METER_GAP_HALT_S"):
+                build_s10_app_from_env()
 
     def test_s10_env_build_can_use_ed25519_token_signer_and_public_verifier(self) -> None:
         base_env = {
@@ -1384,6 +1422,7 @@ class ArgusM0RuntimeServiceTests(unittest.TestCase):
         self.assertEqual(health["price_table"], "unconfigured")
         self.assertEqual(health["resource_meter"], "docker-api-cgroup")
         self.assertLessEqual(health["meter_interval_s"], 5)
+        self.assertGreaterEqual(health["meter_gap_halt_s"], health["meter_interval_s"])
         self.assertFalse(health["dcgm_available"])
         self.assertEqual(runtime_status, 201)
         self.assertEqual(budget_status, 201)
@@ -1427,6 +1466,7 @@ class ArgusM0RuntimeServiceTests(unittest.TestCase):
         self.assertEqual(health["price_table_signer_key_id"], "argus-m0-price-table")
         self.assertEqual(health["resource_meter"], "docker-api-cgroup")
         self.assertLessEqual(health["meter_interval_s"], 5)
+        self.assertGreaterEqual(health["meter_gap_halt_s"], health["meter_interval_s"])
         self.assertFalse(health["dcgm_available"])
         self.assertIsNotNone(app.price_table)
         self.assertTrue(app.price_table.signature.startswith("hmac-sha256:"))
@@ -1853,6 +1893,8 @@ class ArgusM0ComposeTests(unittest.TestCase):
             services["s10-supervisor"]["environment"]["ARGUS_S10_PRICE_TABLE_USD_PER_1K_MODEL_TOKENS"],
             "0.004",
         )
+        self.assertEqual(services["s10-supervisor"]["environment"]["ARGUS_S10_METER_INTERVAL_S"], "1.0")
+        self.assertEqual(services["s10-supervisor"]["environment"]["ARGUS_S10_METER_GAP_HALT_S"], "5.0")
         self.assertEqual(services["s10-supervisor"]["environment"]["ARGUS_S10_POLICY_SIGNING_KEY"], POLICY_SIGNING_KEY)
         self.assertEqual(
             services["s10-supervisor"]["environment"]["ARGUS_S10_CHECKPOINT_SIGNER_KEY_ID"],

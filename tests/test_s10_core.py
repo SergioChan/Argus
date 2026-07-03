@@ -1126,6 +1126,44 @@ class S10DockerSupervisorTests(unittest.TestCase):
         self.assertTrue(all(not sample.dcgm_available for sample in samples))
         self.assertGreaterEqual(max(sample.memory_bytes for sample in samples), 0)
 
+    def test_low_meter_gap_threshold_halts_real_container_fail_closed(self) -> None:
+        if s10_module._resolve_docker_socket_path() is None:
+            self._skip_or_fail("docker API socket is unavailable")
+        samples: list[s10_module.ResourceMeterSample] = []
+        supervisor = DockerSandboxSupervisor(docker_bin=self.docker_bin, meter_interval_s=0.1, meter_gap_halt_s=0.1)
+        request = self._launch_request(
+            entrypoint=("/bin/sh",),
+            args=("-c", "sleep 30"),
+            env={},
+            env_allowlist=(),
+            wallclock_s=5,
+        )
+        handle = self._handle()
+        container_name = f"argus-{handle.sandbox_id.replace('-', '')[:24]}"
+        self.addCleanup(
+            lambda: subprocess.run(
+                [self.docker_bin, "rm", "-f", container_name],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+        )
+
+        result = supervisor.run(handle=handle, request=request, materialized_env={}, meter_sample_sink=samples.append)
+
+        self.assertTrue(result.timed_out)
+        self.assertIsNone(result.exit_code)
+        self.assertIn("meter_gap", result.stderr)
+        gap_samples = [
+            sample
+            for sample in samples
+            if sample.source == "docker-api-cgroup-gap" or "meter_gap" in sample.breached_dimensions
+        ]
+        self.assertGreaterEqual(len(gap_samples), 1)
+        self.assertTrue(all(sample.halted for sample in gap_samples))
+        self.assertTrue(all("meter_gap" in sample.breached_dimensions for sample in gap_samples))
+        self.assertGreater(max(sample.conservative_gap_s for sample in gap_samples), 0)
+
     def _container_exists(self, container_name: str) -> bool:
         inspect = subprocess.run(
             [self.docker_bin, "container", "inspect", container_name],
