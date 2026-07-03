@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import importlib.util
 import json
 from pathlib import Path
 import subprocess
@@ -62,6 +63,27 @@ class S8GeneratedBindingsTests(unittest.TestCase):
         )
 
         self.assertEqual(result.returncode, 0, msg=result.stderr)
+
+    def test_binding_generator_renders_same_bytes_across_repeated_runs(self) -> None:
+        spec = importlib.util.spec_from_file_location("generate_bindings", ROOT / "scripts" / "generate_bindings.py")
+        self.assertIsNotNone(spec)
+        self.assertIsNotNone(spec.loader)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+        first = module.generated_files()
+        second = module.generated_files()
+
+        self.assertEqual(set(first), set(second))
+        self.assertEqual(first, second)
+        rendered = {path.relative_to(ROOT).as_posix(): content for path, content in first.items()}
+        for required in (
+            "bindings/python/argus_contracts/c4.py",
+            "bindings/typescript/src/c4.ts",
+            "bindings/rust/src/c4.rs",
+        ):
+            self.assertIn(required, rendered)
+            self.assertIn(C4_SCHEMA_SHA256, rendered[required])
 
     def test_python_hash_vector_matches_s8_binding_vector(self) -> None:
         self.assertEqual(hash_bytes(b""), "blake3:af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262")
