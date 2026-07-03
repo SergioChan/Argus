@@ -341,6 +341,12 @@ class S10SupervisorApp:
                 "meter_interval_s": self._docker_supervisor.meter_interval_s,
                 "meter_gap_halt_s": self._docker_supervisor.meter_gap_halt_s,
                 "dcgm_available": self._docker_supervisor.dcgm_available,
+                "nvidia_smi_available": self._docker_supervisor.nvidia_smi_available,
+                "gpu_count": self._docker_supervisor.gpu_count,
+                "gpu_models": list(self._docker_supervisor.gpu_models),
+                "mig_enabled": self._docker_supervisor.mig_enabled,
+                "mig_instance_count": self._docker_supervisor.mig_instance_count,
+                "gpu_telemetry_source": self._docker_supervisor.gpu_telemetry_source,
                 "audit_events": len(self.audit.events()),
             }
 

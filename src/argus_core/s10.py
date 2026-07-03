@@ -112,6 +112,18 @@ class BudgetUsage:
 
 
 @dataclass(frozen=True)
+class GpuTelemetrySnapshot:
+    dcgm_available: bool = False
+    nvidia_smi_available: bool = False
+    gpu_count: int = 0
+    gpu_models: tuple[str, ...] = ()
+    mig_enabled: bool = False
+    mig_instance_count: int = 0
+    source: str = "unavailable"
+    error: str = ""
+
+
+@dataclass(frozen=True)
 class ResourceMeterSample:
     sample_seq: int
     elapsed_s: float
@@ -120,6 +132,13 @@ class ResourceMeterSample:
     memory_bytes: int = 0
     source: str = "docker-api-cgroup"
     dcgm_available: bool = False
+    nvidia_smi_available: bool = False
+    gpu_count: int = 0
+    gpu_models: tuple[str, ...] = ()
+    mig_enabled: bool = False
+    mig_instance_count: int = 0
+    gpu_telemetry_source: str = "unavailable"
+    gpu_telemetry_error: str = ""
     breached_dimensions: tuple[str, ...] = ()
     halted: bool = False
     conservative_gap_s: float = 0.0
@@ -1308,6 +1327,82 @@ def _merge_breach_dimensions(*groups: Iterable[str]) -> tuple[str, ...]:
     return tuple(merged)
 
 
+def _run_gpu_telemetry_command(args: tuple[str, ...]) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        list(args),
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=2,
+    )
+
+
+def _safe_gpu_probe_error(value: str) -> str:
+    return " ".join(value.strip().split())[:240]
+
+
+def _parse_nvidia_smi_l(output: str) -> tuple[int, tuple[str, ...], int]:
+    gpu_models: list[str] = []
+    mig_instance_count = 0
+    for line in output.splitlines():
+        gpu_match = re.match(r"^GPU\s+\d+:\s*(.+?)(?:\s+\(UUID:.*)?$", line.strip())
+        if gpu_match:
+            gpu_models.append(gpu_match.group(1).strip())
+            continue
+        if re.match(r"^\s*MIG\s+.+Device\s+\d+:", line):
+            mig_instance_count += 1
+    return len(gpu_models), tuple(gpu_models), mig_instance_count
+
+
+def discover_gpu_telemetry(
+    *,
+    command_runner: Callable[[tuple[str, ...]], subprocess.CompletedProcess[str]] | None = None,
+    command_exists: Callable[[str], bool] | None = None,
+) -> GpuTelemetrySnapshot:
+    runner = command_runner or _run_gpu_telemetry_command
+    exists = command_exists or (lambda command: shutil.which(command) is not None)
+    sources: list[str] = []
+    errors: list[str] = []
+    dcgm_probe_ok = False
+    nvidia_smi_available = False
+    gpu_count = 0
+    gpu_models: tuple[str, ...] = ()
+    mig_instance_count = 0
+
+    if exists("dcgmi"):
+        sources.append("dcgmi")
+        try:
+            dcgm = runner(("dcgmi", "discovery", "-l"))
+            dcgm_probe_ok = dcgm.returncode == 0
+            if dcgm.returncode != 0:
+                errors.append(f"dcgmi:{_safe_gpu_probe_error(dcgm.stderr or dcgm.stdout)}")
+        except (FileNotFoundError, subprocess.TimeoutExpired, TimeoutError) as exc:
+            errors.append(f"dcgmi:{type(exc).__name__}")
+
+    if exists("nvidia-smi"):
+        sources.append("nvidia-smi")
+        try:
+            nvidia = runner(("nvidia-smi", "-L"))
+            nvidia_smi_available = nvidia.returncode == 0
+            if nvidia.returncode == 0:
+                gpu_count, gpu_models, mig_instance_count = _parse_nvidia_smi_l(nvidia.stdout or "")
+            else:
+                errors.append(f"nvidia-smi:{_safe_gpu_probe_error(nvidia.stderr or nvidia.stdout)}")
+        except (FileNotFoundError, subprocess.TimeoutExpired, TimeoutError) as exc:
+            errors.append(f"nvidia-smi:{type(exc).__name__}")
+
+    return GpuTelemetrySnapshot(
+        dcgm_available=dcgm_probe_ok and gpu_count > 0,
+        nvidia_smi_available=nvidia_smi_available,
+        gpu_count=gpu_count,
+        gpu_models=gpu_models,
+        mig_enabled=mig_instance_count > 0,
+        mig_instance_count=mig_instance_count,
+        source="+".join(sources) if sources else "unavailable",
+        error="; ".join(error for error in errors if error),
+    )
+
+
 def _resource_meter_sample_payload(sample: ResourceMeterSample) -> dict[str, Any]:
     return {
         "sample_seq": sample.sample_seq,
@@ -1317,6 +1412,13 @@ def _resource_meter_sample_payload(sample: ResourceMeterSample) -> dict[str, Any
         "memory_bytes": sample.memory_bytes,
         "source": sample.source,
         "dcgm_available": sample.dcgm_available,
+        "nvidia_smi_available": sample.nvidia_smi_available,
+        "gpu_count": sample.gpu_count,
+        "gpu_models": list(sample.gpu_models),
+        "mig_enabled": sample.mig_enabled,
+        "mig_instance_count": sample.mig_instance_count,
+        "gpu_telemetry_source": sample.gpu_telemetry_source,
+        "gpu_telemetry_error": sample.gpu_telemetry_error,
         "breached_dimensions": list(sample.breached_dimensions),
         "halted": sample.halted,
         "conservative_gap_s": round(sample.conservative_gap_s, 6),
@@ -1352,6 +1454,13 @@ def _resource_metering_payload(
         "halt_completion_latency_s": round(halt_completion_latency_s, 6),
         "freeze_capture_latency_s": round(freeze_capture_latency_s, 6),
         "dcgm_available": any(sample.dcgm_available for sample in samples),
+        "nvidia_smi_available": any(sample.nvidia_smi_available for sample in samples),
+        "gpu_count": max((sample.gpu_count for sample in samples), default=0),
+        "gpu_models": sorted({model for sample in samples for model in sample.gpu_models}),
+        "mig_enabled": any(sample.mig_enabled for sample in samples),
+        "mig_instance_count": max((sample.mig_instance_count for sample in samples), default=0),
+        "gpu_telemetry_source": samples[-1].gpu_telemetry_source if samples else "unavailable",
+        "gpu_telemetry_error": samples[-1].gpu_telemetry_error if samples else "",
         "samples": [_resource_meter_sample_payload(sample) for sample in samples],
     }
 
@@ -1783,15 +1892,17 @@ class DockerSandboxSupervisor:
         docker_bin: str | None = None,
         meter_interval_s: float = 1.0,
         meter_gap_halt_s: float = 5.0,
+        gpu_telemetry: GpuTelemetrySnapshot | None = None,
     ) -> None:
         self._docker_bin = docker_bin or shutil.which("docker") or "docker"
         self._meter_interval_s = min(max(float(meter_interval_s), 0.1), 5.0)
         self._meter_gap_halt_s = max(float(meter_gap_halt_s), self._meter_interval_s)
         self._docker_socket_path = _resolve_docker_socket_path()
+        self._gpu_telemetry = gpu_telemetry or discover_gpu_telemetry()
 
     @property
     def resource_meter_kind(self) -> str:
-        return "docker-api-cgroup"
+        return "docker-api-cgroup+dcgm" if self._gpu_telemetry.dcgm_available else "docker-api-cgroup"
 
     @property
     def meter_interval_s(self) -> float:
@@ -1803,7 +1914,43 @@ class DockerSandboxSupervisor:
 
     @property
     def dcgm_available(self) -> bool:
-        return False
+        return self._gpu_telemetry.dcgm_available
+
+    @property
+    def nvidia_smi_available(self) -> bool:
+        return self._gpu_telemetry.nvidia_smi_available
+
+    @property
+    def gpu_count(self) -> int:
+        return self._gpu_telemetry.gpu_count
+
+    @property
+    def gpu_models(self) -> tuple[str, ...]:
+        return self._gpu_telemetry.gpu_models
+
+    @property
+    def mig_enabled(self) -> bool:
+        return self._gpu_telemetry.mig_enabled
+
+    @property
+    def mig_instance_count(self) -> int:
+        return self._gpu_telemetry.mig_instance_count
+
+    @property
+    def gpu_telemetry_source(self) -> str:
+        return self._gpu_telemetry.source
+
+    def _gpu_telemetry_sample_fields(self) -> dict[str, Any]:
+        return {
+            "dcgm_available": self._gpu_telemetry.dcgm_available,
+            "nvidia_smi_available": self._gpu_telemetry.nvidia_smi_available,
+            "gpu_count": self._gpu_telemetry.gpu_count,
+            "gpu_models": self._gpu_telemetry.gpu_models,
+            "mig_enabled": self._gpu_telemetry.mig_enabled,
+            "mig_instance_count": self._gpu_telemetry.mig_instance_count,
+            "gpu_telemetry_source": self._gpu_telemetry.source,
+            "gpu_telemetry_error": self._gpu_telemetry.error,
+        }
 
     def run(
         self,
@@ -2013,6 +2160,7 @@ class DockerSandboxSupervisor:
                     cadence_s=gap_s,
                     usage=_runtime_budget_usage(envelope, elapsed_s),
                     source="docker-api-cgroup-gap",
+                    **self._gpu_telemetry_sample_fields(),
                     breached_dimensions=("meter_gap",),
                     halted=True,
                     conservative_gap_s=gap_s,
@@ -2045,6 +2193,7 @@ class DockerSandboxSupervisor:
                             cadence_s=0.0,
                             usage=usage,
                             source="docker-api-cgroup-final",
+                            **self._gpu_telemetry_sample_fields(),
                         )
                     )
                 return int(container_state.get("ExitCode", 1)), False, "", usage, None
@@ -2197,7 +2346,7 @@ class DockerSandboxSupervisor:
             usage=usage,
             memory_bytes=memory_bytes,
             source=source,
-            dcgm_available=False,
+            **self._gpu_telemetry_sample_fields(),
             conservative_gap_s=conservative_gap_s,
         )
 

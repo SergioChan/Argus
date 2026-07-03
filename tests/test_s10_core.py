@@ -971,6 +971,84 @@ class S10OrchestratorAndAuditTests(unittest.TestCase):
         )
 
 
+class S10GpuTelemetryDiscoveryTests(unittest.TestCase):
+    def test_discovers_dcgm_nvidia_gpus_and_mig_instances_from_real_command_shapes(self) -> None:
+        def exists(command: str) -> bool:
+            return command in {"dcgmi", "nvidia-smi"}
+
+        def runner(args: tuple[str, ...]) -> subprocess.CompletedProcess[str]:
+            if args == ("dcgmi", "discovery", "-l"):
+                return subprocess.CompletedProcess(args, 0, stdout="2 GPUs found.\n", stderr="")
+            if args == ("nvidia-smi", "-L"):
+                return subprocess.CompletedProcess(
+                    args,
+                    0,
+                    stdout=(
+                        "GPU 0: NVIDIA A100-SXM4-40GB (UUID: GPU-aaaaaaaa)\n"
+                        "  MIG 1g.5gb Device 0: (UUID: MIG-bbbbbbbb)\n"
+                        "  MIG 1g.5gb Device 1: (UUID: MIG-cccccccc)\n"
+                        "GPU 1: NVIDIA A100-SXM4-40GB (UUID: GPU-dddddddd)\n"
+                    ),
+                    stderr="",
+                )
+            raise AssertionError(f"unexpected GPU telemetry command: {args}")
+
+        snapshot = s10_module.discover_gpu_telemetry(command_runner=runner, command_exists=exists)
+
+        self.assertTrue(snapshot.dcgm_available)
+        self.assertTrue(snapshot.nvidia_smi_available)
+        self.assertEqual(snapshot.gpu_count, 2)
+        self.assertEqual(snapshot.gpu_models, ("NVIDIA A100-SXM4-40GB", "NVIDIA A100-SXM4-40GB"))
+        self.assertTrue(snapshot.mig_enabled)
+        self.assertEqual(snapshot.mig_instance_count, 2)
+        self.assertEqual(snapshot.source, "dcgmi+nvidia-smi")
+        self.assertEqual(snapshot.error, "")
+
+    def test_reports_unavailable_without_gpu_tools(self) -> None:
+        def exists(command: str) -> bool:
+            return False
+
+        def runner(args: tuple[str, ...]) -> subprocess.CompletedProcess[str]:
+            raise AssertionError(f"runner should not be called when tools are absent: {args}")
+
+        snapshot = s10_module.discover_gpu_telemetry(command_runner=runner, command_exists=exists)
+
+        self.assertFalse(snapshot.dcgm_available)
+        self.assertFalse(snapshot.nvidia_smi_available)
+        self.assertEqual(snapshot.gpu_count, 0)
+        self.assertEqual(snapshot.gpu_models, ())
+        self.assertFalse(snapshot.mig_enabled)
+        self.assertEqual(snapshot.mig_instance_count, 0)
+        self.assertEqual(snapshot.source, "unavailable")
+
+    def test_resource_metering_payload_exposes_gpu_topology_evidence(self) -> None:
+        sample = s10_module.ResourceMeterSample(
+            sample_seq=1,
+            elapsed_s=0.5,
+            cadence_s=0.0,
+            usage=BudgetUsage(gpu_seconds=0.5, wallclock_s=0.5),
+            source="docker-api-cgroup",
+            dcgm_available=True,
+            nvidia_smi_available=True,
+            gpu_count=1,
+            gpu_models=("NVIDIA A100-SXM4-40GB",),
+            mig_enabled=True,
+            mig_instance_count=1,
+            gpu_telemetry_source="dcgmi+nvidia-smi",
+        )
+
+        payload = s10_module._resource_metering_payload((sample,), requested_wallclock_s=1.0)
+
+        self.assertTrue(payload["dcgm_available"])
+        self.assertTrue(payload["nvidia_smi_available"])
+        self.assertEqual(payload["gpu_count"], 1)
+        self.assertEqual(payload["gpu_models"], ["NVIDIA A100-SXM4-40GB"])
+        self.assertTrue(payload["mig_enabled"])
+        self.assertEqual(payload["mig_instance_count"], 1)
+        self.assertEqual(payload["gpu_telemetry_source"], "dcgmi+nvidia-smi")
+        self.assertEqual(payload["samples"][0]["mig_instance_count"], 1)
+
+
 class S10ResourceMeterGapTests(unittest.TestCase):
     def test_docker_stats_preserves_conservative_gpu_seconds_without_dcgm(self) -> None:
         envelope = LaunchEnvelope(

@@ -342,6 +342,12 @@ def main() -> int:
                 "spend_final_meter_sample_count": spend_final["meter_sample_count"],
                 "spend_final_meter_max_cadence_s": spend_final["meter_max_cadence_s"],
                 "spend_final_meter_dcgm_available": spend_final["meter_dcgm_available"],
+                "spend_final_meter_nvidia_smi_available": spend_final["meter_nvidia_smi_available"],
+                "spend_final_meter_gpu_count": spend_final["meter_gpu_count"],
+                "spend_final_meter_gpu_models": spend_final["meter_gpu_models"],
+                "spend_final_meter_mig_enabled": spend_final["meter_mig_enabled"],
+                "spend_final_meter_mig_instance_count": spend_final["meter_mig_instance_count"],
+                "spend_final_meter_gpu_telemetry_source": spend_final["meter_gpu_telemetry_source"],
                 "model_ref": model_record["artifact_ref"],
                 "impact_refs": sorted(impact_refs),
                 "query_refs": sorted(query_refs),
@@ -682,6 +688,14 @@ def _battery_runtime_auth_required(
         raise AssertionError(f"S10 meter gap halt threshold is below the meter cadence: {s10_health}")
     if s10_health.get("dcgm_available") is not False:
         raise AssertionError(f"S10 M0 no-GPU health must report dcgm_available=false: {s10_health}")
+    if s10_health.get("nvidia_smi_available") is not False:
+        raise AssertionError(f"S10 M0 no-GPU health must report nvidia_smi_available=false: {s10_health}")
+    if int(s10_health.get("gpu_count") or 0) != 0:
+        raise AssertionError(f"S10 M0 no-GPU health must report gpu_count=0: {s10_health}")
+    if s10_health.get("mig_enabled") is not False:
+        raise AssertionError(f"S10 M0 no-GPU health must report mig_enabled=false: {s10_health}")
+    if int(s10_health.get("mig_instance_count") or 0) != 0:
+        raise AssertionError(f"S10 M0 no-GPU health must report mig_instance_count=0: {s10_health}")
     _record(
         evidence,
         "auth",
@@ -709,6 +723,12 @@ def _battery_runtime_auth_required(
             "s10_meter_interval_s": s10_health["meter_interval_s"],
             "s10_meter_gap_halt_s": s10_health["meter_gap_halt_s"],
             "s10_dcgm_available": s10_health["dcgm_available"],
+            "s10_nvidia_smi_available": s10_health["nvidia_smi_available"],
+            "s10_gpu_count": s10_health["gpu_count"],
+            "s10_gpu_models": s10_health["gpu_models"],
+            "s10_mig_enabled": s10_health["mig_enabled"],
+            "s10_mig_instance_count": s10_health["mig_instance_count"],
+            "s10_gpu_telemetry_source": s10_health["gpu_telemetry_source"],
         },
     )
     return str(s10_health["checkpoint_signer"])
@@ -1779,6 +1799,12 @@ def _battery_e_budget_halt(
             "spend_final_meter_halt_completion_latency_s": spend_final["meter_halt_completion_latency_s"],
             "spend_final_meter_freeze_capture_latency_s": spend_final["meter_freeze_capture_latency_s"],
             "spend_final_meter_dcgm_available": spend_final["meter_dcgm_available"],
+            "spend_final_meter_nvidia_smi_available": spend_final["meter_nvidia_smi_available"],
+            "spend_final_meter_gpu_count": spend_final["meter_gpu_count"],
+            "spend_final_meter_gpu_models": spend_final["meter_gpu_models"],
+            "spend_final_meter_mig_enabled": spend_final["meter_mig_enabled"],
+            "spend_final_meter_mig_instance_count": spend_final["meter_mig_instance_count"],
+            "spend_final_meter_gpu_telemetry_source": spend_final["meter_gpu_telemetry_source"],
             "spend_final_meter_gap_sample_count": spend_final["meter_gap_sample_count"],
         },
     )
@@ -2161,6 +2187,12 @@ def _battery_non_injected_meter_gap(
             "spend_final_meter_halted_by_meter": spend_final["meter_halted_by_meter"],
             "spend_final_meter_max_cadence_s": spend_final["meter_max_cadence_s"],
             "spend_final_meter_dcgm_available": spend_final["meter_dcgm_available"],
+            "spend_final_meter_nvidia_smi_available": spend_final["meter_nvidia_smi_available"],
+            "spend_final_meter_gpu_count": spend_final["meter_gpu_count"],
+            "spend_final_meter_gpu_models": spend_final["meter_gpu_models"],
+            "spend_final_meter_mig_enabled": spend_final["meter_mig_enabled"],
+            "spend_final_meter_mig_instance_count": spend_final["meter_mig_instance_count"],
+            "spend_final_meter_gpu_telemetry_source": spend_final["meter_gpu_telemetry_source"],
         },
     )
 
@@ -2258,6 +2290,14 @@ def _battery_spend_final(
         raise AssertionError(f"spend.final resource-meter cadence exceeded S10 bound: {payload}")
     if metering.get("dcgm_available") is not False:
         raise AssertionError(f"spend.final M0 no-GPU metering must report dcgm_available=false: {payload}")
+    if metering.get("nvidia_smi_available") is not False:
+        raise AssertionError(f"spend.final M0 no-GPU metering must report nvidia_smi_available=false: {payload}")
+    if int(metering.get("gpu_count") or 0) != 0:
+        raise AssertionError(f"spend.final M0 no-GPU metering must report gpu_count=0: {payload}")
+    if metering.get("mig_enabled") is not False:
+        raise AssertionError(f"spend.final M0 no-GPU metering must report mig_enabled=false: {payload}")
+    if int(metering.get("mig_instance_count") or 0) != 0:
+        raise AssertionError(f"spend.final M0 no-GPU metering must report mig_instance_count=0: {payload}")
     if expected_state == "BUDGET_HALTED":
         if metering.get("halted_by_meter") is not True:
             raise AssertionError(f"spend.final budget halt missing meter halt evidence: {payload}")
@@ -2283,6 +2323,12 @@ def _battery_spend_final(
         "meter_halt_completion_latency_s": float(metering.get("halt_completion_latency_s", 0)),
         "meter_freeze_capture_latency_s": float(metering.get("freeze_capture_latency_s", 0)),
         "meter_dcgm_available": bool(metering["dcgm_available"]),
+        "meter_nvidia_smi_available": bool(metering["nvidia_smi_available"]),
+        "meter_gpu_count": int(metering["gpu_count"]),
+        "meter_gpu_models": list(metering.get("gpu_models") or []),
+        "meter_mig_enabled": bool(metering["mig_enabled"]),
+        "meter_mig_instance_count": int(metering["mig_instance_count"]),
+        "meter_gpu_telemetry_source": str(metering.get("gpu_telemetry_source") or "unavailable"),
         "meter_gap_sample_count": len(meter_gap_samples),
         "meter_gap_sources": meter_gap_sources,
         "meter_gap_max_conservative_gap_s": meter_gap_max_conservative_gap_s,

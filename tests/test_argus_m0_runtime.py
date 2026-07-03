@@ -129,6 +129,12 @@ class ArgusM0RuntimeServiceTests(unittest.TestCase):
             "meter_halted_by_meter": True,
             "meter_max_cadence_s": 0.1,
             "meter_dcgm_available": False,
+            "meter_nvidia_smi_available": False,
+            "meter_gpu_count": 0,
+            "meter_gpu_models": [],
+            "meter_mig_enabled": False,
+            "meter_mig_instance_count": 0,
+            "meter_gpu_telemetry_source": "unavailable",
         }
 
         with (
@@ -1117,6 +1123,10 @@ class ArgusM0RuntimeServiceTests(unittest.TestCase):
             self.assertLessEqual(s10_health_payload["meter_interval_s"], 5)
             self.assertGreaterEqual(s10_health_payload["meter_gap_halt_s"], s10_health_payload["meter_interval_s"])
             self.assertFalse(s10_health_payload["dcgm_available"])
+            self.assertFalse(s10_health_payload["nvidia_smi_available"])
+            self.assertEqual(s10_health_payload["gpu_count"], 0)
+            self.assertFalse(s10_health_payload["mig_enabled"])
+            self.assertEqual(s10_health_payload["mig_instance_count"], 0)
             self.assertEqual(s10_scope_status, 401)
             self.assertEqual(s10_scope_payload["error"], "Unauthorized")
             self.assertEqual(s10_mint_with_health_status, 401)
@@ -1491,6 +1501,10 @@ class ArgusM0RuntimeServiceTests(unittest.TestCase):
         self.assertLessEqual(payload["meter_interval_s"], 5)
         self.assertGreaterEqual(payload["meter_gap_halt_s"], payload["meter_interval_s"])
         self.assertFalse(payload["dcgm_available"])
+        self.assertFalse(payload["nvidia_smi_available"])
+        self.assertEqual(payload["gpu_count"], 0)
+        self.assertFalse(payload["mig_enabled"])
+        self.assertEqual(payload["mig_instance_count"], 0)
 
     def test_s10_env_build_uses_meter_gap_config_and_rejects_invalid_values(self) -> None:
         base_env = {
@@ -1581,6 +1595,10 @@ class ArgusM0RuntimeServiceTests(unittest.TestCase):
         self.assertLessEqual(health["meter_interval_s"], 5)
         self.assertGreaterEqual(health["meter_gap_halt_s"], health["meter_interval_s"])
         self.assertFalse(health["dcgm_available"])
+        self.assertFalse(health["nvidia_smi_available"])
+        self.assertEqual(health["gpu_count"], 0)
+        self.assertFalse(health["mig_enabled"])
+        self.assertEqual(health["mig_instance_count"], 0)
         self.assertEqual(runtime_status, 201)
         self.assertEqual(budget_status, 201)
         self.assertEqual(budget["signer_key_id"], "argus-m0-token-root")
@@ -1625,6 +1643,10 @@ class ArgusM0RuntimeServiceTests(unittest.TestCase):
         self.assertLessEqual(health["meter_interval_s"], 5)
         self.assertGreaterEqual(health["meter_gap_halt_s"], health["meter_interval_s"])
         self.assertFalse(health["dcgm_available"])
+        self.assertFalse(health["nvidia_smi_available"])
+        self.assertEqual(health["gpu_count"], 0)
+        self.assertFalse(health["mig_enabled"])
+        self.assertEqual(health["mig_instance_count"], 0)
         self.assertIsNotNone(app.price_table)
         self.assertTrue(app.price_table.signature.startswith("hmac-sha256:"))
 
