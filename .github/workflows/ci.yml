@@ -30,6 +30,15 @@ jobs:
           ARGUS_S10_TEST_IMAGE: "busybox@sha256:73aaf090f3d85aa34ee199857f03fa3a95c8ede2ffd4cc2cdb5b94e566b11662"
         run: python3 scripts/check.py
 
+      - name: Run S8 lineage scale battery
+        run: python3 scripts/run_s8_lineage_scale_battery.py --evidence-file s8-lineage-scale-evidence.json
+
+      - name: Upload S8 lineage scale evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: s8-lineage-scale-evidence
+          path: s8-lineage-scale-evidence.json
+
       - name: Run M0 spine battery
         env:
           ARGUS_S10_TEST_IMAGE: "busybox@sha256:73aaf090f3d85aa34ee199857f03fa3a95c8ede2ffd4cc2cdb5b94e566b11662"

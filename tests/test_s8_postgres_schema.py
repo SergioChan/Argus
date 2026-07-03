@@ -512,6 +512,88 @@ class S8PostgresSchemaTests(unittest.TestCase):
         self.assertEqual(closure_verified.stdout.strip(), "t")
         self.assertEqual(reader_count.stdout.strip(), "5")
 
+    def test_lineage_closure_reconciler_detects_drift_and_rebuilds(self) -> None:
+        self._commit_record("c4://artifact/source", sequence=1, kind="external_source")
+        self._commit_record(
+            "c4://artifact/dataset",
+            sequence=2,
+            kind="dataset",
+            input_refs=["c4://artifact/source"],
+        )
+        self._commit_record("c4://artifact/report", sequence=3, kind="validation_report")
+        self._commit_record(
+            "c4://artifact/model",
+            sequence=4,
+            kind="model",
+            input_refs=["c4://artifact/dataset"],
+            validation_report_ref="c4://artifact/report",
+        )
+        self._commit_record("c4://artifact/child", sequence=5, kind="model")
+        self._psql(
+            """
+            SET ROLE argus_s8_ledger_writer;
+            SELECT s8.insert_lineage_edge(
+                'c4://artifact/model',
+                'c4://artifact/child',
+                'derived_from',
+                NULL
+            );
+            RESET ROLE;
+            """
+        )
+        self._psql(
+            """
+            ALTER TABLE s8.lineage_closure DISABLE TRIGGER lineage_closure_append_only;
+            UPDATE s8.lineage_closure
+            SET depth = 99
+            WHERE ancestor_id = 'c4://artifact/source'
+              AND descendant_id = 'c4://artifact/child';
+            ALTER TABLE s8.lineage_closure ENABLE TRIGGER lineage_closure_append_only;
+            """
+        )
+
+        verified_before = self._psql("SELECT s8.verify_lineage_closure('c4://artifact/child');")
+        drift = _stdout_lines(
+            self._psql(
+                """
+                SELECT artifact_id || '|' || direction || '|' ||
+                       closure_depth || '|' || recursive_depth || '|' || drift_status
+                FROM s8.lineage_closure_drift('c4://artifact/child')
+                ORDER BY artifact_id, direction;
+                """
+            )
+        )
+        reader_rebuild = self._psql(
+            """
+            SET ROLE argus_s8_reader;
+            SELECT s8.rebuild_lineage_closure();
+            """,
+            check=False,
+        )
+        rebuild_count = self._psql(
+            """
+            SET ROLE argus_s8_ledger_writer;
+            SELECT s8.rebuild_lineage_closure();
+            """
+        )
+        verified_after = self._psql("SELECT s8.verify_lineage_closure('c4://artifact/child');")
+        repaired_depth = self._psql(
+            """
+            SELECT depth
+            FROM s8.lineage_closure
+            WHERE ancestor_id = 'c4://artifact/source'
+              AND descendant_id = 'c4://artifact/child';
+            """
+        )
+
+        self.assertEqual(verified_before.stdout.strip(), "f")
+        self.assertEqual(drift, ["c4://artifact/source|ancestor|99|3|depth_mismatch"])
+        self.assertNotEqual(reader_rebuild.returncode, 0)
+        self.assertIn("permission denied", reader_rebuild.stderr)
+        self.assertEqual(rebuild_count.stdout.strip(), "8")
+        self.assertEqual(verified_after.stdout.strip(), "t")
+        self.assertEqual(repaired_depth.stdout.strip(), "3")
+
     def test_ledger_leaf_function_enforces_sequence_and_denies_direct_insert(self) -> None:
         zero_root = "blake3:" + ("0" * 64)
         first_root = "blake3:leaf-root-1"

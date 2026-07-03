@@ -27,6 +27,7 @@ CHECKS = (
             "scripts/apply_s8_migrations.py",
             "scripts/check.py",
             "scripts/generate_bindings.py",
+            "scripts/run_s8_lineage_scale_battery.py",
             "scripts/run_m0_spine_battery.py",
             "scripts/roadmap_audit.py",
             "scripts/schema_compatibility.py",
