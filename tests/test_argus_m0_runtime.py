@@ -43,6 +43,7 @@ from argus_runtime.s8_writer_service import S8WriterApp
 AUTH_TOKEN = "test-runtime-token"
 S8_READ_TOKEN = "test-s8-read-token"
 S8_REPRO_WRITE_TOKEN = "test-s8-repro-write-token"
+S8_DATASET_WRITE_TOKEN = "test-s8-dataset-write-token"
 S8_BROKER_AUDIENCE_ONLY_READ_TOKEN = "test-s8-broker-audience-only-read-token"
 BOOTSTRAP_TOKEN = "test-bootstrap-token"
 IDENTITY_SIGNING_KEY = b"test-identity-signing-key"
@@ -613,6 +614,136 @@ class ArgusM0RuntimeServiceTests(unittest.TestCase):
             self.assertEqual(unauth_audit_payload["error"], "Unauthorized")
             self.assertEqual(missing_audit_ref_status, 400)
             self.assertEqual(missing_audit_ref_payload["error"], "artifact_ref_required")
+
+    def test_s8_writer_http_dataset_registry_routes_require_capabilities(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            app = S8WriterApp(FileSystemArtifactStore(tmp), data_dir=tmp, auth=_s8_runtime_auth())
+            dataset_body = {
+                "dataset_id": "ewpt-corpus",
+                "version": "1.0.0",
+                "contamination_index_version": "contamination-2026-07-03",
+                "splits": [
+                    {
+                        "split_id": "train",
+                        "role": "train",
+                        "content_hash": "blake3:" + "1" * 64,
+                        "row_count": 10,
+                        "schema_ref": "c4://schemas/ewpt/train",
+                        "access_scope": "agent-readable",
+                    },
+                    {
+                        "split_id": "blind",
+                        "role": "blind",
+                        "content_hash": "blake3:" + "2" * 64,
+                        "row_count": 5,
+                        "schema_ref": "c4://schemas/ewpt/blind",
+                        "access_scope": "verifier-only",
+                        "label_seal_ref": "c4://labels/ewpt/blind",
+                    },
+                ],
+            }
+
+            unauth_register_status, unauth_register_payload = app.http.handle(
+                JsonRequest(method="POST", path="/v1/datasets", query={}, body=dataset_body)
+            )
+            read_only_register_status, read_only_register_payload = app.http.handle(
+                JsonRequest(
+                    method="POST",
+                    path="/v1/datasets",
+                    query={},
+                    body=dataset_body,
+                    headers=_auth_headers(S8_READ_TOKEN),
+                )
+            )
+            register_status, register_payload = app.http.handle(
+                JsonRequest(
+                    method="POST",
+                    path="/v1/datasets",
+                    query={},
+                    body=dataset_body,
+                    headers=_auth_headers(S8_DATASET_WRITE_TOKEN),
+                )
+            )
+            get_status, get_payload = app.http.handle(
+                JsonRequest(
+                    method="GET",
+                    path="/v1/datasets/ewpt-corpus",
+                    query={},
+                    body=None,
+                    headers=_auth_headers(S8_READ_TOKEN),
+                )
+            )
+            exact_get_status, exact_get_payload = app.http.handle(
+                JsonRequest(
+                    method="GET",
+                    path="/v1/datasets/ewpt-corpus",
+                    query={"version": ["1.0.0"]},
+                    body=None,
+                    headers=_auth_headers(S8_READ_TOKEN),
+                )
+            )
+            versions_status, versions_payload = app.http.handle(
+                JsonRequest(
+                    method="GET",
+                    path="/v1/datasets/ewpt-corpus/versions",
+                    query={},
+                    body=None,
+                    headers=_auth_headers(S8_READ_TOKEN),
+                )
+            )
+            write_only_get_status, write_only_get_payload = app.http.handle(
+                JsonRequest(
+                    method="GET",
+                    path="/v1/datasets/ewpt-corpus",
+                    query={},
+                    body=None,
+                    headers=_auth_headers(S8_REPRO_WRITE_TOKEN),
+                )
+            )
+            unauth_get_status, unauth_get_payload = app.http.handle(
+                JsonRequest(method="GET", path="/v1/datasets/ewpt-corpus", query={}, body=None)
+            )
+            conflict_body = {
+                **dataset_body,
+                "splits": [
+                    {
+                        **dataset_body["splits"][0],
+                        "row_count": 11,
+                    }
+                ],
+            }
+            conflict_status, conflict_payload = app.http.handle(
+                JsonRequest(
+                    method="POST",
+                    path="/v1/datasets",
+                    query={},
+                    body=conflict_body,
+                    headers=_auth_headers(S8_DATASET_WRITE_TOKEN),
+                )
+            )
+
+            self.assertEqual(unauth_register_status, 401)
+            self.assertEqual(unauth_register_payload["error"], "Unauthorized")
+            self.assertEqual(read_only_register_status, 403)
+            self.assertEqual(read_only_register_payload["error"], "CapabilityDenied")
+            self.assertEqual(register_status, 201)
+            self.assertEqual(register_payload["dataset_id"], "ewpt-corpus")
+            self.assertEqual(register_payload["version"], "1.0.0")
+            self.assertEqual(register_payload["provenance_ref"]["artifact_ref"], "c4://dataset/ewpt-corpus/1.0.0")
+            self.assertEqual(get_status, 200)
+            self.assertEqual(exact_get_status, 200)
+            self.assertEqual(exact_get_payload["provenance_ref"]["artifact_ref"], get_payload["provenance_ref"]["artifact_ref"])
+            blind_split = next(split for split in get_payload["splits"] if split["split_id"] == "blind")
+            self.assertIsNone(blind_split["content_hash"])
+            self.assertIsNone(blind_split["label_seal_ref"])
+            self.assertEqual(versions_status, 200)
+            self.assertEqual(versions_payload, {"dataset_id": "ewpt-corpus", "versions": ["1.0.0"]})
+            self.assertEqual(write_only_get_status, 403)
+            self.assertEqual(write_only_get_payload["error"], "CapabilityDenied")
+            self.assertEqual(unauth_get_status, 401)
+            self.assertEqual(unauth_get_payload["error"], "Unauthorized")
+            self.assertEqual(conflict_status, 400)
+            self.assertIn(conflict_payload["error"], {"WriteOnceViolationError", "DatasetRegistryError"})
 
     def test_runtime_http_routes_require_bearer_authentication(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1576,6 +1707,14 @@ def _s8_runtime_auth() -> RuntimeAuth:
                 job_id="job-repro-write",
                 root_request_id="root-repro-write",
                 scopes=ScopeGrant(capabilities=("s8.reproducibility.write",)),
+                budget_caps=BudgetCaps(max_compute_units=10, max_wallclock_s=30, max_cost_usd=5),
+                max_ttl_s=300,
+            ),
+            S8_DATASET_WRITE_TOKEN: RuntimeIdentity(
+                caller_id="test-s8-dataset-write",
+                job_id="job-dataset-write",
+                root_request_id="root-dataset-write",
+                scopes=ScopeGrant(capabilities=("s8.dataset.write", "s8.read")),
                 budget_caps=BudgetCaps(max_compute_units=10, max_wallclock_s=30, max_cost_usd=5),
                 max_ttl_s=300,
             ),

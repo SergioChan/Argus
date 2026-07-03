@@ -893,6 +893,54 @@ class S8PostgresSchemaTests(unittest.TestCase):
         with self.assertRaises(HashMismatchError):
             store.get_record(tampered.artifact_ref)
 
+    def test_postgres_store_exposes_dataset_registry_functions(self) -> None:
+        store = self._postgres_store()
+        dataset_artifact = store.create_artifact(
+            artifact_ref="c4://dataset/runtime-corpus/1.0.0",
+            kind="dataset",
+            payload={"dataset_id": "runtime-corpus", "version": "1.0.0", "source": "postgres-store"},
+            producer=Producer(subsystem="S8", version="0.0.0"),
+            lineage=Lineage(input_refs=(), code_ref="git:runtime-dataset", environment_digest="oci:runtime-dataset"),
+        )
+        splits = (
+            DatasetSplit(
+                split_id="train",
+                role="train",
+                content_hash="blake3:" + "1" * 64,
+                row_count=10,
+                schema_ref="c4://schemas/runtime/train",
+                access_scope="agent-readable",
+            ),
+            DatasetSplit(
+                split_id="blind",
+                role="blind",
+                content_hash="blake3:" + "2" * 64,
+                row_count=3,
+                schema_ref="c4://schemas/runtime/blind",
+                access_scope="verifier-only",
+                label_seal_ref="c4://labels/runtime/blind",
+            ),
+        )
+
+        registered = store.register_dataset(
+            dataset_id="runtime-corpus",
+            version="1.0.0",
+            dataset_artifact_ref=dataset_artifact.artifact_ref,
+            splits=splits,
+            contamination_index_version="contam-runtime-1",
+        )
+        latest = store.get_dataset("runtime-corpus")
+        versions = store.list_dataset_versions("runtime-corpus")
+
+        self.assertEqual(registered["provenance_ref"]["artifact_ref"], dataset_artifact.artifact_ref)
+        self.assertEqual(latest["version"], "1.0.0")
+        self.assertEqual(versions, ("1.0.0",))
+        train = next(split for split in latest["splits"] if split["split_id"] == "train")
+        blind = next(split for split in latest["splits"] if split["split_id"] == "blind")
+        self.assertEqual(train["content_hash"], "blake3:" + "1" * 64)
+        self.assertNotIn("content_hash", blind)
+        self.assertNotIn("label_seal_ref", blind)
+
     def test_postgres_store_delegates_commit_to_configured_ledger_writer(self) -> None:
         class RecordingLedgerWriter:
             def __init__(self) -> None:

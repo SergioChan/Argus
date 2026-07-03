@@ -19,6 +19,7 @@ from argus_core import (
     ArtifactRecord,
     ArtifactQueryFilter,
     ArtifactQueryPage,
+    DatasetSplit,
     HashMismatchError,
     InMemoryArtifactStore,
     Lineage,
@@ -384,6 +385,54 @@ class PostgresArtifactStore:
         )
         self._commit_reproducibility_check(check)
         return check
+
+    def register_dataset(
+        self,
+        *,
+        dataset_id: str,
+        version: str,
+        dataset_artifact_ref: str,
+        splits: tuple[DatasetSplit, ...],
+        contamination_index_version: str,
+    ) -> dict[str, Any]:
+        import psycopg
+
+        split_payloads = [asdict(split) for split in splits]
+        with psycopg.connect(self._dsn) as conn:
+            _set_role(conn, self._db_role)
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT s8.register_dataset(%s, %s, %s, %s::jsonb, %s);
+                    """,
+                    (
+                        dataset_id,
+                        version,
+                        dataset_artifact_ref,
+                        json.dumps(split_payloads, separators=(",", ":"), sort_keys=True),
+                        contamination_index_version,
+                    ),
+                )
+                cur.fetchone()
+        return self.get_dataset(dataset_id, version)
+
+    def get_dataset(self, dataset_id: str, version: str | None = None) -> dict[str, Any]:
+        import psycopg
+
+        with psycopg.connect(self._dsn) as conn:
+            _set_role(conn, self._db_role)
+            with conn.cursor() as cur:
+                cur.execute("SELECT s8.get_dataset(%s, %s);", (dataset_id, version))
+                return _dataset_record_object(cur.fetchone()[0])
+
+    def list_dataset_versions(self, dataset_id: str) -> tuple[str, ...]:
+        import psycopg
+
+        with psycopg.connect(self._dsn) as conn:
+            _set_role(conn, self._db_role)
+            with conn.cursor() as cur:
+                cur.execute("SELECT version FROM s8.list_dataset_versions(%s) AS version;", (dataset_id,))
+                return tuple(str(row[0]) for row in cur.fetchall())
 
     def export_audit_slice(self, artifact_refs: tuple[str, ...]) -> dict[str, Any]:
         import psycopg
@@ -959,6 +1008,18 @@ def _jsonb_object(value: Any) -> dict[str, Any]:
         if isinstance(parsed, dict):
             return parsed
     raise TypeError(f"expected json object, got {type(value).__name__}")
+
+
+def _dataset_record_object(value: Any) -> dict[str, Any]:
+    record = _jsonb_object(value)
+    provenance = record.get("provenance_ref")
+    if isinstance(provenance, dict):
+        normalized_provenance = dict(provenance)
+        artifact_id = normalized_provenance.pop("artifact_id", None)
+        if artifact_id is not None and "artifact_ref" not in normalized_provenance:
+            normalized_provenance["artifact_ref"] = artifact_id
+        record["provenance_ref"] = normalized_provenance
+    return record
 
 
 def _latest_checkpoint_from_slice(audit_slice: dict[str, Any]) -> dict[str, Any]:

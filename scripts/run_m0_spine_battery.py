@@ -108,7 +108,7 @@ def main() -> int:
         "s10_url": s10_url,
         "ports": ports,
         "persistence": "postgres-minio",
-        "auth_callers": ["read", "write", "spine", "halt", "verify"],
+        "auth_callers": ["read", "write", "dataset", "spine", "halt", "verify"],
     }
 
     try:
@@ -141,6 +141,16 @@ def main() -> int:
         _battery_revoked_scope_token_denied(evidence, s10_url, token=auth_tokens["write"])
         _battery_b_incomplete_lineage(evidence, s10_url, write_scope_json, token=auth_tokens["write"])
         _battery_c_write_once(evidence, s10_url, write_scope_json, token=auth_tokens["write"])
+        dataset_scope_json = _mint_store_scope(s10_url=s10_url, token=auth_tokens["dataset"])
+        _battery_dataset_registry_service(
+            evidence,
+            s10_url=s10_url,
+            s8_url=s8_url,
+            dataset_scope_json=dataset_scope_json,
+            dataset_token=auth_tokens["dataset"],
+            read_token=auth_tokens["read"],
+            write_token=auth_tokens["write"],
+        )
         verifier_scope_json = _mint_store_scope(s10_url=s10_url, token=auth_tokens["verify"])
         _battery_deployed_report_verifier(
             evidence,
@@ -378,6 +388,17 @@ def _m0_identity_requests() -> dict[str, dict[str, Any]]:
                 "broker_audiences": ["store"],
                 "capabilities": ["s8.reproducibility.write"],
                 "producer_subsystems": ["S2"],
+                "sandbox_risk_class": "standard",
+            },
+        },
+        "dataset": {
+            "caller_id": "m0-dataset-registry",
+            "job_id": "m0-dataset-registry-job",
+            "root_request_id": "m0-dataset-registry-root",
+            "scopes": {
+                "broker_audiences": ["store"],
+                "capabilities": ["s8.read", "s8.dataset.write"],
+                "producer_subsystems": ["S8"],
                 "sandbox_risk_class": "standard",
             },
         },
@@ -769,6 +790,122 @@ def _battery_c_write_once(
         "c",
         "brokered write-once overwrite blocked",
         {"artifact_ref": first["artifact_ref"], "error": second},
+    )
+
+
+def _battery_dataset_registry_service(
+    evidence: dict[str, Any],
+    *,
+    s10_url: str,
+    s8_url: str,
+    dataset_scope_json: dict[str, Any],
+    dataset_token: str,
+    read_token: str,
+    write_token: str,
+) -> None:
+    dataset_id = "m0-dataset-registry"
+    version = "1.0.0"
+    dataset_artifact = _post_json(
+        f"{s10_url}/v1/store/artifacts",
+        {
+            "scope_token": dataset_scope_json,
+            "kind": "dataset",
+            "payload": {
+                "dataset_id": dataset_id,
+                "version": version,
+                "rows": [{"id": "row-1"}, {"id": "row-2"}],
+            },
+            "producer": {"subsystem": "S8", "version": "0.0.0"},
+            "lineage": {
+                "input_refs": [],
+                "code_ref": "git:m0-dataset-registry",
+                "environment_digest": "oci:m0-dataset-registry",
+                "seeds": ["dataset-seed-1"],
+            },
+        },
+        expected_status=201,
+        token=dataset_token,
+    )
+    register_body = {
+        "dataset_id": dataset_id,
+        "version": version,
+        "dataset_artifact_ref": dataset_artifact["artifact_ref"],
+        "contamination_index_version": "contamination-m0-2026-07-03",
+        "splits": [
+            {
+                "split_id": "train",
+                "role": "train",
+                "content_hash": "blake3:" + "a" * 64,
+                "row_count": 2,
+                "schema_ref": "c4://schemas/m0-dataset/train",
+                "access_scope": "agent-readable",
+            },
+            {
+                "split_id": "blind",
+                "role": "blind",
+                "content_hash": "blake3:" + "b" * 64,
+                "row_count": 1,
+                "schema_ref": "c4://schemas/m0-dataset/blind",
+                "access_scope": "verifier-only",
+                "label_seal_ref": "c4://labels/m0-dataset/blind",
+            },
+        ],
+    }
+    read_token_register = _post_json(
+        f"{s8_url}/v1/datasets",
+        register_body,
+        expected_status=403,
+        token=read_token,
+    )
+    registered = _post_json(
+        f"{s8_url}/v1/datasets",
+        register_body,
+        expected_status=201,
+        token=dataset_token,
+    )
+    latest = _get_json(f"{s8_url}/v1/datasets/{dataset_id}", token=read_token)
+    versions = _get_json(f"{s8_url}/v1/datasets/{dataset_id}/versions", token=read_token)
+    write_token_get = _get_json(
+        f"{s8_url}/v1/datasets/{dataset_id}",
+        expected_status=403,
+        token=write_token,
+    )
+    unauth_get = _get_json(
+        f"{s8_url}/v1/datasets/{dataset_id}",
+        expected_status=401,
+        token=None,
+    )
+    blind_split = next(split for split in latest["splits"] if split["split_id"] == "blind")
+    masked_blind_split = "content_hash" not in blind_split and "label_seal_ref" not in blind_split
+    provenance_ref = registered["provenance_ref"]["artifact_ref"]
+    if provenance_ref != dataset_artifact["artifact_ref"]:
+        raise AssertionError(f"dataset registry did not bind the S10-broker-written artifact: {registered}")
+    if latest["version"] != version or versions["versions"] != [version]:
+        raise AssertionError(f"dataset registry version lookup failed: latest={latest}, versions={versions}")
+    if not masked_blind_split:
+        raise AssertionError(f"dataset registry leaked verifier-only split material: {latest}")
+    if read_token_register.get("error") != "CapabilityDenied" or write_token_get.get("error") != "CapabilityDenied":
+        raise AssertionError(
+            "dataset registry capability gates did not fail closed: "
+            f"read_token_register={read_token_register}, write_token_get={write_token_get}"
+        )
+    if unauth_get.get("error") != "Unauthorized":
+        raise AssertionError(f"dataset registry unauthenticated read did not fail closed: {unauth_get}")
+    _record(
+        evidence,
+        "dataset-registry",
+        "S10 broker wrote a dataset C4 artifact and S8 dataset registry HTTP APIs registered, read, listed, and masked it",
+        {
+            "dataset_id": dataset_id,
+            "version": version,
+            "dataset_artifact_ref": dataset_artifact["artifact_ref"],
+            "registered_artifact_ref": provenance_ref,
+            "versions": versions["versions"],
+            "masked_blind_split": masked_blind_split,
+            "read_token_register_error": read_token_register["error"],
+            "write_token_get_error": write_token_get["error"],
+            "unauth_get_error": unauth_get["error"],
+        },
     )
 
 

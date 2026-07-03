@@ -10,7 +10,15 @@ import os
 from pathlib import Path
 from typing import Any
 
-from argus_core import ArtifactQueryFilter, FileSystemArtifactStore, Lineage, Producer, canonical_json_bytes
+from argus_core import (
+    ArtifactQueryFilter,
+    DatasetRegistry,
+    DatasetSplit,
+    FileSystemArtifactStore,
+    Lineage,
+    Producer,
+    canonical_json_bytes,
+)
 
 from .auth import RuntimeAuth, UnauthorizedError, health_token_from_env, require_static_bearer_token, runtime_auth_from_env
 from .http_json import JsonHttpApp, JsonRequest, serve_json_app
@@ -18,6 +26,7 @@ from .http_json import JsonHttpApp, JsonRequest, serve_json_app
 
 S8_READ_CAPABILITY = "s8.read"
 S8_REPRODUCIBILITY_WRITE_CAPABILITY = "s8.reproducibility.write"
+S8_DATASET_WRITE_CAPABILITY = "s8.dataset.write"
 
 
 class S8WriterApp:
@@ -133,6 +142,52 @@ class S8WriterApp:
                 tolerance_id=body.get("tolerance_id") if isinstance(body.get("tolerance_id"), str) else None,
             )
         )
+
+    def register_dataset(self, body: dict[str, Any]) -> dict[str, Any]:
+        self._refresh_store()
+        dataset_id = _required_str(body, "dataset_id")
+        version = _required_str(body, "version")
+        splits = _dataset_splits_from_body(_required_list(body, "splits"))
+        contamination_index_version = _required_str(body, "contamination_index_version")
+        dataset_artifact_ref = _optional_str(body, "dataset_artifact_ref") or _optional_str(
+            body,
+            "dataset_artifact_id",
+        )
+        if hasattr(self.store, "register_dataset"):
+            if dataset_artifact_ref is None:
+                raise ValueError("dataset_artifact_ref is required")
+            return _dataset_wire_payload(
+                self.store.register_dataset(
+                    dataset_id=dataset_id,
+                    version=version,
+                    dataset_artifact_ref=dataset_artifact_ref,
+                    splits=splits,
+                    contamination_index_version=contamination_index_version,
+                )
+            )
+        registry = DatasetRegistry(artifact_store=self.store)
+        return _dataset_wire_payload(
+            registry.register(
+                dataset_id=dataset_id,
+                version=version,
+                splits=splits,
+                contamination_index_version=contamination_index_version,
+            )
+        )
+
+    def get_dataset(self, dataset_id: str, version: str | None = None) -> dict[str, Any]:
+        self._refresh_store()
+        if hasattr(self.store, "get_dataset"):
+            return _dataset_wire_payload(self.store.get_dataset(dataset_id, version))
+        return _dataset_wire_payload(DatasetRegistry(artifact_store=self.store).get(dataset_id, version))
+
+    def list_dataset_versions(self, dataset_id: str) -> dict[str, Any]:
+        self._refresh_store()
+        if hasattr(self.store, "list_dataset_versions"):
+            versions = self.store.list_dataset_versions(dataset_id)
+        else:
+            versions = DatasetRegistry(artifact_store=self.store).list_versions(dataset_id)
+        return {"dataset_id": dataset_id, "versions": list(versions)}
 
     def export_audit_slice(self, artifact_refs: tuple[str, ...]) -> dict[str, Any]:
         self._refresh_store()
@@ -323,6 +378,39 @@ class S8WriterApp:
             except Exception as exc:
                 return 400, {"error": type(exc).__name__, "message": str(exc)}
 
+        @self.http.route("POST", "/v1/datasets")
+        def register_dataset(request: JsonRequest) -> tuple[int, Any]:
+            authorized, status, error_response = self._authorize(
+                request,
+                capability=S8_DATASET_WRITE_CAPABILITY,
+            )
+            if not authorized:
+                return status, error_response
+            try:
+                if not isinstance(request.body, dict):
+                    return 400, {"error": "json_object_required"}
+                return 201, self.register_dataset(request.body)
+            except Exception as exc:
+                return 400, {"error": type(exc).__name__, "message": str(exc)}
+
+        @self.http.prefix("GET", "/v1/datasets/")
+        def get_dataset(request: JsonRequest) -> tuple[int, Any]:
+            authorized, status, error_response = self._authorize(request, capability=S8_READ_CAPABILITY)
+            if not authorized:
+                return status, error_response
+            suffix = request.path.removeprefix("/v1/datasets/")
+            try:
+                if suffix.endswith("/versions"):
+                    dataset_id = suffix.removesuffix("/versions").rstrip("/")
+                    if not dataset_id:
+                        return 400, {"error": "dataset_id_required"}
+                    return 200, self.list_dataset_versions(dataset_id)
+                if not suffix:
+                    return 400, {"error": "dataset_id_required"}
+                return 200, self.get_dataset(suffix, version=_query_str(request.query, "version"))
+            except Exception as exc:
+                return 404, {"error": type(exc).__name__, "message": str(exc)}
+
 
 def build_app_from_env() -> S8WriterApp:
     broker_write_key = os.environ.get("ARGUS_S8_BROKER_WRITE_KEY")
@@ -365,6 +453,22 @@ def _required_dict(body: dict[str, Any], field: str) -> dict[str, Any]:
     return dict(value)
 
 
+def _required_list(body: dict[str, Any], field: str) -> list[Any]:
+    value = body.get(field)
+    if not isinstance(value, list):
+        raise ValueError(f"{field} is required")
+    return list(value)
+
+
+def _optional_str(body: dict[str, Any], field: str) -> str | None:
+    value = body.get(field)
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"{field} must be a non-empty string")
+    return value
+
+
 def _normalize_lineage(value: dict[str, Any]) -> dict[str, Any]:
     normalized = dict(value)
     normalized["input_refs"] = tuple(normalized.get("input_refs") or ())
@@ -405,6 +509,43 @@ def _query_int(query: dict[str, list[str]], name: str) -> int | None:
         return int(value)
     except ValueError as exc:
         raise ValueError(f"{name} must be an integer") from exc
+
+
+def _dataset_splits_from_body(values: list[Any]) -> tuple[DatasetSplit, ...]:
+    splits: list[DatasetSplit] = []
+    for value in values:
+        if not isinstance(value, dict):
+            raise ValueError("dataset splits must be objects")
+        row_count = value.get("row_count")
+        if isinstance(row_count, bool) or not isinstance(row_count, int):
+            raise ValueError("dataset split row_count must be an integer")
+        content_hash = _optional_str(value, "content_hash")
+        splits.append(
+            DatasetSplit(
+                split_id=_required_str(value, "split_id"),
+                role=_required_str(value, "role"),
+                content_hash=content_hash,
+                row_count=row_count,
+                schema_ref=_required_str(value, "schema_ref"),
+                access_scope=_required_str(value, "access_scope"),
+                label_seal_ref=_optional_str(value, "label_seal_ref"),
+            )
+        )
+    return tuple(splits)
+
+
+def _dataset_wire_payload(value: Any) -> dict[str, Any]:
+    payload = _structured_payload(value)
+    if not isinstance(payload, dict):
+        raise TypeError(f"expected dataset payload object, got {type(payload).__name__}")
+    provenance = payload.get("provenance_ref")
+    if isinstance(provenance, dict):
+        normalized_provenance = dict(provenance)
+        artifact_id = normalized_provenance.pop("artifact_id", None)
+        if artifact_id is not None and "artifact_ref" not in normalized_provenance:
+            normalized_provenance["artifact_ref"] = artifact_id
+        payload["provenance_ref"] = normalized_provenance
+    return payload
 
 
 def _structured_payload(value: Any) -> Any:
