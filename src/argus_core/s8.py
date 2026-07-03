@@ -365,6 +365,7 @@ class DatasetResolveAuditEvent:
     version: str
     split_id: str
     requester_audiences: tuple[str, ...]
+    requester_capabilities: tuple[str, ...]
     verdict: str
     label_seal_ref: str | None = None
 
@@ -397,6 +398,7 @@ SCRATCH_BUCKET = "scratch"
 DATASET_SPLIT_ROLES = ("train", "val", "test", "blind", "null_control", "injection")
 DATASET_VERIFIER_ONLY_ROLES = ("blind", "null_control", "injection")
 DATASET_ACCESS_SCOPES = ("agent-readable", "verifier-only")
+DATASET_VERIFIER_LABEL_READ_CAPABILITY = "s8.verifier-labels.read"
 
 
 class ObjectStoreFacade(Protocol):
@@ -1557,15 +1559,17 @@ class DatasetRegistry:
         record = self.get(dataset_id, version, include_verifier_only_seals=True)
         split = self._split(record, split_id)
         requester_audiences = _scope_broker_audiences(scope_token)
+        requester_capabilities = _scope_capabilities(scope_token)
         _assert_dataset_scope_allows(record, scope_token)
 
         if split.access_scope == "verifier-only":
-            if not _scope_has_verifier_audience(scope_token):
+            if not _scope_has_verifier_label_capability(scope_token):
                 event = self._append_resolve_event(
                     dataset_id=record.dataset_id,
                     version=record.version,
                     split_id=split.split_id,
                     requester_audiences=requester_audiences,
+                    requester_capabilities=requester_capabilities,
                     verdict="DENIED",
                     label_seal_ref=None,
                 )
@@ -1582,6 +1586,7 @@ class DatasetRegistry:
             version=record.version,
             split_id=split.split_id,
             requester_audiences=requester_audiences,
+            requester_capabilities=requester_capabilities,
             verdict="ALLOWED",
             label_seal_ref=label_blob_ref,
         )
@@ -1696,6 +1701,7 @@ class DatasetRegistry:
         version: str,
         split_id: str,
         requester_audiences: tuple[str, ...],
+        requester_capabilities: tuple[str, ...],
         verdict: str,
         label_seal_ref: str | None,
     ) -> DatasetResolveAuditEvent:
@@ -1706,6 +1712,7 @@ class DatasetRegistry:
             version=version,
             split_id=split_id,
             requester_audiences=requester_audiences,
+            requester_capabilities=requester_capabilities,
             verdict=verdict,
             label_seal_ref=label_seal_ref,
         )
@@ -1834,14 +1841,18 @@ def _scope_broker_audiences(scope_token: Any) -> tuple[str, ...]:
     return _tuple_field(scopes, "broker_audiences")
 
 
+def _scope_capabilities(scope_token: Any) -> tuple[str, ...]:
+    scopes = _scope_grant(scope_token)
+    return _tuple_field(scopes, "capabilities")
+
+
 def _scope_allowed_datasets(scope_token: Any) -> tuple[str, ...]:
     scopes = _scope_grant(scope_token)
     return _tuple_field(scopes, "allowed_datasets")
 
 
-def _scope_has_verifier_audience(scope_token: Any) -> bool:
-    audiences = set(_scope_broker_audiences(scope_token))
-    return "verifier" in audiences or "s8:verifier" in audiences
+def _scope_has_verifier_label_capability(scope_token: Any) -> bool:
+    return DATASET_VERIFIER_LABEL_READ_CAPABILITY in set(_scope_capabilities(scope_token))
 
 
 def _assert_dataset_scope_allows(record: DatasetRecord, scope_token: Any) -> None:

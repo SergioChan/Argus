@@ -20,6 +20,8 @@ from argus_core import (
 
 
 class DatasetRegistryTests(unittest.TestCase):
+    VERIFIER_LABEL_CAPABILITY = "s8.verifier-labels.read"
+
     def setUp(self) -> None:
         self.store = InMemoryArtifactStore()
         self.registry = DatasetRegistry(artifact_store=self.store)
@@ -184,7 +186,7 @@ class DatasetRegistryTests(unittest.TestCase):
         self.assertEqual(self.registry.resolve_events[-1].verdict, "DENIED")
         self.assertIsNone(self.registry.resolve_events[-1].label_seal_ref)
 
-    def test_verifier_scope_resolves_blind_label_seal_and_audits(self) -> None:
+    def test_broker_audience_no_longer_authorizes_verifier_only_label_resolution(self) -> None:
         self.registry.register(
             dataset_id="ewpt-corpus",
             version="1.0.0",
@@ -192,6 +194,33 @@ class DatasetRegistryTests(unittest.TestCase):
             contamination_index_version="contam-2026-07-01",
         )
         verifier_scope = self._scope(audiences=("verifier",), datasets=("ewpt-corpus@1.0.0",))
+
+        with self.assertRaises(S8ScopeDeniedError) as denied:
+            self.registry.resolve_split(
+                dataset_id="ewpt-corpus",
+                version=None,
+                split_id="blind",
+                scope_token=verifier_scope,
+            )
+
+        self.assertIn("verifier-only split", str(denied.exception))
+        self.assertNotIn("c4://labels/blind", str(denied.exception))
+        self.assertEqual(self.registry.resolve_events[-1].requester_audiences, ("verifier",))
+        self.assertEqual(self.registry.resolve_events[-1].requester_capabilities, ())
+        self.assertEqual(self.registry.resolve_events[-1].verdict, "DENIED")
+
+    def test_verifier_capability_resolves_blind_label_seal_and_audits(self) -> None:
+        self.registry.register(
+            dataset_id="ewpt-corpus",
+            version="1.0.0",
+            splits=(self._split("blind", "blind", access_scope="verifier-only", label_seal_ref="c4://labels/blind"),),
+            contamination_index_version="contam-2026-07-01",
+        )
+        verifier_scope = self._scope(
+            audiences=("store",),
+            capabilities=(self.VERIFIER_LABEL_CAPABILITY,),
+            datasets=("ewpt-corpus@1.0.0",),
+        )
 
         resolved = self.registry.resolve_split(
             dataset_id="ewpt-corpus",
@@ -205,7 +234,8 @@ class DatasetRegistryTests(unittest.TestCase):
         self.assertEqual(resolved.audit_event.event_type, "dataset.split_resolved")
         self.assertEqual(resolved.audit_event.verdict, "ALLOWED")
         self.assertEqual(resolved.audit_event.label_seal_ref, "c4://labels/blind")
-        self.assertEqual(resolved.audit_event.requester_audiences, ("verifier",))
+        self.assertEqual(resolved.audit_event.requester_audiences, ("store",))
+        self.assertEqual(resolved.audit_event.requester_capabilities, (self.VERIFIER_LABEL_CAPABILITY,))
 
     def test_filesystem_store_rebuilds_dataset_index_on_reopen(self) -> None:
         with TemporaryDirectory() as tempdir:
@@ -245,12 +275,19 @@ class DatasetRegistryTests(unittest.TestCase):
             label_seal_ref=label_seal_ref,
         )
 
-    def _scope(self, *, audiences: tuple[str, ...], datasets: tuple[str, ...] = ()) -> object:
+    def _scope(
+        self,
+        *,
+        audiences: tuple[str, ...],
+        capabilities: tuple[str, ...] = (),
+        datasets: tuple[str, ...] = (),
+    ) -> object:
         return self.tokens.mint_scope(
             job_id="job-1",
             scopes=ScopeGrant(
                 allowed_datasets=datasets,
                 broker_audiences=audiences,
+                capabilities=capabilities,
             ),
         )
 

@@ -742,6 +742,7 @@ class S8PostgresSchemaTests(unittest.TestCase):
         self.assertIn("permission denied", commit_denied.stderr)
 
     def test_migration_runner_records_checksum_and_rejects_drift(self) -> None:
+        expected_migration_count = str(len(tuple(MIGRATIONS_DIR.glob("*.sql"))))
         first_count = self._psql("SELECT count(*) FROM s8.schema_migration;")
         reapplied = self._apply_s8_migrations()
         second_count = self._psql("SELECT count(*) FROM s8.schema_migration;")
@@ -754,9 +755,9 @@ class S8PostgresSchemaTests(unittest.TestCase):
         )
         drift = self._apply_s8_migrations(check=False)
 
-        self.assertEqual(first_count.stdout.strip(), "11")
+        self.assertEqual(first_count.stdout.strip(), expected_migration_count)
         self.assertIn("already applied with matching checksum", reapplied.stdout)
-        self.assertEqual(second_count.stdout.strip(), "11")
+        self.assertEqual(second_count.stdout.strip(), expected_migration_count)
         self.assertNotEqual(drift.returncode, 0)
         self.assertIn("checksum drift", drift.stderr)
 
@@ -1679,11 +1680,18 @@ class S8PostgresSchemaTests(unittest.TestCase):
             """,
             check=False,
         )
-        verifier_blind = self._psql(
+        legacy_verifier_blind = self._psql(
+            """
+            SET ROLE argus_s8_reader;
+            SELECT s8.resolve_split('ewpt-corpus', '1.0.0', 'blind', 'verifier');
+            """,
+            check=False,
+        )
+        capability_verifier_blind = self._psql(
             """
             SET ROLE argus_s8_reader;
             WITH resolved AS (
-                SELECT s8.resolve_split('ewpt-corpus', '1.0.0', 'blind', 'verifier') AS payload
+                SELECT s8.resolve_split('ewpt-corpus', '1.0.0', 'blind', 's8.read,s8.verifier-labels.read') AS payload
             )
             SELECT (payload->>'feature_blob_ref') || '|' || (payload->>'label_blob_ref')
             FROM resolved;
@@ -1729,7 +1737,10 @@ class S8PostgresSchemaTests(unittest.TestCase):
         self.assertNotEqual(agent_blind.returncode, 0)
         self.assertIn("SCOPE_DENIED", agent_blind.stderr)
         self.assertNotIn("c4://labels/blind-sealed", agent_blind.stderr)
-        self.assertEqual(verifier_blind.stdout.strip(), "blake3:blind-features|c4://labels/blind-sealed")
+        self.assertNotEqual(legacy_verifier_blind.returncode, 0)
+        self.assertIn("s8.verifier-labels.read capability", legacy_verifier_blind.stderr)
+        self.assertNotIn("c4://labels/blind-sealed", legacy_verifier_blind.stderr)
+        self.assertEqual(capability_verifier_blind.stdout.strip(), "blake3:blind-features|c4://labels/blind-sealed")
         self.assertEqual(audit.stdout.strip(), "2|train:<null>,blind:c4://labels/blind-sealed")
         self.assertNotEqual(direct_insert.returncode, 0)
         self.assertIn("permission denied", direct_insert.stderr)
