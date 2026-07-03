@@ -202,6 +202,7 @@ class LifecycleEvent:
     method: str
     trigger: str
     payload_hash: str
+    idempotency_key: str
     ledger_ref: str | None = None
 
 
@@ -262,10 +263,96 @@ JOB_ENVELOPE_FIELDS = frozenset(JobEnvelope.__dataclass_fields__)
 
 @dataclass(frozen=True)
 class Acceptance:
+    job_id: str
     accepted: bool
     reason: str | None
     state: LifecycleState
+    idempotency_key: str
     estimated_cost: float = 0.0
+
+    def as_c1_payload(self) -> dict[str, object]:
+        payload: dict[str, object] = {
+            "job_id": self.job_id,
+            "accepted": self.accepted,
+            "reason": self.reason,
+            "state": self.state.value,
+            "idempotency_key": self.idempotency_key,
+        }
+        if self.estimated_cost:
+            payload["estimated_cost"] = {"cost_usd": self.estimated_cost}
+        return payload
+
+
+@dataclass(frozen=True)
+class IdempotencyRecord:
+    job_id: str
+    method: str
+    idempotency_key: str
+    request_hash: str
+    response_hash: str
+    response: Any
+
+
+class InMemoryIdempotencyStore:
+    """In-memory idempotency table for mutating S1 method calls."""
+
+    def __init__(self) -> None:
+        self._records: dict[tuple[str, str, str], IdempotencyRecord] = {}
+
+    def resolve(
+        self,
+        *,
+        job_id: str,
+        method: str,
+        idempotency_key: str,
+        request_hash: str,
+    ) -> IdempotencyRecord | None:
+        record = self._records.get((job_id, method, idempotency_key))
+        if record is None:
+            return None
+        if record.request_hash != request_hash:
+            raise LifecyclePolicyError(
+                ErrorEnvelope(
+                    code="IDEMPOTENCY_CONFLICT",
+                    category="POLICY",
+                    message=f"{method} idempotency key reused with a different request",
+                )
+            )
+        return record
+
+    def record(
+        self,
+        *,
+        job_id: str,
+        method: str,
+        idempotency_key: str,
+        request_hash: str,
+        response: Any,
+    ) -> IdempotencyRecord:
+        existing = self.resolve(
+            job_id=job_id,
+            method=method,
+            idempotency_key=idempotency_key,
+            request_hash=request_hash,
+        )
+        if existing is not None:
+            return existing
+        record = IdempotencyRecord(
+            job_id=job_id,
+            method=method,
+            idempotency_key=idempotency_key,
+            request_hash=request_hash,
+            response_hash=_idempotency_response_hash(response),
+            response=response,
+        )
+        self._records[(job_id, method, idempotency_key)] = record
+        return record
+
+    def records(self, job_id: str | None = None) -> tuple[IdempotencyRecord, ...]:
+        records = tuple(self._records.values())
+        if job_id is not None:
+            records = tuple(record for record in records if record.job_id == job_id)
+        return tuple(sorted(records, key=lambda record: (record.job_id, record.method, record.idempotency_key)))
 
 
 def parse_job_envelope(payload: Mapping[str, Any]) -> JobEnvelope:
@@ -286,6 +373,7 @@ class LifecycleStore:
         self,
         *,
         artifact_store: InMemoryArtifactStore | None = None,
+        idempotency_store: InMemoryIdempotencyStore | None = None,
         ledger_producer: Producer | None = None,
         ledger_code_ref: str = S1_LIFECYCLE_LEDGER_CODE_REF,
         ledger_environment_digest: str = S1_LIFECYCLE_LEDGER_ENVIRONMENT_DIGEST,
@@ -293,6 +381,7 @@ class LifecycleStore:
         self._events: dict[str, list[LifecycleEvent]] = {}
         self._current: dict[str, JobCurrent] = {}
         self._artifact_store = artifact_store
+        self._idempotency_store = idempotency_store or InMemoryIdempotencyStore()
         self._ledger_producer = ledger_producer or Producer(
             subsystem="S1",
             version="0.0.0",
@@ -307,12 +396,14 @@ class LifecycleStore:
         events_by_job: Mapping[str, tuple[LifecycleEvent, ...]],
         *,
         artifact_store: InMemoryArtifactStore | None = None,
+        idempotency_store: InMemoryIdempotencyStore | None = None,
         ledger_producer: Producer | None = None,
         ledger_code_ref: str = S1_LIFECYCLE_LEDGER_CODE_REF,
         ledger_environment_digest: str = S1_LIFECYCLE_LEDGER_ENVIRONMENT_DIGEST,
     ) -> "LifecycleStore":
         store = cls(
             artifact_store=artifact_store,
+            idempotency_store=idempotency_store,
             ledger_producer=ledger_producer,
             ledger_code_ref=ledger_code_ref,
             ledger_environment_digest=ledger_environment_digest,
@@ -320,6 +411,8 @@ class LifecycleStore:
         for job_id, events in events_by_job.items():
             store._events[job_id] = list(events)
             store._current[job_id] = reduce_lifecycle(tuple(events), job_id=job_id)
+            for event in events:
+                store._record_event_idempotency(event)
         return store
 
     def create_job(self, job_id: str) -> JobCurrent:
@@ -332,10 +425,25 @@ class LifecycleStore:
         self._current[job_id] = current
         return current
 
-    def apply_method(self, job_id: str, method: str, *, trigger: str = "", payload: Any | None = None) -> LifecycleEvent:
+    def apply_method(
+        self,
+        job_id: str,
+        method: str,
+        *,
+        trigger: str = "",
+        payload: Any | None = None,
+        idempotency_key: str | None = None,
+    ) -> LifecycleEvent:
         if method not in METHOD_TARGETS:
             raise ValueError(f"unknown lifecycle method: {method}")
-        return self.transition(job_id, METHOD_TARGETS[method], method=method, trigger=trigger, payload=payload)
+        return self.transition(
+            job_id,
+            METHOD_TARGETS[method],
+            method=method,
+            trigger=trigger,
+            payload=payload,
+            idempotency_key=idempotency_key,
+        )
 
     def transition(
         self,
@@ -345,10 +453,33 @@ class LifecycleStore:
         method: str,
         trigger: str = "",
         payload: Any | None = None,
+        idempotency_key: str | None = None,
     ) -> LifecycleEvent:
         current = self._current.get(job_id)
         if current is None:
             current = self.create_job(job_id)
+        payload_hash = hash_json(payload or {})
+        request_hash = _lifecycle_request_hash(
+            job_id=job_id,
+            method=method,
+            to_state=to_state,
+            trigger=trigger,
+            payload_hash=payload_hash,
+        )
+        resolved_idempotency_key = idempotency_key or _derive_lifecycle_idempotency_key(
+            job_id=job_id,
+            method=method,
+            next_sequence=current.last_sequence + 1,
+        )
+        existing = self._idempotency_store.resolve(
+            job_id=job_id,
+            method=_lifecycle_idempotency_method(method),
+            idempotency_key=resolved_idempotency_key,
+            request_hash=request_hash,
+        )
+        if existing is not None:
+            return existing.response
+
         self._assert_legal_transition(current.state, to_state, method)
         event = LifecycleEvent(
             job_id=job_id,
@@ -357,11 +488,13 @@ class LifecycleStore:
             to_state=to_state,
             method=method,
             trigger=trigger,
-            payload_hash=hash_json(payload or {}),
+            payload_hash=payload_hash,
+            idempotency_key=resolved_idempotency_key,
         )
         event = self._mirror_event(event)
         self._events[job_id].append(event)
         self._current[job_id] = JobCurrent(job_id=job_id, state=to_state, last_sequence=event.sequence)
+        self._record_event_idempotency(event)
         return event
 
     def current(self, job_id: str) -> JobCurrent:
@@ -388,6 +521,9 @@ class LifecycleStore:
             return ()
         return tuple(self._artifact_store.get_record(ref) for ref in self.ledger_refs(job_id))
 
+    def idempotency_records(self, job_id: str | None = None) -> tuple[IdempotencyRecord, ...]:
+        return self._idempotency_store.records(job_id)
+
     def _mirror_event(self, event: LifecycleEvent) -> LifecycleEvent:
         if self._artifact_store is None:
             return event
@@ -409,6 +545,21 @@ class LifecycleStore:
             return self._ledger_producer
         return replace(self._ledger_producer, job_id=event.job_id)
 
+    def _record_event_idempotency(self, event: LifecycleEvent) -> IdempotencyRecord:
+        return self._idempotency_store.record(
+            job_id=event.job_id,
+            method=_lifecycle_idempotency_method(event.method),
+            idempotency_key=event.idempotency_key,
+            request_hash=_lifecycle_request_hash(
+                job_id=event.job_id,
+                method=event.method,
+                to_state=event.to_state,
+                trigger=event.trigger,
+                payload_hash=event.payload_hash,
+            ),
+            response=event,
+        )
+
     @staticmethod
     def _assert_legal_transition(from_state: LifecycleState, to_state: LifecycleState, method: str) -> None:
         if to_state not in LEGAL_TRANSITIONS[from_state]:
@@ -429,50 +580,79 @@ class SubagentRuntime:
         *,
         descriptor: SubagentDescriptor,
         store: LifecycleStore | None = None,
+        idempotency_store: InMemoryIdempotencyStore | None = None,
     ) -> None:
         self.descriptor = descriptor
-        self.store = store or LifecycleStore()
+        self.idempotency_store = idempotency_store or InMemoryIdempotencyStore()
+        self.store = store or LifecycleStore(idempotency_store=self.idempotency_store)
         self.gate_invocations = 0
-        self._acceptance_cache: dict[str, tuple[str, Acceptance]] = {}
 
-    def accept(self, envelope: JobEnvelope) -> Acceptance:
+    def accept(self, envelope: JobEnvelope, *, idempotency_key: str | None = None) -> Acceptance:
+        resolved_idempotency_key = idempotency_key or _default_accept_idempotency_key(envelope.job_id)
         request_hash = hash_json(envelope.__dict__)
-        cached = self._acceptance_cache.get(envelope.job_id)
-        if cached is not None:
-            cached_hash, cached_acceptance = cached
-            if cached_hash != request_hash:
-                raise LifecyclePolicyError(
-                    ErrorEnvelope(
-                        code="IDEMPOTENCY_CONFLICT",
-                        category="POLICY",
-                        message="same job_id accepted with a different envelope",
-                    )
-                )
-            return cached_acceptance
+        existing = self.idempotency_store.resolve(
+            job_id=envelope.job_id,
+            method="accept",
+            idempotency_key=resolved_idempotency_key,
+            request_hash=request_hash,
+        )
+        if existing is not None:
+            return existing.response
 
         self.gate_invocations += 1
         self.store.create_job(envelope.job_id)
-        acceptance = default_accept(self.descriptor, envelope)
-        self.store.apply_method(envelope.job_id, "accept" if acceptance.accepted else "refuse")
-        self._acceptance_cache[envelope.job_id] = (request_hash, acceptance)
+        acceptance = default_accept(self.descriptor, envelope, idempotency_key=resolved_idempotency_key)
+        self.store.apply_method(
+            envelope.job_id,
+            "accept" if acceptance.accepted else "refuse",
+            trigger="S5",
+            idempotency_key=resolved_idempotency_key,
+        )
+        self.idempotency_store.record(
+            job_id=envelope.job_id,
+            method="accept",
+            idempotency_key=resolved_idempotency_key,
+            request_hash=request_hash,
+            response=acceptance,
+        )
         return acceptance
 
 
-def default_accept(descriptor: SubagentDescriptor, envelope: JobEnvelope) -> Acceptance:
+def default_accept(
+    descriptor: SubagentDescriptor,
+    envelope: JobEnvelope,
+    *,
+    idempotency_key: str | None = None,
+) -> Acceptance:
+    resolved_idempotency_key = idempotency_key or _default_accept_idempotency_key(envelope.job_id)
     if _semver_major(descriptor.contract_version) != _semver_major(envelope.envelope_version):
-        return Acceptance(False, "VERSION_UNSUPPORTED", LifecycleState.REJECTED)
+        return Acceptance(envelope.job_id, False, "VERSION_UNSUPPORTED", LifecycleState.REJECTED, resolved_idempotency_key)
     if envelope.subtopic not in set(descriptor.subtopics):
-        return Acceptance(False, "OUT_OF_SCOPE", LifecycleState.REJECTED)
+        return Acceptance(envelope.job_id, False, "OUT_OF_SCOPE", LifecycleState.REJECTED, resolved_idempotency_key)
     descriptor_adapters = set(descriptor.required_adapters)
     allowed_adapters = set(envelope.allowed_adapters)
     for adapter_ref in envelope.required_adapters:
         if adapter_ref not in descriptor_adapters or adapter_ref not in allowed_adapters:
-            return Acceptance(False, "MISSING_ADAPTER", LifecycleState.REJECTED)
+            return Acceptance(envelope.job_id, False, "MISSING_ADAPTER", LifecycleState.REJECTED, resolved_idempotency_key)
     if envelope.verifier_profile_ref is None:
-        return Acceptance(False, "NO_VERIFIER", LifecycleState.REJECTED)
+        return Acceptance(envelope.job_id, False, "NO_VERIFIER", LifecycleState.REJECTED, resolved_idempotency_key)
     if envelope.budget_cost and envelope.estimated_cost > envelope.budget_cost:
-        return Acceptance(False, "BUDGET_TOO_SMALL", LifecycleState.REJECTED, estimated_cost=envelope.estimated_cost)
-    return Acceptance(True, None, LifecycleState.ACCEPTED, estimated_cost=envelope.estimated_cost)
+        return Acceptance(
+            envelope.job_id,
+            False,
+            "BUDGET_TOO_SMALL",
+            LifecycleState.REJECTED,
+            resolved_idempotency_key,
+            estimated_cost=envelope.estimated_cost,
+        )
+    return Acceptance(
+        envelope.job_id,
+        True,
+        None,
+        LifecycleState.ACCEPTED,
+        resolved_idempotency_key,
+        estimated_cost=envelope.estimated_cost,
+    )
 
 
 def _semver_major(version: str) -> int:
@@ -526,7 +706,50 @@ def _lifecycle_event_ledger_payload(event: LifecycleEvent) -> dict[str, object]:
         "method": event.method,
         "trigger": event.trigger,
         "payload_hash": event.payload_hash,
+        "idempotency_key": event.idempotency_key,
     }
+
+
+def _default_accept_idempotency_key(job_id: str) -> str:
+    return f"accept:{job_id}"
+
+
+def _lifecycle_idempotency_method(method: str) -> str:
+    return f"lifecycle.{method}"
+
+
+def _lifecycle_request_hash(
+    *,
+    job_id: str,
+    method: str,
+    to_state: LifecycleState,
+    trigger: str,
+    payload_hash: str,
+) -> str:
+    return hash_json(
+        {
+            "job_id": job_id,
+            "method": method,
+            "to_state": to_state.value,
+            "trigger": trigger,
+            "payload_hash": payload_hash,
+        }
+    )
+
+
+def _derive_lifecycle_idempotency_key(*, job_id: str, method: str, next_sequence: int) -> str:
+    return f"{method}:{job_id}:{next_sequence}"
+
+
+def _idempotency_response_hash(response: Any) -> str:
+    if isinstance(response, Acceptance):
+        return hash_json(response.as_c1_payload())
+    if isinstance(response, LifecycleEvent):
+        payload = _lifecycle_event_ledger_payload(response)
+        if response.ledger_ref is not None:
+            payload["ledger_ref"] = response.ledger_ref
+        return hash_json(payload)
+    return hash_json(response)
 
 
 def build_subagent_report(

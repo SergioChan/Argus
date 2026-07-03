@@ -10,6 +10,8 @@ from argus_core import (
     C3ReportSigner,
     C3ReportVerifier,
     ExecContext,
+    IdempotencyRecord,
+    InMemoryIdempotencyStore,
     InMemoryArtifactStore,
     InMemoryVerifierTrustStore,
     JobEnvelope,
@@ -151,9 +153,68 @@ class S1LifecycleStoreTests(unittest.TestCase):
         self.assertEqual(accepted_payload["from_state"], "REGISTERED")
         self.assertEqual(accepted_payload["to_state"], "ACCEPTED")
         self.assertEqual(accepted_payload["method"], "accept")
+        self.assertEqual(accepted_payload["idempotency_key"], accepted.idempotency_key)
         self.assertEqual(planned_payload["sequence"], 2)
+        self.assertEqual(planned_payload["idempotency_key"], planned.idempotency_key)
         self.assertEqual(planned_payload["payload_hash"], planned.payload_hash)
         self.assertTrue(artifacts.verify_audit_chain().valid)
+
+    def test_lifecycle_method_idempotency_returns_stored_event_without_new_side_effects(self) -> None:
+        artifacts = InMemoryArtifactStore()
+        store = LifecycleStore(artifact_store=artifacts)
+        store.create_job("job-1")
+
+        first = store.apply_method(
+            "job-1",
+            "accept",
+            trigger="S5",
+            payload={"accepted": True},
+            idempotency_key="accept-job-1",
+        )
+        second = store.apply_method(
+            "job-1",
+            "accept",
+            trigger="S5",
+            payload={"accepted": True},
+            idempotency_key="accept-job-1",
+        )
+
+        self.assertEqual(second, first)
+        self.assertEqual(store.current("job-1").state, LifecycleState.ACCEPTED)
+        self.assertEqual(store.events("job-1"), (first,))
+        self.assertEqual(store.ledger_refs("job-1"), (first.ledger_ref,))
+        self.assertEqual(len(store.ledger_records("job-1")), 1)
+        idempotency = store.idempotency_records("job-1")
+        self.assertEqual(len(idempotency), 1)
+        self.assertEqual(idempotency[0].method, "lifecycle.accept")
+        self.assertEqual(idempotency[0].idempotency_key, "accept-job-1")
+        self.assertIsInstance(idempotency[0], IdempotencyRecord)
+
+    def test_lifecycle_idempotency_conflict_rejects_before_ledger_side_effect(self) -> None:
+        artifacts = InMemoryArtifactStore()
+        store = LifecycleStore(artifact_store=artifacts)
+        store.create_job("job-1")
+        store.apply_method(
+            "job-1",
+            "accept",
+            trigger="S5",
+            payload={"accepted": True},
+            idempotency_key="accept-job-1",
+        )
+
+        with self.assertRaises(LifecyclePolicyError) as raised:
+            store.apply_method(
+                "job-1",
+                "accept",
+                trigger="S5",
+                payload={"accepted": False},
+                idempotency_key="accept-job-1",
+            )
+
+        self.assertEqual(raised.exception.envelope.code, "IDEMPOTENCY_CONFLICT")
+        self.assertEqual(store.current("job-1").state, LifecycleState.ACCEPTED)
+        self.assertEqual(len(store.events("job-1")), 1)
+        self.assertEqual(len(store.ledger_records("job-1")), 1)
 
     def test_job_current_is_rebuildable_from_event_log(self) -> None:
         artifacts = InMemoryArtifactStore()
@@ -170,6 +231,39 @@ class S1LifecycleStoreTests(unittest.TestCase):
         self.assertEqual(rebuilt.current("job-1"), store.current("job-1"))
         self.assertEqual(rebuilt.replay("job-1"), store.current("job-1"))
         self.assertEqual(rebuilt.ledger_refs("job-1"), store.ledger_refs("job-1"))
+
+    def test_event_log_rebuild_restores_lifecycle_idempotency_records(self) -> None:
+        artifacts = InMemoryArtifactStore()
+        store = LifecycleStore(artifact_store=artifacts)
+        store.create_job("job-1")
+        accepted = store.apply_method("job-1", "accept", trigger="S5", idempotency_key="accept-job-1")
+        planned = store.apply_method(
+            "job-1",
+            "plan",
+            trigger="internal",
+            payload={"step": "plan"},
+            idempotency_key="plan-job-1",
+        )
+
+        rebuilt = LifecycleStore.from_event_log(
+            {"job-1": store.events("job-1")},
+            artifact_store=artifacts,
+        )
+        duplicate_plan = rebuilt.apply_method(
+            "job-1",
+            "plan",
+            trigger="internal",
+            payload={"step": "plan"},
+            idempotency_key="plan-job-1",
+        )
+
+        self.assertEqual(duplicate_plan, planned)
+        self.assertEqual(rebuilt.events("job-1"), (accepted, planned))
+        self.assertEqual(rebuilt.ledger_refs("job-1"), store.ledger_refs("job-1"))
+        self.assertEqual(
+            [record.idempotency_key for record in rebuilt.idempotency_records("job-1")],
+            ["accept-job-1", "plan-job-1"],
+        )
 
     def test_replay_rejects_tampered_event_log(self) -> None:
         store = LifecycleStore()
@@ -203,6 +297,7 @@ class S1LifecycleStoreTests(unittest.TestCase):
 
         self.assertEqual(store.current("job-1").state, LifecycleState.REGISTERED)
         self.assertEqual(store.events("job-1"), ())
+        self.assertEqual(store.idempotency_records("job-1"), ())
 
     @staticmethod
     def _c1_def_enum(def_name: str) -> set[str]:
@@ -303,11 +398,25 @@ class S1AcceptGateTests(unittest.TestCase):
         )
 
     def test_default_accept_happy_path(self) -> None:
-        acceptance = default_accept(self.descriptor, self._envelope())
+        envelope = self._envelope()
+        acceptance = default_accept(self.descriptor, envelope)
 
         self.assertTrue(acceptance.accepted)
+        self.assertEqual(acceptance.job_id, envelope.job_id)
         self.assertIsNone(acceptance.reason)
         self.assertEqual(acceptance.state, LifecycleState.ACCEPTED)
+        self.assertEqual(acceptance.idempotency_key, "accept:job-1")
+        self.assertEqual(
+            acceptance.as_c1_payload(),
+            {
+                "job_id": "job-1",
+                "accepted": True,
+                "reason": None,
+                "state": "ACCEPTED",
+                "idempotency_key": "accept:job-1",
+                "estimated_cost": {"cost_usd": 1},
+            },
+        )
 
     def test_default_accept_refuses_missing_adapter_no_verifier_and_major_version(self) -> None:
         missing_adapter = default_accept(
@@ -325,7 +434,8 @@ class S1AcceptGateTests(unittest.TestCase):
         self.assertFalse(major_mismatch.accepted)
 
     def test_runtime_accept_is_idempotent_for_same_envelope(self) -> None:
-        runtime = SubagentRuntime(descriptor=self.descriptor)
+        idempotency = InMemoryIdempotencyStore()
+        runtime = SubagentRuntime(descriptor=self.descriptor, idempotency_store=idempotency)
         envelope = self._envelope()
 
         first = runtime.accept(envelope)
@@ -335,9 +445,15 @@ class S1AcceptGateTests(unittest.TestCase):
         self.assertEqual(runtime.gate_invocations, 1)
         self.assertEqual(len(runtime.store.events(envelope.job_id)), 1)
         self.assertEqual(runtime.store.current(envelope.job_id).state, LifecycleState.ACCEPTED)
+        self.assertEqual(first.idempotency_key, "accept:job-1")
+        self.assertEqual(
+            [(record.method, record.idempotency_key) for record in idempotency.records("job-1")],
+            [("accept", "accept:job-1"), ("lifecycle.accept", "accept:job-1")],
+        )
 
     def test_runtime_accept_rejects_same_job_different_envelope(self) -> None:
-        runtime = SubagentRuntime(descriptor=self.descriptor)
+        idempotency = InMemoryIdempotencyStore()
+        runtime = SubagentRuntime(descriptor=self.descriptor, idempotency_store=idempotency)
         runtime.accept(self._envelope(job_id="job-1"))
 
         with self.assertRaises(LifecyclePolicyError) as raised:
@@ -345,6 +461,11 @@ class S1AcceptGateTests(unittest.TestCase):
 
         self.assertEqual(raised.exception.envelope.code, "IDEMPOTENCY_CONFLICT")
         self.assertEqual(runtime.gate_invocations, 1)
+        self.assertEqual(len(runtime.store.events("job-1")), 1)
+        self.assertEqual(
+            [(record.method, record.idempotency_key) for record in idempotency.records("job-1")],
+            [("accept", "accept:job-1"), ("lifecycle.accept", "accept:job-1")],
+        )
 
     def _envelope(
         self,

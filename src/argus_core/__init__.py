@@ -28,6 +28,8 @@ from .s1 import (
     ErrorBehavior,
     ExecContext,
     Acceptance,
+    IdempotencyRecord,
+    InMemoryIdempotencyStore,
     JobCurrent,
     JobEnvelope,
     LEGAL_TRANSITIONS,
