@@ -971,6 +971,66 @@ class S10OrchestratorAndAuditTests(unittest.TestCase):
         )
 
 
+class S10ResourceMeterGapTests(unittest.TestCase):
+    def test_injected_sampler_gap_halts_conservatively_and_preserves_gap_dimension(self) -> None:
+        tokens = InMemoryTokenService(signing_key=b"test-key", now_fn=lambda: 1_000)
+        request = LaunchRequest(
+            job_id="job-1",
+            subagent_id="subagent-1",
+            trace_id="trace-1",
+            budget_token=tokens.mint_budget(
+                caps=BudgetCaps(max_compute_units=10, max_wallclock_s=10, max_cost_usd=1),
+                job_id="job-1",
+                root_request_id="root-1",
+            ),
+            scope_token=tokens.mint_scope(job_id="job-1", scopes=ScopeGrant()),
+            image="registry.local/argus@sha256:" + "b" * 64,
+            entrypoint=("/bin/sh",),
+            args=("-c", "sleep 30"),
+            env={},
+            env_allowlist=(),
+            requested_envelope=LaunchEnvelope(
+                cpu_m=500,
+                mem_bytes=64 * 1024 * 1024,
+                gpu_count=0,
+                wallclock_s=10,
+                scratch_bytes=1024 * 1024,
+                pids=16,
+                estimated_cost_usd=0.01,
+            ),
+        )
+        supervisor = _GapStallDockerApiSupervisor(meter_interval_s=0.1, meter_gap_halt_s=0.2)
+        clock = _FakeClock()
+        samples: list[s10_module.ResourceMeterSample] = []
+        original_monotonic = s10_module.time.monotonic
+        original_sleep = s10_module.time.sleep
+        s10_module.time.monotonic = clock.monotonic  # type: ignore[assignment]
+        s10_module.time.sleep = clock.sleep_with_injected_stall  # type: ignore[assignment]
+        try:
+            exit_code, timed_out, stderr, usage = supervisor._wait_for_container_with_meter(
+                container_id="container-gap",
+                request=request,
+                started_at=0.0,
+                meter_sample_sink=samples.append,
+            )
+        finally:
+            s10_module.time.monotonic = original_monotonic  # type: ignore[assignment]
+            s10_module.time.sleep = original_sleep  # type: ignore[assignment]
+
+        self.assertIsNone(exit_code)
+        self.assertTrue(timed_out)
+        self.assertEqual(stderr, "argus meter halted container: meter_gap")
+        self.assertTrue(supervisor.killed)
+        self.assertGreater(usage.wallclock_s, 0)
+        self.assertGreaterEqual(len(samples), 3)
+        gap_samples = [sample for sample in samples if sample.conservative_gap_s > 0]
+        self.assertGreaterEqual(len(gap_samples), 2)
+        self.assertTrue(all(sample.halted for sample in gap_samples))
+        self.assertTrue(all("meter_gap" in sample.breached_dimensions for sample in gap_samples))
+        self.assertEqual(samples[-1].source, "docker-api-cgroup-gap")
+        self.assertIn("meter_gap", samples[-1].breached_dimensions)
+
+
 class S10DockerSupervisorTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
@@ -1502,6 +1562,35 @@ class S10DockerOrchestratorFailureTests(unittest.TestCase):
         self.assertEqual(payload["usage"]["cost_usd"], 2.0)
         self.assertEqual(payload["metering"]["sample_count"], 1)
 
+    def test_docker_orchestrator_persists_meter_gap_halt_in_audit_and_spend_final(self) -> None:
+        artifacts = InMemoryArtifactStore()
+        audit = InMemoryAuditLedger()
+        orchestrator = DockerSandboxOrchestrator(
+            token_service=self.tokens,
+            quota_ledger=InMemoryQuotaLedger(),
+            audit_ledger=audit,
+            policy_bundle=self.bundle,
+            artifact_store=artifacts,
+            supervisor=_InjectedMeterGapSupervisor(),
+        )
+
+        result = orchestrator.launch_and_wait(self._launch_request())
+
+        self.assertEqual(result.handle.state, "TIMED_OUT")
+        self.assertTrue(result.timed_out)
+        event_types = [event.event_type for event in audit.events()]
+        self.assertIn("meter.gap", event_types)
+        self.assertIn("meter.halt", event_types)
+        self.assertIn("sandbox.timeout", event_types)
+        spend_records = artifacts.query_artifacts({"kind": "spend.final"})
+        self.assertEqual(len(spend_records), 1)
+        payload = json.loads(artifacts.get_artifact(spend_records[0].artifact_ref).decode("utf-8"))
+        self.assertEqual(payload["final_state"], "TIMED_OUT")
+        self.assertTrue(payload["metering"]["halted_by_meter"])
+        self.assertEqual(payload["metering"]["source"], "test-docker-api-cgroup-gap")
+        self.assertGreater(payload["metering"]["samples"][-1]["conservative_gap_s"], 0)
+        self.assertIn("meter_gap", payload["metering"]["samples"][-1]["breached_dimensions"])
+
     @staticmethod
     def _signed_price_table(*, cpu_rate: str) -> tuple[PriceTable, PriceTableTrustStore]:
         signer = PriceTableSigner(signer_key_id="price-root", signing_key=b"price-secret")
@@ -1585,6 +1674,114 @@ class _FixedUsageSupervisor:
             timed_out=False,
             duration_s=self._budget_usage.wallclock_s,
             budget_usage=self._budget_usage,
+        )
+
+
+class _FakeClock:
+    def __init__(self) -> None:
+        self.current = 0.0
+
+    def monotonic(self) -> float:
+        return self.current
+
+    def sleep_with_injected_stall(self, seconds: float) -> None:
+        self.current += max(float(seconds), 0.0) + 0.25
+
+
+class _GapStallDockerApiSupervisor(DockerSandboxSupervisor):
+    def __init__(self, *, meter_interval_s: float, meter_gap_halt_s: float) -> None:
+        super().__init__(meter_interval_s=meter_interval_s, meter_gap_halt_s=meter_gap_halt_s)
+        self.killed = False
+
+    def _docker_api_request(  # type: ignore[override]
+        self,
+        method: str,
+        path: str,
+        body=None,
+        *,
+        expected,
+        timeout: float = 10,
+    ):
+        if path.endswith("/json"):
+            return {"State": {"Running": True}}
+        if path.endswith("/kill"):
+            self.killed = True
+            return {}
+        raise AssertionError(f"unexpected docker API request during gap test: {method} {path}")
+
+    def _docker_api_resource_sample(  # type: ignore[override]
+        self,
+        *,
+        container_id: str,
+        envelope: LaunchEnvelope,
+        started_at: float,
+        sample_seq: int,
+        previous_sample_at: float | None,
+    ) -> s10_module.ResourceMeterSample:
+        elapsed_s = s10_module.time.monotonic() - started_at
+        cadence_s = 0.0 if previous_sample_at is None else s10_module.time.monotonic() - previous_sample_at
+        return s10_module.ResourceMeterSample(
+            sample_seq=sample_seq,
+            elapsed_s=elapsed_s,
+            cadence_s=cadence_s,
+            usage=s10_module._runtime_budget_usage(envelope, elapsed_s),
+            memory_bytes=123,
+            source="test-docker-api-cgroup",
+        )
+
+
+class _InjectedMeterGapSupervisor:
+    def run(
+        self,
+        *,
+        handle: SandboxHandle,
+        request: LaunchRequest,
+        materialized_env: dict[str, str],
+        meter_sample_sink=None,
+    ) -> SandboxExecutionResult:
+        usage = BudgetUsage(wallclock_s=0.4)
+        if meter_sample_sink is not None:
+            meter_sample_sink(
+                s10_module.ResourceMeterSample(
+                    sample_seq=1,
+                    elapsed_s=0.1,
+                    cadence_s=0.0,
+                    usage=BudgetUsage(wallclock_s=0.1),
+                    source="test-docker-api-cgroup",
+                )
+            )
+            meter_sample_sink(
+                s10_module.ResourceMeterSample(
+                    sample_seq=2,
+                    elapsed_s=0.4,
+                    cadence_s=0.3,
+                    usage=usage,
+                    source="test-docker-api-cgroup-gap",
+                    breached_dimensions=("meter_gap",),
+                    halted=True,
+                    conservative_gap_s=0.3,
+                )
+            )
+            meter_sample_sink(
+                s10_module.ResourceMeterSample(
+                    sample_seq=3,
+                    elapsed_s=0.4,
+                    cadence_s=0.0,
+                    usage=usage,
+                    source="test-docker-api-cgroup-gap",
+                    breached_dimensions=("meter_gap",),
+                    halted=True,
+                    conservative_gap_s=0.3,
+                )
+            )
+        return SandboxExecutionResult(
+            handle=handle,
+            exit_code=None,
+            stdout="",
+            stderr="argus meter halted container: meter_gap",
+            timed_out=True,
+            duration_s=0.4,
+            budget_usage=usage,
         )
 
 

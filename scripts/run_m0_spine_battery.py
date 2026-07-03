@@ -1655,6 +1655,7 @@ def _battery_e_budget_halt(
             "spend_final_meter_halted_by_meter": spend_final["meter_halted_by_meter"],
             "spend_final_meter_halt_latency_s": spend_final["meter_halt_latency_s"],
             "spend_final_meter_dcgm_available": spend_final["meter_dcgm_available"],
+            "spend_final_meter_gap_sample_count": spend_final["meter_gap_sample_count"],
         },
     )
 
@@ -1684,6 +1685,23 @@ def _battery_spend_final(
     usage = payload.get("usage") or {}
     rollup = payload.get("usd_rollup") or {}
     metering = payload.get("metering") or {}
+    meter_samples = metering.get("samples") or []
+    if not isinstance(meter_samples, list):
+        raise AssertionError(f"spend.final metering samples must be a list: {payload}")
+    meter_gap_samples = [
+        sample
+        for sample in meter_samples
+        if isinstance(sample, dict)
+        and (
+            sample.get("source") == "docker-api-cgroup-gap"
+            or float(sample.get("conservative_gap_s") or 0) > 0
+            or "meter_gap" in (sample.get("breached_dimensions") or [])
+        )
+    ]
+    for sample in meter_gap_samples:
+        dimensions = sample.get("breached_dimensions") or []
+        if "meter_gap" not in dimensions or sample.get("halted") is not True:
+            raise AssertionError(f"meter gap sample must fail closed with meter_gap dimension: {payload}")
     if payload.get("schema") != "argus.s10.spend.final.v1":
         raise AssertionError(f"unexpected spend.final schema: {payload}")
     if payload.get("final_state") != expected_state:
@@ -1732,6 +1750,7 @@ def _battery_spend_final(
         "meter_halted_by_meter": bool(metering["halted_by_meter"]),
         "meter_halt_latency_s": float(metering["halt_latency_s"]),
         "meter_dcgm_available": bool(metering["dcgm_available"]),
+        "meter_gap_sample_count": len(meter_gap_samples),
     }
 
 

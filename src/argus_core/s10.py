@@ -14,7 +14,7 @@ import time
 from dataclasses import asdict, dataclass, field, replace
 from decimal import Decimal
 from hashlib import sha256
-from typing import Any, Callable, Literal, Mapping, NoReturn, Protocol
+from typing import Any, Callable, Iterable, Literal, Mapping, NoReturn, Protocol
 from uuid import uuid4
 from weakref import ref
 
@@ -1285,6 +1285,15 @@ def _budget_usage_breach_dimensions(caps: BudgetCaps, usage: BudgetUsage) -> tup
     return tuple(breached)
 
 
+def _merge_breach_dimensions(*groups: Iterable[str]) -> tuple[str, ...]:
+    merged: list[str] = []
+    for group in groups:
+        for dimension in group:
+            if dimension not in merged:
+                merged.append(dimension)
+    return tuple(merged)
+
+
 def _resource_meter_sample_payload(sample: ResourceMeterSample) -> dict[str, Any]:
     return {
         "sample_seq": sample.sample_seq,
@@ -2064,7 +2073,10 @@ class DockerSandboxSupervisor:
             elapsed_s=duration_s,
             cadence_s=max(duration_s - last_sample.elapsed_s, 0.0),
             usage=final_usage,
-            breached_dimensions=final_breach_dimensions,
+            breached_dimensions=_merge_breach_dimensions(
+                last_sample.breached_dimensions,
+                final_breach_dimensions,
+            ),
             halted=True,
         )
         if meter_sample_sink is not None:
