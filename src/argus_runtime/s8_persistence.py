@@ -30,6 +30,7 @@ from argus_core import (
     ReproducibilityCheck,
     ReproducibilityManifest,
     SCRATCH_BUCKET,
+    S8ScopeDeniedError,
     S10VerifierKeyMetadata,
     S10VerifierTrustStoreClient,
     WRITE_ONCE_BUCKET,
@@ -548,7 +549,17 @@ class PostgresArtifactStore:
                     "SELECT s8.resolve_split(%s, %s, %s, %s);",
                     (dataset_id, version, split_id, requester_scope),
                 )
-                return _jsonb_object(cur.fetchone()[0])
+                payload = _jsonb_object(cur.fetchone()[0])
+        if payload.get("verdict") == "DENIED" or payload.get("category") == "SCOPE_DENIED":
+            message = str(
+                payload.get("message")
+                or f"SCOPE_DENIED: verifier-only split {dataset_id}/{split_id} denied"
+            )
+            audit_event_id = payload.get("audit_event_id")
+            if audit_event_id is not None:
+                message = f"{message}; audit_event={audit_event_id}"
+            raise S8ScopeDeniedError(message)
+        return payload
 
     def export_audit_slice(
         self,

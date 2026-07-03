@@ -1246,6 +1246,26 @@ def _battery_real_persistence(
             s10_quota_entry_types = [str(row[0]) for row in cur.fetchall()]
             cur.execute("SELECT count(*) FROM s8.artifact_record;")
             record_count = int(cur.fetchone()[0])
+            cur.execute(
+                """
+                SELECT verdict, count(*)
+                FROM s8.dataset_resolve_audit
+                GROUP BY verdict
+                ORDER BY verdict;
+                """
+            )
+            dataset_resolve_audit_counts = {str(row[0]): int(row[1]) for row in cur.fetchall()}
+            cur.execute(
+                """
+                SELECT count(*)
+                FROM s8.dataset_resolve_audit
+                WHERE dataset_id = 'm0-dataset-registry'
+                  AND split_id = 'blind'
+                  AND verdict = 'DENIED'
+                  AND label_seal_ref IS NULL;
+                """
+            )
+            dataset_resolve_denied_blind_count = int(cur.fetchone()[0])
             cur.execute("SELECT count(*) FROM s8.ledger_leaf;")
             leaf_count = int(cur.fetchone()[0])
             cur.execute("SELECT count(*) FROM s8.merkle_checkpoint;")
@@ -1300,6 +1320,8 @@ def _battery_real_persistence(
         or checkpoint_signer_key_id != "argus-m0-s8-checkpoint"
         or not checkpoint_signature_valid
         or object_count < 2
+        or dataset_resolve_audit_counts.get("DENIED", 0) < 1
+        or dataset_resolve_denied_blind_count < 1
         or not all(append_only_denials.values())
         or not record_hashes_match
         or s10_migration_count < 1
@@ -1313,6 +1335,8 @@ def _battery_real_persistence(
             f"migrations={migration_count} records={record_count} leaves={leaf_count} "
             f"checkpoints={checkpoint_count} checkpoint_sequence={checkpoint_sequence} "
             f"checkpoint_signer={checkpoint_signer_key_id} checkpoint_signature_valid={checkpoint_signature_valid} "
+            f"dataset_resolve_audit_counts={dataset_resolve_audit_counts} "
+            f"dataset_resolve_denied_blind_count={dataset_resolve_denied_blind_count} "
             f"objects={object_count} append_only_denials={append_only_denials} "
             f"record_hashes_match_refreshed_records={record_hashes_match} "
             f"s10_migrations={s10_migration_count} s10_quota_entries={s10_quota_ledger_entries} "
@@ -1333,6 +1357,8 @@ def _battery_real_persistence(
             "s10_quota_remaining_non_negative": s10_quota_remaining_non_negative,
             "s10_quota_entry_types": s10_quota_entry_types,
             "artifact_records": record_count,
+            "dataset_resolve_audit_counts": dataset_resolve_audit_counts,
+            "dataset_resolve_denied_blind_count": dataset_resolve_denied_blind_count,
             "ledger_leaves": leaf_count,
             "merkle_checkpoints": checkpoint_count,
             "latest_checkpoint_sequence": checkpoint_sequence,

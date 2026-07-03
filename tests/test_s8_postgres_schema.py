@@ -950,6 +950,19 @@ class S8PostgresSchemaTests(unittest.TestCase):
             split_id="blind",
             requester_capabilities=("s8.read", "s8.verifier-labels.read"),
         )
+        audit = self._psql(
+            """
+            SELECT count(*) FILTER (WHERE verdict = 'ALLOWED')
+                || '|' || count(*) FILTER (WHERE verdict = 'DENIED')
+                || '|' || count(*) FILTER (
+                    WHERE verdict = 'DENIED'
+                      AND label_seal_ref IS NULL
+                      AND dataset_id = 'runtime-corpus'
+                      AND split_id = 'blind'
+                )
+            FROM s8.dataset_resolve_audit;
+            """
+        )
 
         self.assertEqual(registered["provenance_ref"]["artifact_ref"], dataset_artifact.artifact_ref)
         self.assertEqual(latest["version"], "1.0.0")
@@ -965,6 +978,7 @@ class S8PostgresSchemaTests(unittest.TestCase):
         self.assertNotIn("c4://labels/runtime/blind", str(denied.exception))
         self.assertEqual(verifier_resolution["feature_blob_ref"], "blake3:" + "2" * 64)
         self.assertEqual(verifier_resolution["label_blob_ref"], "c4://labels/runtime/blind")
+        self.assertEqual(audit.stdout.strip(), "2|1|1")
 
     def test_postgres_store_delegates_commit_to_configured_ledger_writer(self) -> None:
         class RecordingLedgerWriter:
@@ -1847,16 +1861,28 @@ class S8PostgresSchemaTests(unittest.TestCase):
         agent_blind = self._psql(
             """
             SET ROLE argus_s8_reader;
-            SELECT s8.resolve_split('ewpt-corpus', '1.0.0', 'blind', 'agent');
-            """,
-            check=False,
+            WITH denied AS (
+                SELECT s8.resolve_split('ewpt-corpus', '1.0.0', 'blind', 'agent') AS payload
+            )
+            SELECT (payload->>'category')
+                || '|' || ((payload->>'message') LIKE '%s8.verifier-labels.read capability%')::text
+                || '|' || COALESCE(payload->>'feature_blob_ref', '<null>')
+                || '|' || COALESCE(payload->>'label_blob_ref', '<null>')
+            FROM denied;
+            """
         )
         legacy_verifier_blind = self._psql(
             """
             SET ROLE argus_s8_reader;
-            SELECT s8.resolve_split('ewpt-corpus', '1.0.0', 'blind', 'verifier');
-            """,
-            check=False,
+            WITH denied AS (
+                SELECT s8.resolve_split('ewpt-corpus', '1.0.0', 'blind', 'verifier') AS payload
+            )
+            SELECT (payload->>'category')
+                || '|' || ((payload->>'message') LIKE '%s8.verifier-labels.read capability%')::text
+                || '|' || COALESCE(payload->>'feature_blob_ref', '<null>')
+                || '|' || COALESCE(payload->>'label_blob_ref', '<null>')
+            FROM denied;
+            """
         )
         capability_verifier_blind = self._psql(
             """
@@ -1870,7 +1896,11 @@ class S8PostgresSchemaTests(unittest.TestCase):
         )
         audit = self._psql(
             """
-            SELECT count(*) || '|' || string_agg(split_id || ':' || COALESCE(label_seal_ref, '<null>'), ',' ORDER BY resolve_id)
+            SELECT count(*) || '|' || count(*) FILTER (WHERE verdict = 'DENIED')
+                || '|' || string_agg(
+                    split_id || ':' || verdict || ':' || requester_scope || ':' || COALESCE(label_seal_ref, '<null>'),
+                    ',' ORDER BY resolve_id
+                )
             FROM s8.dataset_resolve_audit;
             """
         )
@@ -1905,14 +1935,18 @@ class S8PostgresSchemaTests(unittest.TestCase):
         self.assertNotEqual(missing_label.returncode, 0)
         self.assertIn("requires label_seal_ref", missing_label.stderr)
         self.assertEqual(agent_train.stdout.strip(), "blake3:train|<null>")
-        self.assertNotEqual(agent_blind.returncode, 0)
-        self.assertIn("SCOPE_DENIED", agent_blind.stderr)
-        self.assertNotIn("c4://labels/blind-sealed", agent_blind.stderr)
-        self.assertNotEqual(legacy_verifier_blind.returncode, 0)
-        self.assertIn("s8.verifier-labels.read capability", legacy_verifier_blind.stderr)
-        self.assertNotIn("c4://labels/blind-sealed", legacy_verifier_blind.stderr)
+        self.assertEqual(agent_blind.stdout.strip(), "SCOPE_DENIED|true|<null>|<null>")
+        self.assertNotIn("c4://labels/blind-sealed", agent_blind.stdout)
+        self.assertEqual(legacy_verifier_blind.stdout.strip(), "SCOPE_DENIED|true|<null>|<null>")
+        self.assertNotIn("c4://labels/blind-sealed", legacy_verifier_blind.stdout)
         self.assertEqual(capability_verifier_blind.stdout.strip(), "blake3:blind-features|c4://labels/blind-sealed")
-        self.assertEqual(audit.stdout.strip(), "2|train:<null>,blind:c4://labels/blind-sealed")
+        self.assertEqual(
+            audit.stdout.strip(),
+            "4|2|train:ALLOWED:agent:<null>,"
+            "blind:DENIED:agent:<null>,"
+            "blind:DENIED:verifier:<null>,"
+            "blind:ALLOWED:s8.read,s8.verifier-labels.read:c4://labels/blind-sealed",
+        )
         self.assertNotEqual(direct_insert.returncode, 0)
         self.assertIn("permission denied", direct_insert.stderr)
         self.assertNotEqual(update.returncode, 0)
