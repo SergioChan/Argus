@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 import hashlib
 import json
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 from .s5 import C2VersionPolicy, parse_c2_job_envelope
+from .s6 import CapabilityDescriptor, RegistryError
 from .s7 import AdapterBroker, EvalRequest, EvalResult
 from .s8 import ArtifactRecord, InMemoryArtifactStore, Lineage, Producer
 
@@ -27,6 +28,27 @@ class RewardSourceError(S2Error):
 
 class S2ContractModelError(S2Error):
     """Raised when S2's contract-bound model surface is missing or drifting."""
+
+
+class S2SpecCompilerError(S2Error):
+    """Raised when S2 refuses a build before any training execution starts."""
+
+    def __init__(self, *, category: str, code: str, message: str, before_execution: bool = True) -> None:
+        super().__init__(message)
+        self.category = category
+        self.code = code
+        self.message = message
+        self.retryable = False
+        self.before_execution = before_execution
+
+    def as_c1_payload(self) -> dict[str, Any]:
+        return {
+            "category": self.category,
+            "code": self.code,
+            "message": self.message,
+            "retryable": self.retryable,
+            "before_execution": self.before_execution,
+        }
 
 
 S2_REQUIRED_CONTRACT_IDS = ("C1", "C2", "C4", "C6")
@@ -65,6 +87,83 @@ class FieldSpec:
 
 
 @dataclass(frozen=True)
+class C3VerifierProfile:
+    profile_ref: str
+    profile_id: str
+    version: str
+    checks: tuple[str, ...]
+    provenance_ref: str
+
+    def __post_init__(self) -> None:
+        if not self.profile_ref:
+            raise S2ContractModelError("C3 verifier profile requires profile_ref")
+        if not self.profile_id:
+            raise S2ContractModelError("C3 verifier profile requires profile_id")
+        if not self.version:
+            raise S2ContractModelError("C3 verifier profile requires version")
+        object.__setattr__(self, "checks", tuple(self.checks))
+
+
+class C3VerifierProfileCatalog:
+    """Presence-only C3 verifier profile catalog used by S2 preflight."""
+
+    def __init__(self, profiles: tuple[C3VerifierProfile, ...] = ()) -> None:
+        self._profiles: dict[str, C3VerifierProfile] = {}
+        for profile in profiles:
+            self.register(profile)
+
+    def register(self, profile: C3VerifierProfile) -> C3VerifierProfile:
+        self._profiles[profile.profile_ref] = profile
+        return profile
+
+    def resolve(self, profile_ref: str) -> C3VerifierProfile:
+        try:
+            return self._profiles[profile_ref]
+        except KeyError as exc:
+            raise KeyError(profile_ref) from exc
+
+
+@dataclass(frozen=True)
+class ResolvedC5Descriptor:
+    entity_id: str
+    revision: int
+    kind: str
+    owner_subsystem: str
+    provenance_ref: str
+    capability_scopes: tuple[str, ...]
+    contract_versions: tuple[tuple[str, str], ...]
+
+    @classmethod
+    def from_descriptor(cls, descriptor: CapabilityDescriptor) -> "ResolvedC5Descriptor":
+        return cls(
+            entity_id=descriptor.entity_id,
+            revision=descriptor.revision,
+            kind=descriptor.kind,
+            owner_subsystem=descriptor.owner_subsystem,
+            provenance_ref=descriptor.provenance_ref,
+            capability_scopes=tuple(descriptor.capability_scopes),
+            contract_versions=tuple(sorted((str(k), str(v)) for k, v in descriptor.contract_versions.items())),
+        )
+
+
+@dataclass(frozen=True)
+class ResolvedC4Artifact:
+    artifact_ref: str
+    kind: str
+    content_hash: str
+    producer_subsystem: str
+
+    @classmethod
+    def from_record(cls, record: ArtifactRecord) -> "ResolvedC4Artifact":
+        return cls(
+            artifact_ref=record.artifact_ref,
+            kind=record.kind,
+            content_hash=record.content_hash,
+            producer_subsystem=record.producer.subsystem,
+        )
+
+
+@dataclass(frozen=True)
 class BuildBudget:
     max_usd: float
     max_wallclock_seconds: int
@@ -86,6 +185,11 @@ class BuildSpec:
     allowed_adapters: tuple[str, ...]
     allowed_datasets: tuple[str, ...]
     fields: tuple[FieldSpec, ...] = ()
+    constraints: dict[str, Any] = field(default_factory=dict)
+    verifier_profile: C3VerifierProfile | None = None
+    resolved_adapters: tuple[ResolvedC5Descriptor, ...] = ()
+    resolved_datasets: tuple[ResolvedC5Descriptor, ...] = ()
+    resolved_input_artifacts: tuple[ResolvedC4Artifact, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -206,6 +310,11 @@ def compile_build_spec_from_c2_envelope(
         now=now,
     )
     problem_spec = dict(envelope.problem_spec or {})
+    constraints = payload.get("constraints", problem_spec.get("constraints", {}))
+    if constraints is None:
+        constraints = {}
+    if not isinstance(constraints, Mapping):
+        raise S2ContractModelError("C2 constraints must be an object when provided")
     target_observable = str(problem_spec.get("target_observable") or problem_spec.get("observable") or "")
     if not target_observable:
         raise S2ContractModelError("C2 problem_spec must declare observable or target_observable for S2")
@@ -223,7 +332,153 @@ def compile_build_spec_from_c2_envelope(
         allowed_adapters=tuple(envelope.capability_scopes.get("allowed_adapters", ())),
         allowed_datasets=tuple(envelope.capability_scopes.get("allowed_datasets", ())),
         fields=_field_specs(problem_spec),
+        constraints=dict(constraints),
     )
+
+
+class SpecCompiler:
+    """C2 to S2 BuildSpec compiler with C3/C5 fail-closed preflight."""
+
+    def __init__(
+        self,
+        *,
+        verifier_profiles: C3VerifierProfileCatalog | Mapping[str, C3VerifierProfile],
+        capability_registry: Any,
+        artifact_store: InMemoryArtifactStore | None = None,
+        runtime_version: str = "1.0.0",
+        version_policy: C2VersionPolicy | None = None,
+        now: int = 0,
+    ) -> None:
+        self._verifier_profiles = verifier_profiles
+        self._capability_registry = capability_registry
+        self._artifact_store = artifact_store
+        self._runtime_version = runtime_version
+        self._version_policy = version_policy
+        self._now = now
+
+    def compile(self, payload: Mapping[str, Any]) -> BuildSpec:
+        spec = compile_build_spec_from_c2_envelope(
+            payload,
+            runtime_version=self._runtime_version,
+            version_policy=self._version_policy,
+            now=self._now,
+        )
+        self._require_target_units(spec)
+        verifier_profile = self._resolve_verifier_profile(spec.verifier_profile_ref)
+        resolved_adapters = tuple(
+            self._resolve_descriptor(ref, kind="adapter", required_scope="c6.evaluate", code="ADAPTER_UNAVAILABLE")
+            for ref in spec.allowed_adapters
+        )
+        resolved_datasets = tuple(
+            self._resolve_descriptor(ref, kind="dataset", required_scope="c4.read", code="DATASET_UNAVAILABLE")
+            for ref in spec.allowed_datasets
+        )
+        resolved_input_artifacts = tuple(self._resolve_input_artifact(ref) for ref in spec.input_artifact_refs)
+        return BuildSpec(
+            job_id=spec.job_id,
+            trace_id=spec.trace_id,
+            subtopic=spec.subtopic,
+            task_type=spec.task_type,
+            target_observable=spec.target_observable,
+            required_claim_tier_max=spec.required_claim_tier_max,
+            verifier_profile_ref=spec.verifier_profile_ref,
+            budget=spec.budget,
+            input_artifact_refs=spec.input_artifact_refs,
+            allowed_adapters=spec.allowed_adapters,
+            allowed_datasets=spec.allowed_datasets,
+            fields=spec.fields,
+            constraints=dict(spec.constraints),
+            verifier_profile=verifier_profile,
+            resolved_adapters=resolved_adapters,
+            resolved_datasets=resolved_datasets,
+            resolved_input_artifacts=resolved_input_artifacts,
+        )
+
+    def compile_then_execute(self, payload: Mapping[str, Any], executor: Callable[[BuildSpec], Any]) -> Any:
+        spec = self.compile(payload)
+        return executor(spec)
+
+    @staticmethod
+    def _require_target_units(spec: BuildSpec) -> None:
+        if not any(field.role == "target" and field.units for field in spec.fields):
+            raise S2SpecCompilerError(
+                category="POLICY",
+                code="UNITS_CONTRACT_INCOMPLETE",
+                message="S2 SpecCompiler requires target units before execution",
+            )
+
+    def _resolve_verifier_profile(self, profile_ref: str) -> C3VerifierProfile:
+        if not profile_ref:
+            raise S2SpecCompilerError(
+                category="VERIFIER_UNAVAILABLE",
+                code="VERIFIER_PROFILE_REQUIRED",
+                message="S2 SpecCompiler requires a verifier_profile_ref",
+            )
+        try:
+            if hasattr(self._verifier_profiles, "resolve"):
+                profile = self._verifier_profiles.resolve(profile_ref)
+            else:
+                profile = self._verifier_profiles[profile_ref]  # type: ignore[index]
+        except (KeyError, LookupError) as exc:
+            raise S2SpecCompilerError(
+                category="VERIFIER_UNAVAILABLE",
+                code="VERIFIER_PROFILE_UNAVAILABLE",
+                message=f"S2 SpecCompiler could not resolve verifier profile: {profile_ref}",
+            ) from exc
+        if not isinstance(profile, C3VerifierProfile):
+            raise S2SpecCompilerError(
+                category="VERIFIER_UNAVAILABLE",
+                code="VERIFIER_PROFILE_INVALID",
+                message=f"S2 SpecCompiler resolver returned an invalid verifier profile: {profile_ref}",
+            )
+        return profile
+
+    def _resolve_descriptor(
+        self,
+        ref: str,
+        *,
+        kind: str,
+        required_scope: str,
+        code: str,
+    ) -> ResolvedC5Descriptor:
+        if self._capability_registry is None or not hasattr(self._capability_registry, "get"):
+            raise S2SpecCompilerError(
+                category="POLICY",
+                code=code,
+                message=f"S2 SpecCompiler requires a C5 registry to resolve {kind}: {ref}",
+            )
+        try:
+            descriptor = self._capability_registry.get(ref)
+        except (KeyError, RegistryError) as exc:
+            raise S2SpecCompilerError(
+                category="POLICY",
+                code=code,
+                message=f"S2 SpecCompiler could not resolve {kind}: {ref}",
+            ) from exc
+        if descriptor.status != "active" or descriptor.kind != kind or required_scope not in descriptor.capability_scopes:
+            raise S2SpecCompilerError(
+                category="POLICY",
+                code=code,
+                message=f"S2 SpecCompiler rejected {kind} descriptor: {ref}",
+            )
+        return ResolvedC5Descriptor.from_descriptor(descriptor)
+
+    def _resolve_input_artifact(self, ref: str) -> ResolvedC4Artifact:
+        if self._artifact_store is None:
+            raise S2SpecCompilerError(
+                category="POLICY",
+                code="INPUT_ARTIFACT_UNAVAILABLE",
+                message=f"S2 SpecCompiler requires a C4 artifact store to resolve input: {ref}",
+            )
+        try:
+            record = self._artifact_store.get_record(ref)
+        except KeyError as exc:
+            raise S2SpecCompilerError(
+                category="POLICY",
+                code="INPUT_ARTIFACT_UNAVAILABLE",
+                message=f"S2 SpecCompiler could not resolve input artifact: {ref}",
+            ) from exc
+        return ResolvedC4Artifact.from_record(record)
 
 
 class BaselineBuilder:
@@ -398,6 +653,14 @@ def _field_specs(problem_spec: Mapping[str, Any]) -> tuple[FieldSpec, ...]:
                 name=str(field["name"]),
                 units=str(field["units"]),
                 role=str(field.get("role", "feature")),
+            )
+        )
+    if "target_units" in problem_spec:
+        parsed.append(
+            FieldSpec(
+                name=str(problem_spec.get("target_observable") or problem_spec.get("observable") or "target"),
+                units=str(problem_spec["target_units"]),
+                role="target",
             )
         )
     return tuple(parsed)
