@@ -43,6 +43,7 @@ from argus_core import (
     SubagentDescriptor,
     SubagentSDKRunner,
     SubagentRuntime,
+    build_error_envelope,
     build_frozen_pipeline_entrypoint_request,
     hash_bytes,
     run_perturbation_pair,
@@ -193,6 +194,172 @@ class S1SDKBaseClassTests(unittest.TestCase):
         self.assertEqual(built.payload["uncertainty_summary"], {"representation": "none", "value": {}})
         self._assert_c1_valid(planned.payload)
         self._assert_c1_valid(built.payload)
+
+    def test_runner_auto_repairs_retryable_build_once_with_attempt_provenance(self) -> None:
+        class RepairableBuildSubagent(ExampleSubagent):
+            def __init__(self, descriptor: SubagentDescriptor) -> None:
+                super().__init__(descriptor)
+                self.build_plans: list[dict[str, object]] = []
+
+            def build(self, ctx: ExecContext, plan: dict[str, object]) -> dict[str, object]:
+                self.build_plans.append(dict(plan))
+                if not plan.get("repair_applied"):
+                    raise LifecyclePolicyError(
+                        build_error_envelope(
+                            category="RETRYABLE",
+                            code="TRAINING_NAN",
+                            message="loss became NaN during the first build attempt",
+                            retry_after_seconds=0,
+                        )
+                    )
+                payload = super().build(ctx, plan)
+                payload["diagnostics"]["repair_applied"] = plan["repair_applied"]
+                return payload
+
+        repair_calls: list[dict[str, object]] = []
+
+        def repair_hook(ctx: ExecContext, attempt: dict[str, object]) -> dict[str, object]:
+            repair_calls.append(attempt)
+            return {
+                "plan_patch": {"repair_applied": True},
+                "diagnostics": {"action": "lower_learning_rate", "sandbox_job": ctx.job_id},
+            }
+
+        subagent = RepairableBuildSubagent(self.descriptor)
+        runner = SubagentSDKRunner(
+            subagent,
+            runtime=SubagentRuntime(
+                descriptor=self.descriptor,
+                max_build_repair_attempts=2,
+                build_repair_hook=repair_hook,
+            ),
+        )
+
+        runner.accept(self.envelope)
+        planned = runner.plan(self.envelope)
+        built = runner.build(self.envelope.job_id, planned.payload)
+
+        self.assertEqual(len(subagent.build_plans), 2)
+        self.assertFalse(subagent.build_plans[0].get("repair_applied", False))
+        self.assertTrue(subagent.build_plans[1]["repair_applied"])
+        self.assertEqual(len(repair_calls), 1)
+        self.assertEqual(repair_calls[0]["attempt"], 1)
+        self.assertEqual(repair_calls[0]["max_attempts"], 2)
+        self.assertEqual(repair_calls[0]["error"]["category"], "RETRYABLE")
+        self.assertEqual(repair_calls[0]["error"]["code"], "TRAINING_NAN")
+        self.assertEqual(built.payload["diagnostics"]["repair_applied"], True)
+        repair = built.payload["diagnostics"]["repair"]
+        self.assertEqual(repair["repair_attempts"], 1)
+        self.assertEqual(len(repair["attempts"]), 1)
+        self.assertEqual(repair["attempts"][0]["attempt"], 1)
+        self.assertEqual(repair["attempts"][0]["error"]["code"], "TRAINING_NAN")
+        self.assertTrue(str(repair["attempts"][0]["provenance_ref"]).startswith("c4://"))
+        attempt_record = runner.runtime.artifact_store.get_record(str(repair["attempts"][0]["provenance_ref"]))
+        self.assertEqual(attempt_record.kind, "s1_build_repair_attempt")
+        self.assertEqual(attempt_record.lineage.job_id, self.envelope.job_id)
+        self.assertEqual(runner.runtime.store.current(self.envelope.job_id).state, LifecycleState.BUILDING)
+        self.assertEqual(
+            [event.method for event in runner.runtime.store.events(self.envelope.job_id)],
+            ["accept", "plan", "build"],
+        )
+        self._assert_c1_valid(built.payload)
+
+    def test_runner_auto_repair_cap_exhaustion_fails_with_typed_error_and_attempts(self) -> None:
+        class AlwaysFailingBuildSubagent(ExampleSubagent):
+            def __init__(self, descriptor: SubagentDescriptor) -> None:
+                super().__init__(descriptor)
+                self.build_calls = 0
+
+            def build(self, ctx: ExecContext, plan: dict[str, object]) -> dict[str, object]:
+                self.build_calls += 1
+                raise LifecyclePolicyError(
+                    build_error_envelope(
+                        category="RETRYABLE",
+                        code="TRAINING_NAN",
+                        message=f"attempt {self.build_calls} still produced NaN loss",
+                        retry_after_seconds=0,
+                    )
+                )
+
+        repair_calls: list[dict[str, object]] = []
+
+        def repair_hook(ctx: ExecContext, attempt: dict[str, object]) -> dict[str, object]:
+            repair_calls.append(attempt)
+            return {
+                "plan_patch": {"repair_iteration": attempt["attempt"]},
+                "diagnostics": {"action": "retry_with_grad_clip", "sandbox_job": ctx.job_id},
+            }
+
+        subagent = AlwaysFailingBuildSubagent(self.descriptor)
+        runner = SubagentSDKRunner(
+            subagent,
+            runtime=SubagentRuntime(
+                descriptor=self.descriptor,
+                max_build_repair_attempts=2,
+                build_repair_hook=repair_hook,
+            ),
+        )
+
+        runner.accept(self.envelope)
+        planned = runner.plan(self.envelope)
+        with self.assertRaises(LifecyclePolicyError) as raised:
+            runner.build(self.envelope.job_id, planned.payload)
+
+        self.assertEqual(raised.exception.envelope.category, "PERMANENT")
+        self.assertEqual(raised.exception.envelope.code, "S1_BUILD_AUTO_REPAIR_EXHAUSTED")
+        self.assertIn("2 repair attempts", raised.exception.envelope.message)
+        self.assertEqual(subagent.build_calls, 3)
+        self.assertEqual(len(repair_calls), 2)
+        self.assertEqual(runner.runtime.store.current(self.envelope.job_id).state, LifecycleState.FAILED)
+        self.assertEqual(
+            [event.method for event in runner.runtime.store.events(self.envelope.job_id)],
+            ["accept", "plan", "fail"],
+        )
+        attempt_records = runner.runtime.artifact_store.query_artifacts(
+            {"kind": "s1_build_repair_attempt", "job_id": self.envelope.job_id}
+        )
+        self.assertEqual(len(attempt_records), 2)
+        self.assertTrue(all(record.lineage.job_id == self.envelope.job_id for record in attempt_records))
+
+    def test_runner_auto_repair_does_not_retry_policy_or_sandbox_errors(self) -> None:
+        class PolicyFailingBuildSubagent(ExampleSubagent):
+            def build(self, ctx: ExecContext, plan: dict[str, object]) -> dict[str, object]:
+                raise LifecyclePolicyError(
+                    build_error_envelope(
+                        category="POLICY",
+                        code="MODEL_SELF_PROMOTION",
+                        message="author attempted to bypass tier policy",
+                    )
+                )
+
+        repair_calls: list[dict[str, object]] = []
+
+        def repair_hook(ctx: ExecContext, attempt: dict[str, object]) -> dict[str, object]:
+            repair_calls.append(attempt)
+            return {"plan_patch": {"should_not_apply": True}}
+
+        runner = SubagentSDKRunner(
+            PolicyFailingBuildSubagent(self.descriptor),
+            runtime=SubagentRuntime(
+                descriptor=self.descriptor,
+                max_build_repair_attempts=2,
+                build_repair_hook=repair_hook,
+            ),
+        )
+
+        runner.accept(self.envelope)
+        planned = runner.plan(self.envelope)
+        with self.assertRaises(LifecyclePolicyError) as raised:
+            runner.build(self.envelope.job_id, planned.payload)
+
+        self.assertEqual(raised.exception.envelope.category, "POLICY")
+        self.assertEqual(raised.exception.envelope.code, "MODEL_SELF_PROMOTION")
+        self.assertEqual(repair_calls, [])
+        self.assertEqual(runner.runtime.store.current(self.envelope.job_id).state, LifecycleState.PLANNING)
+        self.assertEqual(
+            [event.method for event in runner.runtime.store.events(self.envelope.job_id)],
+            ["accept", "plan"],
+        )
 
     def test_runner_rejects_author_build_tier_self_promotion_fields(self) -> None:
         class SelfPromotingBuildSubagent(ExampleSubagent):

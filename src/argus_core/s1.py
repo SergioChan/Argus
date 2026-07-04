@@ -178,6 +178,10 @@ ACCEPTANCE_REFUSAL_REASONS = frozenset(
 S1_LIFECYCLE_LEDGER_KIND = "s1_lifecycle_event"
 S1_LIFECYCLE_LEDGER_CODE_REF = "argus-core:s1.lifecycle-store"
 S1_LIFECYCLE_LEDGER_ENVIRONMENT_DIGEST = "python:s1-lifecycle-store:v1"
+S1_BUILD_REPAIR_ATTEMPT_KIND = "s1_build_repair_attempt"
+S1_BUILD_REPAIR_CODE_REF = "argus-core:s1.build-auto-repair"
+S1_BUILD_REPAIR_ENVIRONMENT_DIGEST = "python:s1-build-auto-repair:v1"
+S1_BUILD_REPAIRABLE_ERROR_CATEGORIES = frozenset({"RETRYABLE", "PERMANENT", "VALIDATION"})
 S1_FROZEN_PIPELINE_KIND = "frozen_pipeline"
 S1_VALIDATION_REQUEST_KIND = "validation_request"
 S1_VALIDATION_HANDOFF_CODE_REF = "argus-core:s1.validation-handoff"
@@ -2383,7 +2387,11 @@ class SubagentRuntime:
         adapter_client: Any | None = None,
         adapter_egress_allowlist: Mapping[str, Any] | None = None,
         store_egress_rule: EgressRule = S1_CONTENT_STORE_EGRESS_RULE,
+        max_build_repair_attempts: int = 0,
+        build_repair_hook: Any | None = None,
     ) -> None:
+        if max_build_repair_attempts < 0:
+            raise ValueError("max_build_repair_attempts cannot be negative")
         self.descriptor = descriptor
         self.idempotency_store = idempotency_store or InMemoryIdempotencyStore()
         self.sandbox_marshaler = sandbox_marshaler
@@ -2391,6 +2399,8 @@ class SubagentRuntime:
         self.adapter_egress_allowlist = _normalize_adapter_egress_mapping(adapter_egress_allowlist or {})
         _assert_egress_rule_valid(store_egress_rule, "content store")
         self.store_egress_rule = store_egress_rule
+        self.max_build_repair_attempts = max_build_repair_attempts
+        self.build_repair_hook = build_repair_hook
         if store is not None:
             if artifact_store is not None:
                 raise ValueError("artifact_store cannot be provided with an explicit LifecycleStore")
@@ -2507,12 +2517,49 @@ class SubagentSDKRunner:
         self._assert_can_apply(job_id, "build")
         self._assert_no_direct_exec(job_id, "build", self.subagent.build)
         plan_payload = _mapping_payload("plan", plan)
-        ctx = self._exec_context(
-            job_id,
-            allowed_adapters=tuple(str(adapter) for adapter in plan_payload.get("adapters_required", ())),
-            allowed_datasets=tuple(str(dataset) for dataset in plan_payload.get("datasets_required", ())),
-        )
-        payload = _normalize_build_payload(job_id, self.subagent.build(ctx, plan_payload))
+        repair_attempts: list[dict[str, Any]] = []
+        current_plan = dict(plan_payload)
+        while True:
+            ctx = self._exec_context(
+                job_id,
+                allowed_adapters=tuple(str(adapter) for adapter in current_plan.get("adapters_required", ())),
+                allowed_datasets=tuple(str(dataset) for dataset in current_plan.get("datasets_required", ())),
+            )
+            try:
+                payload = _normalize_build_payload(job_id, self.subagent.build(ctx, current_plan))
+                payload = _attach_build_repair_diagnostics(payload, repair_attempts)
+                break
+            except LifecyclePolicyError as exc:
+                if not self._can_auto_repair_build(exc):
+                    raise
+                current_plan = self._repair_build_plan(
+                    job_id=job_id,
+                    plan_payload=current_plan,
+                    error=exc,
+                    repair_attempts=repair_attempts,
+                    idempotency_key=idempotency_key,
+                    root_request_id=root_request_id,
+                    trace_id=trace_id,
+                )
+            except Exception as exc:
+                error = LifecyclePolicyError(
+                    build_error_envelope(
+                        category="PERMANENT",
+                        code="S1_BUILD_HOOK_FAILED",
+                        message=f"build hook failed before returning a valid payload: {exc}",
+                    )
+                )
+                if not self._can_auto_repair_build(error):
+                    raise error from exc
+                current_plan = self._repair_build_plan(
+                    job_id=job_id,
+                    plan_payload=current_plan,
+                    error=error,
+                    repair_attempts=repair_attempts,
+                    idempotency_key=idempotency_key,
+                    root_request_id=root_request_id,
+                    trace_id=trace_id,
+                )
         event = self.runtime.store.apply_method(
             job_id,
             "build",
@@ -2526,6 +2573,78 @@ class SubagentSDKRunner:
             trace_id=trace_id,
         )
         return SDKInvocationResult(event=event, payload=payload)
+
+    def _can_auto_repair_build(self, error: LifecyclePolicyError) -> bool:
+        if self.runtime.max_build_repair_attempts <= 0:
+            return False
+        if self.runtime.build_repair_hook is None:
+            return False
+        return error.envelope.category in S1_BUILD_REPAIRABLE_ERROR_CATEGORIES
+
+    def _repair_build_plan(
+        self,
+        *,
+        job_id: str,
+        plan_payload: Mapping[str, Any],
+        error: LifecyclePolicyError,
+        repair_attempts: list[dict[str, Any]],
+        idempotency_key: str | None,
+        root_request_id: str | None,
+        trace_id: str | None,
+    ) -> dict[str, Any]:
+        max_attempts = self.runtime.max_build_repair_attempts
+        attempt_number = len(repair_attempts) + 1
+        if attempt_number > max_attempts:
+            exhausted = LifecyclePolicyError(
+                build_error_envelope(
+                    category="PERMANENT",
+                    code="S1_BUILD_AUTO_REPAIR_EXHAUSTED",
+                    message=(
+                        f"build failed after {max_attempts} repair attempts; last error "
+                        f"{error.envelope.category}:{error.envelope.code}: {error.envelope.message}"
+                    ),
+                )
+            )
+            self.runtime.store.apply_method(
+                job_id,
+                "fail",
+                trigger="S1 auto-repair",
+                payload={
+                    "plan_hash": plan_payload.get("plan_hash"),
+                    "error": exhausted.envelope.as_c1_payload(),
+                    "last_error": error.envelope.as_c1_payload(),
+                    "repair": _build_repair_summary(repair_attempts),
+                },
+                idempotency_key=idempotency_key,
+                root_request_id=root_request_id,
+                trace_id=trace_id,
+            )
+            raise exhausted from error
+
+        repair_ctx = self._exec_context(
+            job_id,
+            allowed_adapters=tuple(str(adapter) for adapter in plan_payload.get("adapters_required", ())),
+            allowed_datasets=tuple(str(dataset) for dataset in plan_payload.get("datasets_required", ())),
+        )
+        attempt_payload = _build_repair_attempt_payload(
+            job_id=job_id,
+            attempt=attempt_number,
+            max_attempts=max_attempts,
+            plan_payload=plan_payload,
+            error=error,
+        )
+        decision = _call_build_repair_hook(self.runtime.build_repair_hook, repair_ctx, attempt_payload)
+        next_plan = _apply_build_repair_decision(plan_payload, decision)
+        recorded_attempt = _record_build_repair_attempt(
+            artifact_store=self.runtime.artifact_store,
+            job_id=job_id,
+            attempt_payload=attempt_payload,
+            decision=decision,
+            next_plan_hash=str(next_plan["plan_hash"]),
+            prior_attempt_refs=tuple(str(attempt["provenance_ref"]) for attempt in repair_attempts),
+        )
+        repair_attempts.append(recorded_attempt)
+        return next_plan
 
     def validate(
         self,
@@ -2838,6 +2957,159 @@ def _normalize_build_payload(job_id: str, value: Mapping[str, Any] | Any) -> dic
             + ", ".join(sorted(str(field) for field in extra)),
         )
     return payload
+
+
+def _attach_build_repair_diagnostics(
+    payload: dict[str, Any],
+    repair_attempts: list[dict[str, Any]],
+) -> dict[str, Any]:
+    if not repair_attempts:
+        return payload
+    diagnostics = payload.get("diagnostics")
+    if isinstance(diagnostics, Mapping):
+        normalized_diagnostics = dict(diagnostics)
+    else:
+        normalized_diagnostics = {"value": diagnostics}
+    normalized_diagnostics["repair"] = _build_repair_summary(repair_attempts)
+    payload["diagnostics"] = normalized_diagnostics
+    return payload
+
+
+def _build_repair_summary(repair_attempts: list[dict[str, Any]]) -> dict[str, Any]:
+    return {
+        "repair_attempts": len(repair_attempts),
+        "attempts": [dict(attempt) for attempt in repair_attempts],
+        "provenance_refs": [str(attempt["provenance_ref"]) for attempt in repair_attempts],
+    }
+
+
+def _build_repair_attempt_payload(
+    *,
+    job_id: str,
+    attempt: int,
+    max_attempts: int,
+    plan_payload: Mapping[str, Any],
+    error: LifecyclePolicyError,
+) -> dict[str, Any]:
+    return {
+        "schema": "argus.s1.build_repair_attempt.v1",
+        "job_id": job_id,
+        "attempt": attempt,
+        "max_attempts": max_attempts,
+        "plan_hash": str(plan_payload.get("plan_hash") or hash_json(plan_payload)),
+        "error": error.envelope.as_c1_payload(),
+    }
+
+
+def _call_build_repair_hook(hook: Any, ctx: ExecContext, attempt_payload: Mapping[str, Any]) -> dict[str, Any]:
+    try:
+        if hasattr(hook, "repair_build"):
+            decision = hook.repair_build(ctx, dict(attempt_payload))
+        elif callable(hook):
+            decision = hook(ctx, dict(attempt_payload))
+        else:
+            raise TypeError("build_repair_hook must be callable or expose repair_build")
+    except LifecyclePolicyError:
+        raise
+    except Exception as exc:
+        raise LifecyclePolicyError(
+            build_error_envelope(
+                category="PERMANENT",
+                code="S1_BUILD_AUTO_REPAIR_HOOK_FAILED",
+                message=f"build repair hook failed: {exc}",
+            )
+        ) from exc
+    return _normalize_build_repair_decision(decision)
+
+
+def _normalize_build_repair_decision(value: Mapping[str, Any] | Any) -> dict[str, Any]:
+    payload = _mapping_payload("build repair", value)
+    plan_patch_raw = payload.get("plan_patch", {})
+    if plan_patch_raw is None:
+        plan_patch: dict[str, Any] = {}
+    elif isinstance(plan_patch_raw, Mapping):
+        plan_patch = dict(plan_patch_raw)
+    else:
+        raise TypeError("build repair plan_patch must be a mapping")
+    diagnostics_raw = payload.get("diagnostics", {})
+    if diagnostics_raw is None:
+        diagnostics: dict[str, Any] = {}
+    elif isinstance(diagnostics_raw, Mapping):
+        diagnostics = dict(diagnostics_raw)
+    else:
+        diagnostics = {"value": diagnostics_raw}
+    return {
+        "plan_patch": plan_patch,
+        "diagnostics": diagnostics,
+        "stop": bool(payload.get("stop", False)),
+    }
+
+
+def _apply_build_repair_decision(
+    plan_payload: Mapping[str, Any],
+    decision: Mapping[str, Any],
+) -> dict[str, Any]:
+    if decision.get("stop"):
+        raise LifecyclePolicyError(
+            build_error_envelope(
+                category="PERMANENT",
+                code="S1_BUILD_AUTO_REPAIR_STOPPED",
+                message="build repair hook stopped the bounded repair loop",
+            )
+        )
+    patched_plan = dict(plan_payload)
+    patch = decision.get("plan_patch", {})
+    if not isinstance(patch, Mapping):
+        raise TypeError("normalized build repair plan_patch must be a mapping")
+    patched_plan.update(dict(patch))
+    patched_plan.pop("plan_hash", None)
+    patched_plan["plan_hash"] = hash_json(patched_plan)
+    return patched_plan
+
+
+def _record_build_repair_attempt(
+    *,
+    artifact_store: InMemoryArtifactStore | None,
+    job_id: str,
+    attempt_payload: Mapping[str, Any],
+    decision: Mapping[str, Any],
+    next_plan_hash: str,
+    prior_attempt_refs: tuple[str, ...],
+) -> dict[str, Any]:
+    if artifact_store is None:
+        raise LifecyclePolicyError(
+            build_error_envelope(
+                category="POLICY",
+                code="S1_BUILD_AUTO_REPAIR_PROVENANCE_REQUIRED",
+                message="bounded build repair requires a C4 artifact store for per-attempt provenance",
+            )
+        )
+    payload = {
+        **dict(attempt_payload),
+        "decision": {
+            "plan_patch_hash": hash_json(decision.get("plan_patch", {})),
+            "diagnostics": dict(decision.get("diagnostics", {})),
+            "stop": bool(decision.get("stop", False)),
+        },
+        "next_plan_hash": next_plan_hash,
+    }
+    record = artifact_store.create_artifact(
+        kind=S1_BUILD_REPAIR_ATTEMPT_KIND,
+        payload=payload,
+        producer=Producer(
+            subsystem="S1",
+            version="0.0.0",
+            actor_id="s1.build-auto-repair",
+            job_id=job_id,
+        ),
+        lineage=Lineage(
+            input_refs=prior_attempt_refs[-1:],
+            code_ref=S1_BUILD_REPAIR_CODE_REF,
+            environment_digest=S1_BUILD_REPAIR_ENVIRONMENT_DIGEST,
+            job_id=job_id,
+        ),
+    )
+    return {**payload, "provenance_ref": record.artifact_ref}
 
 
 def _normalize_report_payload(job_id: str, value: Mapping[str, Any] | Any) -> dict[str, Any]:
