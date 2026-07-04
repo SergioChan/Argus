@@ -1163,6 +1163,140 @@ class S10GpuTelemetryDiscoveryTests(unittest.TestCase):
         self.assertEqual(payload["gpu_telemetry_source"], "dcgmi+nvidia-smi")
         self.assertEqual(payload["samples"][0]["mig_instance_count"], 1)
 
+    def test_collects_dcgm_dmon_metric_rows_from_real_command_shape(self) -> None:
+        commands: list[tuple[str, ...]] = []
+
+        def exists(command: str) -> bool:
+            return command == "dcgmi"
+
+        def runner(args: tuple[str, ...]) -> subprocess.CompletedProcess[str]:
+            commands.append(args)
+            return subprocess.CompletedProcess(
+                args,
+                0,
+                stdout=(
+                    "# Entity  GRACT  TENSO  DRAMA\n"
+                    "      Id\n"
+                    "    GPU 0  0.552  0.527  0.101\n"
+                    "  GPU-I 0  0.986  0.953  0.202\n"
+                ),
+                stderr="",
+            )
+
+        snapshot = s10_module.collect_dcgm_metric_sample(
+            command_runner=runner,
+            command_exists=exists,
+            gpu_telemetry=s10_module.GpuTelemetrySnapshot(
+                dcgm_available=True,
+                gpu_count=1,
+                source="dcgmi+nvidia-smi",
+            ),
+        )
+
+        self.assertEqual(commands, [("dcgmi", "dmon", "-e", "1001,1004,1005", "-c", "1")])
+        self.assertTrue(snapshot.available)
+        self.assertEqual(snapshot.source, "dcgmi-dmon")
+        self.assertEqual(snapshot.row_count, 2)
+        self.assertAlmostEqual(snapshot.max_gr_engine_active, 0.986)
+        self.assertAlmostEqual(snapshot.max_tensor_active, 0.953)
+        self.assertAlmostEqual(snapshot.max_dram_active, 0.202)
+        self.assertEqual(snapshot.rows[0].entity, "GPU")
+        self.assertEqual(snapshot.rows[0].entity_id, "0")
+        self.assertEqual(snapshot.rows[1].entity, "GPU-I")
+        self.assertEqual(snapshot.rows[1].entity_id, "0")
+
+    def test_dcgm_metric_sampler_failure_is_reported_without_masking_cgroup_meter(self) -> None:
+        def exists(command: str) -> bool:
+            return command == "dcgmi"
+
+        def runner(args: tuple[str, ...]) -> subprocess.CompletedProcess[str]:
+            return subprocess.CompletedProcess(args, 17, stdout="", stderr="Error setting watches")
+
+        snapshot = s10_module.collect_dcgm_metric_sample(
+            command_runner=runner,
+            command_exists=exists,
+            gpu_telemetry=s10_module.GpuTelemetrySnapshot(
+                dcgm_available=True,
+                gpu_count=1,
+                source="dcgmi+nvidia-smi",
+            ),
+        )
+
+        self.assertFalse(snapshot.available)
+        self.assertEqual(snapshot.row_count, 0)
+        self.assertIn("dcgmi-dmon:Error setting watches", snapshot.error)
+
+    def test_docker_resource_sample_attaches_dcgm_metric_evidence(self) -> None:
+        class _DcgmMetricDockerSupervisor(DockerSandboxSupervisor):
+            def __init__(self) -> None:
+                super().__init__(
+                    meter_interval_s=0.1,
+                    gpu_telemetry=s10_module.GpuTelemetrySnapshot(
+                        dcgm_available=True,
+                        nvidia_smi_available=True,
+                        gpu_count=1,
+                        gpu_models=("NVIDIA A100-SXM4-40GB",),
+                        source="dcgmi+nvidia-smi",
+                    ),
+                    dcgm_metric_sampler=lambda: s10_module.DcgmMetricSnapshot(
+                        available=True,
+                        source="dcgmi-dmon",
+                        rows=(
+                            s10_module.DcgmMetricRow(
+                                entity="GPU",
+                                entity_id="0",
+                                gr_engine_active=0.75,
+                                tensor_active=0.25,
+                                dram_active=0.5,
+                            ),
+                        ),
+                    ),
+                )
+
+            def _docker_api_request(  # type: ignore[override]
+                self,
+                method: str,
+                path: str,
+                body=None,
+                *,
+                expected,
+                timeout: float = 10,
+            ):
+                if method != "GET" or "/stats?stream=false&one-shot=true" not in path:
+                    raise AssertionError(f"unexpected docker API request: {method} {path}")
+                return {
+                    "cpu_stats": {"cpu_usage": {"total_usage": 250_000_000}},
+                    "memory_stats": {"usage": 789},
+                }
+
+        envelope = LaunchEnvelope(
+            cpu_m=500,
+            mem_bytes=64 * 1024 * 1024,
+            gpu_count=1,
+            wallclock_s=10,
+            scratch_bytes=1024 * 1024,
+            pids=16,
+            estimated_cost_usd=0.01,
+        )
+        supervisor = _DcgmMetricDockerSupervisor()
+
+        sample = supervisor._docker_api_resource_sample(
+            container_id="container-1",
+            envelope=envelope,
+            started_at=s10_module.time.monotonic() - 1.0,
+            sample_seq=1,
+            previous_sample_at=None,
+        )
+        payload = s10_module._resource_metering_payload((sample,), requested_wallclock_s=10.0)
+
+        self.assertTrue(sample.dcgm_metrics_available)
+        self.assertEqual(sample.dcgm_metric_source, "dcgmi-dmon")
+        self.assertAlmostEqual(sample.dcgm_gr_engine_active, 0.75)
+        self.assertEqual(payload["dcgm_metric_row_count"], 1)
+        self.assertTrue(payload["dcgm_metrics_available"])
+        self.assertAlmostEqual(payload["dcgm_gr_engine_active"], 0.75)
+        self.assertEqual(payload["samples"][0]["dcgm_metric_rows"][0]["entity"], "GPU")
+
 
 class S10ResourceMeterGapTests(unittest.TestCase):
     def test_docker_stats_preserves_conservative_gpu_seconds_without_dcgm(self) -> None:

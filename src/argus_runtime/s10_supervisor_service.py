@@ -347,6 +347,8 @@ class S10SupervisorApp:
                 "mig_enabled": self._docker_supervisor.mig_enabled,
                 "mig_instance_count": self._docker_supervisor.mig_instance_count,
                 "gpu_telemetry_source": self._docker_supervisor.gpu_telemetry_source,
+                "dcgm_metric_sampler_enabled": self._docker_supervisor.dcgm_metric_sampler_enabled,
+                "dcgm_metric_fields": list(self._docker_supervisor.dcgm_metric_fields),
                 "audit_events": len(self.audit.events()),
             }
 

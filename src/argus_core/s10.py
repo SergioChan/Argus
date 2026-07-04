@@ -126,6 +126,44 @@ class GpuTelemetrySnapshot:
 
 
 @dataclass(frozen=True)
+class DcgmMetricRow:
+    entity: str
+    entity_id: str
+    gr_engine_active: float | None = None
+    tensor_active: float | None = None
+    dram_active: float | None = None
+
+
+@dataclass(frozen=True)
+class DcgmMetricSnapshot:
+    available: bool = False
+    source: str = "unavailable"
+    rows: tuple[DcgmMetricRow, ...] = ()
+    error: str = ""
+
+    @property
+    def row_count(self) -> int:
+        return len(self.rows)
+
+    @staticmethod
+    def _max_metric(rows: tuple[DcgmMetricRow, ...], field_name: str) -> float:
+        values = [float(value) for row in rows if (value := getattr(row, field_name)) is not None]
+        return max(values, default=0.0)
+
+    @property
+    def max_gr_engine_active(self) -> float:
+        return self._max_metric(self.rows, "gr_engine_active")
+
+    @property
+    def max_tensor_active(self) -> float:
+        return self._max_metric(self.rows, "tensor_active")
+
+    @property
+    def max_dram_active(self) -> float:
+        return self._max_metric(self.rows, "dram_active")
+
+
+@dataclass(frozen=True)
 class ResourceMeterSample:
     sample_seq: int
     elapsed_s: float
@@ -141,6 +179,13 @@ class ResourceMeterSample:
     mig_instance_count: int = 0
     gpu_telemetry_source: str = "unavailable"
     gpu_telemetry_error: str = ""
+    dcgm_metrics_available: bool = False
+    dcgm_metric_source: str = "unavailable"
+    dcgm_metric_error: str = ""
+    dcgm_metric_rows: tuple[DcgmMetricRow, ...] = ()
+    dcgm_gr_engine_active: float = 0.0
+    dcgm_tensor_active: float = 0.0
+    dcgm_dram_active: float = 0.0
     breached_dimensions: tuple[str, ...] = ()
     halted: bool = False
     conservative_gap_s: float = 0.0
@@ -1434,6 +1479,103 @@ def discover_gpu_telemetry(
     )
 
 
+DCGM_DMON_METRIC_FIELDS: tuple[str, ...] = ("1001", "1004", "1005")
+DCGM_DMON_METRIC_SOURCE = "dcgmi-dmon"
+
+
+def _parse_dcgm_metric_value(value: str) -> float | None:
+    normalized = value.strip()
+    if not normalized or normalized.upper() in {"N/A", "NA", "NOT_SUPPORTED", "-"}:
+        return None
+    try:
+        return float(normalized)
+    except ValueError:
+        return None
+
+
+def _parse_dcgm_dmon_output(output: str) -> tuple[DcgmMetricRow, ...]:
+    rows: list[DcgmMetricRow] = []
+    header_fields: list[str] = []
+    for line in output.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.startswith("#"):
+            parts = stripped.lstrip("#").split()
+            header_fields = [part for part in parts if part not in {"Entity", "Id"}]
+            continue
+        if stripped == "Id":
+            continue
+        metric_fields = header_fields or ["GRACT", "TENSO", "DRAMA"]
+        parts = stripped.split()
+        metric_count = len(metric_fields)
+        if len(parts) <= metric_count:
+            continue
+        entity_tokens = parts[: len(parts) - metric_count]
+        if len(entity_tokens) < 2:
+            continue
+        metric_values = parts[-metric_count:]
+        parsed = {
+            field: _parse_dcgm_metric_value(value)
+            for field, value in zip(metric_fields, metric_values, strict=False)
+        }
+        rows.append(
+            DcgmMetricRow(
+                entity=entity_tokens[0],
+                entity_id=" ".join(entity_tokens[1:]),
+                gr_engine_active=parsed.get("GRACT"),
+                tensor_active=parsed.get("TENSO"),
+                dram_active=parsed.get("DRAMA"),
+            )
+        )
+    return tuple(rows)
+
+
+def collect_dcgm_metric_sample(
+    *,
+    command_runner: Callable[[tuple[str, ...]], subprocess.CompletedProcess[str]] | None = None,
+    command_exists: Callable[[str], bool] | None = None,
+    gpu_telemetry: GpuTelemetrySnapshot | None = None,
+) -> DcgmMetricSnapshot:
+    runner = command_runner or _run_gpu_telemetry_command
+    exists = command_exists or (lambda command: shutil.which(command) is not None)
+    if gpu_telemetry is not None and not gpu_telemetry.dcgm_available:
+        return DcgmMetricSnapshot(source="unavailable")
+    if not exists("dcgmi"):
+        return DcgmMetricSnapshot(source="unavailable", error="dcgmi:not_found")
+
+    command = ("dcgmi", "dmon", "-e", ",".join(DCGM_DMON_METRIC_FIELDS), "-c", "1")
+    try:
+        result = runner(command)
+    except (FileNotFoundError, subprocess.TimeoutExpired, TimeoutError) as exc:
+        return DcgmMetricSnapshot(
+            source=DCGM_DMON_METRIC_SOURCE,
+            error=f"{DCGM_DMON_METRIC_SOURCE}:{type(exc).__name__}",
+        )
+    if result.returncode != 0:
+        return DcgmMetricSnapshot(
+            source=DCGM_DMON_METRIC_SOURCE,
+            error=f"{DCGM_DMON_METRIC_SOURCE}:{_safe_gpu_probe_error(result.stderr or result.stdout)}",
+        )
+    rows = _parse_dcgm_dmon_output(result.stdout or "")
+    return DcgmMetricSnapshot(
+        available=bool(rows),
+        source=DCGM_DMON_METRIC_SOURCE,
+        rows=rows,
+        error="" if rows else f"{DCGM_DMON_METRIC_SOURCE}:no_rows",
+    )
+
+
+def _dcgm_metric_row_payload(row: DcgmMetricRow) -> dict[str, Any]:
+    return {
+        "entity": row.entity,
+        "entity_id": row.entity_id,
+        "gr_engine_active": None if row.gr_engine_active is None else round(row.gr_engine_active, 6),
+        "tensor_active": None if row.tensor_active is None else round(row.tensor_active, 6),
+        "dram_active": None if row.dram_active is None else round(row.dram_active, 6),
+    }
+
+
 def _resource_meter_sample_payload(sample: ResourceMeterSample) -> dict[str, Any]:
     return {
         "sample_seq": sample.sample_seq,
@@ -1450,6 +1592,14 @@ def _resource_meter_sample_payload(sample: ResourceMeterSample) -> dict[str, Any
         "mig_instance_count": sample.mig_instance_count,
         "gpu_telemetry_source": sample.gpu_telemetry_source,
         "gpu_telemetry_error": sample.gpu_telemetry_error,
+        "dcgm_metrics_available": sample.dcgm_metrics_available,
+        "dcgm_metric_source": sample.dcgm_metric_source,
+        "dcgm_metric_error": sample.dcgm_metric_error,
+        "dcgm_metric_row_count": len(sample.dcgm_metric_rows),
+        "dcgm_gr_engine_active": round(sample.dcgm_gr_engine_active, 6),
+        "dcgm_tensor_active": round(sample.dcgm_tensor_active, 6),
+        "dcgm_dram_active": round(sample.dcgm_dram_active, 6),
+        "dcgm_metric_rows": [_dcgm_metric_row_payload(row) for row in sample.dcgm_metric_rows],
         "breached_dimensions": list(sample.breached_dimensions),
         "halted": sample.halted,
         "conservative_gap_s": round(sample.conservative_gap_s, 6),
@@ -1492,6 +1642,13 @@ def _resource_metering_payload(
         "mig_instance_count": max((sample.mig_instance_count for sample in samples), default=0),
         "gpu_telemetry_source": samples[-1].gpu_telemetry_source if samples else "unavailable",
         "gpu_telemetry_error": samples[-1].gpu_telemetry_error if samples else "",
+        "dcgm_metrics_available": any(sample.dcgm_metrics_available for sample in samples),
+        "dcgm_metric_source": samples[-1].dcgm_metric_source if samples else "unavailable",
+        "dcgm_metric_error": samples[-1].dcgm_metric_error if samples else "",
+        "dcgm_metric_row_count": sum(len(sample.dcgm_metric_rows) for sample in samples),
+        "dcgm_gr_engine_active": round(max((sample.dcgm_gr_engine_active for sample in samples), default=0.0), 6),
+        "dcgm_tensor_active": round(max((sample.dcgm_tensor_active for sample in samples), default=0.0), 6),
+        "dcgm_dram_active": round(max((sample.dcgm_dram_active for sample in samples), default=0.0), 6),
         "samples": [_resource_meter_sample_payload(sample) for sample in samples],
     }
 
@@ -2020,12 +2177,16 @@ class DockerSandboxSupervisor:
         meter_interval_s: float = 1.0,
         meter_gap_halt_s: float = 5.0,
         gpu_telemetry: GpuTelemetrySnapshot | None = None,
+        dcgm_metric_sampler: Callable[[], DcgmMetricSnapshot] | None = None,
     ) -> None:
         self._docker_bin = docker_bin or shutil.which("docker") or "docker"
         self._meter_interval_s = min(max(float(meter_interval_s), 0.1), 5.0)
         self._meter_gap_halt_s = max(float(meter_gap_halt_s), self._meter_interval_s)
         self._docker_socket_path = _resolve_docker_socket_path()
         self._gpu_telemetry = gpu_telemetry or discover_gpu_telemetry()
+        self._dcgm_metric_sampler = dcgm_metric_sampler or (
+            lambda: collect_dcgm_metric_sample(gpu_telemetry=self._gpu_telemetry)
+        )
 
     @property
     def resource_meter_kind(self) -> str:
@@ -2067,6 +2228,14 @@ class DockerSandboxSupervisor:
     def gpu_telemetry_source(self) -> str:
         return self._gpu_telemetry.source
 
+    @property
+    def dcgm_metric_sampler_enabled(self) -> bool:
+        return self._gpu_telemetry.dcgm_available
+
+    @property
+    def dcgm_metric_fields(self) -> tuple[str, ...]:
+        return DCGM_DMON_METRIC_FIELDS
+
     def _gpu_telemetry_sample_fields(self) -> dict[str, Any]:
         return {
             "dcgm_available": self._gpu_telemetry.dcgm_available,
@@ -2078,6 +2247,30 @@ class DockerSandboxSupervisor:
             "gpu_telemetry_source": self._gpu_telemetry.source,
             "gpu_telemetry_error": self._gpu_telemetry.error,
         }
+
+    def _dcgm_metric_sample_fields(self, snapshot: DcgmMetricSnapshot | None = None) -> dict[str, Any]:
+        if snapshot is None:
+            snapshot = DcgmMetricSnapshot(source="unavailable")
+        return {
+            "dcgm_metrics_available": snapshot.available,
+            "dcgm_metric_source": snapshot.source,
+            "dcgm_metric_error": snapshot.error,
+            "dcgm_metric_rows": snapshot.rows,
+            "dcgm_gr_engine_active": snapshot.max_gr_engine_active,
+            "dcgm_tensor_active": snapshot.max_tensor_active,
+            "dcgm_dram_active": snapshot.max_dram_active,
+        }
+
+    def _collect_dcgm_metric_snapshot(self) -> DcgmMetricSnapshot:
+        if not self._gpu_telemetry.dcgm_available:
+            return DcgmMetricSnapshot(source="unavailable")
+        try:
+            return self._dcgm_metric_sampler()
+        except (FileNotFoundError, subprocess.TimeoutExpired, TimeoutError) as exc:
+            return DcgmMetricSnapshot(
+                source=DCGM_DMON_METRIC_SOURCE,
+                error=f"{DCGM_DMON_METRIC_SOURCE}:{type(exc).__name__}",
+            )
 
     def run(
         self,
@@ -2494,6 +2687,9 @@ class DockerSandboxSupervisor:
             memory_bytes = 0
             source = "docker-api-cgroup-unavailable"
             conservative_gap_s = max(stats_received_at - stats_started_at, 0.0)
+        dcgm_metrics = self._collect_dcgm_metric_snapshot()
+        if dcgm_metrics.available and source == "docker-api-cgroup":
+            source = "docker-api-cgroup+dcgm"
         cadence_s = 0.0 if previous_sample_at is None else stats_received_at - previous_sample_at
         return ResourceMeterSample(
             sample_seq=sample_seq,
@@ -2503,6 +2699,7 @@ class DockerSandboxSupervisor:
             memory_bytes=memory_bytes,
             source=source,
             **self._gpu_telemetry_sample_fields(),
+            **self._dcgm_metric_sample_fields(dcgm_metrics),
             conservative_gap_s=conservative_gap_s,
         )
 

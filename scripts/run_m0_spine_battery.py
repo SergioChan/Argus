@@ -781,6 +781,10 @@ def _battery_runtime_auth_required(
         raise AssertionError(f"S10 M0 no-GPU health must report mig_enabled=false: {s10_health}")
     if int(s10_health.get("mig_instance_count") or 0) != 0:
         raise AssertionError(f"S10 M0 no-GPU health must report mig_instance_count=0: {s10_health}")
+    if s10_health.get("dcgm_metric_sampler_enabled") is not False:
+        raise AssertionError(f"S10 M0 no-GPU health must report dcgm_metric_sampler_enabled=false: {s10_health}")
+    if s10_health.get("dcgm_metric_fields") != ["1001", "1004", "1005"]:
+        raise AssertionError(f"S10 M0 health must expose DCGM metric field ids: {s10_health}")
     _record(
         evidence,
         "auth",
@@ -814,6 +818,8 @@ def _battery_runtime_auth_required(
             "s10_mig_enabled": s10_health["mig_enabled"],
             "s10_mig_instance_count": s10_health["mig_instance_count"],
             "s10_gpu_telemetry_source": s10_health["gpu_telemetry_source"],
+            "s10_dcgm_metric_sampler_enabled": s10_health["dcgm_metric_sampler_enabled"],
+            "s10_dcgm_metric_fields": s10_health["dcgm_metric_fields"],
         },
     )
     return str(s10_health["checkpoint_signer"])
@@ -2736,6 +2742,10 @@ def _battery_spend_final(
         raise AssertionError(f"spend.final M0 no-GPU metering must report mig_enabled=false: {payload}")
     if int(metering.get("mig_instance_count") or 0) != 0:
         raise AssertionError(f"spend.final M0 no-GPU metering must report mig_instance_count=0: {payload}")
+    if metering.get("dcgm_metrics_available") is not False:
+        raise AssertionError(f"spend.final M0 no-GPU metering must report dcgm_metrics_available=false: {payload}")
+    if int(metering.get("dcgm_metric_row_count") or 0) != 0:
+        raise AssertionError(f"spend.final M0 no-GPU metering must report zero DCGM metric rows: {payload}")
     if expected_state == "BUDGET_HALTED":
         if metering.get("halted_by_meter") is not True:
             raise AssertionError(f"spend.final budget halt missing meter halt evidence: {payload}")
@@ -2767,6 +2777,12 @@ def _battery_spend_final(
         "meter_mig_enabled": bool(metering["mig_enabled"]),
         "meter_mig_instance_count": int(metering["mig_instance_count"]),
         "meter_gpu_telemetry_source": str(metering.get("gpu_telemetry_source") or "unavailable"),
+        "meter_dcgm_metrics_available": bool(metering["dcgm_metrics_available"]),
+        "meter_dcgm_metric_row_count": int(metering["dcgm_metric_row_count"]),
+        "meter_dcgm_metric_source": str(metering.get("dcgm_metric_source") or "unavailable"),
+        "meter_dcgm_gr_engine_active": float(metering.get("dcgm_gr_engine_active") or 0),
+        "meter_dcgm_tensor_active": float(metering.get("dcgm_tensor_active") or 0),
+        "meter_dcgm_dram_active": float(metering.get("dcgm_dram_active") or 0),
         "meter_breached_dimensions": meter_breached_dimensions,
         "meter_gap_sample_count": len(meter_gap_samples),
         "meter_gap_sources": meter_gap_sources,

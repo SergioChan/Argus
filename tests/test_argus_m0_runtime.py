@@ -1243,6 +1243,8 @@ class ArgusM0RuntimeServiceTests(unittest.TestCase):
             self.assertEqual(s10_health_payload["gpu_count"], 0)
             self.assertFalse(s10_health_payload["mig_enabled"])
             self.assertEqual(s10_health_payload["mig_instance_count"], 0)
+            self.assertFalse(s10_health_payload["dcgm_metric_sampler_enabled"])
+            self.assertEqual(s10_health_payload["dcgm_metric_fields"], ["1001", "1004", "1005"])
             self.assertEqual(s10_scope_status, 401)
             self.assertEqual(s10_scope_payload["error"], "Unauthorized")
             self.assertEqual(s10_mint_with_health_status, 401)
@@ -1661,6 +1663,8 @@ class ArgusM0RuntimeServiceTests(unittest.TestCase):
         self.assertEqual(payload["gpu_count"], 0)
         self.assertFalse(payload["mig_enabled"])
         self.assertEqual(payload["mig_instance_count"], 0)
+        self.assertFalse(payload["dcgm_metric_sampler_enabled"])
+        self.assertEqual(payload["dcgm_metric_fields"], ["1001", "1004", "1005"])
 
     def test_s10_env_build_uses_meter_gap_config_and_rejects_invalid_values(self) -> None:
         base_env = {
@@ -1755,6 +1759,8 @@ class ArgusM0RuntimeServiceTests(unittest.TestCase):
         self.assertEqual(health["gpu_count"], 0)
         self.assertFalse(health["mig_enabled"])
         self.assertEqual(health["mig_instance_count"], 0)
+        self.assertFalse(health["dcgm_metric_sampler_enabled"])
+        self.assertEqual(health["dcgm_metric_fields"], ["1001", "1004", "1005"])
         self.assertEqual(runtime_status, 201)
         self.assertEqual(budget_status, 201)
         self.assertEqual(budget["signer_key_id"], "argus-m0-token-root")
@@ -1803,6 +1809,8 @@ class ArgusM0RuntimeServiceTests(unittest.TestCase):
         self.assertEqual(health["gpu_count"], 0)
         self.assertFalse(health["mig_enabled"])
         self.assertEqual(health["mig_instance_count"], 0)
+        self.assertFalse(health["dcgm_metric_sampler_enabled"])
+        self.assertEqual(health["dcgm_metric_fields"], ["1001", "1004", "1005"])
         self.assertIsNotNone(app.price_table)
         self.assertTrue(app.price_table.signature.startswith("hmac-sha256:"))
 
