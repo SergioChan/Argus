@@ -317,6 +317,13 @@ class Acceptance:
 SDK_FRAMEWORK_METHODS = frozenset({"register", "accept", "validate", "report", "cancel", "heartbeat"})
 
 
+def _sdk_framework_method_owner(cls: type[object], method: str) -> type[object] | None:
+    for owner in cls.__mro__:
+        if method in owner.__dict__:
+            return owner
+    return None
+
+
 @dataclass(frozen=True)
 class SDKInvocationResult:
     event: LifecycleEvent
@@ -328,7 +335,11 @@ class Subagent(ABC):
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
         super().__init_subclass__(**kwargs)
-        overridden = sorted(method for method in SDK_FRAMEWORK_METHODS if method in cls.__dict__)
+        overridden = sorted(
+            method
+            for method in SDK_FRAMEWORK_METHODS
+            if (owner := _sdk_framework_method_owner(cls, method)) is not None and owner is not Subagent
+        )
         if overridden:
             methods = ", ".join(overridden)
             raise TypeError(f"{cls.__name__} overrides framework-owned S1 SDK method(s): {methods}")

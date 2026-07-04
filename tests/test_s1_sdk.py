@@ -125,6 +125,22 @@ class S1SDKBaseClassTests(unittest.TestCase):
                 def accept(self) -> bool:
                     return True
 
+    def test_framework_owned_methods_cannot_be_inherited_from_mixins(self) -> None:
+        def plan(self: Subagent, ctx: ExecContext, envelope: JobEnvelope) -> dict[str, object]:
+            return {}
+
+        def build(self: Subagent, ctx: ExecContext, plan: dict[str, object]) -> dict[str, object]:
+            return {}
+
+        for method in ("register", "accept", "validate", "report", "cancel", "heartbeat"):
+            with self.subTest(method=method):
+                mixin_method = lambda self, *args, **kwargs: {"bypassed": method}
+                mixin = type(f"{method.title()}Mixin", (), {method: mixin_method})
+                attrs = {"plan": plan, "build": build}
+
+                with self.assertRaisesRegex(TypeError, method):
+                    type(f"Sneaky{method.title()}Subagent", (mixin, Subagent), attrs)
+
     def test_base_validate_is_framework_owned_policy_error(self) -> None:
         subagent = ExampleSubagent(self.descriptor)
 
