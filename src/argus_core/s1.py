@@ -8,12 +8,25 @@ import textwrap
 from abc import ABC, abstractmethod
 from dataclasses import asdict, dataclass, field, is_dataclass, replace
 from enum import Enum
-from typing import Any, Mapping, final
-from uuid import NAMESPACE_URL, uuid5
+from typing import Any, Mapping, NoReturn, final
+from uuid import NAMESPACE_URL, uuid4, uuid5
+from weakref import ref
 
 from argusverify import C3ReportVerifier
 from .hashing import hash_json
-from .s10 import EgressRule, LaunchRequest, S10Error, SandboxExecutionResult, SandboxHandle
+from .s7 import AdapterBroker, EvalRequest, EvalResult, Quantity, S7Error
+from .s10 import (
+    EgressRule,
+    InMemoryAuditLedger,
+    InMemoryTokenService,
+    LaunchRequest,
+    S10Error,
+    SandboxExecutionResult,
+    SandboxHandle,
+    ScopeDeniedError,
+    ScopeToken,
+    TokenInvalidError,
+)
 from .s8 import (
     ArtifactRecord,
     InMemoryArtifactStore,
@@ -387,6 +400,142 @@ EXEC_CONTEXT_CAPABILITIES = (
 _EXEC_CONTEXT_CAPABILITY_SET = frozenset(EXEC_CONTEXT_CAPABILITIES)
 
 
+@dataclass(frozen=True)
+class AdapterBrokerHandle:
+    handle_id: str
+    scope_id: str
+    expires_at: int
+
+
+class S1AdapterBrokerProxy:
+    """Brokered C6 adapter evaluation path for S1 author contexts."""
+
+    def __init__(
+        self,
+        *,
+        token_service: InMemoryTokenService,
+        adapter_broker: AdapterBroker,
+        audit_ledger: InMemoryAuditLedger,
+    ) -> None:
+        self._token_service = token_service
+        self._adapter_broker = adapter_broker
+        self._audit_ledger = audit_ledger
+        self._capabilities: dict[str, ScopeToken] = {}
+        self._endpoint = _S1AdapterBrokerEndpoint(self)
+
+    def client_for(self, scope_token: ScopeToken) -> "BrokeredAdapterClient":
+        handle = AdapterBrokerHandle(
+            handle_id=str(uuid4()),
+            scope_id=scope_token.scope_id,
+            expires_at=scope_token.expires_at,
+        )
+        self._capabilities[handle.handle_id] = scope_token
+        return BrokeredAdapterClient(handle=handle, endpoint=self._endpoint)
+
+    def _evaluate_by_handle(self, *, handle: AdapterBrokerHandle, request: EvalRequest) -> EvalResult:
+        scope_token = self._scope_for_handle(handle)
+        verification = self._token_service.verify_scope(scope_token)
+        if not verification.valid:
+            self._audit_ledger.append(
+                "adapter.token_verify_fail",
+                {"token": "scope", "reason": verification.reason, "audience": request.adapter_id},
+            )
+            raise TokenInvalidError(verification.reason or "invalid scope token")
+        if request.adapter_id not in scope_token.scopes.allowed_adapters:
+            self._deny_adapter(
+                scope_token=scope_token,
+                adapter_id=request.adapter_id,
+                reason="adapter_not_allowlisted",
+                message=f"adapter is not allowlisted by scope token: {request.adapter_id}",
+            )
+        if request.adapter_id not in scope_token.scopes.broker_audiences:
+            self._deny_adapter(
+                scope_token=scope_token,
+                adapter_id=request.adapter_id,
+                reason="broker_audience_missing",
+                message=f"adapter broker audience is not granted: {request.adapter_id}",
+            )
+        try:
+            result = self._adapter_broker.evaluate(request)
+        except KeyError as exc:
+            self._deny_adapter(
+                scope_token=scope_token,
+                adapter_id=request.adapter_id,
+                reason="adapter_not_registered",
+                message=f"adapter is not registered with broker: {request.adapter_id}",
+            )
+        self._audit_ledger.append(
+            "adapter.evaluate",
+            {
+                "audience": request.adapter_id,
+                "adapter_id": request.adapter_id,
+                "scope_id": scope_token.scope_id,
+                "job_id": scope_token.job_id,
+                "provenance_ref": result.provenance_ref,
+                "request_hash": hash_json(_eval_request_payload(request)),
+            },
+        )
+        return result
+
+    def _scope_for_handle(self, handle: AdapterBrokerHandle) -> ScopeToken:
+        scope_token = self._capabilities.get(handle.handle_id)
+        if scope_token is None or scope_token.scope_id != handle.scope_id:
+            self._audit_ledger.append(
+                "adapter.denied",
+                {"audience": "adapter", "reason": "invalid_handle", "scope_id": handle.scope_id},
+            )
+            raise ScopeDeniedError("invalid adapter broker handle")
+        return scope_token
+
+    def _deny_adapter(
+        self,
+        *,
+        scope_token: ScopeToken,
+        adapter_id: str,
+        reason: str,
+        message: str,
+    ) -> NoReturn:
+        self._audit_ledger.append(
+            "adapter.denied",
+            {
+                "audience": adapter_id,
+                "adapter_id": adapter_id,
+                "reason": reason,
+                "scope_id": scope_token.scope_id,
+                "job_id": scope_token.job_id,
+            },
+        )
+        raise ScopeDeniedError(message)
+
+
+class _S1AdapterBrokerEndpoint:
+    """In-process adapter broker endpoint; clients only hold opaque handles."""
+
+    __slots__ = ("_proxy_ref",)
+
+    def __init__(self, proxy: S1AdapterBrokerProxy) -> None:
+        self._proxy_ref = ref(proxy)
+
+    def evaluate(self, *, handle: AdapterBrokerHandle, request: EvalRequest) -> EvalResult:
+        proxy = self._proxy_ref()
+        if proxy is None:
+            raise ScopeDeniedError("adapter broker handle is no longer valid")
+        return proxy._evaluate_by_handle(handle=handle, request=request)
+
+
+class BrokeredAdapterClient:
+    """Sandbox-facing adapter client exposing only C6 evaluate via an opaque handle."""
+
+    __slots__ = ("_handle", "_endpoint")
+
+    def __init__(self, *, handle: AdapterBrokerHandle, endpoint: _S1AdapterBrokerEndpoint) -> None:
+        self._handle = handle
+        self._endpoint = endpoint
+
+    def evaluate(self, request: EvalRequest) -> EvalResult:
+        return self._endpoint.evaluate(handle=self._handle, request=request)
+
+
 @dataclass(frozen=True, init=False)
 class ExecContext:
     job_id: str
@@ -397,6 +546,7 @@ class ExecContext:
     _store_egress_rule: EgressRule = field(repr=False, compare=False)
     _artifact_store: InMemoryArtifactStore = field(init=False, repr=False, compare=False)
     _sandbox_marshaler: Any = field(init=False, repr=False, compare=False)
+    _adapter_client: Any = field(init=False, repr=False, compare=False)
 
     def __init__(
         self,
@@ -409,6 +559,7 @@ class ExecContext:
         store_egress_rule: EgressRule = S1_CONTENT_STORE_EGRESS_RULE,
         artifact_store: InMemoryArtifactStore | None = None,
         sandbox_marshaler: Any | None = None,
+        adapter_client: Any | None = None,
     ) -> None:
         capabilities = tuple(dict.fromkeys(capabilities))
         unknown = tuple(capability for capability in capabilities if capability not in _EXEC_CONTEXT_CAPABILITY_SET)
@@ -427,6 +578,7 @@ class ExecContext:
         object.__setattr__(self, "_store_egress_rule", store_egress_rule)
         object.__setattr__(self, "_artifact_store", artifact_store or InMemoryArtifactStore())
         object.__setattr__(self, "_sandbox_marshaler", sandbox_marshaler)
+        object.__setattr__(self, "_adapter_client", adapter_client)
 
     def capability_methods(self) -> tuple[str, ...]:
         return self.capabilities
@@ -557,11 +709,56 @@ class ExecContext:
         self._require_capability("call_adapter")
         if adapter_ref not in self._allowed_adapters:
             self._deny_capability("call_adapter", f"adapter is not allowlisted: {adapter_ref}")
+        if self._adapter_client is None:
+            raise LifecyclePolicyError(
+                build_error_envelope(
+                    category="SANDBOX",
+                    code="S1_ADAPTER_BROKER_UNAVAILABLE",
+                    message="S1 brokered adapter proxy is unavailable; direct adapter calls are forbidden",
+                )
+            )
+        if not hasattr(self._adapter_client, "evaluate"):
+            raise LifecyclePolicyError(
+                build_error_envelope(
+                    category="SANDBOX",
+                    code="S1_ADAPTER_BROKER_INVALID",
+                    message="S1 brokered adapter proxy must expose evaluate",
+                )
+            )
+        eval_request = _eval_request_from_call(adapter_ref, request)
+        try:
+            result = self._adapter_client.evaluate(eval_request)
+        except TokenInvalidError as exc:
+            raise LifecyclePolicyError(
+                build_error_envelope(
+                    category="POLICY",
+                    code="S1_ADAPTER_SCOPE_TOKEN_INVALID",
+                    message=f"S1 adapter scope token is invalid: {exc}",
+                )
+            ) from exc
+        except ScopeDeniedError as exc:
+            raise LifecyclePolicyError(
+                build_error_envelope(
+                    category="POLICY",
+                    code="S1_ADAPTER_SCOPE_DENIED",
+                    message=f"S1 adapter broker denied request: {exc}",
+                )
+            ) from exc
+        except S7Error as exc:
+            raise LifecyclePolicyError(
+                build_error_envelope(
+                    category="VALIDATION",
+                    code=exc.category,
+                    message=exc.message,
+                )
+            ) from exc
         return {
             "capability": "call_adapter",
             "job_id": self.job_id,
             "adapter_ref": adapter_ref,
-            "request_hash": hash_json(request),
+            "request_hash": hash_json(_eval_request_payload(eval_request)),
+            "provenance_ref": result.provenance_ref,
+            "result": _eval_result_payload(result),
         }
 
     def read_dataset(self, dataset_ref: str) -> dict[str, str]:
@@ -675,6 +872,110 @@ def _raise_c4_write_error(exc: S8Error) -> None:
             message=message,
         )
     ) from exc
+
+
+def _eval_request_from_call(adapter_ref: str, request: Mapping[str, Any]) -> EvalRequest:
+    if not isinstance(adapter_ref, str) or not adapter_ref:
+        _raise_adapter_request_error("S1_ADAPTER_REQUEST_INVALID", "adapter_ref is required")
+    if not isinstance(request, Mapping):
+        _raise_adapter_request_error("S1_ADAPTER_REQUEST_INVALID", "adapter request must be a mapping")
+    raw_request = request.get("eval_request")
+    if raw_request is None:
+        eval_request = _eval_request_from_mapping(request, default_adapter_ref=adapter_ref)
+    elif isinstance(raw_request, EvalRequest):
+        eval_request = raw_request
+    elif isinstance(raw_request, Mapping):
+        eval_request = _eval_request_from_mapping(raw_request, default_adapter_ref=adapter_ref)
+    else:
+        _raise_adapter_request_error("S1_ADAPTER_REQUEST_INVALID", "eval_request must be an EvalRequest or mapping")
+    if eval_request.adapter_id != adapter_ref:
+        raise LifecyclePolicyError(
+            build_error_envelope(
+                category="POLICY",
+                code="S1_ADAPTER_REQUEST_MISMATCH",
+                message=f"adapter_ref {adapter_ref} does not match EvalRequest adapter_id {eval_request.adapter_id}",
+            )
+        )
+    return eval_request
+
+
+def _eval_request_from_mapping(request: Mapping[str, Any], *, default_adapter_ref: str) -> EvalRequest:
+    adapter_id = str(request.get("adapter_id") or default_adapter_ref)
+    raw_inputs = request.get("inputs")
+    if not isinstance(raw_inputs, Mapping):
+        _raise_adapter_request_error("S1_ADAPTER_REQUEST_INVALID", "adapter request inputs must be a mapping")
+    inputs = {str(field): _quantity_from_value(value) for field, value in raw_inputs.items()}
+    seed_value = request.get("seed")
+    if seed_value is None:
+        seed = None
+    elif isinstance(seed_value, bool):
+        _raise_adapter_request_error("S1_ADAPTER_REQUEST_INVALID", "adapter request seed must be an integer")
+    else:
+        try:
+            seed = int(seed_value)
+        except (TypeError, ValueError) as exc:
+            raise LifecyclePolicyError(
+                build_error_envelope(
+                    category="POLICY",
+                    code="S1_ADAPTER_REQUEST_INVALID",
+                    message="adapter request seed must be an integer",
+                )
+            ) from exc
+    return EvalRequest(adapter_id=adapter_id, inputs=inputs, seed=seed)
+
+
+def _quantity_from_value(value: Any) -> Quantity:
+    if isinstance(value, Quantity):
+        return value
+    if not isinstance(value, Mapping):
+        _raise_adapter_request_error("S1_ADAPTER_REQUEST_INVALID", "adapter input quantities must be mappings")
+    if "value" not in value or "units" not in value:
+        _raise_adapter_request_error("S1_ADAPTER_REQUEST_INVALID", "adapter input quantity requires value and units")
+    try:
+        quantity_value = float(value["value"])
+    except (TypeError, ValueError) as exc:
+        raise LifecyclePolicyError(
+            build_error_envelope(
+                category="POLICY",
+                code="S1_ADAPTER_REQUEST_INVALID",
+                message="adapter input quantity value must be numeric",
+            )
+        ) from exc
+    return Quantity(
+        value=quantity_value,
+        units=str(value["units"]),
+        uncertainty=value.get("uncertainty"),
+    )
+
+
+def _eval_request_payload(request: EvalRequest) -> dict[str, Any]:
+    return {
+        "adapter_id": request.adapter_id,
+        "inputs": {field: asdict(quantity) for field, quantity in sorted(request.inputs.items())},
+        "seed": request.seed,
+    }
+
+
+def _eval_result_payload(result: EvalResult) -> dict[str, Any]:
+    return {
+        "adapter_id": result.adapter_id,
+        "outputs": {field: asdict(quantity) for field, quantity in sorted(result.outputs.items())},
+        "in_validity_domain": result.in_validity_domain,
+        "extrapolation_flag": result.extrapolation_flag,
+        "provenance_ref": result.provenance_ref,
+        "violated_fields": list(result.violated_fields),
+        "cache_hit": result.cache_hit,
+    }
+
+
+def _raise_adapter_request_error(code: str, message: str) -> None:
+    raise LifecyclePolicyError(
+        build_error_envelope(
+            category="POLICY",
+            code=code,
+            message=message,
+        )
+    )
 
 
 def _launch_request_from_sandbox_spec(job_id: str, spec: Mapping[str, Any]) -> LaunchRequest:

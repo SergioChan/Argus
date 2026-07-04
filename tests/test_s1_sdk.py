@@ -10,6 +10,8 @@ import unittest
 from jsonschema import Draft202012Validator
 
 from argus_core import (
+    AdapterBroker,
+    AdapterDescriptor,
     BudgetCaps,
     EgressRule,
     ExecContext,
@@ -26,8 +28,11 @@ from argus_core import (
     Lineage,
     PolicyBundle,
     Producer,
+    Quantity,
     ResourceCeilings,
+    S1AdapterBrokerProxy,
     ScopeGrant,
+    SimpleAdapter,
     Subagent,
     SubagentDescriptor,
     SubagentSDKRunner,
@@ -62,7 +67,12 @@ class ExampleSubagent(Subagent):
                 "raw_credentials",
                 "allowed_adapters",
                 "allowed_datasets",
+                "adapter_broker",
+                "adapter_client",
                 "artifact_store",
+                "broker_secret",
+                "scope_token",
+                "token_service",
             )
         }
         return {
@@ -99,6 +109,7 @@ class S1SDKBaseClassTests(unittest.TestCase):
         cls.c1_validator = Draft202012Validator(cls.c1_schema)
 
     def setUp(self) -> None:
+        self._adapter_broker_proxies: list[S1AdapterBrokerProxy] = []
         self.descriptor = SubagentDescriptor(
             subagent_id="sdk-subagent",
             contract_version="1.0.0",
@@ -139,7 +150,12 @@ class S1SDKBaseClassTests(unittest.TestCase):
                 "raw_credentials": False,
                 "allowed_adapters": False,
                 "allowed_datasets": False,
+                "adapter_broker": False,
+                "adapter_client": False,
                 "artifact_store": False,
+                "broker_secret": False,
+                "scope_token": False,
+                "token_service": False,
             },
         )
         self.assertEqual(subagent.build_log_handle["capability"], "log")
@@ -228,11 +244,130 @@ class S1SDKBaseClassTests(unittest.TestCase):
         self.assertIn("adapter is not allowlisted", adapter_denied.exception.envelope.message)
         self.assertIn("dataset is not allowlisted", dataset_denied.exception.envelope.message)
 
+    def test_exec_context_call_adapter_requires_brokered_proxy_for_allowlisted_adapter(self) -> None:
+        ctx = ExecContext(
+            job_id=self.envelope.job_id,
+            allowed_adapters=("adapter:bounce",),
+        )
+
+        with self.assertRaises(LifecyclePolicyError) as raised:
+            ctx.call_adapter("adapter:bounce", self._adapter_call_payload(x=2.0))
+
+        self.assertEqual(raised.exception.envelope.category, "SANDBOX")
+        self.assertEqual(raised.exception.envelope.code, "S1_ADAPTER_BROKER_UNAVAILABLE")
+        self.assertIn("brokered adapter proxy is unavailable", raised.exception.envelope.message)
+
+    def test_exec_context_call_adapter_uses_brokered_c6_client_without_exposing_secrets(self) -> None:
+        client, audit, artifacts = self._brokered_adapter_client(
+            allowed_adapters=("adapter:bounce",),
+            broker_audiences=("adapter:bounce",),
+        )
+        ctx = ExecContext(
+            job_id=self.envelope.job_id,
+            allowed_adapters=("adapter:bounce",),
+            adapter_client=client,
+        )
+
+        result = ctx.call_adapter("adapter:bounce", self._adapter_call_payload(x=2.0, seed=7))
+
+        self.assertEqual(result["capability"], "call_adapter")
+        self.assertEqual(result["adapter_ref"], "adapter:bounce")
+        self.assertTrue(str(result["request_hash"]).startswith("blake3:"))
+        self.assertTrue(str(result["provenance_ref"]).startswith("c4://"))
+        self.assertEqual(result["result"]["adapter_id"], "adapter:bounce")
+        self.assertEqual(result["result"]["outputs"]["y"]["value"], 4.0)
+        self.assertEqual(result["result"]["outputs"]["y"]["units"], "dimensionless")
+        self.assertEqual(result["result"]["outputs"]["y"]["uncertainty"], {"kind": "interval", "radius": 0.1})
+        self.assertEqual(artifacts.get_record(str(result["provenance_ref"])).kind, "log")
+        self.assertEqual(audit.events()[-1].event_type, "adapter.evaluate")
+        self.assertEqual(audit.events()[-1].payload["adapter_id"], "adapter:bounce")
+        for forbidden in (
+            "adapter_broker",
+            "scope_token",
+            "token_service",
+            "raw_credentials",
+            "credentials",
+            "broker_secret",
+        ):
+            self.assertFalse(hasattr(ctx, forbidden), forbidden)
+            self.assertFalse(hasattr(client, forbidden), forbidden)
+        self.assertFalse(hasattr(client, "__dict__"))
+        self.assertFalse(hasattr(client, "_scope_token"))
+        self.assertFalse(hasattr(client, "_broker"))
+
+    def test_exec_context_call_adapter_rejects_scope_without_adapter_broker_audience(self) -> None:
+        client, audit, artifacts = self._brokered_adapter_client(
+            allowed_adapters=("adapter:bounce",),
+            broker_audiences=(),
+        )
+        ctx = ExecContext(
+            job_id=self.envelope.job_id,
+            allowed_adapters=("adapter:bounce",),
+            adapter_client=client,
+        )
+
+        with self.assertRaises(LifecyclePolicyError) as raised:
+            ctx.call_adapter("adapter:bounce", self._adapter_call_payload(x=2.0))
+
+        self.assertEqual(raised.exception.envelope.category, "POLICY")
+        self.assertEqual(raised.exception.envelope.code, "S1_ADAPTER_SCOPE_DENIED")
+        self.assertIn("adapter broker audience is not granted", raised.exception.envelope.message)
+        self.assertEqual(len(artifacts), 0)
+        self.assertEqual(audit.events()[-1].event_type, "adapter.denied")
+
+    def test_exec_context_call_adapter_rejects_unregistered_broker_adapter_fail_closed(self) -> None:
+        client, audit, artifacts = self._brokered_adapter_client(
+            allowed_adapters=("adapter:bounce",),
+            broker_audiences=("adapter:bounce",),
+            register_adapter=False,
+        )
+        ctx = ExecContext(
+            job_id=self.envelope.job_id,
+            allowed_adapters=("adapter:bounce",),
+            adapter_client=client,
+        )
+
+        with self.assertRaises(LifecyclePolicyError) as raised:
+            ctx.call_adapter("adapter:bounce", self._adapter_call_payload(x=2.0))
+
+        self.assertEqual(raised.exception.envelope.category, "POLICY")
+        self.assertEqual(raised.exception.envelope.code, "S1_ADAPTER_SCOPE_DENIED")
+        self.assertIn("adapter is not registered with broker", raised.exception.envelope.message)
+        self.assertEqual(len(artifacts), 0)
+        self.assertEqual(audit.events()[-1].event_type, "adapter.denied")
+        self.assertEqual(audit.events()[-1].payload["reason"], "adapter_not_registered")
+
+    def test_exec_context_call_adapter_rejects_mismatched_request_adapter_id(self) -> None:
+        client, _audit, artifacts = self._brokered_adapter_client(
+            allowed_adapters=("adapter:bounce",),
+            broker_audiences=("adapter:bounce",),
+        )
+        ctx = ExecContext(
+            job_id=self.envelope.job_id,
+            allowed_adapters=("adapter:bounce",),
+            adapter_client=client,
+        )
+
+        with self.assertRaises(LifecyclePolicyError) as raised:
+            ctx.call_adapter(
+                "adapter:bounce",
+                {"adapter_id": "adapter:other", **self._adapter_call_payload(x=2.0)},
+            )
+
+        self.assertEqual(raised.exception.envelope.category, "POLICY")
+        self.assertEqual(raised.exception.envelope.code, "S1_ADAPTER_REQUEST_MISMATCH")
+        self.assertEqual(len(artifacts), 0)
+
     def test_exec_context_brokers_documented_capabilities_with_allowlists(self) -> None:
+        client, _audit, _artifacts = self._brokered_adapter_client(
+            allowed_adapters=("adapter:bounce",),
+            broker_audiences=("adapter:bounce",),
+        )
         ctx = ExecContext(
             job_id=self.envelope.job_id,
             allowed_adapters=("adapter:bounce",),
             allowed_datasets=("c4://dataset/ewpt-toy",),
+            adapter_client=client,
         )
 
         artifact = ctx.emit_artifact(
@@ -244,7 +379,9 @@ class S1SDKBaseClassTests(unittest.TestCase):
         self.assertEqual(artifact["kind"], "diagnostic")
         self.assertTrue(str(artifact["artifact_ref"]).startswith("c4://"))
         self.assertTrue(str(artifact["content_hash"]).startswith("blake3:"))
-        self.assertEqual(ctx.call_adapter("adapter:bounce", {"input": 1})["capability"], "call_adapter")
+        adapter_result = ctx.call_adapter("adapter:bounce", self._adapter_call_payload(x=1.0))
+        self.assertEqual(adapter_result["capability"], "call_adapter")
+        self.assertEqual(adapter_result["result"]["outputs"]["y"]["value"], 2.0)
         self.assertEqual(ctx.read_dataset("c4://dataset/ewpt-toy")["dataset_ref"], "c4://dataset/ewpt-toy")
         with self.assertRaises(LifecyclePolicyError) as adapter_denied:
             ctx.call_adapter("adapter:unlisted", {"input": 1})
@@ -760,6 +897,71 @@ class S1SDKBaseClassTests(unittest.TestCase):
         validator = self.c1_validator.evolve(schema=self.c1_schema["$defs"][def_name])
         errors = sorted(validator.iter_errors(payload), key=lambda error: list(error.path))
         self.assertEqual(errors, [], msg=[error.message for error in errors])
+
+    def _brokered_adapter_client(
+        self,
+        *,
+        allowed_adapters: tuple[str, ...],
+        broker_audiences: tuple[str, ...],
+        register_adapter: bool = True,
+    ) -> tuple[object, InMemoryAuditLedger, InMemoryArtifactStore]:
+        artifacts = InMemoryArtifactStore()
+        audit = InMemoryAuditLedger()
+        tokens = InMemoryTokenService(signing_key=b"s1-t13-token-key", now_fn=lambda: 1_000)
+        adapter_broker = AdapterBroker(artifact_store=artifacts)
+        if register_adapter:
+            adapter_broker.register(self._bounce_adapter())
+        scope = tokens.mint_scope(
+            job_id=self.envelope.job_id,
+            scopes=ScopeGrant(
+                allowed_adapters=allowed_adapters,
+                broker_audiences=broker_audiences,
+            ),
+        )
+        proxy = S1AdapterBrokerProxy(
+            token_service=tokens,
+            adapter_broker=adapter_broker,
+            audit_ledger=audit,
+        )
+        self._adapter_broker_proxies.append(proxy)
+        return proxy.client_for(scope), audit, artifacts
+
+    @staticmethod
+    def _adapter_call_payload(*, x: float, seed: int | None = None) -> dict[str, object]:
+        payload: dict[str, object] = {
+            "inputs": {
+                "x": {
+                    "value": x,
+                    "units": "dimensionless",
+                    "uncertainty": {"kind": "interval", "radius": 0.01},
+                }
+            }
+        }
+        if seed is not None:
+            payload["seed"] = seed
+        return payload
+
+    @staticmethod
+    def _bounce_adapter() -> SimpleAdapter:
+        descriptor = AdapterDescriptor(
+            adapter_id="adapter:bounce",
+            version="1.0.0",
+            input_units={"x": "dimensionless"},
+            output_units={"y": "dimensionless"},
+            validity_domain={"x": (0.0, 10.0)},
+            determinism="deterministic",
+            provenance_ref="c4://adapter/bounce",
+        )
+        return SimpleAdapter(
+            descriptor,
+            lambda inputs, _seed: {
+                "y": Quantity(
+                    value=inputs["x"].value * 2.0,
+                    units="dimensionless",
+                    uncertainty={"kind": "interval", "radius": 0.1},
+                )
+            },
+        )
 
     def _s10_orchestrator_and_request(
         self,
