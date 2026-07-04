@@ -2,13 +2,28 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
+from hashlib import sha256
+import hmac
 import json
 from typing import Any, Iterable, Mapping
 
+from .canonical import canonical_json_bytes
 from .hashing import hash_json
 from .s8 import ArtifactRecord, InMemoryArtifactStore, Lineage, Producer
+
+
+S1_TRUSTED_CONFORMANCE_EVIDENCE_KIND = "s1_reference_conformance_evidence"
+S1_TRUSTED_CONFORMANCE_PRODUCER_SUBSYSTEM = "S1"
+S1_TRUSTED_CONFORMANCE_PRODUCER_ACTOR_ID = "s1.reference_conformance"
+S1_TRUSTED_CONFORMANCE_CODE_REF = "argus-core:s1.reference-conformance"
+S1_TRUSTED_CONFORMANCE_ENVIRONMENT_DIGEST = "python:s1-reference-conformance:v1"
+S1_CONFORMANCE_ATTESTATION_ALGORITHM = "hmac-sha256"
+S1_CONFORMANCE_ATTESTATION_PREFIX = "hmac-sha256:"
+S1_CONFORMANCE_ATTESTATION_KEY_ID = "s1-reference-conformance-key-v1"
+_S1_CONFORMANCE_ATTESTATION_SECRET = b"argus-s1-reference-conformance-dev-key-v1"
 
 
 class S6Error(Exception):
@@ -284,12 +299,21 @@ class InMemoryRegistry:
             raise RegistryError("CONFORMANCE_EXPIRED")
         if self._artifact_store is None:
             return
-        evidence = self._load_conformance_evidence(conformance["evidence_ref"])
+        evidence_ref = conformance["evidence_ref"]
+        evidence_record = self._load_conformance_evidence_record(evidence_ref)
+        evidence = self._load_conformance_evidence(evidence_ref)
         _assert_conformance_evidence_matches_descriptor(
             descriptor=descriptor,
             conformance=conformance,
             evidence=evidence,
+            evidence_record=evidence_record,
         )
+
+    def _load_conformance_evidence_record(self, evidence_ref: str) -> ArtifactRecord:
+        try:
+            return self._artifact_store.get_record(evidence_ref)
+        except KeyError as exc:
+            raise RegistryError("CONFORMANCE_EVIDENCE_NOT_FOUND") from exc
 
     def _load_conformance_evidence(self, evidence_ref: str) -> Mapping[str, Any]:
         try:
@@ -380,12 +404,26 @@ def _parse_conformance_expiry(value: str) -> datetime:
     return parsed.astimezone(UTC)
 
 
+def sign_s1_reference_conformance_evidence(evidence: Mapping[str, Any]) -> dict[str, Any]:
+    signed = deepcopy(dict(evidence))
+    signed["attestation"] = {
+        "algorithm": S1_CONFORMANCE_ATTESTATION_ALGORITHM,
+        "key_id": S1_CONFORMANCE_ATTESTATION_KEY_ID,
+        "value": "",
+    }
+    signed["attestation"]["value"] = _s1_conformance_attestation_value(signed)
+    return signed
+
+
 def _assert_conformance_evidence_matches_descriptor(
     *,
     descriptor: CapabilityDescriptor,
     conformance: Mapping[str, str],
     evidence: Mapping[str, Any],
+    evidence_record: ArtifactRecord,
 ) -> None:
+    _assert_trusted_s1_conformance_record(evidence_record, conformance=conformance)
+    _assert_s1_conformance_evidence_attestation(evidence)
     expected = {
         "subagent_id": descriptor.entity_id,
         "level_awarded": conformance["level"],
@@ -400,5 +438,57 @@ def _assert_conformance_evidence_matches_descriptor(
         raise RegistryError("CONFORMANCE_TAMPERED: determinism_hash")
     unsigned_evidence = dict(evidence)
     unsigned_evidence.pop("determinism_hash", None)
+    unsigned_evidence.pop("attestation", None)
     if hash_json(unsigned_evidence) != conformance["determinism_hash"]:
         raise RegistryError("CONFORMANCE_TAMPERED: evidence_hash")
+
+
+def _assert_trusted_s1_conformance_record(
+    evidence_record: ArtifactRecord,
+    *,
+    conformance: Mapping[str, str],
+) -> None:
+    if evidence_record.kind != S1_TRUSTED_CONFORMANCE_EVIDENCE_KIND:
+        raise RegistryError("CONFORMANCE_UNTRUSTED: evidence_kind")
+    if evidence_record.producer.subsystem != S1_TRUSTED_CONFORMANCE_PRODUCER_SUBSYSTEM:
+        raise RegistryError("CONFORMANCE_UNTRUSTED: producer_subsystem")
+    if evidence_record.producer.version != conformance["suite_version"]:
+        raise RegistryError("CONFORMANCE_UNTRUSTED: producer_version")
+    if evidence_record.producer.actor_id != S1_TRUSTED_CONFORMANCE_PRODUCER_ACTOR_ID:
+        raise RegistryError("CONFORMANCE_UNTRUSTED: producer_actor")
+    if not evidence_record.producer.job_id:
+        raise RegistryError("CONFORMANCE_UNTRUSTED: producer_job")
+    if evidence_record.lineage.code_ref != S1_TRUSTED_CONFORMANCE_CODE_REF:
+        raise RegistryError("CONFORMANCE_UNTRUSTED: code_ref")
+    if evidence_record.lineage.environment_digest != S1_TRUSTED_CONFORMANCE_ENVIRONMENT_DIGEST:
+        raise RegistryError("CONFORMANCE_UNTRUSTED: environment_digest")
+    if evidence_record.lineage.job_id != evidence_record.producer.job_id:
+        raise RegistryError("CONFORMANCE_UNTRUSTED: lineage_job")
+
+
+def _assert_s1_conformance_evidence_attestation(evidence: Mapping[str, Any]) -> None:
+    attestation = evidence.get("attestation")
+    if not isinstance(attestation, Mapping):
+        raise RegistryError("CONFORMANCE_UNTRUSTED: attestation")
+    if attestation.get("algorithm") != S1_CONFORMANCE_ATTESTATION_ALGORITHM:
+        raise RegistryError("CONFORMANCE_UNTRUSTED: attestation_algorithm")
+    if attestation.get("key_id") != S1_CONFORMANCE_ATTESTATION_KEY_ID:
+        raise RegistryError("CONFORMANCE_UNTRUSTED: attestation_key")
+    value = attestation.get("value")
+    if not isinstance(value, str) or not value.startswith(S1_CONFORMANCE_ATTESTATION_PREFIX):
+        raise RegistryError("CONFORMANCE_UNTRUSTED: attestation_value")
+    signed = deepcopy(dict(evidence))
+    signed["attestation"] = dict(attestation)
+    signed["attestation"]["value"] = ""
+    expected = _s1_conformance_attestation_value(signed)
+    if not hmac.compare_digest(value, expected):
+        raise RegistryError("CONFORMANCE_UNTRUSTED: attestation_signature")
+
+
+def _s1_conformance_attestation_value(evidence_with_empty_attestation: Mapping[str, Any]) -> str:
+    digest = hmac.new(
+        _S1_CONFORMANCE_ATTESTATION_SECRET,
+        canonical_json_bytes(evidence_with_empty_attestation),
+        sha256,
+    ).hexdigest()
+    return f"{S1_CONFORMANCE_ATTESTATION_PREFIX}{digest}"

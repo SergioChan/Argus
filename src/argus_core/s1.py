@@ -14,7 +14,7 @@ from uuid import NAMESPACE_URL, uuid4, uuid5
 
 from argusverify import C3ReportVerifier
 from .hashing import hash_json
-from .s6 import CapabilityDescriptor, InMemoryRegistry
+from .s6 import CapabilityDescriptor, InMemoryRegistry, sign_s1_reference_conformance_evidence
 from .s7 import AdapterBroker, EvalRequest, EvalResult, Quantity, S7Error
 from .s10 import (
     EgressRule,
@@ -1622,6 +1622,7 @@ class S1ReferenceConformanceHarness:
         )
         determinism_hash = hash_json(evidence_payload)
         evidence_payload["determinism_hash"] = determinism_hash
+        evidence_payload = sign_s1_reference_conformance_evidence(evidence_payload)
         evidence_record = store.create_artifact(
             kind=S1_REFERENCE_CONFORMANCE_EVIDENCE_KIND,
             payload=evidence_payload,

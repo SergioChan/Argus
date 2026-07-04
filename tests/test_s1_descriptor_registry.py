@@ -12,10 +12,13 @@ from argus_core import (
     InMemoryRegistry,
     JobEnvelope,
     Lineage,
+    Producer,
+    S1_REFERENCE_CONFORMANCE_EVIDENCE_KIND,
     S1ReferenceConformanceHarness,
     Subagent,
     SubagentDescriptor,
     build_s1_capability_descriptor,
+    hash_json,
     publish_s1_capability_descriptor,
 )
 
@@ -165,6 +168,10 @@ class S1CapabilityDescriptorRegistryTests(unittest.TestCase):
         self.assertEqual(payload["conformance"], expected)
         self.assertEqual(record_payload["conformance"], expected)
         self.assertEqual(registry.get(self.subagent_descriptor.subagent_id).conformance, expected)
+        evidence = json.loads(store.get_artifact(result.evidence_ref).decode("utf-8"))
+        self.assertEqual(evidence["attestation"]["algorithm"], "hmac-sha256")
+        self.assertEqual(evidence["attestation"]["key_id"], "s1-reference-conformance-key-v1")
+        self.assertTrue(evidence["attestation"]["value"].startswith("hmac-sha256:"))
 
     def test_publish_rejects_failed_conformance_result_before_registry_mutation(self) -> None:
         store = InMemoryArtifactStore()
@@ -209,6 +216,103 @@ class S1CapabilityDescriptorRegistryTests(unittest.TestCase):
             registry.publish(expired)
         with self.assertRaisesRegex(Exception, "CONFORMANCE_TAMPERED"):
             registry.publish(tampered)
+
+        self.assertEqual(registry.events, ())
+
+    def test_registry_rejects_self_consistent_forged_conformance_evidence(self) -> None:
+        store = InMemoryArtifactStore()
+        registry = InMemoryRegistry(artifact_store=store)
+        forged = {
+            "schema": "argus.s1.reference_conformance_evidence.v1",
+            "subagent_id": self.subagent_descriptor.subagent_id,
+            "level_requested": "gold",
+            "level_awarded": "gold",
+            "suite_version": "s1-reference-conformance.v1",
+            "standard_release_ref": "c4://standard/c1/1.0.0",
+            "aggregate_passed": True,
+            "checks": [],
+        }
+        forged["determinism_hash"] = hash_json(forged)
+        forged_record = store.create_artifact(
+            kind=S1_REFERENCE_CONFORMANCE_EVIDENCE_KIND,
+            payload=forged,
+            producer=Producer(subsystem="ATTACKER", version="0.0.0", actor_id="forged-conformance"),
+            lineage=Lineage(
+                input_refs=(),
+                code_ref="argus-core:attacker.forged-conformance",
+                environment_digest="python:attacker:v1",
+            ),
+        )
+        descriptor = build_s1_capability_descriptor(
+            self.subagent_descriptor,
+            revision=1,
+            independence_tags=("impl-reference",),
+            conformance={
+                "level": "gold",
+                "suite_version": "s1-reference-conformance.v1",
+                "standard_release_ref": "c4://standard/c1/1.0.0",
+                "evidence_ref": forged_record.artifact_ref,
+                "determinism_hash": forged["determinism_hash"],
+                "expires_at": FUTURE_EXPIRES_AT,
+            },
+        )
+
+        with self.assertRaisesRegex(Exception, "CONFORMANCE_UNTRUSTED"):
+            registry.publish(descriptor)
+
+        self.assertEqual(registry.events, ())
+
+    def test_registry_rejects_forged_conformance_with_impersonated_record_metadata(self) -> None:
+        store = InMemoryArtifactStore()
+        registry = InMemoryRegistry(artifact_store=store)
+        forged = {
+            "schema": "argus.s1.reference_conformance_evidence.v1",
+            "subagent_id": self.subagent_descriptor.subagent_id,
+            "level_requested": "gold",
+            "level_awarded": "gold",
+            "suite_version": "s1-reference-conformance.v1",
+            "standard_release_ref": "c4://standard/c1/1.0.0",
+            "aggregate_passed": True,
+            "checks": [],
+        }
+        forged["determinism_hash"] = hash_json(forged)
+        forged["attestation"] = {
+            "algorithm": "hmac-sha256",
+            "key_id": "s1-reference-conformance-key-v1",
+            "value": "hmac-sha256:forged",
+        }
+        forged_record = store.create_artifact(
+            kind=S1_REFERENCE_CONFORMANCE_EVIDENCE_KIND,
+            payload=forged,
+            producer=Producer(
+                subsystem="S1",
+                version="s1-reference-conformance.v1",
+                actor_id="s1.reference_conformance",
+                job_id=self.envelope.job_id,
+            ),
+            lineage=Lineage(
+                input_refs=(),
+                code_ref="argus-core:s1.reference-conformance",
+                environment_digest="python:s1-reference-conformance:v1",
+                job_id=self.envelope.job_id,
+            ),
+        )
+        descriptor = build_s1_capability_descriptor(
+            self.subagent_descriptor,
+            revision=1,
+            independence_tags=("impl-reference",),
+            conformance={
+                "level": "gold",
+                "suite_version": "s1-reference-conformance.v1",
+                "standard_release_ref": "c4://standard/c1/1.0.0",
+                "evidence_ref": forged_record.artifact_ref,
+                "determinism_hash": forged["determinism_hash"],
+                "expires_at": FUTURE_EXPIRES_AT,
+            },
+        )
+
+        with self.assertRaisesRegex(Exception, "CONFORMANCE_UNTRUSTED: attestation_signature"):
+            registry.publish(descriptor)
 
         self.assertEqual(registry.events, ())
 
