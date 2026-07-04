@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import subprocess
 import unittest
+from weakref import ReferenceType
 
 from jsonschema import Draft202012Validator
 
@@ -375,6 +376,35 @@ class S1SDKBaseClassTests(unittest.TestCase):
         self.assertFalse(hasattr(client, "__dict__"))
         self.assertFalse(hasattr(client, "_scope_token"))
         self.assertFalse(hasattr(client, "_broker"))
+
+    def test_brokered_adapter_client_object_graph_cannot_reach_proxy_or_signing_key(self) -> None:
+        signing_key = b"TOP-SECRET-SIGNING-KEY-CAFEBABE"
+        artifacts = InMemoryArtifactStore()
+        audit = InMemoryAuditLedger()
+        tokens = InMemoryTokenService(signing_key=signing_key, now_fn=lambda: 1_000)
+        adapter_broker = AdapterBroker(artifact_store=artifacts)
+        adapter_broker.register(self._bounce_adapter())
+        scope = tokens.mint_scope(
+            job_id=self.envelope.job_id,
+            scopes=ScopeGrant(
+                allowed_adapters=("adapter:bounce",),
+                broker_audiences=("adapter:bounce",),
+            ),
+        )
+        proxy = S1AdapterBrokerProxy(
+            token_service=tokens,
+            adapter_broker=adapter_broker,
+            audit_ledger=audit,
+        )
+        self._adapter_broker_proxies.append(proxy)
+        client = proxy.client_for(scope)
+
+        reachable = self._walk_client_object_graph(client, max_depth=6)
+
+        self.assertNotIn(id(proxy), {id(item) for item in reachable})
+        self.assertFalse(any(item is tokens for item in reachable))
+        self.assertFalse(any(getattr(item, "_signing_key", None) == signing_key for item in reachable))
+        self.assertFalse(any(callable(getattr(item, "mint_scope", None)) for item in reachable))
 
     def test_exec_context_call_adapter_rejects_scope_without_adapter_broker_audience(self) -> None:
         client, audit, artifacts = self._brokered_adapter_client(
@@ -978,6 +1008,46 @@ class S1SDKBaseClassTests(unittest.TestCase):
         validator = self.c1_validator.evolve(schema=self.c1_schema["$defs"][def_name])
         errors = sorted(validator.iter_errors(payload), key=lambda error: list(error.path))
         self.assertEqual(errors, [], msg=[error.message for error in errors])
+
+    def _walk_client_object_graph(self, root: object, *, max_depth: int) -> list[object]:
+        simple = (str, bytes, int, float, bool, type(None))
+        seen: set[int] = set()
+        queue: list[tuple[object, int]] = [(root, 0)]
+        reachable: list[object] = []
+        while queue:
+            item, depth = queue.pop(0)
+            if id(item) in seen:
+                continue
+            seen.add(id(item))
+            reachable.append(item)
+            if depth >= max_depth or isinstance(item, simple):
+                continue
+            children: list[object] = []
+            if isinstance(item, ReferenceType):
+                target = item()
+                if target is not None:
+                    children.append(target)
+            if isinstance(item, dict):
+                children.extend(item.keys())
+                children.extend(item.values())
+            elif isinstance(item, (list, tuple, set, frozenset)):
+                children.extend(item)
+            item_dict = getattr(item, "__dict__", None)
+            if isinstance(item_dict, dict):
+                children.extend(item_dict.values())
+            for cls in type(item).__mro__:
+                slots = getattr(cls, "__slots__", ())
+                if isinstance(slots, str):
+                    slots = (slots,)
+                for slot in slots:
+                    if slot in {"__weakref__", "__dict__"}:
+                        continue
+                    if hasattr(item, slot):
+                        children.append(getattr(item, slot))
+            for child in children:
+                if id(child) not in seen:
+                    queue.append((child, depth + 1))
+        return reachable
 
     def _brokered_adapter_client(
         self,

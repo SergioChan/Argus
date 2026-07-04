@@ -10,7 +10,6 @@ from dataclasses import asdict, dataclass, field, is_dataclass, replace
 from enum import Enum
 from typing import Any, Mapping, NoReturn, final
 from uuid import NAMESPACE_URL, uuid4, uuid5
-from weakref import ref
 
 from argusverify import C3ReportVerifier
 from .hashing import hash_json
@@ -513,6 +512,18 @@ class AdapterBrokerHandle:
     expires_at: int
 
 
+@dataclass(frozen=True)
+class _S1AdapterBrokerCapability:
+    scope_token: ScopeToken
+    token_service: InMemoryTokenService
+    adapter_broker: AdapterBroker
+    audit_ledger: InMemoryAuditLedger
+
+
+_S1_ADAPTER_BROKER_CAPABILITIES: dict[str, _S1AdapterBrokerCapability] = {}
+_S1_ADAPTER_BROKER_ENDPOINT = None
+
+
 class S1AdapterBrokerProxy:
     """Brokered C6 adapter evaluation path for S1 author contexts."""
 
@@ -526,8 +537,6 @@ class S1AdapterBrokerProxy:
         self._token_service = token_service
         self._adapter_broker = adapter_broker
         self._audit_ledger = audit_ledger
-        self._capabilities: dict[str, ScopeToken] = {}
-        self._endpoint = _S1AdapterBrokerEndpoint(self)
 
     def client_for(self, scope_token: ScopeToken) -> "BrokeredAdapterClient":
         handle = AdapterBrokerHandle(
@@ -535,98 +544,106 @@ class S1AdapterBrokerProxy:
             scope_id=scope_token.scope_id,
             expires_at=scope_token.expires_at,
         )
-        self._capabilities[handle.handle_id] = scope_token
-        return BrokeredAdapterClient(handle=handle, endpoint=self._endpoint)
-
-    def _evaluate_by_handle(self, *, handle: AdapterBrokerHandle, request: EvalRequest) -> EvalResult:
-        scope_token = self._scope_for_handle(handle)
-        verification = self._token_service.verify_scope(scope_token)
-        if not verification.valid:
-            self._audit_ledger.append(
-                "adapter.token_verify_fail",
-                {"token": "scope", "reason": verification.reason, "audience": request.adapter_id},
-            )
-            raise TokenInvalidError(verification.reason or "invalid scope token")
-        if request.adapter_id not in scope_token.scopes.allowed_adapters:
-            self._deny_adapter(
-                scope_token=scope_token,
-                adapter_id=request.adapter_id,
-                reason="adapter_not_allowlisted",
-                message=f"adapter is not allowlisted by scope token: {request.adapter_id}",
-            )
-        if request.adapter_id not in scope_token.scopes.broker_audiences:
-            self._deny_adapter(
-                scope_token=scope_token,
-                adapter_id=request.adapter_id,
-                reason="broker_audience_missing",
-                message=f"adapter broker audience is not granted: {request.adapter_id}",
-            )
-        try:
-            result = self._adapter_broker.evaluate(request)
-        except KeyError as exc:
-            self._deny_adapter(
-                scope_token=scope_token,
-                adapter_id=request.adapter_id,
-                reason="adapter_not_registered",
-                message=f"adapter is not registered with broker: {request.adapter_id}",
-            )
-        self._audit_ledger.append(
-            "adapter.evaluate",
-            {
-                "audience": request.adapter_id,
-                "adapter_id": request.adapter_id,
-                "scope_id": scope_token.scope_id,
-                "job_id": scope_token.job_id,
-                "provenance_ref": result.provenance_ref,
-                "request_hash": hash_json(_eval_request_payload(request)),
-            },
+        _S1_ADAPTER_BROKER_CAPABILITIES[handle.handle_id] = _S1AdapterBrokerCapability(
+            scope_token=scope_token,
+            token_service=self._token_service,
+            adapter_broker=self._adapter_broker,
+            audit_ledger=self._audit_ledger,
         )
-        return result
+        return BrokeredAdapterClient(handle=handle, endpoint=_s1_adapter_broker_endpoint())
 
-    def _scope_for_handle(self, handle: AdapterBrokerHandle) -> ScopeToken:
-        scope_token = self._capabilities.get(handle.handle_id)
-        if scope_token is None or scope_token.scope_id != handle.scope_id:
-            self._audit_ledger.append(
-                "adapter.denied",
-                {"audience": "adapter", "reason": "invalid_handle", "scope_id": handle.scope_id},
-            )
-            raise ScopeDeniedError("invalid adapter broker handle")
-        return scope_token
 
-    def _deny_adapter(
-        self,
-        *,
-        scope_token: ScopeToken,
-        adapter_id: str,
-        reason: str,
-        message: str,
-    ) -> NoReturn:
-        self._audit_ledger.append(
-            "adapter.denied",
-            {
-                "audience": adapter_id,
-                "adapter_id": adapter_id,
-                "reason": reason,
-                "scope_id": scope_token.scope_id,
-                "job_id": scope_token.job_id,
-            },
+def _s1_adapter_broker_endpoint() -> "_S1AdapterBrokerEndpoint":
+    global _S1_ADAPTER_BROKER_ENDPOINT
+    if _S1_ADAPTER_BROKER_ENDPOINT is None:
+        _S1_ADAPTER_BROKER_ENDPOINT = _S1AdapterBrokerEndpoint()
+    return _S1_ADAPTER_BROKER_ENDPOINT
+
+
+def _evaluate_s1_adapter_broker_capability(
+    *,
+    handle: AdapterBrokerHandle,
+    request: EvalRequest,
+) -> EvalResult:
+    capability = _S1_ADAPTER_BROKER_CAPABILITIES.get(handle.handle_id)
+    if capability is None or capability.scope_token.scope_id != handle.scope_id:
+        raise ScopeDeniedError("invalid adapter broker handle")
+    scope_token = capability.scope_token
+    verification = capability.token_service.verify_scope(scope_token)
+    if not verification.valid:
+        capability.audit_ledger.append(
+            "adapter.token_verify_fail",
+            {"token": "scope", "reason": verification.reason, "audience": request.adapter_id},
         )
-        raise ScopeDeniedError(message)
+        raise TokenInvalidError(verification.reason or "invalid scope token")
+    if request.adapter_id not in scope_token.scopes.allowed_adapters:
+        _deny_s1_adapter_request(
+            audit_ledger=capability.audit_ledger,
+            scope_token=scope_token,
+            adapter_id=request.adapter_id,
+            reason="adapter_not_allowlisted",
+            message=f"adapter is not allowlisted by scope token: {request.adapter_id}",
+        )
+    if request.adapter_id not in scope_token.scopes.broker_audiences:
+        _deny_s1_adapter_request(
+            audit_ledger=capability.audit_ledger,
+            scope_token=scope_token,
+            adapter_id=request.adapter_id,
+            reason="broker_audience_missing",
+            message=f"adapter broker audience is not granted: {request.adapter_id}",
+        )
+    try:
+        result = capability.adapter_broker.evaluate(request)
+    except KeyError:
+        _deny_s1_adapter_request(
+            audit_ledger=capability.audit_ledger,
+            scope_token=scope_token,
+            adapter_id=request.adapter_id,
+            reason="adapter_not_registered",
+            message=f"adapter is not registered with broker: {request.adapter_id}",
+        )
+    capability.audit_ledger.append(
+        "adapter.evaluate",
+        {
+            "audience": request.adapter_id,
+            "adapter_id": request.adapter_id,
+            "scope_id": scope_token.scope_id,
+            "job_id": scope_token.job_id,
+            "provenance_ref": result.provenance_ref,
+            "request_hash": hash_json(_eval_request_payload(request)),
+        },
+    )
+    return result
+
+
+def _deny_s1_adapter_request(
+    *,
+    audit_ledger: InMemoryAuditLedger,
+    scope_token: ScopeToken,
+    adapter_id: str,
+    reason: str,
+    message: str,
+) -> NoReturn:
+    audit_ledger.append(
+        "adapter.denied",
+        {
+            "audience": adapter_id,
+            "adapter_id": adapter_id,
+            "reason": reason,
+            "scope_id": scope_token.scope_id,
+            "job_id": scope_token.job_id,
+        },
+    )
+    raise ScopeDeniedError(message)
 
 
 class _S1AdapterBrokerEndpoint:
     """In-process adapter broker endpoint; clients only hold opaque handles."""
 
-    __slots__ = ("_proxy_ref",)
-
-    def __init__(self, proxy: S1AdapterBrokerProxy) -> None:
-        self._proxy_ref = ref(proxy)
+    __slots__ = ()
 
     def evaluate(self, *, handle: AdapterBrokerHandle, request: EvalRequest) -> EvalResult:
-        proxy = self._proxy_ref()
-        if proxy is None:
-            raise ScopeDeniedError("adapter broker handle is no longer valid")
-        return proxy._evaluate_by_handle(handle=handle, request=request)
+        return _evaluate_s1_adapter_broker_capability(handle=handle, request=request)
 
 
 class BrokeredAdapterClient:
