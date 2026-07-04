@@ -1,16 +1,30 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
+import subprocess
 import unittest
 
 from jsonschema import Draft202012Validator
 
 from argus_core import (
+    BudgetCaps,
+    EgressRule,
     ExecContext,
+    InMemoryArtifactStore,
+    InMemoryAuditLedger,
+    InMemoryQuotaLedger,
+    InMemorySandboxOrchestrator,
+    InMemoryTokenService,
     JobEnvelope,
+    LaunchEnvelope,
+    LaunchRequest,
     LifecyclePolicyError,
     LifecycleState,
+    PolicyBundle,
+    ResourceCeilings,
+    ScopeGrant,
     Subagent,
     SubagentDescriptor,
     SubagentSDKRunner,
@@ -218,6 +232,86 @@ class S1SDKBaseClassTests(unittest.TestCase):
         self.assertEqual(adapter_denied.exception.envelope.code, "EXEC_CONTEXT_CAPABILITY_DENIED")
         self.assertEqual(dataset_denied.exception.envelope.code, "EXEC_CONTEXT_CAPABILITY_DENIED")
 
+    def test_exec_context_submit_sandbox_job_fails_closed_without_s10_marshaler(self) -> None:
+        ctx = ExecContext(job_id=self.envelope.job_id)
+
+        with self.assertRaises(LifecyclePolicyError) as raised:
+            ctx.submit_sandbox_job({"entrypoint": ["python", "build.py"]})
+
+        self.assertEqual(raised.exception.envelope.code, "S10_MARSHALER_UNAVAILABLE")
+        self.assertEqual(raised.exception.envelope.category, "SANDBOX")
+        self.assertFalse(raised.exception.envelope.retryable)
+        self.assertIn("direct in-process execution is forbidden", raised.exception.envelope.message)
+
+    def test_exec_context_submit_sandbox_job_delegates_to_real_s10_orchestrator(self) -> None:
+        from argus_core.s1 import S10SandboxMarshaler
+
+        orchestrator, request, audit, artifacts = self._s10_orchestrator_and_request()
+        ctx = ExecContext(
+            job_id=self.envelope.job_id,
+            sandbox_marshaler=S10SandboxMarshaler(orchestrator),
+        )
+
+        result = ctx.submit_sandbox_job({"launch_request": request})
+
+        self.assertEqual(result["capability"], "submit_sandbox_job")
+        self.assertEqual(result["job_id"], self.envelope.job_id)
+        self.assertEqual(result["state"], "ADMITTED")
+        self.assertEqual(result["runtime_class"], "gvisor")
+        self.assertEqual(result["policy_bundle_version"], "s1-t11-test")
+        self.assertEqual(result["budget_epoch"], request.budget_token.budget_epoch)
+        self.assertTrue(str(result["sandbox_id"]))
+        self.assertTrue(str(result["launch_provenance_ref"]).startswith("c4://artifact/"))
+        self.assertEqual(audit.events()[-1].event_type, "sandbox.launched")
+        self.assertEqual(artifacts.get_record(str(result["launch_provenance_ref"])).kind, "container")
+
+    def test_subagent_linter_flags_direct_in_process_exec_patterns(self) -> None:
+        from argus_core.s1 import lint_subagent_for_direct_exec
+
+        class DirectExecSubagent(Subagent):
+            def plan(self, ctx: ExecContext, envelope: JobEnvelope) -> dict[str, object]:
+                return {"unsafe": eval("1")}
+
+            def build(self, ctx: ExecContext, plan: dict[str, object]) -> dict[str, object]:
+                subprocess.run(["true"], check=False)
+                return {"artifact_refs": []}
+
+        violations = lint_subagent_for_direct_exec(DirectExecSubagent(self.descriptor))
+
+        self.assertIn("plan: eval", violations)
+        self.assertIn("build: subprocess.run", violations)
+
+    def test_runner_quarantines_direct_in_process_exec_before_build_invocation(self) -> None:
+        class DirectExecBuildSubagent(Subagent):
+            def __init__(self, descriptor: SubagentDescriptor) -> None:
+                super().__init__(descriptor)
+                self.build_called = False
+
+            def plan(self, ctx: ExecContext, envelope: JobEnvelope) -> dict[str, object]:
+                return {}
+
+            def build(self, ctx: ExecContext, plan: dict[str, object]) -> dict[str, object]:
+                self.build_called = True
+                os.system("true")
+                return {"artifact_refs": []}
+
+        subagent = DirectExecBuildSubagent(self.descriptor)
+        runner = SubagentSDKRunner(subagent)
+        runner.accept(self.envelope)
+        planned = runner.plan(self.envelope)
+
+        with self.assertRaises(LifecyclePolicyError) as raised:
+            runner.build(self.envelope.job_id, planned.payload)
+
+        self.assertEqual(raised.exception.envelope.code, "DIRECT_IN_PROCESS_EXEC_FORBIDDEN")
+        self.assertEqual(raised.exception.envelope.category, "SANDBOX")
+        self.assertFalse(subagent.build_called)
+        self.assertEqual(runner.runtime.store.current(self.envelope.job_id).state, LifecycleState.QUARANTINED)
+        self.assertEqual(
+            [event.method for event in runner.runtime.store.events(self.envelope.job_id)],
+            ["accept", "plan", "quarantine"],
+        )
+
     def test_framework_owned_methods_cannot_be_overridden_by_authors(self) -> None:
         with self.assertRaisesRegex(TypeError, "validate"):
 
@@ -293,6 +387,69 @@ class S1SDKBaseClassTests(unittest.TestCase):
         validator = self.c1_validator.evolve(schema=self.c1_schema["$defs"][def_name])
         errors = sorted(validator.iter_errors(payload), key=lambda error: list(error.path))
         self.assertEqual(errors, [], msg=[error.message for error in errors])
+
+    def _s10_orchestrator_and_request(
+        self,
+    ) -> tuple[InMemorySandboxOrchestrator, LaunchRequest, InMemoryAuditLedger, InMemoryArtifactStore]:
+        audit = InMemoryAuditLedger()
+        artifacts = InMemoryArtifactStore()
+        tokens = InMemoryTokenService(signing_key=b"s1-t11-token-key", now_fn=lambda: 1_000)
+        policy = PolicyBundle(
+            bundle_version="s1-t11-test",
+            egress_allowlist=(EgressRule("store.local", 443, "https"),),
+            resource_ceilings=ResourceCeilings(
+                cpu_m=2_000,
+                mem_bytes=4_000_000_000,
+                gpu_count=0,
+                wallclock_s=120,
+                max_cost_usd=10,
+            ),
+            risk_to_runtime={"standard": "gvisor", "federated": "firecracker", "high": "firecracker"},
+            seccomp_profile_hash="blake3:" + "a" * 64,
+            signer_key_id="policy",
+            signature="test-signature",
+        )
+        budget = tokens.mint_budget(
+            caps=BudgetCaps(max_compute_units=1_000, max_wallclock_s=120, max_cost_usd=10),
+            job_id=self.envelope.job_id,
+            root_request_id="root-s1-t11",
+        )
+        scope = tokens.mint_scope(
+            job_id=self.envelope.job_id,
+            scopes=ScopeGrant(
+                egress_allowlist=(EgressRule("store.local", 443, "https"),),
+                broker_audiences=("store",),
+            ),
+        )
+        request = LaunchRequest(
+            job_id=self.envelope.job_id,
+            subagent_id=self.descriptor.subagent_id,
+            trace_id="trace-s1-t11",
+            budget_token=budget,
+            scope_token=scope,
+            image="registry.local/argus@sha256:" + "b" * 64,
+            entrypoint=("python",),
+            args=("build.py",),
+            env={},
+            env_allowlist=(),
+            requested_envelope=LaunchEnvelope(
+                cpu_m=1_000,
+                mem_bytes=1_000_000,
+                gpu_count=0,
+                wallclock_s=10,
+                scratch_bytes=1_000,
+                pids=10,
+                estimated_cost_usd=0.01,
+            ),
+        )
+        orchestrator = InMemorySandboxOrchestrator(
+            token_service=tokens,
+            quota_ledger=InMemoryQuotaLedger(),
+            audit_ledger=audit,
+            policy_bundle=policy,
+            artifact_store=artifacts,
+        )
+        return orchestrator, request, audit, artifacts
 
 
 if __name__ == "__main__":

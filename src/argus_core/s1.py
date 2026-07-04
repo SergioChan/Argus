@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import ast
+import inspect
+import textwrap
 from abc import ABC, abstractmethod
 from dataclasses import asdict, dataclass, field, is_dataclass, replace
 from enum import Enum
@@ -10,6 +13,7 @@ from uuid import NAMESPACE_URL, uuid5
 
 from argusverify import C3ReportVerifier
 from .hashing import hash_json
+from .s10 import LaunchRequest, S10Error, SandboxExecutionResult, SandboxHandle
 from .s8 import ArtifactRecord, InMemoryArtifactStore, Lineage, Producer
 
 
@@ -230,6 +234,34 @@ class JobCurrent:
     last_sequence: int
 
 
+@dataclass(frozen=True)
+class S10SandboxMarshaler:
+    launcher: Any
+
+    def submit_sandbox_job(self, *, job_id: str, spec: Mapping[str, Any]) -> Any:
+        request = _launch_request_from_sandbox_spec(job_id, spec)
+        try:
+            if hasattr(self.launcher, "launch_and_wait"):
+                return self.launcher.launch_and_wait(request)
+            if hasattr(self.launcher, "launch"):
+                return self.launcher.launch(request)
+        except S10Error as exc:
+            raise LifecyclePolicyError(
+                build_error_envelope(
+                    category="SANDBOX",
+                    code="S10_SANDBOX_LAUNCH_FAILED",
+                    message=f"S10 sandbox launch failed: {exc}",
+                )
+            ) from exc
+        raise LifecyclePolicyError(
+            build_error_envelope(
+                category="SANDBOX",
+                code="S10_MARSHALER_INVALID",
+                message="S10 sandbox marshaler must expose launch or launch_and_wait",
+            )
+        )
+
+
 EXEC_CONTEXT_CAPABILITIES = (
     "submit_sandbox_job",
     "emit_artifact",
@@ -248,6 +280,7 @@ class ExecContext:
     _allowed_adapters: tuple[str, ...] = field(repr=False, compare=False)
     _allowed_datasets: tuple[str, ...] = field(repr=False, compare=False)
     _artifact_store: InMemoryArtifactStore = field(init=False, repr=False, compare=False)
+    _sandbox_marshaler: Any = field(init=False, repr=False, compare=False)
 
     def __init__(
         self,
@@ -257,6 +290,7 @@ class ExecContext:
         allowed_adapters: tuple[str, ...] = (),
         allowed_datasets: tuple[str, ...] = (),
         artifact_store: InMemoryArtifactStore | None = None,
+        sandbox_marshaler: Any | None = None,
     ) -> None:
         capabilities = tuple(dict.fromkeys(capabilities))
         unknown = tuple(capability for capability in capabilities if capability not in _EXEC_CONTEXT_CAPABILITY_SET)
@@ -267,6 +301,7 @@ class ExecContext:
         object.__setattr__(self, "_allowed_adapters", tuple(allowed_adapters))
         object.__setattr__(self, "_allowed_datasets", tuple(allowed_datasets))
         object.__setattr__(self, "_artifact_store", artifact_store or InMemoryArtifactStore())
+        object.__setattr__(self, "_sandbox_marshaler", sandbox_marshaler)
 
     def capability_methods(self) -> tuple[str, ...]:
         return self.capabilities
@@ -276,12 +311,27 @@ class ExecContext:
 
     def submit_sandbox_job(self, spec: dict[str, Any]) -> dict[str, Any]:
         self._require_capability("submit_sandbox_job")
-        return {
-            "capability": "submit_sandbox_job",
-            "job_id": self.job_id,
-            "submitted": True,
-            "spec_hash": hash_json(spec),
-        }
+        if self._sandbox_marshaler is None:
+            raise LifecyclePolicyError(
+                build_error_envelope(
+                    category="SANDBOX",
+                    code="S10_MARSHALER_UNAVAILABLE",
+                    message=(
+                        "S10 sandbox marshaler is unavailable; "
+                        "direct in-process execution is forbidden"
+                    ),
+                )
+            )
+        if not hasattr(self._sandbox_marshaler, "submit_sandbox_job"):
+            raise LifecyclePolicyError(
+                build_error_envelope(
+                    category="SANDBOX",
+                    code="S10_MARSHALER_INVALID",
+                    message="S10 sandbox marshaler must expose submit_sandbox_job",
+                )
+            )
+        result = self._sandbox_marshaler.submit_sandbox_job(job_id=self.job_id, spec=spec)
+        return _normalize_sandbox_result(self.job_id, result)
 
     def emit_artifact(self, payload: Any, kind: str, lineage_inputs: tuple[str, ...]) -> dict[str, Any]:
         self._require_capability("emit_artifact")
@@ -348,6 +398,108 @@ class ExecContext:
                 message=f"ExecContext denied {capability}: {message}",
             )
         )
+
+
+def _launch_request_from_sandbox_spec(job_id: str, spec: Mapping[str, Any]) -> LaunchRequest:
+    request = spec.get("launch_request")
+    if not isinstance(request, LaunchRequest):
+        raise LifecyclePolicyError(
+            build_error_envelope(
+                category="SANDBOX",
+                code="S10_LAUNCH_REQUEST_REQUIRED",
+                message="submit_sandbox_job requires a canonical S10 LaunchRequest",
+            )
+        )
+    if request.job_id != job_id:
+        raise LifecyclePolicyError(
+            build_error_envelope(
+                category="SANDBOX",
+                code="S10_LAUNCH_REQUEST_JOB_MISMATCH",
+                message=f"S10 LaunchRequest job_id {request.job_id} does not match ExecContext job_id {job_id}",
+            )
+        )
+    return request
+
+
+def _normalize_sandbox_result(job_id: str, result: Any) -> dict[str, Any]:
+    if isinstance(result, SandboxExecutionResult):
+        payload = _sandbox_handle_payload(job_id, result.handle)
+        payload.update(
+            {
+                "exit_code": result.exit_code,
+                "stdout": result.stdout,
+                "stderr": result.stderr,
+                "timed_out": result.timed_out,
+                "duration_s": result.duration_s,
+                "budget_usage": _json_compatible_payload(result.budget_usage),
+            }
+        )
+        if result.partial_result is not None:
+            payload["partial_result"] = _json_compatible_payload(result.partial_result)
+        return payload
+    if isinstance(result, SandboxHandle):
+        return _sandbox_handle_payload(job_id, result)
+    if isinstance(result, Mapping):
+        return _normalize_sandbox_mapping(job_id, result)
+    raise LifecyclePolicyError(
+        build_error_envelope(
+            category="SANDBOX",
+            code="S10_SANDBOX_RESULT_INVALID",
+            message=f"S10 sandbox marshaler returned unsupported result type: {type(result).__name__}",
+        )
+    )
+
+
+def _sandbox_handle_payload(job_id: str, handle: SandboxHandle) -> dict[str, Any]:
+    if handle.job_id != job_id:
+        raise LifecyclePolicyError(
+            build_error_envelope(
+                category="SANDBOX",
+                code="S10_SANDBOX_RESULT_JOB_MISMATCH",
+                message=f"S10 sandbox result job_id {handle.job_id} does not match ExecContext job_id {job_id}",
+            )
+        )
+    return {
+        "capability": "submit_sandbox_job",
+        "job_id": job_id,
+        "sandbox_id": handle.sandbox_id,
+        "runtime_class": handle.runtime_class,
+        "budget_epoch": handle.budget_epoch,
+        "policy_bundle_version": handle.policy_bundle_version,
+        "state": handle.state,
+        "launch_provenance_ref": handle.launch_provenance_ref,
+    }
+
+
+def _normalize_sandbox_mapping(job_id: str, result: Mapping[str, Any]) -> dict[str, Any]:
+    handle = result.get("handle")
+    if isinstance(handle, SandboxHandle):
+        payload = _sandbox_handle_payload(job_id, handle)
+        for key in ("exit_code", "stdout", "stderr", "timed_out", "duration_s", "budget_usage", "partial_result"):
+            if key in result:
+                payload[key] = _json_compatible_payload(result[key])
+        return payload
+    payload = _json_compatible_payload(result)
+    if not isinstance(payload, dict):
+        raise LifecyclePolicyError(
+            build_error_envelope(
+                category="SANDBOX",
+                code="S10_SANDBOX_RESULT_INVALID",
+                message="S10 sandbox marshaler returned a non-object mapping payload",
+            )
+        )
+    result_job_id = str(payload.get("job_id", job_id))
+    if result_job_id != job_id:
+        raise LifecyclePolicyError(
+            build_error_envelope(
+                category="SANDBOX",
+                code="S10_SANDBOX_RESULT_JOB_MISMATCH",
+                message=f"S10 sandbox result job_id {result_job_id} does not match ExecContext job_id {job_id}",
+            )
+        )
+    payload.setdefault("capability", "submit_sandbox_job")
+    payload["job_id"] = job_id
+    return payload
 
 
 @dataclass(frozen=True)
@@ -418,12 +570,88 @@ class Acceptance:
 
 
 SDK_FRAMEWORK_METHODS = frozenset({"register", "accept", "validate", "report", "cancel", "heartbeat"})
+DIRECT_EXEC_FORBIDDEN_CALLS = frozenset(
+    {
+        "eval",
+        "exec",
+        "os.popen",
+        "os.system",
+        "subprocess.call",
+        "subprocess.check_call",
+        "subprocess.check_output",
+        "subprocess.getoutput",
+        "subprocess.getstatusoutput",
+        "subprocess.Popen",
+        "subprocess.run",
+    }
+)
 
 
 def _sdk_framework_method_owner(cls: type[object], method: str) -> type[object] | None:
     for owner in cls.__mro__:
         if method in owner.__dict__:
             return owner
+    return None
+
+
+def lint_subagent_for_direct_exec(subagent: "Subagent") -> tuple[str, ...]:
+    violations: list[str] = []
+    for method in ("plan", "build"):
+        violations.extend(_direct_exec_violations(method, getattr(subagent, method)))
+    return tuple(dict.fromkeys(violations))
+
+
+def _direct_exec_violations(method: str, hook: Any) -> tuple[str, ...]:
+    violations: list[str] = []
+    hook = inspect.unwrap(hook)
+    function = getattr(hook, "__func__", hook)
+    try:
+        source = textwrap.dedent(inspect.getsource(hook))
+    except (OSError, TypeError):
+        source = ""
+    if source:
+        try:
+            tree = ast.parse(source)
+        except SyntaxError:
+            tree = None
+        if tree is not None:
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Call):
+                    call_name = _ast_call_name(node.func)
+                    if call_name in DIRECT_EXEC_FORBIDDEN_CALLS:
+                        violations.append(f"{method}: {call_name}")
+    code = getattr(function, "__code__", None)
+    if code is not None:
+        names = set(code.co_names)
+        if "eval" in names:
+            violations.append(f"{method}: eval")
+        if "exec" in names:
+            violations.append(f"{method}: exec")
+        for module, function in (("os", "popen"), ("os", "system")):
+            if module in names and function in names:
+                violations.append(f"{method}: {module}.{function}")
+        for function in (
+            "call",
+            "check_call",
+            "check_output",
+            "getoutput",
+            "getstatusoutput",
+            "Popen",
+            "run",
+        ):
+            if "subprocess" in names and function in names:
+                violations.append(f"{method}: subprocess.{function}")
+    return tuple(dict.fromkeys(violations))
+
+
+def _ast_call_name(node: ast.AST) -> str | None:
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        base = _ast_call_name(node.value)
+        if base:
+            return f"{base}.{node.attr}"
+        return node.attr
     return None
 
 
@@ -787,9 +1015,11 @@ class SubagentRuntime:
         store: LifecycleStore | None = None,
         idempotency_store: InMemoryIdempotencyStore | None = None,
         artifact_store: InMemoryArtifactStore | None = None,
+        sandbox_marshaler: Any | None = None,
     ) -> None:
         self.descriptor = descriptor
         self.idempotency_store = idempotency_store or InMemoryIdempotencyStore()
+        self.sandbox_marshaler = sandbox_marshaler
         if store is not None:
             if artifact_store is not None:
                 raise ValueError("artifact_store cannot be provided with an explicit LifecycleStore")
@@ -880,6 +1110,7 @@ class SubagentSDKRunner:
         trace_id: str | None = None,
     ) -> SDKInvocationResult:
         self._assert_can_apply(envelope.job_id, "plan")
+        self._assert_no_direct_exec(envelope.job_id, "plan", self.subagent.plan)
         ctx = self._exec_context(envelope.job_id, allowed_adapters=envelope.allowed_adapters)
         payload = _normalize_plan_payload(envelope, self.subagent.plan(ctx, envelope))
         event = self.runtime.store.apply_method(
@@ -903,6 +1134,7 @@ class SubagentSDKRunner:
         trace_id: str | None = None,
     ) -> SDKInvocationResult:
         self._assert_can_apply(job_id, "build")
+        self._assert_no_direct_exec(job_id, "build", self.subagent.build)
         plan_payload = _mapping_payload("plan", plan)
         ctx = self._exec_context(
             job_id,
@@ -936,7 +1168,25 @@ class SubagentSDKRunner:
             allowed_adapters=allowed_adapters,
             allowed_datasets=allowed_datasets,
             artifact_store=self.runtime.artifact_store,
+            sandbox_marshaler=self.runtime.sandbox_marshaler,
         )
+
+    def _assert_no_direct_exec(self, job_id: str, method: str, hook: Any) -> None:
+        violations = _direct_exec_violations(method, hook)
+        if not violations:
+            return
+        envelope = build_error_envelope(
+            category="SANDBOX",
+            code="DIRECT_IN_PROCESS_EXEC_FORBIDDEN",
+            message=f"{method} hook contains forbidden direct in-process execution: {', '.join(violations)}",
+        )
+        self.runtime.store.apply_method(
+            job_id,
+            "quarantine",
+            trigger="S1 direct-exec guard",
+            payload={"error": envelope.as_c1_payload(), "violations": list(violations)},
+        )
+        raise LifecyclePolicyError(envelope)
 
     def _assert_can_apply(self, job_id: str, method: str) -> None:
         try:
