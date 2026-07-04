@@ -22,6 +22,7 @@ from argus_core import (
     InMemoryArtifactStore,
     InMemoryAuditLedger,
     InMemoryQuotaLedger,
+    InMemoryS1TelemetrySink,
     InMemorySandboxOrchestrator,
     InMemoryTokenService,
     InMemoryVerifierTrustStore,
@@ -43,6 +44,7 @@ from argus_core import (
     SubagentDescriptor,
     SubagentSDKRunner,
     SubagentRuntime,
+    TraceAssembler,
     build_error_envelope,
     build_frozen_pipeline_entrypoint_request,
     hash_bytes,
@@ -194,6 +196,36 @@ class S1SDKBaseClassTests(unittest.TestCase):
         self.assertEqual(built.payload["uncertainty_summary"], {"representation": "none", "value": {}})
         self._assert_c1_valid(planned.payload)
         self._assert_c1_valid(built.payload)
+
+    def test_runner_records_method_and_author_spans_for_s11_trace_assembly(self) -> None:
+        telemetry = InMemoryS1TelemetrySink()
+        subagent = ExampleSubagent(self.descriptor)
+        runner = SubagentSDKRunner(
+            subagent,
+            runtime=SubagentRuntime(descriptor=self.descriptor, telemetry_sink=telemetry),
+        )
+
+        runner.accept(self.envelope, root_request_id="root-s1-t24", trace_id="trace-s1-t24")
+        planned = runner.plan(self.envelope, root_request_id="root-s1-t24", trace_id="trace-s1-t24")
+        runner.build(
+            self.envelope.job_id,
+            planned.payload,
+            root_request_id="root-s1-t24",
+            trace_id="trace-s1-t24",
+        )
+
+        spans = telemetry.spans(trace_id="trace-s1-t24")
+        span_names = [span.name for span in spans]
+        self.assertEqual(span_names, ["S1.accept", "S1.plan", "S1.exec.build", "S1.build"])
+        self.assertEqual(subagent.build_span_handle["span_name"], "S1.exec.build")
+        self.assertEqual(subagent.build_span_handle["trace_id"], "trace-s1-t24")
+        self.assertEqual(spans[2].attributes["author_span_name"], "build")
+        self.assertEqual(spans[2].attributes["job_id"], self.envelope.job_id)
+        summary = TraceAssembler(required_spans=("S1.accept", "S1.plan", "S1.exec.build", "S1.build")).assemble(
+            trace_id="trace-s1-t24",
+            spans=spans,
+        )
+        self.assertEqual(summary.status, "complete")
 
     def test_runner_auto_repairs_retryable_build_once_with_attempt_provenance(self) -> None:
         class RepairableBuildSubagent(ExampleSubagent):

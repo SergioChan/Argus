@@ -69,14 +69,11 @@ class C1WireService:
 
     def _register(self, body: dict[str, Any]) -> dict[str, Any]:
         requested_subagent_id = body.get("subagent_id")
-        if requested_subagent_id is not None and requested_subagent_id != self.descriptor.subagent_id:
-            raise ValueError(f"subagent_id {requested_subagent_id} does not match {self.descriptor.subagent_id}")
-        return {
-            "subagent_id": self.descriptor.subagent_id,
-            "contract_version": self.descriptor.contract_version,
-            "subtopics": list(self.descriptor.subtopics),
-            "required_adapters": list(self.descriptor.required_adapters),
-        }
+        return self.runtime.register(
+            subagent_id=requested_subagent_id,
+            root_request_id=_root_request_id(body, self.descriptor.subagent_id),
+            trace_id=_trace_id(body, self.descriptor.subagent_id),
+        )
 
     def _accept(self, body: dict[str, Any]) -> dict[str, Any]:
         envelope_payload = _job_envelope_payload(body)
@@ -100,6 +97,13 @@ class C1WireService:
             root_request_id=_root_request_id(body, job_id),
             trace_id=_trace_id(body, job_id),
         )
+        self.runtime._record_method_span(
+            method,
+            job_id=job_id,
+            root_request_id=_root_request_id(body, job_id),
+            trace_id=_trace_id(body, job_id),
+            attributes={"state": event.to_state.value},
+        )
         return lifecycle_event_wire_payload(event)
 
     def _cancel(self, body: dict[str, Any]) -> dict[str, Any]:
@@ -122,7 +126,11 @@ class C1WireService:
     def _heartbeat(self, body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
         job_id = _required_string(body, "job_id")
         try:
-            heartbeat = self.runtime.heartbeat(job_id)
+            heartbeat = self.runtime.heartbeat(
+                job_id,
+                root_request_id=_root_request_id(body, job_id),
+                trace_id=_trace_id(body, job_id),
+            )
         except KeyError:
             return 404, {"error": _error_payload("JOB_NOT_FOUND", "NOT_FOUND", f"unknown job {job_id}")}
         return 200, heartbeat.as_c1_payload()

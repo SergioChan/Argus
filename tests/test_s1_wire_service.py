@@ -9,7 +9,13 @@ from uuid import UUID
 import grpc
 from jsonschema import Draft202012Validator
 
-from argus_core import LifecycleState, SubagentDescriptor, SubagentRuntime
+from argus_core import (
+    InMemoryS1EventBus,
+    InMemoryS1TelemetrySink,
+    LifecycleState,
+    SubagentDescriptor,
+    SubagentRuntime,
+)
 from argus_core.s1 import S1_LIFECYCLE_LEDGER_KIND
 from argus_runtime.http_json import JsonRequest
 from argus_runtime.s1_wire_service import C1_GRPC_SERVICE, C1WireService, build_s1_grpc_server, build_s1_http_app
@@ -188,6 +194,61 @@ class S1WireServiceHttpTests(unittest.TestCase):
         errors = sorted(self.c1_validator.iter_errors(payload), key=lambda error: list(error.path))
         self.assertEqual(errors, [], msg=[error.message for error in errors])
         self.assertEqual([event.method for event in self.runtime.store.events(self.job_id)], ["accept", "plan", "build"])
+
+    def test_http_methods_emit_s1_spans_and_nats_style_events(self) -> None:
+        event_bus = InMemoryS1EventBus()
+        telemetry = InMemoryS1TelemetrySink()
+        runtime = SubagentRuntime(
+            descriptor=SubagentDescriptor(
+                subagent_id="subagent-wire-observed",
+                contract_version="1.0.0",
+                subtopics=("ewpt",),
+                required_adapters=("adapter:bounce",),
+            ),
+            event_bus=event_bus,
+            telemetry_sink=telemetry,
+        )
+        app = build_s1_http_app(C1WireService(runtime))
+
+        register_status, register_payload = app.handle(
+            JsonRequest(
+                method="POST",
+                path="/v1/subagents/subagent-wire-observed/register",
+                query={},
+                body={"root_request_id": self.root_request_id, "trace_id": self.trace_id},
+            )
+        )
+        accept_status, _accept_payload = app.handle(
+            JsonRequest(
+                method="POST",
+                path=f"/v1/jobs/{self.job_id}/accept",
+                query={},
+                body={
+                    "root_request_id": self.root_request_id,
+                    "trace_id": self.trace_id,
+                    "job_envelope": self._job_envelope_payload(),
+                },
+            )
+        )
+        heartbeat_status, _heartbeat_payload = app.handle(
+            JsonRequest(
+                method="GET",
+                path=f"/v1/jobs/{self.job_id}/heartbeat",
+                query={"trace_id": [self.trace_id], "root_request_id": [self.root_request_id]},
+                body=None,
+            )
+        )
+
+        self.assertEqual(register_status, 200)
+        self.assertEqual(accept_status, 200)
+        self.assertEqual(heartbeat_status, 200)
+        self.assertEqual(register_payload["subagent_id"], "subagent-wire-observed")
+        self.assertEqual([span.name for span in telemetry.spans(trace_id=self.trace_id)], ["S1.register", "S1.accept", "S1.heartbeat"])
+        self.assertEqual(event_bus.subscribe("s1.subagent.registered")[0].payload["subagent_id"], "subagent-wire-observed")
+        transition = event_bus.subscribe("s1.lifecycle.transition")[0]
+        self.assertEqual(transition.payload["method"], "accept")
+        self.assertEqual(transition.payload["trace_id"], self.trace_id)
+        self.assertEqual(transition.payload["root_request_id"], self.root_request_id)
 
     def _accept_job(self) -> None:
         status, payload = self.app.handle(

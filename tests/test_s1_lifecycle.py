@@ -14,6 +14,8 @@ from argus_core import (
     IdempotencyRecord,
     InMemoryIdempotencyStore,
     InMemoryArtifactStore,
+    InMemoryS1EventBus,
+    InMemoryS1TelemetrySink,
     InMemoryVerifierTrustStore,
     JobEnvelope,
     LEGAL_TRANSITIONS,
@@ -236,6 +238,114 @@ class S1LifecycleStoreTests(unittest.TestCase):
         self.assertEqual(planned_payload["idempotency_key"], planned.idempotency_key)
         self.assertEqual(planned_payload["payload_hash"], planned.payload_hash)
         self.assertTrue(artifacts.verify_audit_chain().valid)
+
+    def test_lifecycle_store_publishes_nats_style_transition_events(self) -> None:
+        artifacts = InMemoryArtifactStore()
+        event_bus = InMemoryS1EventBus()
+        store = LifecycleStore(artifact_store=artifacts, event_bus=event_bus)
+        store.create_job("job-1")
+
+        accepted = store.apply_method(
+            "job-1",
+            "accept",
+            trigger="S5",
+            payload={"accepted": True},
+            root_request_id="root-1",
+            trace_id="trace-s1-t24",
+        )
+        planned = store.apply_method(
+            "job-1",
+            "plan",
+            trigger="internal",
+            payload={"step": "inspect"},
+            root_request_id="root-1",
+            trace_id="trace-s1-t24",
+        )
+
+        transition_events = event_bus.subscribe("s1.lifecycle.transition")
+        self.assertEqual([event.payload["method"] for event in transition_events], ["accept", "plan"])
+        self.assertEqual([event.payload["event_id"] for event in transition_events], [accepted.event_id, planned.event_id])
+        self.assertEqual(transition_events[0].payload["from_state"], "REGISTERED")
+        self.assertEqual(transition_events[0].payload["to_state"], "ACCEPTED")
+        self.assertEqual(transition_events[1].payload["seq"], 2)
+        self.assertEqual(transition_events[1].payload["ledger_ref"], planned.ledger_ref)
+        self.assertEqual(transition_events[1].payload["root_request_id"], "root-1")
+        self.assertEqual(transition_events[1].payload["trace_id"], "trace-s1-t24")
+
+    def test_runtime_publishes_register_refusal_and_quarantine_domain_events(self) -> None:
+        event_bus = InMemoryS1EventBus()
+        runtime = SubagentRuntime(descriptor=_test_descriptor(), event_bus=event_bus)
+
+        registration = runtime.register(root_request_id="root-register", trace_id="trace-register")
+        refused = runtime.accept(
+            JobEnvelope(
+                job_id="11111111-1111-4111-8111-111111111111",
+                envelope_version="1.0.0",
+                subtopic="ewpt",
+                required_adapters=("adapter:bounce",),
+                allowed_adapters=("adapter:bounce",),
+                verifier_profile_ref=None,
+                estimated_cost=0.5,
+                budget_cost=1.0,
+            ),
+            root_request_id="root-refuse",
+            trace_id="trace-refuse",
+        )
+        runtime.store.create_job("22222222-2222-4222-8222-222222222222")
+        runtime.store.apply_method("22222222-2222-4222-8222-222222222222", "accept")
+        runtime.store.apply_method("22222222-2222-4222-8222-222222222222", "plan")
+        quarantine_error = build_error_envelope(
+            category="SANDBOX",
+            code="DIRECT_IN_PROCESS_EXEC_FORBIDDEN",
+            message="direct exec attempted",
+        )
+        quarantined = runtime.quarantine(
+            "22222222-2222-4222-8222-222222222222",
+            error=quarantine_error,
+            root_request_id="root-quarantine",
+            trace_id="trace-quarantine",
+        )
+
+        registered_events = event_bus.subscribe("s1.subagent.registered")
+        refused_events = event_bus.subscribe("s1.job.refused")
+        quarantine_events = event_bus.subscribe("s1.job.quarantined")
+        self.assertEqual(registration["subagent_id"], _test_descriptor().subagent_id)
+        self.assertEqual(registered_events[0].payload["subagent_id"], _test_descriptor().subagent_id)
+        self.assertFalse(refused.accepted)
+        self.assertEqual(refused_events[0].payload["reason"], "NO_VERIFIER")
+        self.assertEqual(refused_events[0].payload["job_id"], refused.job_id)
+        self.assertEqual(quarantine_events[0].payload["job_id"], quarantined.job_id)
+        self.assertEqual(quarantine_events[0].payload["error"]["code"], "DIRECT_IN_PROCESS_EXEC_FORBIDDEN")
+
+    def test_runtime_records_s11_compatible_method_spans(self) -> None:
+        telemetry = InMemoryS1TelemetrySink()
+        runtime = SubagentRuntime(descriptor=_test_descriptor(), telemetry_sink=telemetry)
+        job_id = "33333333-3333-4333-8333-333333333333"
+        runtime.store.create_job(job_id)
+
+        runtime.accept(
+            JobEnvelope(
+                job_id=job_id,
+                envelope_version="1.0.0",
+                subtopic="ewpt",
+                required_adapters=("adapter:bounce",),
+                allowed_adapters=("adapter:bounce",),
+                verifier_profile_ref="c4://profile/ewpt/v1",
+                estimated_cost=0.5,
+                budget_cost=1.0,
+            ),
+            root_request_id="root-span",
+            trace_id="trace-span",
+        )
+        runtime.heartbeat(job_id, root_request_id="root-span", trace_id="trace-span")
+
+        spans = telemetry.spans(trace_id="trace-span")
+        self.assertEqual([span.name for span in spans], ["S1.accept", "S1.heartbeat"])
+        self.assertEqual([span.subsystem for span in spans], ["S1", "S1"])
+        self.assertEqual(spans[0].attributes["job_id"], job_id)
+        self.assertEqual(spans[0].attributes["root_request_id"], "root-span")
+        self.assertEqual(spans[0].attributes["method"], "accept")
+        self.assertEqual(spans[1].attributes["state"], "ACCEPTED")
 
     def test_lifecycle_method_idempotency_returns_stored_event_without_new_side_effects(self) -> None:
         artifacts = InMemoryArtifactStore()

@@ -410,6 +410,105 @@ class HeartbeatStatus:
 
 
 @dataclass(frozen=True)
+class S1LifecycleBusEvent:
+    subject: str
+    event_id: str
+    trace_id: str
+    root_request_id: str
+    payload: dict[str, Any]
+    occurred_at: str
+
+
+@dataclass(frozen=True)
+class S1TelemetrySpan:
+    trace_id: str
+    span_id: str
+    name: str
+    subsystem: str
+    attributes: dict[str, Any]
+
+
+class InMemoryS1EventBus:
+    """Deterministic NATS-style event bus for S1 local tests and mock consumers."""
+
+    def __init__(self) -> None:
+        self._events: list[S1LifecycleBusEvent] = []
+
+    def publish(
+        self,
+        subject: str,
+        payload: Mapping[str, Any],
+        *,
+        event_id: str | None = None,
+        trace_id: str | None = None,
+        root_request_id: str | None = None,
+    ) -> S1LifecycleBusEvent:
+        normalized_payload = dict(_json_compatible_payload(payload))
+        resolved_trace_id = _event_trace_id(normalized_payload, trace_id)
+        resolved_root_request_id = _event_root_request_id(normalized_payload, root_request_id)
+        resolved_event_id = event_id or _derive_s1_bus_event_id(
+            subject=subject,
+            payload=normalized_payload,
+            index=len(self._events) + 1,
+        )
+        event = S1LifecycleBusEvent(
+            subject=subject,
+            event_id=resolved_event_id,
+            trace_id=resolved_trace_id,
+            root_request_id=resolved_root_request_id,
+            payload=normalized_payload,
+            occurred_at=_utc_now_s1(),
+        )
+        self._events.append(event)
+        return event
+
+    def subscribe(self, subject: str) -> tuple[S1LifecycleBusEvent, ...]:
+        return tuple(event for event in self._events if event.subject == subject)
+
+    def events(self, subject: str | None = None) -> tuple[S1LifecycleBusEvent, ...]:
+        if subject is None:
+            return tuple(self._events)
+        return self.subscribe(subject)
+
+
+class InMemoryS1TelemetrySink:
+    """S11-compatible in-memory span sink for S1 runtime and wire-method spans."""
+
+    def __init__(self) -> None:
+        self._spans: list[S1TelemetrySpan] = []
+
+    def record_span(
+        self,
+        name: str,
+        *,
+        trace_id: str,
+        attributes: Mapping[str, Any] | None = None,
+        span_id: str | None = None,
+    ) -> S1TelemetrySpan:
+        normalized_attributes = dict(_json_compatible_payload(attributes or {}))
+        resolved_span_id = span_id or _derive_s1_span_id(
+            trace_id=trace_id,
+            name=name,
+            attributes=normalized_attributes,
+            index=len(self._spans) + 1,
+        )
+        span = S1TelemetrySpan(
+            trace_id=trace_id,
+            span_id=resolved_span_id,
+            name=name,
+            subsystem="S1",
+            attributes=normalized_attributes,
+        )
+        self._spans.append(span)
+        return span
+
+    def spans(self, trace_id: str | None = None) -> tuple[S1TelemetrySpan, ...]:
+        if trace_id is None:
+            return tuple(self._spans)
+        return tuple(span for span in self._spans if span.trace_id == trace_id)
+
+
+@dataclass(frozen=True)
 class S10SandboxMarshaler:
     launcher: Any
 
@@ -798,6 +897,10 @@ class ExecContext:
     _heartbeat_recorder: Any = field(init=False, repr=False, compare=False)
     _sandbox_result_recorder: Any = field(init=False, repr=False, compare=False)
     _cancel_checker: Any = field(init=False, repr=False, compare=False)
+    _trace_id: str | None = field(init=False, repr=False, compare=False)
+    _root_request_id: str | None = field(init=False, repr=False, compare=False)
+    _telemetry_sink: InMemoryS1TelemetrySink | None = field(init=False, repr=False, compare=False)
+    _event_bus: InMemoryS1EventBus | None = field(init=False, repr=False, compare=False)
 
     def __init__(
         self,
@@ -814,6 +917,10 @@ class ExecContext:
         heartbeat_recorder: Any | None = None,
         sandbox_result_recorder: Any | None = None,
         cancel_checker: Any | None = None,
+        trace_id: str | None = None,
+        root_request_id: str | None = None,
+        telemetry_sink: InMemoryS1TelemetrySink | None = None,
+        event_bus: InMemoryS1EventBus | None = None,
     ) -> None:
         capabilities = tuple(dict.fromkeys(capabilities))
         unknown = tuple(capability for capability in capabilities if capability not in _EXEC_CONTEXT_CAPABILITY_SET)
@@ -840,6 +947,10 @@ class ExecContext:
         object.__setattr__(self, "_heartbeat_recorder", heartbeat_recorder)
         object.__setattr__(self, "_sandbox_result_recorder", sandbox_result_recorder)
         object.__setattr__(self, "_cancel_checker", cancel_checker)
+        object.__setattr__(self, "_trace_id", trace_id)
+        object.__setattr__(self, "_root_request_id", root_request_id)
+        object.__setattr__(self, "_telemetry_sink", telemetry_sink)
+        object.__setattr__(self, "_event_bus", event_bus)
 
     def capability_methods(self) -> tuple[str, ...]:
         return self.capabilities
@@ -943,7 +1054,7 @@ class ExecContext:
             )
         except S8Error as exc:
             _raise_c4_write_error(exc)
-        return {
+        handle = {
             "capability": "emit_artifact",
             "job_id": self.job_id,
             "artifact_ref": record.artifact_ref,
@@ -952,6 +1063,23 @@ class ExecContext:
             "claim_tier": record.claim_tier,
             "validation_report_ref": record.validation_report_ref,
         }
+        if self._event_bus is not None:
+            self._event_bus.publish(
+                "s1.artifact.emitted",
+                {
+                    "job_id": self.job_id,
+                    "artifact_ref": record.artifact_ref,
+                    "kind": record.kind,
+                    "content_hash": record.content_hash,
+                    "claim_tier": record.claim_tier,
+                    "validation_report_ref": record.validation_report_ref,
+                    "root_request_id": self._root_request_id or self.job_id,
+                    "trace_id": self._trace_id or f"trace:{self.job_id}",
+                },
+                trace_id=self._trace_id,
+                root_request_id=self._root_request_id,
+            )
+        return handle
 
     def _artifact_lineage(
         self,
@@ -1069,8 +1197,30 @@ class ExecContext:
 
     def span(self, name: str, *, attributes: Mapping[str, Any] | None = None) -> dict[str, Any]:
         self._require_capability("span")
-        payload = {"name": name, "attributes": dict(attributes or {})}
-        return {"capability": "span", "job_id": self.job_id, "span_hash": hash_json(payload)}
+        normalized_attributes = dict(attributes or {})
+        payload = {"name": name, "attributes": normalized_attributes}
+        span_name = f"S1.exec.{name}"
+        trace_id = self._trace_id or f"trace:{self.job_id}"
+        handle: dict[str, Any] = {
+            "capability": "span",
+            "job_id": self.job_id,
+            "span_hash": hash_json(payload),
+            "span_name": span_name,
+            "trace_id": trace_id,
+        }
+        if self._telemetry_sink is not None:
+            recorded = self._telemetry_sink.record_span(
+                span_name,
+                trace_id=trace_id,
+                attributes={
+                    **normalized_attributes,
+                    "author_span_name": name,
+                    "job_id": self.job_id,
+                    "root_request_id": self._root_request_id or self.job_id,
+                },
+            )
+            handle["span_id"] = recorded.span_id
+        return handle
 
     def tag_uncertainty(self, representation: str, value: Mapping[str, Any] | None = None) -> dict[str, Any]:
         return tag_uncertainty(representation, value)
@@ -2494,6 +2644,7 @@ class LifecycleStore:
         *,
         artifact_store: InMemoryArtifactStore | None = None,
         idempotency_store: InMemoryIdempotencyStore | None = None,
+        event_bus: InMemoryS1EventBus | None = None,
         ledger_producer: Producer | None = None,
         ledger_code_ref: str = S1_LIFECYCLE_LEDGER_CODE_REF,
         ledger_environment_digest: str = S1_LIFECYCLE_LEDGER_ENVIRONMENT_DIGEST,
@@ -2502,6 +2653,7 @@ class LifecycleStore:
         self._current: dict[str, JobCurrent] = {}
         self._artifact_store = artifact_store
         self._idempotency_store = idempotency_store or InMemoryIdempotencyStore()
+        self._event_bus = event_bus
         self._ledger_producer = ledger_producer or Producer(
             subsystem="S1",
             version="0.0.0",
@@ -2517,6 +2669,7 @@ class LifecycleStore:
         *,
         artifact_store: InMemoryArtifactStore | None = None,
         idempotency_store: InMemoryIdempotencyStore | None = None,
+        event_bus: InMemoryS1EventBus | None = None,
         ledger_producer: Producer | None = None,
         ledger_code_ref: str = S1_LIFECYCLE_LEDGER_CODE_REF,
         ledger_environment_digest: str = S1_LIFECYCLE_LEDGER_ENVIRONMENT_DIGEST,
@@ -2524,6 +2677,7 @@ class LifecycleStore:
         store = cls(
             artifact_store=artifact_store,
             idempotency_store=idempotency_store,
+            event_bus=event_bus,
             ledger_producer=ledger_producer,
             ledger_code_ref=ledger_code_ref,
             ledger_environment_digest=ledger_environment_digest,
@@ -2630,6 +2784,7 @@ class LifecycleStore:
         self._events[job_id].append(event)
         self._current[job_id] = JobCurrent(job_id=job_id, state=to_state, last_sequence=event.sequence)
         self._record_event_idempotency(event)
+        self._publish_transition_event(event)
         return event
 
     def current(self, job_id: str) -> JobCurrent:
@@ -2659,6 +2814,10 @@ class LifecycleStore:
     @property
     def artifact_store(self) -> InMemoryArtifactStore | None:
         return self._artifact_store
+
+    @property
+    def event_bus(self) -> InMemoryS1EventBus | None:
+        return self._event_bus
 
     def idempotency_records(self, job_id: str | None = None) -> tuple[IdempotencyRecord, ...]:
         return self._idempotency_store.records(job_id)
@@ -2699,6 +2858,17 @@ class LifecycleStore:
             response=event,
         )
 
+    def _publish_transition_event(self, event: LifecycleEvent) -> None:
+        if self._event_bus is None:
+            return
+        self._event_bus.publish(
+            "s1.lifecycle.transition",
+            _lifecycle_event_bus_payload(event),
+            event_id=event.event_id,
+            trace_id=event.trace_id,
+            root_request_id=event.root_request_id,
+        )
+
     @staticmethod
     def _assert_legal_transition(from_state: LifecycleState, to_state: LifecycleState, method: str) -> None:
         if to_state not in LEGAL_TRANSITIONS[from_state]:
@@ -2727,11 +2897,15 @@ class SubagentRuntime:
         store_egress_rule: EgressRule = S1_CONTENT_STORE_EGRESS_RULE,
         max_build_repair_attempts: int = 0,
         build_repair_hook: Any | None = None,
+        event_bus: InMemoryS1EventBus | None = None,
+        telemetry_sink: InMemoryS1TelemetrySink | None = None,
     ) -> None:
         if max_build_repair_attempts < 0:
             raise ValueError("max_build_repair_attempts cannot be negative")
         self.descriptor = descriptor
         self.idempotency_store = idempotency_store or InMemoryIdempotencyStore()
+        self.event_bus = event_bus or (store.event_bus if store is not None else None)
+        self.telemetry_sink = telemetry_sink
         self.sandbox_marshaler = sandbox_marshaler
         self.adapter_client = adapter_client
         self.adapter_egress_allowlist = _normalize_adapter_egress_mapping(adapter_egress_allowlist or {})
@@ -2743,12 +2917,15 @@ class SubagentRuntime:
             if artifact_store is not None:
                 raise ValueError("artifact_store cannot be provided with an explicit LifecycleStore")
             self.store = store
+            if self.event_bus is not None and store.event_bus is None:
+                store._event_bus = self.event_bus
             self.artifact_store = store.artifact_store
         else:
             self.artifact_store = artifact_store if artifact_store is not None else InMemoryArtifactStore()
             self.store = LifecycleStore(
                 artifact_store=self.artifact_store,
                 idempotency_store=self.idempotency_store,
+                event_bus=self.event_bus,
             )
         self.gate_invocations = 0
         self._heartbeats: dict[str, HeartbeatStatus] = {}
@@ -2756,6 +2933,39 @@ class SubagentRuntime:
         self._active_sandboxes: dict[str, dict[str, dict[str, Any]]] = {}
         self._cancel_events: dict[str, LifecycleEvent] = {}
         self._quarantine_events: dict[str, LifecycleEvent] = {}
+
+    def register(
+        self,
+        *,
+        subagent_id: str | None = None,
+        root_request_id: str | None = None,
+        trace_id: str | None = None,
+    ) -> dict[str, Any]:
+        if subagent_id is not None and subagent_id != self.descriptor.subagent_id:
+            raise ValueError(f"subagent_id {subagent_id} does not match {self.descriptor.subagent_id}")
+        payload: dict[str, Any] = {
+            "subagent_id": self.descriptor.subagent_id,
+            "contract_version": self.descriptor.contract_version,
+            "subtopics": list(self.descriptor.subtopics),
+            "required_adapters": list(self.descriptor.required_adapters),
+        }
+        self._record_method_span(
+            "register",
+            root_request_id=root_request_id or self.descriptor.subagent_id,
+            trace_id=trace_id or f"trace:{self.descriptor.subagent_id}",
+            attributes={"status": "ok"},
+        )
+        self._publish_domain_event(
+            "s1.subagent.registered",
+            {
+                **payload,
+                "root_request_id": root_request_id or self.descriptor.subagent_id,
+                "trace_id": trace_id or f"trace:{self.descriptor.subagent_id}",
+            },
+            root_request_id=root_request_id or self.descriptor.subagent_id,
+            trace_id=trace_id or f"trace:{self.descriptor.subagent_id}",
+        )
+        return payload
 
     def accept(
         self,
@@ -2774,19 +2984,64 @@ class SubagentRuntime:
             request_hash=request_hash,
         )
         if existing is not None:
+            self._record_method_span(
+                "accept",
+                job_id=envelope.job_id,
+                root_request_id=root_request_id or envelope.job_id,
+                trace_id=trace_id or f"trace:{envelope.job_id}",
+                attributes={
+                    "accepted": existing.response.accepted,
+                    "reason": existing.response.reason,
+                    "state": existing.response.state.value,
+                    "idempotent": True,
+                },
+            )
             return existing.response
 
         self.gate_invocations += 1
         self.store.create_job(envelope.job_id)
         acceptance = default_accept(self.descriptor, envelope, idempotency_key=resolved_idempotency_key)
+        transition_payload = {
+            "accepted": acceptance.accepted,
+            "reason": acceptance.reason,
+            "state": acceptance.state.value,
+            "estimated_cost": acceptance.estimated_cost,
+        }
         self.store.apply_method(
             envelope.job_id,
             "accept" if acceptance.accepted else "refuse",
             trigger="S5",
+            payload=transition_payload,
             idempotency_key=resolved_idempotency_key,
             root_request_id=root_request_id,
             trace_id=trace_id,
         )
+        self._record_method_span(
+            "accept",
+            job_id=envelope.job_id,
+            root_request_id=root_request_id or envelope.job_id,
+            trace_id=trace_id or f"trace:{envelope.job_id}",
+            attributes={
+                "accepted": acceptance.accepted,
+                "reason": acceptance.reason,
+                "state": acceptance.state.value,
+                "idempotent": False,
+            },
+        )
+        if not acceptance.accepted:
+            self._publish_domain_event(
+                "s1.job.refused",
+                {
+                    "job_id": envelope.job_id,
+                    "reason": acceptance.reason,
+                    "state": acceptance.state.value,
+                    "idempotency_key": acceptance.idempotency_key,
+                    "root_request_id": root_request_id or envelope.job_id,
+                    "trace_id": trace_id or f"trace:{envelope.job_id}",
+                },
+                root_request_id=root_request_id or envelope.job_id,
+                trace_id=trace_id or f"trace:{envelope.job_id}",
+            )
         self.idempotency_store.record(
             job_id=envelope.job_id,
             method="accept",
@@ -2819,18 +3074,35 @@ class SubagentRuntime:
         self._heartbeats[job_id] = heartbeat
         return heartbeat
 
-    def heartbeat(self, job_id: str) -> HeartbeatStatus:
+    def heartbeat(
+        self,
+        job_id: str,
+        *,
+        root_request_id: str | None = None,
+        trace_id: str | None = None,
+    ) -> HeartbeatStatus:
         current = self.store.current(job_id)
         heartbeat = self._heartbeats.get(job_id)
         if heartbeat is None:
-            return HeartbeatStatus(
+            heartbeat = HeartbeatStatus(
                 job_id=job_id,
                 status=current.state,
                 progress=1.0 if current.state in TERMINAL_STATES else 0.0,
                 spend_so_far={"cost_usd": 0.0},
                 last_heartbeat_at=_utc_now_s1(),
             )
-        return replace(heartbeat, status=current.state)
+        heartbeat = replace(heartbeat, status=current.state)
+        self._record_method_span(
+            "heartbeat",
+            job_id=job_id,
+            root_request_id=root_request_id or job_id,
+            trace_id=trace_id or f"trace:{job_id}",
+            attributes={
+                "state": heartbeat.status.value,
+                "progress": heartbeat.progress,
+            },
+        )
+        return heartbeat
 
     def register_sandbox_result(self, job_id: str, result: Mapping[str, Any]) -> None:
         sandbox_id = result.get("sandbox_id")
@@ -2852,6 +3124,13 @@ class SubagentRuntime:
         trace_id: str | None = None,
     ) -> LifecycleEvent:
         if job_id in self._cancel_events and idempotency_key is None:
+            self._record_method_span(
+                "cancel",
+                job_id=job_id,
+                root_request_id=root_request_id or job_id,
+                trace_id=trace_id or f"trace:{job_id}",
+                attributes={"state": self._cancel_events[job_id].to_state.value, "idempotent": True},
+            )
             return self._cancel_events[job_id]
         normalized_grace_seconds = _normalize_cancel_grace_seconds(grace_seconds)
         self._cancel_flags.add(job_id)
@@ -2882,6 +3161,13 @@ class SubagentRuntime:
         )
         self._cancel_events[job_id] = event
         self._active_sandboxes.pop(job_id, None)
+        self._record_method_span(
+            "cancel",
+            job_id=job_id,
+            root_request_id=root_request_id or job_id,
+            trace_id=trace_id or f"trace:{job_id}",
+            attributes={"state": event.to_state.value, "idempotent": False},
+        )
         return event
 
     def _cancel_active_sandbox(
@@ -2925,6 +3211,13 @@ class SubagentRuntime:
         trace_id: str | None = None,
     ) -> LifecycleEvent:
         if job_id in self._quarantine_events and idempotency_key is None:
+            self._record_method_span(
+                "quarantine",
+                job_id=job_id,
+                root_request_id=root_request_id or job_id,
+                trace_id=trace_id or f"trace:{job_id}",
+                attributes={"state": self._quarantine_events[job_id].to_state.value, "idempotent": True},
+            )
             return self._quarantine_events[job_id]
         if not error.behavior.quarantine:
             raise LifecyclePolicyError(
@@ -2966,7 +3259,80 @@ class SubagentRuntime:
         )
         self._quarantine_events[job_id] = event
         self._active_sandboxes.pop(job_id, None)
+        self._record_method_span(
+            "quarantine",
+            job_id=job_id,
+            root_request_id=root_request_id or job_id,
+            trace_id=trace_id or f"trace:{job_id}",
+            attributes={
+                "state": event.to_state.value,
+                "category": error.category,
+                "code": error.code,
+                "idempotent": False,
+            },
+        )
+        self._publish_domain_event(
+            "s1.job.quarantined",
+            {
+                "job_id": job_id,
+                "reason": resolved_reason,
+                "state": event.to_state.value,
+                "error": error_payload,
+                "root_request_id": root_request_id or job_id,
+                "trace_id": trace_id or f"trace:{job_id}",
+            },
+            root_request_id=root_request_id or job_id,
+            trace_id=trace_id or f"trace:{job_id}",
+        )
         return event
+
+    def _record_method_span(
+        self,
+        method: str,
+        *,
+        job_id: str | None = None,
+        root_request_id: str | None = None,
+        trace_id: str | None = None,
+        attributes: Mapping[str, Any] | None = None,
+    ) -> S1TelemetrySpan | None:
+        if self.telemetry_sink is None:
+            return None
+        resolved_trace_id = trace_id or (f"trace:{job_id}" if job_id is not None else f"trace:{self.descriptor.subagent_id}")
+        resolved_root_request_id = root_request_id or job_id or self.descriptor.subagent_id
+        span_attributes: dict[str, Any] = {
+            "method": method,
+            "root_request_id": resolved_root_request_id,
+            "subagent_id": self.descriptor.subagent_id,
+        }
+        if job_id is not None:
+            span_attributes["job_id"] = job_id
+            try:
+                span_attributes["state"] = self.store.current(job_id).state.value
+            except KeyError:
+                pass
+        span_attributes.update(dict(attributes or {}))
+        return self.telemetry_sink.record_span(
+            f"S1.{method}",
+            trace_id=resolved_trace_id,
+            attributes=span_attributes,
+        )
+
+    def _publish_domain_event(
+        self,
+        subject: str,
+        payload: Mapping[str, Any],
+        *,
+        root_request_id: str | None = None,
+        trace_id: str | None = None,
+    ) -> S1LifecycleBusEvent | None:
+        if self.event_bus is None:
+            return None
+        return self.event_bus.publish(
+            subject,
+            payload,
+            trace_id=trace_id,
+            root_request_id=root_request_id,
+        )
 
     def _quarantine_active_sandbox(
         self,
@@ -3044,8 +3410,19 @@ class SubagentSDKRunner:
         trace_id: str | None = None,
     ) -> SDKInvocationResult:
         self._assert_can_apply(envelope.job_id, "plan")
-        self._assert_no_direct_exec(envelope.job_id, "plan", self.subagent.plan)
-        ctx = self._exec_context(envelope.job_id, allowed_adapters=envelope.allowed_adapters)
+        self._assert_no_direct_exec(
+            envelope.job_id,
+            "plan",
+            self.subagent.plan,
+            root_request_id=root_request_id,
+            trace_id=trace_id,
+        )
+        ctx = self._exec_context(
+            envelope.job_id,
+            allowed_adapters=envelope.allowed_adapters,
+            root_request_id=root_request_id,
+            trace_id=trace_id,
+        )
         payload = _normalize_plan_payload(envelope, self.subagent.plan(ctx, envelope))
         event = self.runtime.store.apply_method(
             envelope.job_id,
@@ -3055,6 +3432,13 @@ class SubagentSDKRunner:
             idempotency_key=idempotency_key,
             root_request_id=root_request_id,
             trace_id=trace_id,
+        )
+        self.runtime._record_method_span(
+            "plan",
+            job_id=envelope.job_id,
+            root_request_id=root_request_id or envelope.job_id,
+            trace_id=trace_id or f"trace:{envelope.job_id}",
+            attributes={"state": event.to_state.value},
         )
         return SDKInvocationResult(event=event, payload=payload)
 
@@ -3068,7 +3452,13 @@ class SubagentSDKRunner:
         trace_id: str | None = None,
     ) -> SDKInvocationResult:
         self._assert_can_apply(job_id, "build")
-        self._assert_no_direct_exec(job_id, "build", self.subagent.build)
+        self._assert_no_direct_exec(
+            job_id,
+            "build",
+            self.subagent.build,
+            root_request_id=root_request_id,
+            trace_id=trace_id,
+        )
         plan_payload = _mapping_payload("plan", plan)
         repair_attempts: list[dict[str, Any]] = []
         current_plan = dict(plan_payload)
@@ -3077,6 +3467,8 @@ class SubagentSDKRunner:
                 job_id,
                 allowed_adapters=tuple(str(adapter) for adapter in current_plan.get("adapters_required", ())),
                 allowed_datasets=tuple(str(dataset) for dataset in current_plan.get("datasets_required", ())),
+                root_request_id=root_request_id,
+                trace_id=trace_id,
             )
             try:
                 payload = _normalize_build_payload(job_id, self.subagent.build(ctx, current_plan))
@@ -3131,6 +3523,13 @@ class SubagentSDKRunner:
             idempotency_key=idempotency_key,
             root_request_id=root_request_id,
             trace_id=trace_id,
+        )
+        self.runtime._record_method_span(
+            "build",
+            job_id=job_id,
+            root_request_id=root_request_id or job_id,
+            trace_id=trace_id or f"trace:{job_id}",
+            attributes={"state": event.to_state.value},
         )
         return SDKInvocationResult(event=event, payload=payload)
 
@@ -3204,6 +3603,8 @@ class SubagentSDKRunner:
             job_id,
             allowed_adapters=tuple(str(adapter) for adapter in plan_payload.get("adapters_required", ())),
             allowed_datasets=tuple(str(dataset) for dataset in plan_payload.get("datasets_required", ())),
+            root_request_id=root_request_id,
+            trace_id=trace_id,
         )
         attempt_payload = _build_repair_attempt_payload(
             job_id=job_id,
@@ -3266,6 +3667,13 @@ class SubagentSDKRunner:
             root_request_id=root_request_id,
             trace_id=trace_id,
         )
+        self.runtime._record_method_span(
+            "validate",
+            job_id=job_id,
+            root_request_id=root_request_id or job_id,
+            trace_id=trace_id or f"trace:{job_id}",
+            attributes={"state": event.to_state.value},
+        )
         return SDKInvocationResult(event=event, payload=payload)
 
     def report(
@@ -3293,6 +3701,13 @@ class SubagentSDKRunner:
             root_request_id=root_request_id,
             trace_id=trace_id,
         )
+        self.runtime._record_method_span(
+            "report",
+            job_id=job_id,
+            root_request_id=root_request_id or job_id,
+            trace_id=trace_id or f"trace:{job_id}",
+            attributes={"state": event.to_state.value},
+        )
         return SDKInvocationResult(event=event, payload=payload)
 
     def _exec_context(
@@ -3301,6 +3716,8 @@ class SubagentSDKRunner:
         *,
         allowed_adapters: tuple[str, ...] = (),
         allowed_datasets: tuple[str, ...] = (),
+        root_request_id: str | None = None,
+        trace_id: str | None = None,
     ) -> ExecContext:
         return ExecContext(
             job_id=job_id,
@@ -3314,9 +3731,21 @@ class SubagentSDKRunner:
             heartbeat_recorder=self.runtime.record_heartbeat,
             sandbox_result_recorder=self.runtime.register_sandbox_result,
             cancel_checker=self.runtime.cancel_requested,
+            trace_id=trace_id,
+            root_request_id=root_request_id,
+            telemetry_sink=self.runtime.telemetry_sink,
+            event_bus=self.runtime.event_bus,
         )
 
-    def _assert_no_direct_exec(self, job_id: str, method: str, hook: Any) -> None:
+    def _assert_no_direct_exec(
+        self,
+        job_id: str,
+        method: str,
+        hook: Any,
+        *,
+        root_request_id: str | None = None,
+        trace_id: str | None = None,
+    ) -> None:
         violations = _direct_exec_violations(method, hook)
         if not violations:
             return
@@ -3325,11 +3754,12 @@ class SubagentSDKRunner:
             code="DIRECT_IN_PROCESS_EXEC_FORBIDDEN",
             message=f"{method} hook contains forbidden direct in-process execution: {', '.join(violations)}",
         )
-        self.runtime.store.apply_method(
+        self.runtime.quarantine(
             job_id,
-            "quarantine",
-            trigger="S1 direct-exec guard",
-            payload={"error": envelope.as_c1_payload(), "violations": list(violations)},
+            error=envelope,
+            reason="S1 direct-exec guard",
+            root_request_id=root_request_id,
+            trace_id=trace_id,
         )
         raise LifecyclePolicyError(envelope)
 
@@ -3441,6 +3871,50 @@ def _lifecycle_event_ledger_payload(event: LifecycleEvent) -> dict[str, object]:
         "trace_id": event.trace_id,
         "idempotency_key": event.idempotency_key,
     }
+
+
+def _lifecycle_event_bus_payload(event: LifecycleEvent) -> dict[str, object]:
+    payload = _lifecycle_event_ledger_payload(event)
+    payload["ledger_ref"] = event.ledger_ref
+    return payload
+
+
+def _event_trace_id(payload: Mapping[str, Any], trace_id: str | None) -> str:
+    if trace_id:
+        return trace_id
+    payload_trace_id = payload.get("trace_id")
+    if isinstance(payload_trace_id, str) and payload_trace_id:
+        return payload_trace_id
+    payload_job_id = payload.get("job_id")
+    if isinstance(payload_job_id, str) and payload_job_id:
+        return f"trace:{payload_job_id}"
+    payload_subagent_id = payload.get("subagent_id")
+    if isinstance(payload_subagent_id, str) and payload_subagent_id:
+        return f"trace:{payload_subagent_id}"
+    return "trace:s1"
+
+
+def _event_root_request_id(payload: Mapping[str, Any], root_request_id: str | None) -> str:
+    if root_request_id:
+        return root_request_id
+    payload_root_request_id = payload.get("root_request_id")
+    if isinstance(payload_root_request_id, str) and payload_root_request_id:
+        return payload_root_request_id
+    payload_job_id = payload.get("job_id")
+    if isinstance(payload_job_id, str) and payload_job_id:
+        return payload_job_id
+    payload_subagent_id = payload.get("subagent_id")
+    if isinstance(payload_subagent_id, str) and payload_subagent_id:
+        return payload_subagent_id
+    return "s1"
+
+
+def _derive_s1_bus_event_id(*, subject: str, payload: Mapping[str, Any], index: int) -> str:
+    return str(uuid5(NAMESPACE_URL, f"argus:s1:event-bus:{subject}:{index}:{hash_json(payload)}"))
+
+
+def _derive_s1_span_id(*, trace_id: str, name: str, attributes: Mapping[str, Any], index: int) -> str:
+    return str(uuid5(NAMESPACE_URL, f"argus:s1:span:{trace_id}:{name}:{index}:{hash_json(attributes)}"))
 
 
 def _default_accept_idempotency_key(job_id: str) -> str:
