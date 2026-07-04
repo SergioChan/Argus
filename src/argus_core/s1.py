@@ -14,7 +14,14 @@ from uuid import NAMESPACE_URL, uuid5
 from argusverify import C3ReportVerifier
 from .hashing import hash_json
 from .s10 import EgressRule, LaunchRequest, S10Error, SandboxExecutionResult, SandboxHandle
-from .s8 import ArtifactRecord, InMemoryArtifactStore, Lineage, Producer
+from .s8 import (
+    ArtifactRecord,
+    InMemoryArtifactStore,
+    Lineage,
+    Producer,
+    S8Error,
+    assert_lineage_complete,
+)
 
 
 ERROR_CATEGORIES = frozenset(
@@ -453,31 +460,98 @@ class ExecContext:
         result = self._sandbox_marshaler.submit_sandbox_job(job_id=self.job_id, spec=spec)
         return _normalize_sandbox_result(self.job_id, result)
 
-    def emit_artifact(self, payload: Any, kind: str, lineage_inputs: tuple[str, ...]) -> dict[str, Any]:
+    def emit_artifact(
+        self,
+        payload: Any,
+        kind: str,
+        lineage_inputs: tuple[str, ...] = (),
+        *,
+        lineage: Lineage | Mapping[str, Any] | None = None,
+        claim_tier: str = "ran-toy",
+        validation_report_ref: str | None = None,
+    ) -> dict[str, Any]:
         self._require_capability("emit_artifact")
-        record = self._artifact_store.create_artifact(
-            kind=kind,
+        resolved_lineage = self._artifact_lineage(
             payload=payload,
-            producer=Producer(
-                subsystem="s1",
-                version="exec-context-v1",
-                actor_id="subagent-runtime",
-                job_id=self.job_id,
-            ),
-            lineage=Lineage(
-                input_refs=tuple(lineage_inputs),
-                code_ref="argus-core:s1.exec_context.emit_artifact",
-                environment_digest="python:s1-exec-context:v1",
-                job_id=self.job_id,
-            ),
+            kind=kind,
+            lineage_inputs=lineage_inputs,
+            lineage=lineage,
+            claim_tier=claim_tier,
+            validation_report_ref=validation_report_ref,
         )
+        producer = Producer(
+            subsystem="s1",
+            version="exec-context-v1",
+            actor_id="subagent-runtime",
+            job_id=self.job_id,
+        )
+        try:
+            record = self._artifact_store.create_artifact(
+                kind=kind,
+                payload=payload,
+                producer=producer,
+                lineage=resolved_lineage,
+                claim_tier=claim_tier,
+                validation_report_ref=validation_report_ref,
+            )
+        except S8Error as exc:
+            _raise_c4_write_error(exc)
         return {
             "capability": "emit_artifact",
             "job_id": self.job_id,
             "artifact_ref": record.artifact_ref,
             "kind": record.kind,
             "content_hash": record.content_hash,
+            "claim_tier": record.claim_tier,
+            "validation_report_ref": record.validation_report_ref,
         }
+
+    def _artifact_lineage(
+        self,
+        *,
+        payload: Any,
+        kind: str,
+        lineage_inputs: tuple[str, ...],
+        lineage: Lineage | Mapping[str, Any] | None,
+        claim_tier: str,
+        validation_report_ref: str | None,
+    ) -> Lineage:
+        if lineage is not None and lineage_inputs:
+            raise LifecyclePolicyError(
+                build_error_envelope(
+                    category="POLICY",
+                    code="ARTIFACT_LINEAGE_CONFLICT",
+                    message="emit_artifact received both lineage and lineage_inputs",
+                )
+            )
+        if lineage is None:
+            resolved = Lineage(
+                input_refs=tuple(lineage_inputs),
+                code_ref="argus-core:s1.exec_context.emit_artifact",
+                environment_digest="python:s1-exec-context:v1",
+                job_id=self.job_id,
+            )
+        elif isinstance(lineage, Lineage):
+            resolved = lineage
+        elif isinstance(lineage, Mapping):
+            try:
+                assert_lineage_complete(
+                    lineage,
+                    kind=kind,
+                    payload=payload if isinstance(payload, Mapping) else None,
+                    claim_tier=claim_tier,
+                    validation_report_ref=validation_report_ref,
+                )
+            except S8Error as exc:
+                _raise_c4_write_error(exc)
+            resolved = _lineage_from_mapping(lineage)
+        else:
+            raise TypeError("lineage must be a Lineage or mapping")
+        return replace(
+            resolved,
+            actor_id=resolved.actor_id or "subagent-runtime",
+            job_id=self.job_id,
+        )
 
     def call_adapter(self, adapter_ref: str, request: dict[str, Any]) -> dict[str, Any]:
         self._require_capability("call_adapter")
@@ -569,6 +643,38 @@ class ExecContext:
                     + _format_egress_rules(missing_egress),
                 )
             )
+
+
+def _lineage_from_mapping(lineage: Mapping[str, Any]) -> Lineage:
+    values = dict(lineage)
+    return Lineage(
+        input_refs=tuple(str(ref) for ref in values.get("input_refs", ())),
+        code_ref=str(values.get("code_ref") or ""),
+        environment_digest=str(values.get("environment_digest") or ""),
+        seeds=tuple(str(seed) for seed in values.get("seeds", ())),
+        actor_id=_optional_str(values.get("actor_id")),
+        job_id=_optional_str(values.get("job_id")),
+        contamination_index_version=_optional_str(values.get("contamination_index_version")),
+    )
+
+
+def _optional_str(value: Any) -> str | None:
+    return None if value is None else str(value)
+
+
+def _raise_c4_write_error(exc: S8Error) -> None:
+    code = str(getattr(exc, "category", exc.__class__.__name__))
+    details = getattr(exc, "missing_fields", None)
+    message = str(exc)
+    if details:
+        message = f"{message}; missing_fields={', '.join(str(field) for field in details)}"
+    raise LifecyclePolicyError(
+        build_error_envelope(
+            category="POLICY",
+            code=code,
+            message=message,
+        )
+    ) from exc
 
 
 def _launch_request_from_sandbox_spec(job_id: str, spec: Mapping[str, Any]) -> LaunchRequest:

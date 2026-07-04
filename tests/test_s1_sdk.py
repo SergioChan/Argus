@@ -23,13 +23,16 @@ from argus_core import (
     LaunchRequest,
     LifecyclePolicyError,
     LifecycleState,
+    Lineage,
     PolicyBundle,
+    Producer,
     ResourceCeilings,
     ScopeGrant,
     Subagent,
     SubagentDescriptor,
     SubagentSDKRunner,
     SubagentRuntime,
+    hash_bytes,
 )
 from argus_core.s1 import S1_LIFECYCLE_LEDGER_KIND
 
@@ -233,6 +236,155 @@ class S1SDKBaseClassTests(unittest.TestCase):
 
         self.assertEqual(adapter_denied.exception.envelope.code, "EXEC_CONTEXT_CAPABILITY_DENIED")
         self.assertEqual(dataset_denied.exception.envelope.code, "EXEC_CONTEXT_CAPABILITY_DENIED")
+
+    def test_exec_context_emit_artifact_fails_closed_on_incomplete_lineage_without_commit(self) -> None:
+        artifacts = InMemoryArtifactStore()
+        ctx = ExecContext(job_id=self.envelope.job_id, artifact_store=artifacts)
+
+        with self.assertRaises(LifecyclePolicyError) as raised:
+            ctx.emit_artifact(
+                {"weights": [1]},
+                kind="model",
+                lineage=Lineage(
+                    input_refs=("c4://artifact/source",),
+                    code_ref="git:project-argus@deadbeef",
+                    environment_digest="",
+                    seeds=("seed-1",),
+                ),
+            )
+
+        self.assertEqual(raised.exception.envelope.code, "INCOMPLETE_LINEAGE")
+        self.assertEqual(raised.exception.envelope.category, "POLICY")
+        self.assertIn("lineage.environment_digest", raised.exception.envelope.message)
+        self.assertEqual(len(artifacts), 0)
+
+    def test_exec_context_emit_artifact_writes_complete_c4_lineage_to_store(self) -> None:
+        artifacts = InMemoryArtifactStore()
+        source = artifacts.create_artifact(
+            kind="dataset",
+            payload={"rows": [{"x": 1}]},
+            producer=Producer(subsystem="S6", version="test"),
+            lineage=Lineage(
+                input_refs=(),
+                code_ref="git:project-argus@source",
+                environment_digest="oci:dataset@sha256-source",
+                seeds=("seed-source",),
+            ),
+        )
+        ctx = ExecContext(job_id=self.envelope.job_id, artifact_store=artifacts)
+
+        result = ctx.emit_artifact(
+            {"weights": [1], "bias": 0.5},
+            kind="model",
+            lineage=Lineage(
+                input_refs=(source.artifact_ref,),
+                code_ref="git:project-argus@model",
+                environment_digest="oci:model@sha256-model",
+                seeds=("seed-model",),
+            ),
+        )
+        record = artifacts.get_record(str(result["artifact_ref"]))
+        payload_bytes = artifacts.get_artifact(record.artifact_ref)
+        lineage_graph = artifacts.get_lineage(record.artifact_ref, direction="ancestors")
+
+        self.assertEqual(result["capability"], "emit_artifact")
+        self.assertEqual(record.kind, "model")
+        self.assertEqual(record.content_hash, result["content_hash"])
+        self.assertEqual(hash_bytes(payload_bytes), record.content_hash)
+        self.assertEqual(record.producer.subsystem, "s1")
+        self.assertEqual(record.producer.job_id, self.envelope.job_id)
+        self.assertEqual(record.lineage.input_refs, (source.artifact_ref,))
+        self.assertEqual(record.lineage.job_id, self.envelope.job_id)
+        self.assertEqual(
+            {node.artifact_ref for node in lineage_graph.nodes},
+            {source.artifact_ref, record.artifact_ref},
+        )
+        self.assertEqual(
+            [(edge.source_ref, edge.target_ref) for edge in lineage_graph.edges],
+            [(source.artifact_ref, record.artifact_ref)],
+        )
+
+    def test_exec_context_emit_artifact_rejects_illegal_tier_without_commit(self) -> None:
+        artifacts = InMemoryArtifactStore()
+        ctx = ExecContext(job_id=self.envelope.job_id, artifact_store=artifacts)
+
+        with self.assertRaises(LifecyclePolicyError) as raised:
+            ctx.emit_artifact(
+                {"weights": [1]},
+                kind="model",
+                lineage=Lineage(
+                    input_refs=("c4://artifact/source",),
+                    code_ref="git:project-argus@tier",
+                    environment_digest="oci:model@sha256-tier",
+                    seeds=("seed-tier",),
+                ),
+                claim_tier="recapitulated-known",
+            )
+
+        self.assertEqual(raised.exception.envelope.code, "ILLEGAL_TIER")
+        self.assertEqual(raised.exception.envelope.category, "POLICY")
+        self.assertIn("validation_report_ref", raised.exception.envelope.message)
+        self.assertEqual(len(artifacts), 0)
+
+    def test_runner_author_build_emits_artifact_through_runtime_c4_store(self) -> None:
+        artifacts = InMemoryArtifactStore()
+        source = artifacts.create_artifact(
+            kind="dataset",
+            payload={"rows": [{"x": 2}]},
+            producer=Producer(subsystem="S6", version="test"),
+            lineage=Lineage(
+                input_refs=(),
+                code_ref="git:project-argus@source",
+                environment_digest="oci:dataset@sha256-source",
+                seeds=("seed-source",),
+            ),
+        )
+
+        class ArtifactBuildSubagent(Subagent):
+            def __init__(self, descriptor: SubagentDescriptor) -> None:
+                super().__init__(descriptor)
+                self.emitted_ref: str | None = None
+
+            def plan(self, ctx: ExecContext, envelope: JobEnvelope) -> dict[str, object]:
+                return {"datasets_required": [source.artifact_ref], "steps": []}
+
+            def build(self, ctx: ExecContext, plan: dict[str, object]) -> dict[str, object]:
+                result = ctx.emit_artifact(
+                    {"weights": [2], "bias": 0.25},
+                    kind="model",
+                    lineage=Lineage(
+                        input_refs=(source.artifact_ref,),
+                        code_ref="git:project-argus@author-build",
+                        environment_digest="oci:model@sha256-author-build",
+                        seeds=("seed-author-build",),
+                    ),
+                )
+                self.emitted_ref = str(result["artifact_ref"])
+                return {
+                    "artifact_refs": [self.emitted_ref],
+                    "diagnostics": {"content_hash": result["content_hash"]},
+                }
+
+        subagent = ArtifactBuildSubagent(self.descriptor)
+        runner = SubagentSDKRunner(
+            subagent,
+            runtime=SubagentRuntime(descriptor=self.descriptor, artifact_store=artifacts),
+        )
+
+        runner.accept(self.envelope)
+        planned = runner.plan(self.envelope)
+        built = runner.build(self.envelope.job_id, planned.payload)
+        record = artifacts.get_record(subagent.emitted_ref or "")
+        lineage_graph = artifacts.get_lineage(record.artifact_ref, direction="ancestors")
+
+        self.assertEqual(built.payload["artifact_refs"], [record.artifact_ref])
+        self.assertEqual(record.kind, "model")
+        self.assertEqual(record.producer.subsystem, "s1")
+        self.assertEqual(record.lineage.input_refs, (source.artifact_ref,))
+        self.assertEqual(
+            {node.artifact_ref for node in lineage_graph.nodes},
+            {source.artifact_ref, record.artifact_ref},
+        )
 
     def test_exec_context_submit_sandbox_job_fails_closed_without_s10_marshaler(self) -> None:
         ctx = ExecContext(job_id=self.envelope.job_id)
