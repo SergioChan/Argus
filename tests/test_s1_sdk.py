@@ -569,6 +569,26 @@ class S1SDKBaseClassTests(unittest.TestCase):
             [(source.artifact_ref, record.artifact_ref)],
         )
 
+    def test_exec_context_retains_empty_injected_artifact_store(self) -> None:
+        artifacts = InMemoryArtifactStore()
+        self.assertFalse(bool(artifacts))
+        ctx = ExecContext(job_id=self.envelope.job_id, artifact_store=artifacts)
+
+        result = ctx.emit_artifact(
+            {"weights": [1]},
+            kind="model",
+            lineage=Lineage(
+                input_refs=(),
+                code_ref="git:project-argus@empty-store",
+                environment_digest="oci:model@sha256-empty-store",
+                seeds=("seed-empty-store",),
+            ),
+        )
+
+        self.assertIs(ctx._artifact_store, artifacts)
+        self.assertEqual(len(artifacts), 1)
+        self.assertEqual(artifacts.get_record(str(result["artifact_ref"])).kind, "model")
+
     def test_exec_context_emit_artifact_rejects_promoted_tier_before_c4_commit(self) -> None:
         artifacts = InMemoryArtifactStore()
         ctx = ExecContext(job_id=self.envelope.job_id, artifact_store=artifacts)
@@ -650,6 +670,20 @@ class S1SDKBaseClassTests(unittest.TestCase):
             {node.artifact_ref for node in lineage_graph.nodes},
             {source.artifact_ref, record.artifact_ref},
         )
+
+    def test_subagent_runtime_retains_empty_injected_artifact_store(self) -> None:
+        artifacts = InMemoryArtifactStore()
+        self.assertFalse(bool(artifacts))
+        runtime = SubagentRuntime(descriptor=self.descriptor, artifact_store=artifacts)
+
+        acceptance = runtime.accept(self.envelope)
+        event = runtime.store.events(self.envelope.job_id)[0]
+
+        self.assertTrue(acceptance.accepted)
+        self.assertIs(runtime.artifact_store, artifacts)
+        self.assertIs(runtime.store.artifact_store, artifacts)
+        self.assertEqual(len(artifacts), 1)
+        self.assertEqual(artifacts.get_record(str(event.ledger_ref)).kind, S1_LIFECYCLE_LEDGER_KIND)
 
     def test_runner_plan_context_default_denies_empty_adapter_allowlist(self) -> None:
         class UndeclaredAdapterPlanSubagent(Subagent):

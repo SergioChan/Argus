@@ -699,7 +699,11 @@ class ExecContext:
         )
         _assert_egress_rule_valid(store_egress_rule, "content store")
         object.__setattr__(self, "_store_egress_rule", store_egress_rule)
-        object.__setattr__(self, "_artifact_store", artifact_store or InMemoryArtifactStore())
+        object.__setattr__(
+            self,
+            "_artifact_store",
+            artifact_store if artifact_store is not None else InMemoryArtifactStore(),
+        )
         object.__setattr__(self, "_sandbox_marshaler", sandbox_marshaler)
         object.__setattr__(self, "_adapter_client", adapter_client)
 
@@ -1746,7 +1750,7 @@ class SubagentRuntime:
             self.store = store
             self.artifact_store = store.artifact_store
         else:
-            self.artifact_store = artifact_store or InMemoryArtifactStore()
+            self.artifact_store = artifact_store if artifact_store is not None else InMemoryArtifactStore()
             self.store = LifecycleStore(
                 artifact_store=self.artifact_store,
                 idempotency_store=self.idempotency_store,
