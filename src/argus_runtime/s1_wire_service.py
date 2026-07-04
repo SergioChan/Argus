@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from concurrent import futures
 from dataclasses import asdict, is_dataclass
+from datetime import datetime, timezone
 import json
 from typing import Any, Callable
 
@@ -111,8 +112,7 @@ class C1WireService:
             "status": current.state.value,
             "progress": 1.0 if current.state in _TERMINAL_STATES else 0.0,
             "spend_so_far": {"cost_usd": 0.0},
-            "last_sequence": current.last_sequence,
-            "trace_id": _trace_id(body, job_id),
+            "last_heartbeat_at": _utc_now_c1(),
         }
 
 
@@ -333,6 +333,10 @@ def _jsonable(value: Any) -> Any:
     if isinstance(value, LifecycleState):
         return value.value
     return value
+
+
+def _utc_now_c1() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 _TERMINAL_STATES = {

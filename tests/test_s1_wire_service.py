@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime
 import json
 from pathlib import Path
 import unittest
@@ -142,8 +143,14 @@ class S1WireServiceHttpTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(payload["job_id"], self.job_id)
         self.assertEqual(payload["status"], "ACCEPTED")
-        self.assertEqual(payload["last_sequence"], 1)
-        self.assertEqual(payload["trace_id"], self.trace_id)
+        self.assertEqual(payload["progress"], 0.0)
+        self.assertEqual(payload["spend_so_far"], {"cost_usd": 0.0})
+        self.assertIn("last_heartbeat_at", payload)
+        datetime.fromisoformat(str(payload["last_heartbeat_at"]).replace("Z", "+00:00"))
+        self.assertNotIn("last_sequence", payload)
+        self.assertNotIn("trace_id", payload)
+        errors = sorted(self.c1_validator.iter_errors(payload), key=lambda error: list(error.path))
+        self.assertEqual(errors, [], msg=[error.message for error in errors])
         self.assertEqual(len(self.runtime.store.events(self.job_id)), 1)
 
     def _accept_job(self) -> None:
@@ -193,6 +200,7 @@ class S1WireServiceGrpcTests(unittest.TestCase):
             register = _grpc_method(channel, "Register")
             accept = _grpc_method(channel, "Accept")
             plan = _grpc_method(channel, "Plan")
+            heartbeat = _grpc_method(channel, "Heartbeat")
             job_id = "33333333-3333-4333-8333-333333333333"
             root_request_id = "44444444-4444-4444-8444-444444444444"
             trace_id = "trace-wire-grpc"
@@ -233,6 +241,16 @@ class S1WireServiceGrpcTests(unittest.TestCase):
             self.assertEqual(planned["root_request_id"], root_request_id)
             self.assertEqual(planned["trace_id"], trace_id)
             self.assertEqual(runtime.store.current(job_id).state, LifecycleState.PLANNING)
+
+            heartbeat_payload = heartbeat({"job_id": job_id, "trace_id": trace_id}, timeout=5)
+            self.assertEqual(heartbeat_payload["status"], "PLANNING")
+            self.assertIn("last_heartbeat_at", heartbeat_payload)
+            self.assertNotIn("last_sequence", heartbeat_payload)
+            self.assertNotIn("trace_id", heartbeat_payload)
+            schema_path = Path(__file__).resolve().parents[1] / "schemas" / "contracts" / "c1.subagent.schema.json"
+            c1_validator = Draft202012Validator(json.loads(schema_path.read_text(encoding="utf-8")))
+            errors = sorted(c1_validator.iter_errors(heartbeat_payload), key=lambda error: list(error.path))
+            self.assertEqual(errors, [], msg=[error.message for error in errors])
         finally:
             server.stop(0)
 
