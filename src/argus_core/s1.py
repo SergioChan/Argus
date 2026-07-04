@@ -469,7 +469,7 @@ class LifecycleStore:
         resolved_idempotency_key = idempotency_key or _derive_lifecycle_idempotency_key(
             job_id=job_id,
             method=method,
-            next_sequence=current.last_sequence + 1,
+            request_hash=request_hash,
         )
         existing = self._idempotency_store.resolve(
             job_id=job_id,
@@ -737,8 +737,8 @@ def _lifecycle_request_hash(
     )
 
 
-def _derive_lifecycle_idempotency_key(*, job_id: str, method: str, next_sequence: int) -> str:
-    return f"{method}:{job_id}:{next_sequence}"
+def _derive_lifecycle_idempotency_key(*, job_id: str, method: str, request_hash: str) -> str:
+    return f"{method}:{job_id}:{request_hash}"
 
 
 def _idempotency_response_hash(response: Any) -> str:

@@ -109,7 +109,12 @@ class S1LifecycleStoreTests(unittest.TestCase):
                 for method in METHOD_TARGETS:
                     with self.subTest(method=method):
                         with self.assertRaises(LifecyclePolicyError):
-                            store.apply_method("job-1", method)
+                            store.apply_method(
+                                "job-1",
+                                method,
+                                trigger="terminal-probe",
+                                payload={"method": method},
+                            )
                         self.assertEqual(len(store.events("job-1")), event_count)
                         self.assertEqual(store.current("job-1").state, terminal_state)
 
@@ -189,6 +194,42 @@ class S1LifecycleStoreTests(unittest.TestCase):
         self.assertEqual(idempotency[0].method, "lifecycle.accept")
         self.assertEqual(idempotency[0].idempotency_key, "accept-job-1")
         self.assertIsInstance(idempotency[0], IdempotencyRecord)
+
+    def test_default_cancel_idempotency_returns_stored_event_for_bare_retry(self) -> None:
+        artifacts = InMemoryArtifactStore()
+        store = LifecycleStore(artifact_store=artifacts)
+        store.create_job("job-1")
+        store.apply_method("job-1", "accept")
+        store.apply_method("job-1", "plan")
+
+        first = store.apply_method("job-1", "cancel", trigger="operator", payload={"reason": "blip"})
+        second = store.apply_method("job-1", "cancel", trigger="operator", payload={"reason": "blip"})
+
+        self.assertEqual(second, first)
+        self.assertEqual(store.current("job-1").state, LifecycleState.CANCELLED)
+        self.assertEqual(store.events("job-1")[-1], first)
+        self.assertEqual(len(store.events("job-1")), 3)
+        self.assertEqual(len(store.ledger_records("job-1")), 3)
+        self.assertEqual(len(store.idempotency_records("job-1")), 3)
+        self.assertTrue(first.idempotency_key.startswith("cancel:job-1:"))
+
+    def test_default_report_idempotency_returns_stored_event_for_bare_retry(self) -> None:
+        artifacts = InMemoryArtifactStore()
+        store = LifecycleStore(artifact_store=artifacts)
+        store.create_job("job-1")
+        for method in ("accept", "plan", "build", "validate"):
+            store.apply_method("job-1", method, payload={"method": method})
+
+        first = store.apply_method("job-1", "report", trigger="runtime", payload={"artifact_refs": ["c4://a"]})
+        second = store.apply_method("job-1", "report", trigger="runtime", payload={"artifact_refs": ["c4://a"]})
+
+        self.assertEqual(second, first)
+        self.assertEqual(store.current("job-1").state, LifecycleState.REPORTED)
+        self.assertEqual(store.events("job-1")[-1], first)
+        self.assertEqual(len(store.events("job-1")), 5)
+        self.assertEqual(len(store.ledger_records("job-1")), 5)
+        self.assertEqual(len(store.idempotency_records("job-1")), 5)
+        self.assertTrue(first.idempotency_key.startswith("report:job-1:"))
 
     def test_lifecycle_idempotency_conflict_rejects_before_ledger_side_effect(self) -> None:
         artifacts = InMemoryArtifactStore()
