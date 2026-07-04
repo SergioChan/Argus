@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from abc import ABC, abstractmethod
+from dataclasses import asdict, dataclass, is_dataclass, replace
 from enum import Enum
-from typing import Any, Mapping
+from typing import Any, Mapping, final
 from uuid import NAMESPACE_URL, uuid5
 
 from argusverify import C3ReportVerifier
@@ -285,6 +286,47 @@ class Acceptance:
         if self.estimated_cost:
             payload["estimated_cost"] = {"cost_usd": self.estimated_cost}
         return payload
+
+
+SDK_FRAMEWORK_METHODS = frozenset({"register", "accept", "validate", "report", "cancel", "heartbeat"})
+
+
+@dataclass(frozen=True)
+class SDKInvocationResult:
+    event: LifecycleEvent
+    payload: dict[str, Any]
+
+
+class Subagent(ABC):
+    """Author-facing SDK base class for C1 subagents."""
+
+    def __init_subclass__(cls, **kwargs: Any) -> None:
+        super().__init_subclass__(**kwargs)
+        overridden = sorted(method for method in SDK_FRAMEWORK_METHODS if method in cls.__dict__)
+        if overridden:
+            methods = ", ".join(overridden)
+            raise TypeError(f"{cls.__name__} overrides framework-owned S1 SDK method(s): {methods}")
+
+    def __init__(self, descriptor: SubagentDescriptor) -> None:
+        self.descriptor = descriptor
+
+    @abstractmethod
+    def plan(self, ctx: ExecContext, envelope: JobEnvelope) -> Mapping[str, Any]:
+        raise NotImplementedError
+
+    @abstractmethod
+    def build(self, ctx: ExecContext, plan: Mapping[str, Any]) -> Mapping[str, Any]:
+        raise NotImplementedError
+
+    @final
+    def validate(self, *_args: Any, **_kwargs: Any) -> Mapping[str, Any]:
+        raise LifecyclePolicyError(
+            ErrorEnvelope(
+                code="SDK_VALIDATE_FRAMEWORK_OWNED",
+                category="POLICY",
+                message="validate is framework-owned and cannot be implemented by subagent authors",
+            )
+        )
 
 
 @dataclass(frozen=True)
@@ -646,6 +688,97 @@ class SubagentRuntime:
         return acceptance
 
 
+class SubagentSDKRunner:
+    """IoC runner that binds an author Subagent to the real S1 runtime."""
+
+    def __init__(self, subagent: Subagent, *, runtime: SubagentRuntime | None = None) -> None:
+        self.subagent = subagent
+        self.runtime = runtime or SubagentRuntime(descriptor=subagent.descriptor)
+        if self.runtime.descriptor != subagent.descriptor:
+            raise ValueError("SubagentSDKRunner runtime descriptor must match the subagent descriptor")
+
+    @property
+    def descriptor(self) -> SubagentDescriptor:
+        return self.runtime.descriptor
+
+    def accept(
+        self,
+        envelope: JobEnvelope,
+        *,
+        idempotency_key: str | None = None,
+        root_request_id: str | None = None,
+        trace_id: str | None = None,
+    ) -> Acceptance:
+        return self.runtime.accept(
+            envelope,
+            idempotency_key=idempotency_key,
+            root_request_id=root_request_id,
+            trace_id=trace_id,
+        )
+
+    def plan(
+        self,
+        envelope: JobEnvelope,
+        *,
+        idempotency_key: str | None = None,
+        root_request_id: str | None = None,
+        trace_id: str | None = None,
+    ) -> SDKInvocationResult:
+        self._assert_can_apply(envelope.job_id, "plan")
+        ctx = ExecContext(job_id=envelope.job_id)
+        payload = _normalize_plan_payload(envelope, self.subagent.plan(ctx, envelope))
+        event = self.runtime.store.apply_method(
+            envelope.job_id,
+            "plan",
+            trigger="internal",
+            payload={"plan_hash": payload["plan_hash"]},
+            idempotency_key=idempotency_key,
+            root_request_id=root_request_id,
+            trace_id=trace_id,
+        )
+        return SDKInvocationResult(event=event, payload=payload)
+
+    def build(
+        self,
+        job_id: str,
+        plan: Mapping[str, Any],
+        *,
+        idempotency_key: str | None = None,
+        root_request_id: str | None = None,
+        trace_id: str | None = None,
+    ) -> SDKInvocationResult:
+        self._assert_can_apply(job_id, "build")
+        plan_payload = _mapping_payload("plan", plan)
+        ctx = ExecContext(job_id=job_id)
+        payload = _normalize_build_payload(job_id, self.subagent.build(ctx, plan_payload))
+        event = self.runtime.store.apply_method(
+            job_id,
+            "build",
+            trigger="internal",
+            payload={
+                "plan_hash": plan_payload.get("plan_hash"),
+                "build_result_hash": hash_json(payload),
+            },
+            idempotency_key=idempotency_key,
+            root_request_id=root_request_id,
+            trace_id=trace_id,
+        )
+        return SDKInvocationResult(event=event, payload=payload)
+
+    def _assert_can_apply(self, job_id: str, method: str) -> None:
+        try:
+            current = self.runtime.store.current(job_id)
+        except KeyError as exc:
+            raise LifecyclePolicyError(
+                ErrorEnvelope(
+                    code="JOB_NOT_FOUND",
+                    category="NOT_FOUND",
+                    message=f"{method} cannot run before job {job_id} exists",
+                )
+            ) from exc
+        LifecycleStore._assert_legal_transition(current.state, METHOD_TARGETS[method], method)
+
+
 def default_accept(
     descriptor: SubagentDescriptor,
     envelope: JobEnvelope,
@@ -786,6 +919,53 @@ def _idempotency_response_hash(response: Any) -> str:
             payload["ledger_ref"] = response.ledger_ref
         return hash_json(payload)
     return hash_json(response)
+
+
+def _mapping_payload(name: str, value: Mapping[str, Any] | Any) -> dict[str, Any]:
+    payload = _json_compatible_payload(value)
+    if not isinstance(payload, dict):
+        raise TypeError(f"{name} hook must return a mapping payload")
+    return payload
+
+
+def _normalize_plan_payload(envelope: JobEnvelope, value: Mapping[str, Any] | Any) -> dict[str, Any]:
+    payload = _mapping_payload("plan", value)
+    payload.setdefault("job_id", envelope.job_id)
+    if payload["job_id"] != envelope.job_id:
+        raise ValueError("plan payload job_id must match the accepted envelope")
+    payload.setdefault("adapters_required", list(envelope.required_adapters))
+    payload.setdefault("datasets_required", [])
+    if envelope.verifier_profile_ref is not None:
+        payload.setdefault("verifier_profile_ref", envelope.verifier_profile_ref)
+    payload.setdefault("budget_breakdown", {"total": {"cost_usd": envelope.estimated_cost}})
+    payload.setdefault("risk_notes", [])
+    if "plan_hash" not in payload:
+        hash_payload = {key: item for key, item in payload.items() if key != "plan_hash"}
+        payload["plan_hash"] = hash_json(hash_payload)
+    return payload
+
+
+def _normalize_build_payload(job_id: str, value: Mapping[str, Any] | Any) -> dict[str, Any]:
+    payload = _mapping_payload("build", value)
+    payload.setdefault("job_id", job_id)
+    if payload["job_id"] != job_id:
+        raise ValueError("build payload job_id must match the lifecycle job")
+    payload.setdefault("diagnostics", {})
+    payload.setdefault("self_checks", [])
+    payload.setdefault("uncertainty_summary", {"representation": "none", "value": {}})
+    return payload
+
+
+def _json_compatible_payload(value: Any) -> Any:
+    if is_dataclass(value):
+        return _json_compatible_payload(asdict(value))
+    if isinstance(value, Mapping):
+        return {str(key): _json_compatible_payload(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_compatible_payload(item) for item in value]
+    if isinstance(value, Enum):
+        return value.value
+    return value
 
 
 def build_subagent_report(
