@@ -8,7 +8,7 @@ from typing import Annotated, Any, Literal, Mapping
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
 
-C1_SCHEMA_SHA256 = "sha256:bec647eec1f70625af766a1dd67f6bf81990d80d1b414b4c74f4254ca62ff7ab"
+C1_SCHEMA_SHA256 = "sha256:70de039b4c9687e9ce83ed5dc0ff444c681dd068cf79b8c1d6138bfd9c4b56d5"
 
 Uuid = Annotated[
     str,
@@ -240,6 +240,7 @@ class LifecycleEvent(BaseModel):
     spend_delta: CostEstimate | None = None
     trace_id: str = Field(min_length=1)
     idempotency_key: str = Field(min_length=1)
+    ledger_ref: ArtifactRef | None = None
 
 
 class Heartbeat(BaseModel):

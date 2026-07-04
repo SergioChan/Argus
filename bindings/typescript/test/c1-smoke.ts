@@ -30,7 +30,7 @@ const acceptance: Acceptance = {
   estimated_cost: { cost_usd: 0.01 },
 };
 
-assert.equal(C1_SCHEMA_SHA256, "sha256:bec647eec1f70625af766a1dd67f6bf81990d80d1b414b4c74f4254ca62ff7ab");
+assert.equal(C1_SCHEMA_SHA256, "sha256:70de039b4c9687e9ce83ed5dc0ff444c681dd068cf79b8c1d6138bfd9c4b56d5");
 assert.doesNotThrow(() => assertSubagentEnvelope(envelope));
 assert.doesNotThrow(() => assertAcceptance(acceptance));
 

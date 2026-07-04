@@ -15,6 +15,7 @@ from argus_core import (
     SubagentDescriptor,
     SubagentSDKRunner,
 )
+from argus_core.s1 import S1_LIFECYCLE_LEDGER_KIND
 
 
 class ExampleSubagent(Subagent):
@@ -91,6 +92,14 @@ class S1SDKBaseClassTests(unittest.TestCase):
         self.assertEqual(planned.event.trigger, "internal")
         self.assertEqual(built.event.to_state, LifecycleState.BUILDING)
         self.assertEqual(built.event.trigger, "internal")
+        self.assertIsNotNone(runner.runtime.store.events(self.envelope.job_id)[0].ledger_ref)
+        self.assertIsNotNone(planned.event.ledger_ref)
+        self.assertIsNotNone(built.event.ledger_ref)
+        ledger_records = runner.runtime.store.ledger_records(self.envelope.job_id)
+        self.assertEqual(len(ledger_records), 3)
+        self.assertEqual([record.kind for record in ledger_records], [S1_LIFECYCLE_LEDGER_KIND] * 3)
+        self.assertEqual(ledger_records[1].lineage.input_refs, (ledger_records[0].artifact_ref,))
+        self.assertEqual(ledger_records[2].lineage.input_refs, (ledger_records[1].artifact_ref,))
         self.assertEqual(planned.payload["job_id"], self.envelope.job_id)
         self.assertEqual(planned.payload["adapters_required"], ["adapter:bounce"])
         self.assertEqual(planned.payload["verifier_profile_ref"], "c4://profile/ewpt/v1")

@@ -506,6 +506,22 @@ class S1AcceptGateTests(unittest.TestCase):
             [("accept", "accept:job-1"), ("lifecycle.accept", "accept:job-1")],
         )
 
+    def test_runtime_default_accept_mirrors_to_c4_ledger(self) -> None:
+        runtime = SubagentRuntime(descriptor=self.descriptor)
+        envelope = self._envelope()
+
+        acceptance = runtime.accept(envelope)
+
+        self.assertTrue(acceptance.accepted)
+        events = runtime.store.events(envelope.job_id)
+        self.assertEqual(len(events), 1)
+        self.assertIsNotNone(events[0].ledger_ref)
+        records = runtime.store.ledger_records(envelope.job_id)
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0].kind, S1_LIFECYCLE_LEDGER_KIND)
+        self.assertEqual(records[0].producer.subsystem, "S1")
+        self.assertEqual(records[0].lineage.job_id, envelope.job_id)
+
     def test_runtime_accept_refusal_is_non_error_and_idempotent(self) -> None:
         idempotency = InMemoryIdempotencyStore()
         runtime = SubagentRuntime(descriptor=self.descriptor, idempotency_store=idempotency)

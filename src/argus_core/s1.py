@@ -619,6 +619,10 @@ class LifecycleStore:
             return ()
         return tuple(self._artifact_store.get_record(ref) for ref in self.ledger_refs(job_id))
 
+    @property
+    def artifact_store(self) -> InMemoryArtifactStore | None:
+        return self._artifact_store
+
     def idempotency_records(self, job_id: str | None = None) -> tuple[IdempotencyRecord, ...]:
         return self._idempotency_store.records(job_id)
 
@@ -671,7 +675,7 @@ class LifecycleStore:
 
 
 class SubagentRuntime:
-    """Small S1 runtime facade for default accept gate and idempotency."""
+    """Small S1 runtime facade for default accept gate, idempotency, and C4 provenance."""
 
     def __init__(
         self,
@@ -679,10 +683,21 @@ class SubagentRuntime:
         descriptor: SubagentDescriptor,
         store: LifecycleStore | None = None,
         idempotency_store: InMemoryIdempotencyStore | None = None,
+        artifact_store: InMemoryArtifactStore | None = None,
     ) -> None:
         self.descriptor = descriptor
         self.idempotency_store = idempotency_store or InMemoryIdempotencyStore()
-        self.store = store or LifecycleStore(idempotency_store=self.idempotency_store)
+        if store is not None:
+            if artifact_store is not None:
+                raise ValueError("artifact_store cannot be provided with an explicit LifecycleStore")
+            self.store = store
+            self.artifact_store = store.artifact_store
+        else:
+            self.artifact_store = artifact_store or InMemoryArtifactStore()
+            self.store = LifecycleStore(
+                artifact_store=self.artifact_store,
+                idempotency_store=self.idempotency_store,
+            )
         self.gate_invocations = 0
 
     def accept(

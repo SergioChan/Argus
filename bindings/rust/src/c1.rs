@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-pub const C1_SCHEMA_SHA256: &str = "sha256:bec647eec1f70625af766a1dd67f6bf81990d80d1b414b4c74f4254ca62ff7ab";
+pub const C1_SCHEMA_SHA256: &str = "sha256:70de039b4c9687e9ce83ed5dc0ff444c681dd068cf79b8c1d6138bfd9c4b56d5";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -169,6 +169,8 @@ pub struct LifecycleEvent {
     pub spend_delta: Option<CostEstimate>,
     pub trace_id: String,
     pub idempotency_key: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ledger_ref: Option<String>,
 }
 
 #[cfg(test)]

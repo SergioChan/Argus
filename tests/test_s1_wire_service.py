@@ -10,6 +10,7 @@ import grpc
 from jsonschema import Draft202012Validator
 
 from argus_core import LifecycleState, SubagentDescriptor, SubagentRuntime
+from argus_core.s1 import S1_LIFECYCLE_LEDGER_KIND
 from argus_runtime.http_json import JsonRequest
 from argus_runtime.s1_wire_service import C1_GRPC_SERVICE, C1WireService, build_s1_grpc_server, build_s1_http_app
 
@@ -55,6 +56,7 @@ class S1WireServiceHttpTests(unittest.TestCase):
         self.assertEqual(self.runtime.store.current(self.job_id).state, LifecycleState.ACCEPTED)
         self.assertEqual(self.runtime.store.events(self.job_id)[0].root_request_id, self.root_request_id)
         self.assertEqual(self.runtime.store.events(self.job_id)[0].trace_id, self.trace_id)
+        self.assertIsNotNone(self.runtime.store.events(self.job_id)[0].ledger_ref)
 
         plan_status, plan_payload = self.app.handle(
             JsonRequest(
@@ -78,6 +80,11 @@ class S1WireServiceHttpTests(unittest.TestCase):
         self.assertEqual(plan_payload["from_state"], "ACCEPTED")
         self.assertEqual(plan_payload["to_state"], "PLANNING")
         self.assertEqual(plan_payload["method"], "plan")
+        self.assertIn("ledger_ref", plan_payload)
+        ledger_records = self.runtime.store.ledger_records(self.job_id)
+        self.assertEqual(len(ledger_records), 2)
+        self.assertEqual([record.kind for record in ledger_records], [S1_LIFECYCLE_LEDGER_KIND] * 2)
+        self.assertEqual(ledger_records[1].lineage.input_refs, (ledger_records[0].artifact_ref,))
         UUID(plan_payload["event_id"])
         errors = sorted(self.c1_validator.iter_errors(plan_payload), key=lambda error: list(error.path))
         self.assertEqual(errors, [], msg=[error.message for error in errors])

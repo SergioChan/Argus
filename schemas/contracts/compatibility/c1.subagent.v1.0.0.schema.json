@@ -391,7 +391,8 @@
         "payload_hash": { "$ref": "#/$defs/HashRef" },
         "spend_delta": { "$ref": "#/$defs/CostEstimate" },
         "trace_id": { "$ref": "#/$defs/NonEmptyString" },
-        "idempotency_key": { "$ref": "#/$defs/NonEmptyString" }
+        "idempotency_key": { "$ref": "#/$defs/NonEmptyString" },
+        "ledger_ref": { "$ref": "#/$defs/ArtifactRef" }
       }
     },
     "Heartbeat": {

@@ -82,6 +82,7 @@ class C1ContractSchemaTests(unittest.TestCase):
             "payload_hash": "blake3:abc123",
             "trace_id": "trace-1",
             "idempotency_key": "cancel-job-4",
+            "ledger_ref": "c4://artifact/s1-lifecycle-event",
         }
         bad_event = {**event, "to_state": "REFUSED"}
 

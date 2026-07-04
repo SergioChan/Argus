@@ -1072,6 +1072,7 @@ class LifecycleEvent(BaseModel):
     spend_delta: CostEstimate | None = None
     trace_id: str = Field(min_length=1)
     idempotency_key: str = Field(min_length=1)
+    ledger_ref: ArtifactRef | None = None
 
 
 class Heartbeat(BaseModel):
@@ -1607,6 +1608,8 @@ pub struct LifecycleEvent {
     pub spend_delta: Option<CostEstimate>,
     pub trace_id: String,
     pub idempotency_key: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ledger_ref: Option<String>,
 }
 
 #[cfg(test)]
