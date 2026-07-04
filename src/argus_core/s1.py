@@ -8,7 +8,7 @@ import textwrap
 from abc import ABC, abstractmethod
 from collections.abc import Mapping as CollectionsMapping
 from dataclasses import asdict, dataclass, field, is_dataclass, replace
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Mapping, NoReturn, final
 from uuid import NAMESPACE_URL, uuid4, uuid5
@@ -207,6 +207,8 @@ S1_CONFORMANCE_LEVEL_ORDER = {"none": 0, "bronze": 1, "silver": 2, "gold": 3}
 S1_CAPABILITY_DESCRIPTOR_DEFAULT_SCOPES = ("c1.accept", "c1.plan", "c1.build", "c1.validate", "c1.report")
 S1_CONTENT_STORE_EGRESS_RULE = EgressRule("store.local", 443, "https")
 S1_EGRESS_PROTOCOLS = frozenset({"https", "grpc", "tcp"})
+S1_HEARTBEAT_COST_FIELDS = frozenset({"compute_units", "gpu_seconds", "model_tokens", "cost_usd"})
+S1_CANCEL_DEFAULT_GRACE_SECONDS = 30.0
 
 
 def derive_sandbox_egress_allowlist(
@@ -390,6 +392,24 @@ class JobCurrent:
 
 
 @dataclass(frozen=True)
+class HeartbeatStatus:
+    job_id: str
+    status: LifecycleState
+    progress: float
+    spend_so_far: dict[str, float]
+    last_heartbeat_at: str
+
+    def as_c1_payload(self) -> dict[str, object]:
+        return {
+            "job_id": self.job_id,
+            "status": self.status.value,
+            "progress": self.progress,
+            "spend_so_far": dict(self.spend_so_far),
+            "last_heartbeat_at": self.last_heartbeat_at,
+        }
+
+
+@dataclass(frozen=True)
 class S10SandboxMarshaler:
     launcher: Any
 
@@ -415,6 +435,39 @@ class S10SandboxMarshaler:
                 message="S10 sandbox marshaler must expose launch or launch_and_wait",
             )
         )
+
+    def cancel_sandbox_job(
+        self,
+        *,
+        job_id: str,
+        sandbox_id: str,
+        reason: str,
+        grace_seconds: float,
+    ) -> Any:
+        try:
+            for name in ("cancel_sandbox_job", "terminate_sandbox_job", "cancel"):
+                hook = getattr(self.launcher, name, None)
+                if callable(hook):
+                    return hook(
+                        job_id=job_id,
+                        sandbox_id=sandbox_id,
+                        reason=reason,
+                        grace_seconds=grace_seconds,
+                    )
+        except S10Error as exc:
+            raise LifecyclePolicyError(
+                build_error_envelope(
+                    category="SANDBOX",
+                    code="S10_SANDBOX_CANCEL_FAILED",
+                    message=f"S10 sandbox cancel failed: {exc}",
+                )
+            ) from exc
+        return {
+            "job_id": job_id,
+            "sandbox_id": sandbox_id,
+            "state": "CANCEL_REQUESTED",
+            "terminate_succeeded": False,
+        }
 
 
 EXEC_CONTEXT_CAPABILITIES = (
@@ -699,6 +752,9 @@ class ExecContext:
     _artifact_store: InMemoryArtifactStore = field(init=False, repr=False, compare=False)
     _sandbox_marshaler: Any = field(init=False, repr=False, compare=False)
     _adapter_client: Any = field(init=False, repr=False, compare=False)
+    _heartbeat_recorder: Any = field(init=False, repr=False, compare=False)
+    _sandbox_result_recorder: Any = field(init=False, repr=False, compare=False)
+    _cancel_checker: Any = field(init=False, repr=False, compare=False)
 
     def __init__(
         self,
@@ -712,6 +768,9 @@ class ExecContext:
         artifact_store: InMemoryArtifactStore | None = None,
         sandbox_marshaler: Any | None = None,
         adapter_client: Any | None = None,
+        heartbeat_recorder: Any | None = None,
+        sandbox_result_recorder: Any | None = None,
+        cancel_checker: Any | None = None,
     ) -> None:
         capabilities = tuple(dict.fromkeys(capabilities))
         unknown = tuple(capability for capability in capabilities if capability not in _EXEC_CONTEXT_CAPABILITY_SET)
@@ -735,6 +794,9 @@ class ExecContext:
         )
         object.__setattr__(self, "_sandbox_marshaler", sandbox_marshaler)
         object.__setattr__(self, "_adapter_client", adapter_client)
+        object.__setattr__(self, "_heartbeat_recorder", heartbeat_recorder)
+        object.__setattr__(self, "_sandbox_result_recorder", sandbox_result_recorder)
+        object.__setattr__(self, "_cancel_checker", cancel_checker)
 
     def capability_methods(self) -> tuple[str, ...]:
         return self.capabilities
@@ -766,7 +828,31 @@ class ExecContext:
         request = _launch_request_from_sandbox_spec(self.job_id, spec)
         self._assert_sandbox_launch_scopes(request)
         result = self._sandbox_marshaler.submit_sandbox_job(job_id=self.job_id, spec=spec)
-        return _normalize_sandbox_result(self.job_id, result)
+        payload = _normalize_sandbox_result(self.job_id, result)
+        if self._sandbox_result_recorder is not None:
+            self._sandbox_result_recorder(self.job_id, payload)
+        return payload
+
+    def record_heartbeat(self, *, progress: float, spend_so_far: Mapping[str, Any]) -> dict[str, object]:
+        if self._heartbeat_recorder is None:
+            raise LifecyclePolicyError(
+                build_error_envelope(
+                    category="POLICY",
+                    code="S1_HEARTBEAT_RECORDER_UNAVAILABLE",
+                    message="ExecContext cannot record heartbeat without a runtime heartbeat recorder",
+                )
+            )
+        heartbeat = self._heartbeat_recorder(
+            self.job_id,
+            progress=progress,
+            spend_so_far=spend_so_far,
+        )
+        return heartbeat.as_c1_payload()
+
+    def cancel_requested(self) -> bool:
+        if self._cancel_checker is None:
+            return False
+        return bool(self._cancel_checker(self.job_id))
 
     def emit_artifact(
         self,
@@ -1246,6 +1332,134 @@ def _normalize_sandbox_mapping(job_id: str, result: Mapping[str, Any]) -> dict[s
         )
     payload.setdefault("capability", "submit_sandbox_job")
     payload["job_id"] = job_id
+    return payload
+
+
+def _utc_now_s1() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _normalize_heartbeat_progress(progress: Any) -> float:
+    if isinstance(progress, bool):
+        _raise_heartbeat_policy("S1_HEARTBEAT_PROGRESS_INVALID", "heartbeat progress must be a number in [0, 1]")
+    try:
+        value = float(progress)
+    except (TypeError, ValueError) as exc:
+        raise LifecyclePolicyError(
+            build_error_envelope(
+                category="POLICY",
+                code="S1_HEARTBEAT_PROGRESS_INVALID",
+                message="heartbeat progress must be a number in [0, 1]",
+            )
+        ) from exc
+    if value < 0.0 or value > 1.0:
+        _raise_heartbeat_policy("S1_HEARTBEAT_PROGRESS_INVALID", "heartbeat progress must be a number in [0, 1]")
+    return value
+
+
+def _normalize_heartbeat_spend(spend_so_far: Mapping[str, Any]) -> dict[str, float]:
+    if not isinstance(spend_so_far, Mapping):
+        _raise_heartbeat_policy("S1_HEARTBEAT_SPEND_INVALID", "heartbeat spend_so_far must be a CostEstimate object")
+    fields = set(str(field) for field in spend_so_far)
+    extra = fields - S1_HEARTBEAT_COST_FIELDS
+    if extra:
+        _raise_heartbeat_policy(
+            "S1_HEARTBEAT_SPEND_INVALID",
+            "heartbeat spend_so_far contains unsupported fields: " + ", ".join(sorted(extra)),
+        )
+    if "cost_usd" not in fields:
+        _raise_heartbeat_policy("S1_HEARTBEAT_SPEND_INVALID", "heartbeat spend_so_far requires cost_usd")
+    normalized: dict[str, float] = {}
+    for field_name, raw_value in spend_so_far.items():
+        if isinstance(raw_value, bool):
+            _raise_heartbeat_policy("S1_HEARTBEAT_SPEND_INVALID", f"heartbeat spend {field_name} must be numeric")
+        try:
+            value = float(raw_value)
+        except (TypeError, ValueError) as exc:
+            raise LifecyclePolicyError(
+                build_error_envelope(
+                    category="POLICY",
+                    code="S1_HEARTBEAT_SPEND_INVALID",
+                    message=f"heartbeat spend {field_name} must be numeric",
+                )
+            ) from exc
+        if value < 0.0:
+            _raise_heartbeat_policy("S1_HEARTBEAT_SPEND_INVALID", f"heartbeat spend {field_name} cannot be negative")
+        normalized[str(field_name)] = value
+    return normalized
+
+
+def _assert_heartbeat_spend_monotonic(previous: Mapping[str, float], current: Mapping[str, float]) -> None:
+    missing_fields = tuple(sorted(set(previous) - set(current)))
+    if missing_fields:
+        _raise_heartbeat_policy(
+            "S1_HEARTBEAT_SPEND_REGRESSION",
+            "heartbeat spend_so_far cannot drop previously reported fields: " + ", ".join(missing_fields),
+        )
+    regressed = tuple(
+        sorted(field for field, previous_value in previous.items() if current[field] < previous_value)
+    )
+    if regressed:
+        _raise_heartbeat_policy(
+            "S1_HEARTBEAT_SPEND_REGRESSION",
+            "heartbeat spend_so_far must be monotonically non-decreasing: " + ", ".join(regressed),
+        )
+
+
+def _raise_heartbeat_policy(code: str, message: str) -> NoReturn:
+    raise LifecyclePolicyError(build_error_envelope(category="POLICY", code=code, message=message))
+
+
+def _normalize_cancel_grace_seconds(grace_seconds: Any) -> float:
+    if isinstance(grace_seconds, bool):
+        _raise_policy("S1_CANCEL_GRACE_INVALID", "cancel grace_seconds must be non-negative")
+    try:
+        value = float(grace_seconds)
+    except (TypeError, ValueError) as exc:
+        raise LifecyclePolicyError(
+            build_error_envelope(
+                category="POLICY",
+                code="S1_CANCEL_GRACE_INVALID",
+                message="cancel grace_seconds must be non-negative",
+            )
+        ) from exc
+    if value < 0:
+        _raise_policy("S1_CANCEL_GRACE_INVALID", "cancel grace_seconds must be non-negative")
+    return value
+
+
+def _normalize_sandbox_cancellation(
+    *,
+    job_id: str,
+    active: Mapping[str, Any],
+    result: Any,
+) -> dict[str, Any]:
+    sandbox_id = str(active["sandbox_id"])
+    payload: dict[str, Any] = {
+        "job_id": job_id,
+        "sandbox_id": sandbox_id,
+    }
+    launch_provenance_ref = active.get("launch_provenance_ref")
+    if isinstance(launch_provenance_ref, str) and launch_provenance_ref:
+        payload["launch_provenance_ref"] = launch_provenance_ref
+    result_payload = _json_compatible_payload(result)
+    if isinstance(result_payload, Mapping):
+        state = result_payload.get("state")
+        if state is not None:
+            payload["state"] = str(state)
+        terminate_succeeded = result_payload.get("terminate_succeeded")
+        if terminate_succeeded is not None:
+            payload["terminate_succeeded"] = bool(terminate_succeeded)
+        partial_result_ref = result_payload.get("partial_result_ref")
+        if isinstance(partial_result_ref, str) and partial_result_ref:
+            payload["partial_result_ref"] = partial_result_ref
+        elif "partial_result" in result_payload:
+            payload["partial_result"] = result_payload["partial_result"]
+    else:
+        payload["state"] = "CANCEL_REQUESTED"
+        payload["terminate_succeeded"] = False
+    payload.setdefault("state", "CANCEL_REQUESTED")
+    payload.setdefault("terminate_succeeded", False)
     return payload
 
 
@@ -2459,6 +2673,10 @@ class SubagentRuntime:
                 idempotency_store=self.idempotency_store,
             )
         self.gate_invocations = 0
+        self._heartbeats: dict[str, HeartbeatStatus] = {}
+        self._cancel_flags: set[str] = set()
+        self._active_sandboxes: dict[str, dict[str, dict[str, Any]]] = {}
+        self._cancel_events: dict[str, LifecycleEvent] = {}
 
     def accept(
         self,
@@ -2498,6 +2716,123 @@ class SubagentRuntime:
             response=acceptance,
         )
         return acceptance
+
+    def record_heartbeat(
+        self,
+        job_id: str,
+        *,
+        progress: float,
+        spend_so_far: Mapping[str, Any],
+    ) -> HeartbeatStatus:
+        current = self.store.current(job_id)
+        normalized_progress = _normalize_heartbeat_progress(progress)
+        normalized_spend = _normalize_heartbeat_spend(spend_so_far)
+        previous = self._heartbeats.get(job_id)
+        if previous is not None:
+            _assert_heartbeat_spend_monotonic(previous.spend_so_far, normalized_spend)
+        heartbeat = HeartbeatStatus(
+            job_id=job_id,
+            status=current.state,
+            progress=normalized_progress,
+            spend_so_far=normalized_spend,
+            last_heartbeat_at=_utc_now_s1(),
+        )
+        self._heartbeats[job_id] = heartbeat
+        return heartbeat
+
+    def heartbeat(self, job_id: str) -> HeartbeatStatus:
+        current = self.store.current(job_id)
+        heartbeat = self._heartbeats.get(job_id)
+        if heartbeat is None:
+            return HeartbeatStatus(
+                job_id=job_id,
+                status=current.state,
+                progress=1.0 if current.state in TERMINAL_STATES else 0.0,
+                spend_so_far={"cost_usd": 0.0},
+                last_heartbeat_at=_utc_now_s1(),
+            )
+        return replace(heartbeat, status=current.state)
+
+    def register_sandbox_result(self, job_id: str, result: Mapping[str, Any]) -> None:
+        sandbox_id = result.get("sandbox_id")
+        if not isinstance(sandbox_id, str) or not sandbox_id:
+            return
+        self._active_sandboxes.setdefault(job_id, {})[sandbox_id] = dict(_json_compatible_payload(result))
+
+    def cancel_requested(self, job_id: str) -> bool:
+        return job_id in self._cancel_flags
+
+    def cancel(
+        self,
+        job_id: str,
+        *,
+        reason: str = "operator",
+        grace_seconds: float = S1_CANCEL_DEFAULT_GRACE_SECONDS,
+        idempotency_key: str | None = None,
+        root_request_id: str | None = None,
+        trace_id: str | None = None,
+    ) -> LifecycleEvent:
+        if job_id in self._cancel_events and idempotency_key is None:
+            return self._cancel_events[job_id]
+        normalized_grace_seconds = _normalize_cancel_grace_seconds(grace_seconds)
+        self._cancel_flags.add(job_id)
+        sandbox_cancellations = [
+            self._cancel_active_sandbox(
+                job_id=job_id,
+                active=active,
+                reason=str(reason),
+                grace_seconds=normalized_grace_seconds,
+            )
+            for _sandbox_id, active in sorted(self._active_sandboxes.get(job_id, {}).items())
+        ]
+        payload = {
+            "category": "CANCELLED",
+            "cooperative": True,
+            "grace_seconds": normalized_grace_seconds,
+            "reason": str(reason),
+            "sandbox_cancellations": sandbox_cancellations,
+        }
+        event = self.store.apply_method(
+            job_id,
+            "cancel",
+            trigger="cancel",
+            payload=payload,
+            idempotency_key=idempotency_key,
+            root_request_id=root_request_id,
+            trace_id=trace_id,
+        )
+        self._cancel_events[job_id] = event
+        self._active_sandboxes.pop(job_id, None)
+        return event
+
+    def _cancel_active_sandbox(
+        self,
+        *,
+        job_id: str,
+        active: Mapping[str, Any],
+        reason: str,
+        grace_seconds: float,
+    ) -> dict[str, Any]:
+        sandbox_id = str(active["sandbox_id"])
+        hook = None
+        for name in ("cancel_sandbox_job", "terminate_sandbox_job", "cancel"):
+            candidate = getattr(self.sandbox_marshaler, name, None)
+            if callable(candidate):
+                hook = candidate
+                break
+        if hook is None:
+            return _normalize_sandbox_cancellation(
+                job_id=job_id,
+                active=active,
+                result={"state": "CANCEL_REQUESTED", "terminate_succeeded": False},
+            )
+        result = hook(
+            job_id=job_id,
+            sandbox_id=sandbox_id,
+            reason=reason,
+            grace_seconds=grace_seconds,
+        )
+        return _normalize_sandbox_cancellation(job_id=job_id, active=active, result=result)
 
 
 class SubagentSDKRunner:
@@ -2778,6 +3113,9 @@ class SubagentSDKRunner:
             artifact_store=self.runtime.artifact_store,
             sandbox_marshaler=self.runtime.sandbox_marshaler,
             adapter_client=self.runtime.adapter_client,
+            heartbeat_recorder=self.runtime.record_heartbeat,
+            sandbox_result_recorder=self.runtime.register_sandbox_result,
+            cancel_checker=self.runtime.cancel_requested,
         )
 
     def _assert_no_direct_exec(self, job_id: str, method: str, hook: Any) -> None:

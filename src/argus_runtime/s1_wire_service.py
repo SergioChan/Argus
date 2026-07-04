@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from concurrent import futures
 from dataclasses import asdict, is_dataclass
-from datetime import datetime, timezone
 import json
 from typing import Any, Callable
 
@@ -54,8 +53,10 @@ class C1WireService:
                 return 200, self._register(body)
             if method == "accept":
                 return 200, self._accept(body)
-            if method in {"plan", "build", "validate", "report", "cancel"}:
+            if method in {"plan", "build", "validate", "report"}:
                 return 200, self._transition(method, body)
+            if method == "cancel":
+                return 200, self._cancel(body)
             if method == "heartbeat":
                 return self._heartbeat(body)
         except LifecyclePolicyError as exc:
@@ -101,19 +102,30 @@ class C1WireService:
         )
         return lifecycle_event_wire_payload(event)
 
+    def _cancel(self, body: dict[str, Any]) -> dict[str, Any]:
+        job_id = _required_string(body, "job_id")
+        payload = body.get("payload") or {}
+        if not isinstance(payload, dict):
+            raise ValueError("cancel payload must be an object")
+        reason = payload.get("reason", body.get("reason", "operator"))
+        grace_seconds = payload.get("grace_seconds", body.get("grace_seconds", 30.0))
+        event = self.runtime.cancel(
+            job_id,
+            reason=str(reason),
+            grace_seconds=grace_seconds,
+            idempotency_key=_idempotency_key(body),
+            root_request_id=_root_request_id(body, job_id),
+            trace_id=_trace_id(body, job_id),
+        )
+        return lifecycle_event_wire_payload(event)
+
     def _heartbeat(self, body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
         job_id = _required_string(body, "job_id")
         try:
-            current = self.runtime.store.current(job_id)
+            heartbeat = self.runtime.heartbeat(job_id)
         except KeyError:
             return 404, {"error": _error_payload("JOB_NOT_FOUND", "NOT_FOUND", f"unknown job {job_id}")}
-        return 200, {
-            "job_id": job_id,
-            "status": current.state.value,
-            "progress": 1.0 if current.state in _TERMINAL_STATES else 0.0,
-            "spend_so_far": {"cost_usd": 0.0},
-            "last_heartbeat_at": _utc_now_c1(),
-        }
+        return 200, heartbeat.as_c1_payload()
 
 
 def build_s1_http_app(service: C1WireService) -> JsonHttpApp:
@@ -333,16 +345,3 @@ def _jsonable(value: Any) -> Any:
     if isinstance(value, LifecycleState):
         return value.value
     return value
-
-
-def _utc_now_c1() -> str:
-    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-
-
-_TERMINAL_STATES = {
-    LifecycleState.REPORTED,
-    LifecycleState.FAILED,
-    LifecycleState.REJECTED,
-    LifecycleState.CANCELLED,
-    LifecycleState.QUARANTINED,
-}

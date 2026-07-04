@@ -1276,6 +1276,98 @@ class S1SDKBaseClassTests(unittest.TestCase):
         self.assertEqual(built.payload["diagnostics"], {"sandbox_state": "ADMITTED"})
         self.assertEqual(runner.runtime.store.current(self.envelope.job_id).state, LifecycleState.BUILDING)
 
+    def test_runtime_cancel_uses_real_s10_marshaler_and_partial_provenance(self) -> None:
+        from argus_core.s1 import S10SandboxMarshaler
+
+        adapter_rule = EgressRule("bounce.adapter.local", 8443, "grpc")
+        orchestrator, request, audit, artifacts = self._s10_orchestrator_and_request(
+            scope_allowed_adapters=("adapter:bounce",),
+            egress_allowlist=(EgressRule("store.local", 443, "https"), adapter_rule),
+        )
+
+        class SandboxBuildSubagent(Subagent):
+            def __init__(self, descriptor: SubagentDescriptor) -> None:
+                super().__init__(descriptor)
+                self.sandbox_id: str | None = None
+                self.launch_provenance_ref: str | None = None
+
+            def plan(self, ctx: ExecContext, envelope: JobEnvelope) -> dict[str, object]:
+                return {
+                    "steps": [
+                        {
+                            "step_id": "sandbox-build",
+                            "kind": "feature",
+                            "description": "Run cancellable sandbox build",
+                        }
+                    ]
+                }
+
+            def build(self, ctx: ExecContext, plan: dict[str, object]) -> dict[str, object]:
+                result = ctx.submit_sandbox_job({"launch_request": request})
+                self.sandbox_id = str(result["sandbox_id"])
+                self.launch_provenance_ref = str(result["launch_provenance_ref"])
+                return {
+                    "artifact_refs": ["c4://artifact/cancellable-sandbox-model"],
+                    "diagnostics": {"sandbox_id": self.sandbox_id},
+                }
+
+        subagent = SandboxBuildSubagent(self.descriptor)
+        runner = SubagentSDKRunner(
+            subagent,
+            runtime=SubagentRuntime(
+                descriptor=self.descriptor,
+                sandbox_marshaler=S10SandboxMarshaler(orchestrator),
+                adapter_egress_allowlist={"adapter:bounce": adapter_rule},
+            ),
+        )
+
+        runner.accept(self.envelope)
+        planned = runner.plan(self.envelope)
+        runner.build(self.envelope.job_id, planned.payload)
+        event = runner.runtime.cancel(self.envelope.job_id, reason="operator", grace_seconds=0.25)
+
+        assert subagent.sandbox_id is not None
+        assert subagent.launch_provenance_ref is not None
+        self.assertEqual(orchestrator.get(subagent.sandbox_id).state, "TERMINATED")
+        self.assertEqual(event.to_state, LifecycleState.CANCELLED)
+        self.assertEqual(runner.runtime.store.current(self.envelope.job_id).state, LifecycleState.CANCELLED)
+        event_types = [item.event_type for item in audit.events()]
+        self.assertIn("sandbox.partial_result", event_types)
+        self.assertIn("sandbox.cancelled", event_types)
+        partial_records = artifacts.query_artifacts({"kind": "sandbox.partial_result"})
+        self.assertEqual(len(partial_records), 1)
+        partial_record = partial_records[0]
+        partial_payload = json.loads(artifacts.get_artifact(partial_record.artifact_ref).decode("utf-8"))
+        self.assertEqual(partial_payload["reason"], "operator")
+        self.assertEqual(partial_payload["terminated_state"], "TERMINATED")
+        self.assertEqual(partial_record.lineage.input_refs, (subagent.launch_provenance_ref,))
+
+    def test_build_context_records_runtime_heartbeat_spend(self) -> None:
+        class HeartbeatBuildSubagent(ExampleSubagent):
+            def build(self, ctx: ExecContext, plan: dict[str, object]) -> dict[str, object]:
+                payload = super().build(ctx, plan)
+                heartbeat = ctx.record_heartbeat(progress=0.40, spend_so_far={"cost_usd": 0.125})
+                payload["diagnostics"]["heartbeat_progress"] = heartbeat["progress"]
+                payload["diagnostics"]["heartbeat_spend"] = heartbeat["spend_so_far"]
+                return payload
+
+        runner = SubagentSDKRunner(HeartbeatBuildSubagent(self.descriptor))
+
+        runner.accept(self.envelope)
+        planned = runner.plan(self.envelope)
+        built = runner.build(self.envelope.job_id, planned.payload)
+        health = runner.runtime.heartbeat(self.envelope.job_id)
+
+        self.assertEqual(health.status, LifecycleState.BUILDING)
+        self.assertEqual(health.progress, 0.40)
+        self.assertEqual(health.spend_so_far, {"cost_usd": 0.125})
+        self.assertEqual(built.payload["diagnostics"]["heartbeat_progress"], 0.40)
+        self.assertEqual(built.payload["diagnostics"]["heartbeat_spend"], {"cost_usd": 0.125})
+        self.assertEqual(
+            [event.method for event in runner.runtime.store.events(self.envelope.job_id)],
+            ["accept", "plan", "build"],
+        )
+
     def test_subagent_linter_flags_direct_in_process_exec_patterns(self) -> None:
         from argus_core.s1 import lint_subagent_for_direct_exec
 

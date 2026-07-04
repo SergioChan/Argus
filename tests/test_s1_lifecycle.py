@@ -26,10 +26,49 @@ from argus_core import (
     build_subagent_report,
     canonical_json_bytes,
     default_accept,
+    hash_json,
     reduce_lifecycle,
     tag_uncertainty,
 )
 from argus_core.s1 import METHOD_TARGETS, NON_TRANSITION_METHODS, S1_LIFECYCLE_LEDGER_KIND
+
+
+def _test_descriptor() -> SubagentDescriptor:
+    return SubagentDescriptor(
+        subagent_id="s1-t19-subagent",
+        contract_version="1.0.0",
+        subtopics=("ewpt",),
+        required_adapters=("adapter:bounce",),
+    )
+
+
+class _CancelableSandboxMarshaler:
+    def __init__(self) -> None:
+        self.cancellations: list[dict[str, object]] = []
+
+    def cancel_sandbox_job(
+        self,
+        *,
+        job_id: str,
+        sandbox_id: str,
+        reason: str,
+        grace_seconds: float,
+    ) -> dict[str, object]:
+        self.cancellations.append(
+            {
+                "job_id": job_id,
+                "sandbox_id": sandbox_id,
+                "reason": reason,
+                "grace_seconds": grace_seconds,
+            }
+        )
+        return {
+            "job_id": job_id,
+            "sandbox_id": sandbox_id,
+            "state": "TERMINATED",
+            "terminate_succeeded": True,
+            "partial_result_ref": "c4://artifact/partial-cancel-1",
+        }
 
 
 class S1LifecycleStoreTests(unittest.TestCase):
@@ -214,6 +253,95 @@ class S1LifecycleStoreTests(unittest.TestCase):
         self.assertEqual(len(store.ledger_records("job-1")), 3)
         self.assertEqual(len(store.idempotency_records("job-1")), 3)
         self.assertTrue(first.idempotency_key.startswith("cancel:job-1:"))
+
+    def test_runtime_heartbeat_records_progress_and_monotonic_spend(self) -> None:
+        runtime = SubagentRuntime(descriptor=_test_descriptor())
+        job_id = "11111111-1111-4111-8111-111111111111"
+        runtime.store.create_job(job_id)
+        runtime.store.apply_method(job_id, "accept")
+        runtime.store.apply_method(job_id, "plan")
+        runtime.store.apply_method(job_id, "build")
+
+        first = runtime.record_heartbeat(job_id, progress=0.25, spend_so_far={"cost_usd": 0.5})
+        second = runtime.record_heartbeat(
+            job_id,
+            progress=0.75,
+            spend_so_far={"cost_usd": 0.5, "gpu_seconds": 2.0},
+        )
+        health = runtime.heartbeat(job_id)
+
+        self.assertEqual(first.status, LifecycleState.BUILDING)
+        self.assertEqual(second.status, LifecycleState.BUILDING)
+        self.assertEqual(health.job_id, job_id)
+        self.assertEqual(health.progress, 0.75)
+        self.assertEqual(health.spend_so_far, {"cost_usd": 0.5, "gpu_seconds": 2.0})
+        self.assertEqual(health.as_c1_payload()["spend_so_far"], {"cost_usd": 0.5, "gpu_seconds": 2.0})
+        self.assertEqual(len(runtime.store.events(job_id)), 3)
+
+        with self.assertRaises(LifecyclePolicyError) as raised:
+            runtime.record_heartbeat(job_id, progress=0.80, spend_so_far={"cost_usd": 0.4})
+
+        self.assertEqual(raised.exception.envelope.code, "S1_HEARTBEAT_SPEND_REGRESSION")
+        self.assertEqual(runtime.heartbeat(job_id).spend_so_far["cost_usd"], 0.5)
+
+    def test_runtime_cancel_terminates_active_sandbox_with_partial_provenance(self) -> None:
+        artifacts = InMemoryArtifactStore()
+        marshaler = _CancelableSandboxMarshaler()
+        runtime = SubagentRuntime(
+            descriptor=_test_descriptor(),
+            artifact_store=artifacts,
+            sandbox_marshaler=marshaler,
+        )
+        job_id = "22222222-2222-4222-8222-222222222222"
+        runtime.store.create_job(job_id)
+        runtime.store.apply_method(job_id, "accept")
+        runtime.store.apply_method(job_id, "plan")
+        runtime.store.apply_method(job_id, "build")
+        runtime.register_sandbox_result(
+            job_id,
+            {
+                "sandbox_id": "sandbox-cancel-1",
+                "state": "ADMITTED",
+                "launch_provenance_ref": "c4://artifact/launch-1",
+            },
+        )
+
+        event = runtime.cancel(job_id, reason="operator", grace_seconds=1.5)
+
+        self.assertTrue(runtime.cancel_requested(job_id))
+        self.assertEqual(runtime.store.current(job_id).state, LifecycleState.CANCELLED)
+        self.assertEqual(event.to_state, LifecycleState.CANCELLED)
+        self.assertEqual(
+            marshaler.cancellations,
+            [
+                {
+                    "job_id": job_id,
+                    "sandbox_id": "sandbox-cancel-1",
+                    "reason": "operator",
+                    "grace_seconds": 1.5,
+                }
+            ],
+        )
+        expected_payload = {
+            "category": "CANCELLED",
+            "cooperative": True,
+            "grace_seconds": 1.5,
+            "reason": "operator",
+            "sandbox_cancellations": [
+                {
+                    "job_id": job_id,
+                    "launch_provenance_ref": "c4://artifact/launch-1",
+                    "partial_result_ref": "c4://artifact/partial-cancel-1",
+                    "sandbox_id": "sandbox-cancel-1",
+                    "state": "TERMINATED",
+                    "terminate_succeeded": True,
+                }
+            ],
+        }
+        self.assertEqual(event.payload_hash, hash_json(expected_payload))
+        self.assertIsNotNone(event.ledger_ref)
+        cancel_record = artifacts.get_record(event.ledger_ref or "")
+        self.assertEqual(cancel_record.lineage.input_refs, (runtime.store.events(job_id)[-2].ledger_ref,))
 
     def test_default_report_idempotency_returns_stored_event_for_bare_retry(self) -> None:
         artifacts = InMemoryArtifactStore()

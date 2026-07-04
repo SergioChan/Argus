@@ -160,6 +160,35 @@ class S1WireServiceHttpTests(unittest.TestCase):
         self.assertEqual(errors, [], msg=[error.message for error in errors])
         self.assertEqual(len(self.runtime.store.events(self.job_id)), 1)
 
+    def test_http_heartbeat_reports_runtime_progress_and_spend(self) -> None:
+        self._accept_job()
+        self.runtime.store.apply_method(self.job_id, "plan", payload={"step": "inspect"})
+        self.runtime.store.apply_method(self.job_id, "build", payload={"artifact_refs": []})
+        self.runtime.record_heartbeat(
+            self.job_id,
+            progress=0.60,
+            spend_so_far={"cost_usd": 1.25, "gpu_seconds": 10.0},
+        )
+
+        status, payload = self.app.handle(
+            JsonRequest(
+                method="GET",
+                path=f"/v1/jobs/{self.job_id}/heartbeat",
+                query={"trace_id": [self.trace_id]},
+                body=None,
+            )
+        )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["job_id"], self.job_id)
+        self.assertEqual(payload["status"], "BUILDING")
+        self.assertEqual(payload["progress"], 0.60)
+        self.assertEqual(payload["spend_so_far"], {"cost_usd": 1.25, "gpu_seconds": 10.0})
+        datetime.fromisoformat(str(payload["last_heartbeat_at"]).replace("Z", "+00:00"))
+        errors = sorted(self.c1_validator.iter_errors(payload), key=lambda error: list(error.path))
+        self.assertEqual(errors, [], msg=[error.message for error in errors])
+        self.assertEqual([event.method for event in self.runtime.store.events(self.job_id)], ["accept", "plan", "build"])
+
     def _accept_job(self) -> None:
         status, payload = self.app.handle(
             JsonRequest(

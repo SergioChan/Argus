@@ -2719,6 +2719,7 @@ class InMemorySandboxOrchestrator:
         self._policy_service = policy_service
         self._artifact_store = artifact_store
         self._handles: dict[str, SandboxHandle] = {}
+        self._requests: dict[str, LaunchRequest] = {}
 
     def launch(self, request: LaunchRequest) -> SandboxHandle:
         self._verify_tokens_for_launch(request)
@@ -2757,6 +2758,7 @@ class InMemorySandboxOrchestrator:
             launch_provenance_ref=launch_provenance_ref,
         )
         self._handles[handle.sandbox_id] = handle
+        self._requests[handle.sandbox_id] = request
         self._audit_ledger.append(
             "sandbox.launched",
             {"sandbox_id": handle.sandbox_id, "job_id": request.job_id, "runtime_class": handle.runtime_class},
@@ -2765,6 +2767,91 @@ class InMemorySandboxOrchestrator:
 
     def get(self, sandbox_id: str) -> SandboxHandle:
         return self._handles[sandbox_id]
+
+    def cancel_sandbox_job(
+        self,
+        *,
+        job_id: str,
+        sandbox_id: str,
+        reason: str,
+        grace_seconds: float,
+    ) -> dict[str, Any]:
+        handle = self.get(sandbox_id)
+        if handle.job_id != job_id:
+            self._audit_ledger.append(
+                "sandbox.cancel_denied",
+                {"sandbox_id": sandbox_id, "job_id": job_id, "handle_job_id": handle.job_id},
+            )
+            raise PolicyDeniedError("sandbox job_id mismatch")
+        request = self._requests.get(sandbox_id)
+        partial_result_ref = self._emit_cancel_partial_result(
+            request=request,
+            handle=handle,
+            reason=reason,
+            grace_seconds=grace_seconds,
+        )
+        if request is not None:
+            self._quota_ledger.release(request.budget_token.budget_id, request.requested_envelope.budget_usage())
+        cancelled_handle = replace(handle, state="TERMINATED")
+        self._handles[sandbox_id] = cancelled_handle
+        payload = {
+            "sandbox_id": sandbox_id,
+            "job_id": job_id,
+            "reason": reason,
+            "grace_seconds": grace_seconds,
+            "state": cancelled_handle.state,
+            "terminate_succeeded": True,
+            "partial_result_ref": partial_result_ref,
+        }
+        self._audit_ledger.append("sandbox.cancelled", payload)
+        return payload
+
+    def _emit_cancel_partial_result(
+        self,
+        *,
+        request: LaunchRequest | None,
+        handle: SandboxHandle,
+        reason: str,
+        grace_seconds: float,
+    ) -> str | None:
+        if self._artifact_store is None or request is None:
+            return None
+        payload = {
+            "schema": "argus.s10.partial_result.v1",
+            "job_id": request.job_id,
+            "sandbox_id": handle.sandbox_id,
+            "reason": reason,
+            "grace_seconds": grace_seconds,
+            "frozen_state": "FROZEN",
+            "terminated_state": "TERMINATED",
+            "stdout": "",
+            "stderr": "",
+            "captured_after_freeze": True,
+            "freeze_succeeded": True,
+            "terminate_succeeded": True,
+            "capture_error": None,
+        }
+        record = self._artifact_store.create_artifact(
+            kind="sandbox.partial_result",
+            payload=payload,
+            producer=Producer(subsystem="S10", version=handle.policy_bundle_version, job_id=request.job_id),
+            lineage=Lineage(
+                input_refs=tuple(ref for ref in (handle.launch_provenance_ref,) if ref),
+                code_ref="argus-core:s10.in-memory-cancel",
+                environment_digest="python:s10-in-memory-cancel:v1",
+                job_id=request.job_id,
+            ),
+        )
+        self._audit_ledger.append(
+            "sandbox.partial_result",
+            {
+                "sandbox_id": handle.sandbox_id,
+                "job_id": request.job_id,
+                "partial_result_ref": record.artifact_ref,
+                "reason": reason,
+            },
+        )
+        return record.artifact_ref
 
     def _verify_tokens_for_launch(self, request: LaunchRequest) -> None:
         budget_verification = self._token_service.verify_budget(request.budget_token)
