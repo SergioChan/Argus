@@ -8,6 +8,7 @@ import textwrap
 from abc import ABC, abstractmethod
 from collections.abc import Mapping as CollectionsMapping
 from dataclasses import asdict, dataclass, field, is_dataclass, replace
+from datetime import datetime
 from enum import Enum
 from typing import Any, Mapping, NoReturn, final
 from uuid import NAMESPACE_URL, uuid4, uuid5
@@ -192,6 +193,16 @@ S1_REFERENCE_CONFORMANCE_ENVIRONMENT_DIGEST = "python:s1-reference-conformance:v
 S1_REFERENCE_CONFORMANCE_CREATED_AT = "1970-01-01T00:00:00Z"
 S1_REFERENCE_CONFORMANCE_SUITE_VERSION = "s1-reference-conformance.v1"
 S1_REFERENCE_CONFORMANCE_STANDARD_REF = "c4://standard/c1/1.0.0"
+_S1_DESCRIPTOR_CONFORMANCE_FIELDS = frozenset(
+    {
+        "level",
+        "suite_version",
+        "standard_release_ref",
+        "evidence_ref",
+        "determinism_hash",
+        "expires_at",
+    }
+)
 S1_CONFORMANCE_LEVEL_ORDER = {"none": 0, "bronze": 1, "silver": 2, "gold": 3}
 S1_CAPABILITY_DESCRIPTOR_DEFAULT_SCOPES = ("c1.accept", "c1.plan", "c1.build", "c1.validate", "c1.report")
 S1_CONTENT_STORE_EGRESS_RULE = EgressRule("store.local", 443, "https")
@@ -1559,7 +1570,41 @@ def _normalize_s1_descriptor_conformance(conformance: Mapping[str, str] | None) 
             value,
             f"conformance.{key}",
         )
+    missing = sorted(_S1_DESCRIPTOR_CONFORMANCE_FIELDS - set(normalized))
+    if missing:
+        raise ValueError("conformance missing required field(s): " + ", ".join(missing))
+    extra = sorted(set(normalized) - _S1_DESCRIPTOR_CONFORMANCE_FIELDS)
+    if extra:
+        raise ValueError("conformance has unrecognized field(s): " + ", ".join(extra))
+    if normalized["level"] not in {"bronze", "silver", "gold"}:
+        raise ValueError("conformance.level must be one of: bronze, silver, gold")
+    _assert_s1_descriptor_artifact_ref(normalized["standard_release_ref"], "conformance.standard_release_ref")
+    _assert_s1_descriptor_artifact_ref(normalized["evidence_ref"], "conformance.evidence_ref")
+    _assert_s1_descriptor_determinism_hash(normalized["determinism_hash"])
+    _assert_s1_descriptor_conformance_expiry_parseable(normalized["expires_at"])
     return normalized
+
+
+def _assert_s1_descriptor_artifact_ref(value: str, name: str) -> None:
+    if not value.startswith("c4://") or value == "c4://":
+        raise ValueError(f"{name} must be a C4 artifact ref")
+
+
+def _assert_s1_descriptor_determinism_hash(value: str) -> None:
+    prefix = "blake3:"
+    digest = value[len(prefix) :] if value.startswith(prefix) else ""
+    if len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest):
+        raise ValueError("conformance.determinism_hash must be a blake3 digest")
+
+
+def _assert_s1_descriptor_conformance_expiry_parseable(value: str) -> None:
+    normalized = value.replace("Z", "+00:00") if value.endswith("Z") else value
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError as exc:
+        raise ValueError("conformance.expires_at must be an RFC3339 date-time") from exc
+    if parsed.tzinfo is None:
+        raise ValueError("conformance.expires_at must include a timezone")
 
 
 def _s1_descriptor_conformance_from_result(

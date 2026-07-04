@@ -291,6 +291,9 @@ class InMemoryRegistry:
         missing = sorted(required - set(conformance))
         if missing:
             raise RegistryError("CONFORMANCE_MISSING: " + ", ".join(missing))
+        extra = sorted(set(conformance) - required)
+        if extra:
+            raise RegistryError("CONFORMANCE_UNRECOGNIZED: " + ", ".join(extra))
         level = conformance["level"]
         if level not in {"bronze", "silver", "gold"}:
             raise RegistryError("CONFORMANCE_LEVEL_INVALID")
@@ -298,7 +301,7 @@ class InMemoryRegistry:
         if expires_at <= datetime.now(UTC):
             raise RegistryError("CONFORMANCE_EXPIRED")
         if self._artifact_store is None:
-            return
+            raise RegistryError("CONFORMANCE_EVIDENCE_STORE_REQUIRED")
         evidence_ref = conformance["evidence_ref"]
         evidence_record = self._load_conformance_evidence_record(evidence_ref)
         evidence = self._load_conformance_evidence(evidence_ref)

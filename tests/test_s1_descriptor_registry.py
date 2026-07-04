@@ -193,6 +193,59 @@ class S1CapabilityDescriptorRegistryTests(unittest.TestCase):
         self.assertEqual(registry.events, ())
         self.assertEqual(store.record_count, evidence_records)
 
+    def test_builder_rejects_incomplete_raw_conformance_block(self) -> None:
+        with self.assertRaisesRegex(ValueError, "conformance missing required field"):
+            build_s1_capability_descriptor(
+                self.subagent_descriptor,
+                revision=1,
+                independence_tags=("impl-reference",),
+                conformance={"level": "gold"},
+            )
+
+    def test_builder_rejects_raw_conformance_block_with_unrecognized_fields(self) -> None:
+        store = InMemoryArtifactStore()
+        result = self._run_conformance(store, level="bronze")
+        with self.assertRaisesRegex(ValueError, "conformance has unrecognized field"):
+            build_s1_capability_descriptor(
+                self.subagent_descriptor,
+                revision=1,
+                independence_tags=("impl-reference",),
+                conformance=result.descriptor_conformance_block(expires_at=FUTURE_EXPIRES_AT)
+                | {"self_attested": "true"},
+            )
+
+    def test_storeless_registry_rejects_raw_conformance_evidence_pass_through(self) -> None:
+        store = InMemoryArtifactStore()
+        result = self._run_conformance(store, level="bronze")
+        registry = InMemoryRegistry()
+
+        with self.assertRaisesRegex(Exception, "CONFORMANCE_EVIDENCE_STORE_REQUIRED"):
+            publish_s1_capability_descriptor(
+                registry,
+                self.subagent_descriptor,
+                revision=1,
+                independence_tags=("impl-reference",),
+                conformance=result.descriptor_conformance_block(expires_at=FUTURE_EXPIRES_AT),
+            )
+
+        self.assertEqual(registry.events, ())
+
+    def test_store_backed_registry_accepts_verified_raw_conformance_pass_through(self) -> None:
+        store = InMemoryArtifactStore()
+        result = self._run_conformance(store, level="bronze")
+        registry = InMemoryRegistry(artifact_store=store)
+
+        published = publish_s1_capability_descriptor(
+            registry,
+            self.subagent_descriptor,
+            revision=1,
+            independence_tags=("impl-reference",),
+            conformance=result.descriptor_conformance_block(expires_at=FUTURE_EXPIRES_AT),
+        )
+
+        self.assertEqual(published.conformance["evidence_ref"], result.evidence_ref)
+        self.assertEqual(registry.get(self.subagent_descriptor.subagent_id), published)
+
     def test_registry_rejects_expired_or_tampered_conformance_block(self) -> None:
         store = InMemoryArtifactStore()
         registry = InMemoryRegistry(artifact_store=store)
@@ -209,7 +262,7 @@ class S1CapabilityDescriptorRegistryTests(unittest.TestCase):
             self.subagent_descriptor,
             revision=1,
             independence_tags=("impl-reference",),
-            conformance=valid_conformance | {"determinism_hash": "blake3:tampered"},
+            conformance=valid_conformance | {"determinism_hash": "blake3:" + ("0" * 64)},
         )
 
         with self.assertRaisesRegex(Exception, "CONFORMANCE_EXPIRED"):
