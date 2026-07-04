@@ -402,6 +402,25 @@ UNCERTAINTY_REPRESENTATIONS = frozenset(
     {"covariance", "interval", "samples", "conformal", "ensemble", "none"}
 )
 UNCERTAINTY_REQUIRED_CLAIM_TIERS = frozenset({"recapitulated-known", "novel-needs-human"})
+BUILD_RESULT_FIELDS = frozenset(
+    {
+        "job_id",
+        "artifact_refs",
+        "training_log_ref",
+        "diagnostics",
+        "self_checks",
+        "uncertainty_summary",
+    }
+)
+BUILD_RESULT_TIER_SELF_PROMOTION_FIELDS = frozenset(
+    {
+        "claim_tier",
+        "claimed_tier",
+        "tier",
+        "validation_report_payload",
+        "validation_report_ref",
+    }
+)
 
 
 def no_uncertainty_summary() -> dict[str, Any]:
@@ -474,6 +493,10 @@ def _assert_uncertainty_for_claim_tier(summary: Mapping[str, Any], claim_tier: s
 
 
 def _raise_uncertainty_policy(code: str, message: str) -> NoReturn:
+    _raise_policy(code, message)
+
+
+def _raise_policy(code: str, message: str) -> NoReturn:
     raise LifecyclePolicyError(
         build_error_envelope(
             category="POLICY",
@@ -706,6 +729,16 @@ class ExecContext:
         validation_report_ref: str | None = None,
     ) -> dict[str, Any]:
         self._require_capability("emit_artifact")
+        if claim_tier != "ran-toy":
+            _raise_policy(
+                "S1_ARTIFACT_TIER_SELF_PROMOTION_FORBIDDEN",
+                "ExecContext.emit_artifact cannot set claim_tier above ran-toy; promoted artifacts require framework-owned signed C3 validation",
+            )
+        if validation_report_ref is not None:
+            _raise_policy(
+                "S1_ARTIFACT_VALIDATION_REPORT_REF_FORBIDDEN",
+                "ExecContext.emit_artifact cannot attach validation_report_ref; signed validation refs are framework-owned",
+            )
         resolved_lineage = self._artifact_lineage(
             payload=payload,
             kind=kind,
@@ -2050,6 +2083,21 @@ def _normalize_build_payload(job_id: str, value: Mapping[str, Any] | Any) -> dic
     payload["uncertainty_summary"] = _normalize_uncertainty_summary(
         payload.get("uncertainty_summary", no_uncertainty_summary())
     )
+    extra = set(payload) - BUILD_RESULT_FIELDS
+    self_promotion_fields = extra & BUILD_RESULT_TIER_SELF_PROMOTION_FIELDS
+    if self_promotion_fields:
+        _raise_policy(
+            "S1_BUILD_TIER_SELF_PROMOTION_FORBIDDEN",
+            "build payload cannot set tier or validation fields: "
+            + ", ".join(sorted(str(field) for field in self_promotion_fields))
+            + "; claim_tier comes only from signed C3 reports",
+        )
+    if extra:
+        _raise_policy(
+            "S1_BUILD_RESULT_FIELD_UNSUPPORTED",
+            "build payload contains unsupported top-level fields: "
+            + ", ".join(sorted(str(field) for field in extra)),
+        )
     return payload
 
 
@@ -2081,6 +2129,11 @@ def build_subagent_report(
         verification = report_verifier.verify(validation_report_payload)
         if verification.valid and verification.claim_tier:
             _assert_uncertainty_for_claim_tier(normalized_uncertainty, verification.claim_tier)
+            if verification.claim_tier != "ran-toy" and not validation_report_ref:
+                _raise_policy(
+                    "S1_VALIDATION_REPORT_REF_REQUIRED",
+                    f"claim tier {verification.claim_tier} requires validation_report_ref from the signed C3 report artifact",
+                )
             return SubagentReport(
                 artifact_refs=artifact_refs,
                 validation_report_ref=validation_report_ref,

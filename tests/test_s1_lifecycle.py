@@ -403,6 +403,25 @@ class S1TierRelayTests(unittest.TestCase):
         self.assertEqual(raised.exception.envelope.code, "S1_UNCERTAINTY_REQUIRED_FOR_TIER")
         self.assertIn("recapitulated-known", raised.exception.envelope.message)
 
+    def test_signed_report_tier_requires_validation_report_ref(self) -> None:
+        signed = self.signer.sign(self._report("recapitulated-known"))
+        uncertainty_summary = tag_uncertainty(
+            "interval",
+            {"radius": 0.1, "confidence": 0.95, "source": "signed-c3-report"},
+        )
+
+        with self.assertRaises(LifecyclePolicyError) as raised:
+            build_subagent_report(
+                artifact_refs=("c4://artifact/model",),
+                validation_report_payload=signed,
+                report_verifier=self.verifier,
+                uncertainty_summary=uncertainty_summary,
+            )
+
+        self.assertEqual(raised.exception.envelope.category, "POLICY")
+        self.assertEqual(raised.exception.envelope.code, "S1_VALIDATION_REPORT_REF_REQUIRED")
+        self.assertIn("validation_report_ref", raised.exception.envelope.message)
+
     def test_unsigned_report_is_rejected_and_tier_stays_ran_toy(self) -> None:
         signed = self.signer.sign(self._report("recapitulated-known"))
         signed["aggregate"]["score"] = 0.1

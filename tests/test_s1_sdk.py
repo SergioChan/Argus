@@ -186,6 +186,33 @@ class S1SDKBaseClassTests(unittest.TestCase):
         self._assert_c1_valid(planned.payload)
         self._assert_c1_valid(built.payload)
 
+    def test_runner_rejects_author_build_tier_self_promotion_fields(self) -> None:
+        class SelfPromotingBuildSubagent(ExampleSubagent):
+            def build(self, ctx: ExecContext, plan: dict[str, object]) -> dict[str, object]:
+                payload = super().build(ctx, plan)
+                payload["claim_tier"] = "novel-needs-human"
+                payload["validation_report_ref"] = "c4://artifact/author-claimed-report"
+                payload["self_checks"] = [
+                    {"type": "PHYSICAL_CONSISTENCY", "status": "PASS", "advisory": True}
+                ]
+                return payload
+
+        runner = SubagentSDKRunner(SelfPromotingBuildSubagent(self.descriptor))
+
+        runner.accept(self.envelope)
+        planned = runner.plan(self.envelope)
+        with self.assertRaises(LifecyclePolicyError) as raised:
+            runner.build(self.envelope.job_id, planned.payload)
+
+        self.assertEqual(raised.exception.envelope.category, "POLICY")
+        self.assertEqual(raised.exception.envelope.code, "S1_BUILD_TIER_SELF_PROMOTION_FORBIDDEN")
+        self.assertIn("claim_tier", raised.exception.envelope.message)
+        self.assertEqual(runner.runtime.store.current(self.envelope.job_id).state, LifecycleState.PLANNING)
+        self.assertEqual(
+            [event.method for event in runner.runtime.store.events(self.envelope.job_id)],
+            ["accept", "plan"],
+        )
+
     def test_exec_context_is_canonical_restricted_capability_handle(self) -> None:
         expected_capabilities = [
             "submit_sandbox_job",
@@ -512,7 +539,7 @@ class S1SDKBaseClassTests(unittest.TestCase):
             [(source.artifact_ref, record.artifact_ref)],
         )
 
-    def test_exec_context_emit_artifact_rejects_illegal_tier_without_commit(self) -> None:
+    def test_exec_context_emit_artifact_rejects_promoted_tier_before_c4_commit(self) -> None:
         artifacts = InMemoryArtifactStore()
         ctx = ExecContext(job_id=self.envelope.job_id, artifact_store=artifacts)
 
@@ -529,9 +556,9 @@ class S1SDKBaseClassTests(unittest.TestCase):
                 claim_tier="recapitulated-known",
             )
 
-        self.assertEqual(raised.exception.envelope.code, "ILLEGAL_TIER")
+        self.assertEqual(raised.exception.envelope.code, "S1_ARTIFACT_TIER_SELF_PROMOTION_FORBIDDEN")
         self.assertEqual(raised.exception.envelope.category, "POLICY")
-        self.assertIn("validation_report_ref", raised.exception.envelope.message)
+        self.assertIn("claim_tier", raised.exception.envelope.message)
         self.assertEqual(len(artifacts), 0)
 
     def test_runner_author_build_emits_artifact_through_runtime_c4_store(self) -> None:
