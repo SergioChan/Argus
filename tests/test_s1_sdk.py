@@ -24,9 +24,28 @@ class ExampleSubagent(Subagent):
         self.plan_ctx_job_id: str | None = None
         self.build_ctx_job_id: str | None = None
         self.seen_plan_hash: str | None = None
+        self.plan_ctx_payload: dict[str, object] | None = None
+        self.build_ctx_payload: dict[str, object] | None = None
+        self.build_log_handle: dict[str, object] | None = None
+        self.build_span_handle: dict[str, object] | None = None
+        self.plan_ctx_forbidden_handles: dict[str, bool] | None = None
 
     def plan(self, ctx: ExecContext, envelope: JobEnvelope) -> dict[str, object]:
         self.plan_ctx_job_id = ctx.job_id
+        self.plan_ctx_payload = ctx.as_c1_payload()
+        self.plan_ctx_forbidden_handles = {
+            name: hasattr(ctx, name)
+            for name in (
+                "set_claim_tier",
+                "verifier",
+                "report_verifier",
+                "credentials",
+                "raw_credentials",
+                "allowed_adapters",
+                "allowed_datasets",
+                "artifact_store",
+            )
+        }
         return {
             "steps": [
                 {
@@ -42,6 +61,9 @@ class ExampleSubagent(Subagent):
 
     def build(self, ctx: ExecContext, plan: dict[str, object]) -> dict[str, object]:
         self.build_ctx_job_id = ctx.job_id
+        self.build_ctx_payload = ctx.as_c1_payload()
+        self.build_log_handle = ctx.log("building toy model", fields={"phase": "build"})
+        self.build_span_handle = ctx.span("build", attributes={"job_id": ctx.job_id})
         self.seen_plan_hash = str(plan["plan_hash"])
         return {
             "artifact_refs": ["c4://artifact/ewpt-toy/model"],
@@ -54,7 +76,8 @@ class S1SDKBaseClassTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         schema_path = Path(__file__).resolve().parents[1] / "schemas" / "contracts" / "c1.subagent.schema.json"
-        cls.c1_validator = Draft202012Validator(json.loads(schema_path.read_text(encoding="utf-8")))
+        cls.c1_schema = json.loads(schema_path.read_text(encoding="utf-8"))
+        cls.c1_validator = Draft202012Validator(cls.c1_schema)
 
     def setUp(self) -> None:
         self.descriptor = SubagentDescriptor(
@@ -85,6 +108,23 @@ class S1SDKBaseClassTests(unittest.TestCase):
         self.assertTrue(acceptance.accepted)
         self.assertEqual(subagent.plan_ctx_job_id, self.envelope.job_id)
         self.assertEqual(subagent.build_ctx_job_id, self.envelope.job_id)
+        self.assertEqual(subagent.plan_ctx_payload, subagent.build_ctx_payload)
+        self._assert_c1_def_valid("ExecContext", subagent.plan_ctx_payload or {})
+        self.assertEqual(
+            subagent.plan_ctx_forbidden_handles,
+            {
+                "set_claim_tier": False,
+                "verifier": False,
+                "report_verifier": False,
+                "credentials": False,
+                "raw_credentials": False,
+                "allowed_adapters": False,
+                "allowed_datasets": False,
+                "artifact_store": False,
+            },
+        )
+        self.assertEqual(subagent.build_log_handle["capability"], "log")
+        self.assertEqual(subagent.build_span_handle["capability"], "span")
         self.assertEqual(subagent.seen_plan_hash, planned.payload["plan_hash"])
         self.assertEqual(runner.runtime.store.current(self.envelope.job_id).state, LifecycleState.BUILDING)
         self.assertEqual([event.method for event in runner.runtime.store.events(self.envelope.job_id)], ["accept", "plan", "build"])
@@ -108,6 +148,75 @@ class S1SDKBaseClassTests(unittest.TestCase):
         self.assertEqual(built.payload["uncertainty_summary"], {"representation": "none", "value": {}})
         self._assert_c1_valid(planned.payload)
         self._assert_c1_valid(built.payload)
+
+    def test_exec_context_is_canonical_restricted_capability_handle(self) -> None:
+        expected_capabilities = [
+            "submit_sandbox_job",
+            "emit_artifact",
+            "call_adapter",
+            "read_dataset",
+            "log",
+            "span",
+        ]
+        ctx = ExecContext(job_id=self.envelope.job_id)
+
+        self.assertEqual(ctx.capabilities, tuple(expected_capabilities))
+        self.assertEqual(ctx.capability_methods(), tuple(expected_capabilities))
+        self.assertEqual(ctx.as_c1_payload(), {"job_id": self.envelope.job_id, "capabilities": expected_capabilities})
+        self._assert_c1_def_valid("ExecContext", ctx.as_c1_payload())
+        for capability in expected_capabilities:
+            self.assertTrue(callable(getattr(ctx, capability)))
+        for forbidden in (
+            "set_claim_tier",
+            "verifier",
+            "report_verifier",
+            "credentials",
+            "raw_credentials",
+            "allowed_adapters",
+            "allowed_datasets",
+            "artifact_store",
+        ):
+            self.assertFalse(hasattr(ctx, forbidden), forbidden)
+
+    def test_exec_context_denies_missing_and_unknown_capabilities(self) -> None:
+        ctx = ExecContext(job_id=self.envelope.job_id, capabilities=("read_dataset",))
+
+        self.assertEqual(ctx.as_c1_payload(), {"job_id": self.envelope.job_id, "capabilities": ["read_dataset"]})
+        self.assertEqual(ctx.read_dataset("c4://dataset/ewpt-toy")["capability"], "read_dataset")
+        with self.assertRaises(LifecyclePolicyError) as raised:
+            ctx.call_adapter("adapter:bounce", {"input": 1})
+
+        self.assertEqual(raised.exception.envelope.code, "EXEC_CONTEXT_CAPABILITY_DENIED")
+        self.assertEqual(raised.exception.envelope.category, "POLICY")
+        self.assertIn("call_adapter", raised.exception.envelope.message)
+        with self.assertRaisesRegex(ValueError, "unknown ExecContext capability"):
+            ExecContext(job_id=self.envelope.job_id, capabilities=("set_claim_tier",))
+
+    def test_exec_context_brokers_documented_capabilities_with_allowlists(self) -> None:
+        ctx = ExecContext(
+            job_id=self.envelope.job_id,
+            allowed_adapters=("adapter:bounce",),
+            allowed_datasets=("c4://dataset/ewpt-toy",),
+        )
+
+        artifact = ctx.emit_artifact(
+            {"metric": 0.98},
+            kind="diagnostic",
+            lineage_inputs=("c4://artifact/source",),
+        )
+        self.assertEqual(artifact["capability"], "emit_artifact")
+        self.assertEqual(artifact["kind"], "diagnostic")
+        self.assertTrue(str(artifact["artifact_ref"]).startswith("c4://"))
+        self.assertTrue(str(artifact["content_hash"]).startswith("blake3:"))
+        self.assertEqual(ctx.call_adapter("adapter:bounce", {"input": 1})["capability"], "call_adapter")
+        self.assertEqual(ctx.read_dataset("c4://dataset/ewpt-toy")["dataset_ref"], "c4://dataset/ewpt-toy")
+        with self.assertRaises(LifecyclePolicyError) as adapter_denied:
+            ctx.call_adapter("adapter:unlisted", {"input": 1})
+        with self.assertRaises(LifecyclePolicyError) as dataset_denied:
+            ctx.read_dataset("c4://dataset/other")
+
+        self.assertEqual(adapter_denied.exception.envelope.code, "EXEC_CONTEXT_CAPABILITY_DENIED")
+        self.assertEqual(dataset_denied.exception.envelope.code, "EXEC_CONTEXT_CAPABILITY_DENIED")
 
     def test_framework_owned_methods_cannot_be_overridden_by_authors(self) -> None:
         with self.assertRaisesRegex(TypeError, "validate"):
@@ -178,6 +287,11 @@ class S1SDKBaseClassTests(unittest.TestCase):
 
     def _assert_c1_valid(self, payload: dict[str, object]) -> None:
         errors = sorted(self.c1_validator.iter_errors(payload), key=lambda error: list(error.path))
+        self.assertEqual(errors, [], msg=[error.message for error in errors])
+
+    def _assert_c1_def_valid(self, def_name: str, payload: dict[str, object]) -> None:
+        validator = self.c1_validator.evolve(schema=self.c1_schema["$defs"][def_name])
+        errors = sorted(validator.iter_errors(payload), key=lambda error: list(error.path))
         self.assertEqual(errors, [], msg=[error.message for error in errors])
 
 

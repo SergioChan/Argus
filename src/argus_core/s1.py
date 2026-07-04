@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from dataclasses import asdict, dataclass, is_dataclass, replace
+from dataclasses import asdict, dataclass, field, is_dataclass, replace
 from enum import Enum
 from typing import Any, Mapping, final
 from uuid import NAMESPACE_URL, uuid5
@@ -230,21 +230,124 @@ class JobCurrent:
     last_sequence: int
 
 
-@dataclass(frozen=True)
+EXEC_CONTEXT_CAPABILITIES = (
+    "submit_sandbox_job",
+    "emit_artifact",
+    "call_adapter",
+    "read_dataset",
+    "log",
+    "span",
+)
+_EXEC_CONTEXT_CAPABILITY_SET = frozenset(EXEC_CONTEXT_CAPABILITIES)
+
+
+@dataclass(frozen=True, init=False)
 class ExecContext:
     job_id: str
+    capabilities: tuple[str, ...]
+    _allowed_adapters: tuple[str, ...] = field(repr=False, compare=False)
+    _allowed_datasets: tuple[str, ...] = field(repr=False, compare=False)
+    _artifact_store: InMemoryArtifactStore = field(init=False, repr=False, compare=False)
+
+    def __init__(
+        self,
+        *,
+        job_id: str,
+        capabilities: tuple[str, ...] = EXEC_CONTEXT_CAPABILITIES,
+        allowed_adapters: tuple[str, ...] = (),
+        allowed_datasets: tuple[str, ...] = (),
+        artifact_store: InMemoryArtifactStore | None = None,
+    ) -> None:
+        capabilities = tuple(dict.fromkeys(capabilities))
+        unknown = tuple(capability for capability in capabilities if capability not in _EXEC_CONTEXT_CAPABILITY_SET)
+        if unknown:
+            raise ValueError("unknown ExecContext capability: " + ", ".join(unknown))
+        object.__setattr__(self, "job_id", job_id)
+        object.__setattr__(self, "capabilities", capabilities)
+        object.__setattr__(self, "_allowed_adapters", tuple(allowed_adapters))
+        object.__setattr__(self, "_allowed_datasets", tuple(allowed_datasets))
+        object.__setattr__(self, "_artifact_store", artifact_store or InMemoryArtifactStore())
+
+    def capability_methods(self) -> tuple[str, ...]:
+        return self.capabilities
+
+    def as_c1_payload(self) -> dict[str, object]:
+        return {"job_id": self.job_id, "capabilities": list(self.capabilities)}
 
     def submit_sandbox_job(self, spec: dict[str, Any]) -> dict[str, Any]:
-        return {"submitted": True, "spec_hash": hash_json(spec)}
+        self._require_capability("submit_sandbox_job")
+        return {
+            "capability": "submit_sandbox_job",
+            "job_id": self.job_id,
+            "submitted": True,
+            "spec_hash": hash_json(spec),
+        }
 
     def emit_artifact(self, payload: Any, kind: str, lineage_inputs: tuple[str, ...]) -> dict[str, Any]:
-        return {"kind": kind, "payload_hash": hash_json(payload), "lineage_inputs": lineage_inputs}
+        self._require_capability("emit_artifact")
+        record = self._artifact_store.create_artifact(
+            kind=kind,
+            payload=payload,
+            producer=Producer(
+                subsystem="s1",
+                version="exec-context-v1",
+                actor_id="subagent-runtime",
+                job_id=self.job_id,
+            ),
+            lineage=Lineage(
+                input_refs=tuple(lineage_inputs),
+                code_ref="argus-core:s1.exec_context.emit_artifact",
+                environment_digest="python:s1-exec-context:v1",
+                job_id=self.job_id,
+            ),
+        )
+        return {
+            "capability": "emit_artifact",
+            "job_id": self.job_id,
+            "artifact_ref": record.artifact_ref,
+            "kind": record.kind,
+            "content_hash": record.content_hash,
+        }
 
     def call_adapter(self, adapter_ref: str, request: dict[str, Any]) -> dict[str, Any]:
-        return {"adapter_ref": adapter_ref, "request_hash": hash_json(request)}
+        self._require_capability("call_adapter")
+        if self._allowed_adapters and adapter_ref not in self._allowed_adapters:
+            self._deny_capability("call_adapter", f"adapter is not allowlisted: {adapter_ref}")
+        return {
+            "capability": "call_adapter",
+            "job_id": self.job_id,
+            "adapter_ref": adapter_ref,
+            "request_hash": hash_json(request),
+        }
 
     def read_dataset(self, dataset_ref: str) -> dict[str, str]:
-        return {"dataset_ref": dataset_ref}
+        self._require_capability("read_dataset")
+        if self._allowed_datasets and dataset_ref not in self._allowed_datasets:
+            self._deny_capability("read_dataset", f"dataset is not allowlisted: {dataset_ref}")
+        return {"capability": "read_dataset", "job_id": self.job_id, "dataset_ref": dataset_ref}
+
+    def log(self, message: str, *, fields: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        self._require_capability("log")
+        payload = {"message": message, "fields": dict(fields or {})}
+        return {"capability": "log", "job_id": self.job_id, "message_hash": hash_json(payload)}
+
+    def span(self, name: str, *, attributes: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        self._require_capability("span")
+        payload = {"name": name, "attributes": dict(attributes or {})}
+        return {"capability": "span", "job_id": self.job_id, "span_hash": hash_json(payload)}
+
+    def _require_capability(self, capability: str) -> None:
+        if capability not in self.capabilities:
+            self._deny_capability(capability, f"capability is not enabled: {capability}")
+
+    def _deny_capability(self, capability: str, message: str) -> None:
+        raise LifecyclePolicyError(
+            ErrorEnvelope(
+                code="EXEC_CONTEXT_CAPABILITY_DENIED",
+                category="POLICY",
+                message=f"ExecContext denied {capability}: {message}",
+            )
+        )
 
 
 @dataclass(frozen=True)
@@ -777,7 +880,7 @@ class SubagentSDKRunner:
         trace_id: str | None = None,
     ) -> SDKInvocationResult:
         self._assert_can_apply(envelope.job_id, "plan")
-        ctx = ExecContext(job_id=envelope.job_id)
+        ctx = self._exec_context(envelope.job_id, allowed_adapters=envelope.allowed_adapters)
         payload = _normalize_plan_payload(envelope, self.subagent.plan(ctx, envelope))
         event = self.runtime.store.apply_method(
             envelope.job_id,
@@ -801,7 +904,11 @@ class SubagentSDKRunner:
     ) -> SDKInvocationResult:
         self._assert_can_apply(job_id, "build")
         plan_payload = _mapping_payload("plan", plan)
-        ctx = ExecContext(job_id=job_id)
+        ctx = self._exec_context(
+            job_id,
+            allowed_adapters=tuple(str(adapter) for adapter in plan_payload.get("adapters_required", ())),
+            allowed_datasets=tuple(str(dataset) for dataset in plan_payload.get("datasets_required", ())),
+        )
         payload = _normalize_build_payload(job_id, self.subagent.build(ctx, plan_payload))
         event = self.runtime.store.apply_method(
             job_id,
@@ -816,6 +923,20 @@ class SubagentSDKRunner:
             trace_id=trace_id,
         )
         return SDKInvocationResult(event=event, payload=payload)
+
+    def _exec_context(
+        self,
+        job_id: str,
+        *,
+        allowed_adapters: tuple[str, ...] = (),
+        allowed_datasets: tuple[str, ...] = (),
+    ) -> ExecContext:
+        return ExecContext(
+            job_id=job_id,
+            allowed_adapters=allowed_adapters,
+            allowed_datasets=allowed_datasets,
+            artifact_store=self.runtime.artifact_store,
+        )
 
     def _assert_can_apply(self, job_id: str, method: str) -> None:
         try:
