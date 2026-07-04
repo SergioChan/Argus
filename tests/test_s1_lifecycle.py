@@ -23,6 +23,7 @@ from argus_core import (
     SubagentDescriptor,
     SubagentRuntime,
     TERMINAL_STATES,
+    build_error_envelope,
     build_subagent_report,
     canonical_json_bytes,
     default_accept,
@@ -68,6 +69,37 @@ class _CancelableSandboxMarshaler:
             "state": "TERMINATED",
             "terminate_succeeded": True,
             "partial_result_ref": "c4://artifact/partial-cancel-1",
+        }
+
+
+class _QuarantineSandboxMarshaler:
+    def __init__(self) -> None:
+        self.quarantines: list[dict[str, object]] = []
+
+    def quarantine_sandbox_job(
+        self,
+        *,
+        job_id: str,
+        sandbox_id: str,
+        reason: str,
+        grace_seconds: float,
+        error: dict[str, object],
+    ) -> dict[str, object]:
+        self.quarantines.append(
+            {
+                "job_id": job_id,
+                "sandbox_id": sandbox_id,
+                "reason": reason,
+                "grace_seconds": grace_seconds,
+                "error": error,
+            }
+        )
+        return {
+            "job_id": job_id,
+            "sandbox_id": sandbox_id,
+            "state": "QUARANTINED",
+            "terminate_succeeded": True,
+            "partial_result_ref": "c4://artifact/partial-quarantine-1",
         }
 
 
@@ -342,6 +374,70 @@ class S1LifecycleStoreTests(unittest.TestCase):
         self.assertIsNotNone(event.ledger_ref)
         cancel_record = artifacts.get_record(event.ledger_ref or "")
         self.assertEqual(cancel_record.lineage.input_refs, (runtime.store.events(job_id)[-2].ledger_ref,))
+
+    def test_runtime_quarantine_freezes_active_sandbox_with_forensic_provenance(self) -> None:
+        artifacts = InMemoryArtifactStore()
+        marshaler = _QuarantineSandboxMarshaler()
+        runtime = SubagentRuntime(
+            descriptor=_test_descriptor(),
+            artifact_store=artifacts,
+            sandbox_marshaler=marshaler,
+        )
+        job_id = "23232323-2323-4323-8323-232323232323"
+        runtime.store.create_job(job_id)
+        runtime.store.apply_method(job_id, "accept")
+        runtime.store.apply_method(job_id, "plan")
+        runtime.store.apply_method(job_id, "build")
+        runtime.register_sandbox_result(
+            job_id,
+            {
+                "sandbox_id": "sandbox-quarantine-1",
+                "state": "ADMITTED",
+                "launch_provenance_ref": "c4://artifact/launch-quarantine-1",
+            },
+        )
+        error = build_error_envelope(
+            category="SANDBOX",
+            code="TRUST_PATH_WRITE",
+            message="sandbox attempted to write a verifier mount",
+        )
+
+        event = runtime.quarantine(job_id, error=error, reason="trust-path-write", grace_seconds=2.0)
+
+        self.assertEqual(runtime.store.current(job_id).state, LifecycleState.QUARANTINED)
+        self.assertEqual(event.to_state, LifecycleState.QUARANTINED)
+        self.assertEqual(
+            marshaler.quarantines,
+            [
+                {
+                    "job_id": job_id,
+                    "sandbox_id": "sandbox-quarantine-1",
+                    "reason": "trust-path-write",
+                    "grace_seconds": 2.0,
+                    "error": error.as_c1_payload(),
+                }
+            ],
+        )
+        expected_payload = {
+            "category": "SANDBOX",
+            "code": "TRUST_PATH_WRITE",
+            "error": error.as_c1_payload(),
+            "grace_seconds": 2.0,
+            "reason": "trust-path-write",
+            "sandbox_quarantines": [
+                {
+                    "job_id": job_id,
+                    "launch_provenance_ref": "c4://artifact/launch-quarantine-1",
+                    "partial_result_ref": "c4://artifact/partial-quarantine-1",
+                    "sandbox_id": "sandbox-quarantine-1",
+                    "state": "QUARANTINED",
+                    "terminate_succeeded": True,
+                }
+            ],
+        }
+        self.assertEqual(event.payload_hash, hash_json(expected_payload))
+        quarantine_record = artifacts.get_record(event.ledger_ref or "")
+        self.assertEqual(quarantine_record.lineage.input_refs, (runtime.store.events(job_id)[-2].ledger_ref,))
 
     def test_default_report_idempotency_returns_stored_event_for_bare_retry(self) -> None:
         artifacts = InMemoryArtifactStore()

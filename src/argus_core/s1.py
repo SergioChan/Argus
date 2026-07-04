@@ -469,6 +469,49 @@ class S10SandboxMarshaler:
             "terminate_succeeded": False,
         }
 
+    def quarantine_sandbox_job(
+        self,
+        *,
+        job_id: str,
+        sandbox_id: str,
+        reason: str,
+        grace_seconds: float,
+        error: Mapping[str, Any] | None = None,
+    ) -> Any:
+        try:
+            quarantine_hook = getattr(self.launcher, "quarantine_sandbox_job", None)
+            if callable(quarantine_hook):
+                return quarantine_hook(
+                    job_id=job_id,
+                    sandbox_id=sandbox_id,
+                    reason=reason,
+                    grace_seconds=grace_seconds,
+                    error=error or {},
+                )
+            for name in ("cancel_sandbox_job", "terminate_sandbox_job", "cancel"):
+                hook = getattr(self.launcher, name, None)
+                if callable(hook):
+                    return hook(
+                        job_id=job_id,
+                        sandbox_id=sandbox_id,
+                        reason=reason,
+                        grace_seconds=grace_seconds,
+                    )
+        except S10Error as exc:
+            raise LifecyclePolicyError(
+                build_error_envelope(
+                    category="SANDBOX",
+                    code="S10_SANDBOX_QUARANTINE_FAILED",
+                    message=f"S10 sandbox quarantine failed: {exc}",
+                )
+            ) from exc
+        return {
+            "job_id": job_id,
+            "sandbox_id": sandbox_id,
+            "state": "QUARANTINE_REQUESTED",
+            "terminate_succeeded": False,
+        }
+
 
 EXEC_CONTEXT_CAPABILITIES = (
     "submit_sandbox_job",
@@ -1459,6 +1502,41 @@ def _normalize_sandbox_cancellation(
         payload["state"] = "CANCEL_REQUESTED"
         payload["terminate_succeeded"] = False
     payload.setdefault("state", "CANCEL_REQUESTED")
+    payload.setdefault("terminate_succeeded", False)
+    return payload
+
+
+def _normalize_sandbox_quarantine(
+    *,
+    job_id: str,
+    active: Mapping[str, Any],
+    result: Any,
+) -> dict[str, Any]:
+    sandbox_id = str(active["sandbox_id"])
+    payload: dict[str, Any] = {
+        "job_id": job_id,
+        "sandbox_id": sandbox_id,
+    }
+    launch_provenance_ref = active.get("launch_provenance_ref")
+    if isinstance(launch_provenance_ref, str) and launch_provenance_ref:
+        payload["launch_provenance_ref"] = launch_provenance_ref
+    result_payload = _json_compatible_payload(result)
+    if isinstance(result_payload, Mapping):
+        state = result_payload.get("state")
+        if state is not None:
+            payload["state"] = str(state)
+        terminate_succeeded = result_payload.get("terminate_succeeded")
+        if terminate_succeeded is not None:
+            payload["terminate_succeeded"] = bool(terminate_succeeded)
+        partial_result_ref = result_payload.get("partial_result_ref")
+        if isinstance(partial_result_ref, str) and partial_result_ref:
+            payload["partial_result_ref"] = partial_result_ref
+        elif "partial_result" in result_payload:
+            payload["partial_result"] = result_payload["partial_result"]
+    else:
+        payload["state"] = "QUARANTINE_REQUESTED"
+        payload["terminate_succeeded"] = False
+    payload.setdefault("state", "QUARANTINE_REQUESTED")
     payload.setdefault("terminate_succeeded", False)
     return payload
 
@@ -2677,6 +2755,7 @@ class SubagentRuntime:
         self._cancel_flags: set[str] = set()
         self._active_sandboxes: dict[str, dict[str, dict[str, Any]]] = {}
         self._cancel_events: dict[str, LifecycleEvent] = {}
+        self._quarantine_events: dict[str, LifecycleEvent] = {}
 
     def accept(
         self,
@@ -2834,6 +2913,99 @@ class SubagentRuntime:
         )
         return _normalize_sandbox_cancellation(job_id=job_id, active=active, result=result)
 
+    def quarantine(
+        self,
+        job_id: str,
+        *,
+        error: ErrorEnvelope,
+        reason: str | None = None,
+        grace_seconds: float = S1_CANCEL_DEFAULT_GRACE_SECONDS,
+        idempotency_key: str | None = None,
+        root_request_id: str | None = None,
+        trace_id: str | None = None,
+    ) -> LifecycleEvent:
+        if job_id in self._quarantine_events and idempotency_key is None:
+            return self._quarantine_events[job_id]
+        if not error.behavior.quarantine:
+            raise LifecyclePolicyError(
+                build_error_envelope(
+                    category="POLICY",
+                    code="S1_QUARANTINE_ERROR_CATEGORY_INVALID",
+                    message=f"{error.category} errors do not use the S1 quarantine path",
+                )
+            )
+        normalized_grace_seconds = _normalize_cancel_grace_seconds(grace_seconds)
+        resolved_reason = reason or f"{error.category}:{error.code}"
+        error_payload = error.as_c1_payload()
+        sandbox_quarantines = [
+            self._quarantine_active_sandbox(
+                job_id=job_id,
+                active=active,
+                reason=resolved_reason,
+                grace_seconds=normalized_grace_seconds,
+                error_payload=error_payload,
+            )
+            for _sandbox_id, active in sorted(self._active_sandboxes.get(job_id, {}).items())
+        ]
+        payload = {
+            "category": error.category,
+            "code": error.code,
+            "error": error_payload,
+            "grace_seconds": normalized_grace_seconds,
+            "reason": resolved_reason,
+            "sandbox_quarantines": sandbox_quarantines,
+        }
+        event = self.store.apply_method(
+            job_id,
+            "quarantine",
+            trigger="S1 quarantine",
+            payload=payload,
+            idempotency_key=idempotency_key,
+            root_request_id=root_request_id,
+            trace_id=trace_id,
+        )
+        self._quarantine_events[job_id] = event
+        self._active_sandboxes.pop(job_id, None)
+        return event
+
+    def _quarantine_active_sandbox(
+        self,
+        *,
+        job_id: str,
+        active: Mapping[str, Any],
+        reason: str,
+        grace_seconds: float,
+        error_payload: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        sandbox_id = str(active["sandbox_id"])
+        quarantine_hook = getattr(self.sandbox_marshaler, "quarantine_sandbox_job", None)
+        try:
+            if callable(quarantine_hook):
+                result = quarantine_hook(
+                    job_id=job_id,
+                    sandbox_id=sandbox_id,
+                    reason=reason,
+                    grace_seconds=grace_seconds,
+                    error=dict(error_payload),
+                )
+                return _normalize_sandbox_quarantine(job_id=job_id, active=active, result=result)
+            return self._cancel_active_sandbox(
+                job_id=job_id,
+                active=active,
+                reason=reason,
+                grace_seconds=grace_seconds,
+            )
+        except LifecyclePolicyError as exc:
+            return _normalize_sandbox_quarantine(
+                job_id=job_id,
+                active=active,
+                result={
+                    "state": "QUARANTINE_FAILED",
+                    "terminate_succeeded": False,
+                    "error": exc.envelope.as_c1_payload(),
+                },
+            )
+
 
 class SubagentSDKRunner:
     """IoC runner that binds an author Subagent to the real S1 runtime."""
@@ -2912,6 +3084,13 @@ class SubagentSDKRunner:
                 break
             except LifecyclePolicyError as exc:
                 if not self._can_auto_repair_build(exc):
+                    self._quarantine_build_error(
+                        job_id=job_id,
+                        error=exc,
+                        idempotency_key=idempotency_key,
+                        root_request_id=root_request_id,
+                        trace_id=trace_id,
+                    )
                     raise
                 current_plan = self._repair_build_plan(
                     job_id=job_id,
@@ -2961,6 +3140,25 @@ class SubagentSDKRunner:
         if self.runtime.build_repair_hook is None:
             return False
         return error.envelope.category in S1_BUILD_REPAIRABLE_ERROR_CATEGORIES
+
+    def _quarantine_build_error(
+        self,
+        *,
+        job_id: str,
+        error: LifecyclePolicyError,
+        idempotency_key: str | None,
+        root_request_id: str | None,
+        trace_id: str | None,
+    ) -> None:
+        if not error.envelope.behavior.quarantine:
+            return
+        self.runtime.quarantine(
+            job_id,
+            error=error.envelope,
+            idempotency_key=idempotency_key,
+            root_request_id=root_request_id,
+            trace_id=trace_id,
+        )
 
     def _repair_build_plan(
         self,

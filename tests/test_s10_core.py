@@ -998,6 +998,53 @@ class S10OrchestratorAndAuditTests(unittest.TestCase):
         self.assertFalse(verification.valid)
         self.assertEqual(verification.break_sequence, 1)
 
+    def test_quarantine_sandbox_records_partial_result_and_releases_reservation(self) -> None:
+        artifacts = InMemoryArtifactStore()
+        quota = InMemoryQuotaLedger()
+        orchestrator = InMemorySandboxOrchestrator(
+            token_service=self.tokens,
+            quota_ledger=quota,
+            audit_ledger=self.audit,
+            policy_bundle=self.bundle,
+            artifact_store=artifacts,
+        )
+        request = self._launch_request(max_cost_usd=10, estimated_cost_usd=2)
+        handle = orchestrator.launch(request)
+
+        payload = orchestrator.quarantine_sandbox_job(
+            job_id=request.job_id,
+            sandbox_id=handle.sandbox_id,
+            reason="SANDBOX:TRUST_PATH_WRITE",
+            grace_seconds=3.0,
+            error={
+                "category": "SANDBOX",
+                "code": "TRUST_PATH_WRITE",
+                "message": "sandbox attempted to write trust-path",
+                "retryable": False,
+            },
+        )
+
+        self.assertEqual(orchestrator.get(handle.sandbox_id).state, "QUARANTINED")
+        self.assertEqual(quota.state(request.budget_token.budget_id).reserved, BudgetUsage())
+        self.assertEqual(payload["state"], "QUARANTINED")
+        self.assertTrue(payload["terminate_succeeded"])
+        self.assertTrue(str(payload["partial_result_ref"]).startswith("c4://artifact/"))
+        event_types = [event.event_type for event in self.audit.events()]
+        self.assertIn("sandbox.partial_result", event_types)
+        self.assertIn("sandbox.quarantined", event_types)
+        partial_records = artifacts.query_artifacts({"kind": "sandbox.partial_result"})
+        self.assertEqual(len(partial_records), 1)
+        partial_payload = json.loads(artifacts.get_artifact(partial_records[0].artifact_ref).decode("utf-8"))
+        self.assertEqual(partial_payload["schema"], "argus.s10.partial_result.v1")
+        self.assertEqual(partial_payload["reason"], "SANDBOX:TRUST_PATH_WRITE")
+        self.assertEqual(partial_payload["error"]["code"], "TRUST_PATH_WRITE")
+        self.assertEqual(partial_payload["frozen_state"], "FROZEN")
+        self.assertEqual(partial_payload["terminated_state"], "TERMINATED")
+        self.assertTrue(partial_payload["captured_after_freeze"])
+        self.assertTrue(partial_payload["freeze_succeeded"])
+        self.assertTrue(partial_payload["terminate_succeeded"])
+        self.assertEqual(partial_records[0].lineage.input_refs, (handle.launch_provenance_ref,))
+
     def _launch_request(self, *, max_cost_usd: float, estimated_cost_usd: float) -> LaunchRequest:
         budget = self.tokens.mint_budget(
             caps=BudgetCaps(

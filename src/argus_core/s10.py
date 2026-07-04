@@ -2806,6 +2806,49 @@ class InMemorySandboxOrchestrator:
         self._audit_ledger.append("sandbox.cancelled", payload)
         return payload
 
+    def quarantine_sandbox_job(
+        self,
+        *,
+        job_id: str,
+        sandbox_id: str,
+        reason: str,
+        grace_seconds: float,
+        error: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        handle = self.get(sandbox_id)
+        if handle.job_id != job_id:
+            self._audit_ledger.append(
+                "sandbox.quarantine_denied",
+                {"sandbox_id": sandbox_id, "job_id": job_id, "handle_job_id": handle.job_id},
+            )
+            raise PolicyDeniedError("sandbox job_id mismatch")
+        request = self._requests.get(sandbox_id)
+        error_payload = dict(error or {})
+        partial_result_ref = self._emit_quarantine_partial_result(
+            request=request,
+            handle=handle,
+            reason=reason,
+            grace_seconds=grace_seconds,
+            error=error_payload,
+        )
+        if request is not None:
+            self._quota_ledger.release(request.budget_token.budget_id, request.requested_envelope.budget_usage())
+        quarantined_handle = replace(handle, state="QUARANTINED")
+        self._handles[sandbox_id] = quarantined_handle
+        payload: dict[str, Any] = {
+            "sandbox_id": sandbox_id,
+            "job_id": job_id,
+            "reason": reason,
+            "grace_seconds": grace_seconds,
+            "state": quarantined_handle.state,
+            "terminate_succeeded": True,
+            "partial_result_ref": partial_result_ref,
+        }
+        if error_payload:
+            payload["error"] = error_payload
+        self._audit_ledger.append("sandbox.quarantined", payload)
+        return payload
+
     def _emit_cancel_partial_result(
         self,
         *,
@@ -2839,6 +2882,67 @@ class InMemorySandboxOrchestrator:
                 input_refs=tuple(ref for ref in (handle.launch_provenance_ref,) if ref),
                 code_ref="argus-core:s10.in-memory-cancel",
                 environment_digest="python:s10-in-memory-cancel:v1",
+                job_id=request.job_id,
+            ),
+        )
+        self._audit_ledger.append(
+            "sandbox.partial_result",
+            {
+                "sandbox_id": handle.sandbox_id,
+                "job_id": request.job_id,
+                "partial_result_ref": record.artifact_ref,
+                "reason": reason,
+            },
+        )
+        return record.artifact_ref
+
+    def _emit_quarantine_partial_result(
+        self,
+        *,
+        request: LaunchRequest | None,
+        handle: SandboxHandle,
+        reason: str,
+        grace_seconds: float,
+        error: Mapping[str, Any],
+    ) -> str | None:
+        if self._artifact_store is None or request is None:
+            return None
+        payload: dict[str, Any] = {
+            "schema": "argus.s10.partial_result.v1",
+            "job_id": request.job_id,
+            "sandbox_id": handle.sandbox_id,
+            "reason": reason,
+            "grace_seconds": grace_seconds,
+            "frozen_state": "FROZEN",
+            "terminated_state": "TERMINATED",
+            "stdout": "",
+            "stderr": "",
+            "stdout_bytes": 0,
+            "stderr_bytes": 0,
+            "log_capture_limit_bytes": PARTIAL_RESULT_LOG_CAPTURE_LIMIT_BYTES,
+            "logs_truncated": False,
+            "captured_after_freeze": True,
+            "freeze_succeeded": True,
+            "terminate_succeeded": True,
+            "capture_error": None,
+        }
+        if error:
+            payload["error"] = dict(error)
+        record = self._artifact_store.create_artifact(
+            kind="sandbox.partial_result",
+            payload=payload,
+            producer=Producer(subsystem="S10", version=handle.policy_bundle_version, job_id=request.job_id),
+            lineage=Lineage(
+                input_refs=tuple(ref for ref in (handle.launch_provenance_ref,) if ref),
+                code_ref="argus-core:s10.in-memory-quarantine",
+                environment_digest=hash_json(
+                    {
+                        "kind": "argus.s10.quarantine.env.v1",
+                        "launch_provenance_ref": handle.launch_provenance_ref,
+                        "reason": reason,
+                        "error": dict(error),
+                    }
+                ),
                 job_id=request.job_id,
             ),
         )

@@ -355,10 +355,10 @@ class S1SDKBaseClassTests(unittest.TestCase):
         self.assertEqual(raised.exception.envelope.category, "POLICY")
         self.assertEqual(raised.exception.envelope.code, "MODEL_SELF_PROMOTION")
         self.assertEqual(repair_calls, [])
-        self.assertEqual(runner.runtime.store.current(self.envelope.job_id).state, LifecycleState.PLANNING)
+        self.assertEqual(runner.runtime.store.current(self.envelope.job_id).state, LifecycleState.QUARANTINED)
         self.assertEqual(
             [event.method for event in runner.runtime.store.events(self.envelope.job_id)],
-            ["accept", "plan"],
+            ["accept", "plan", "quarantine"],
         )
 
     def test_runner_rejects_author_build_tier_self_promotion_fields(self) -> None:
@@ -382,10 +382,10 @@ class S1SDKBaseClassTests(unittest.TestCase):
         self.assertEqual(raised.exception.envelope.category, "POLICY")
         self.assertEqual(raised.exception.envelope.code, "S1_BUILD_TIER_SELF_PROMOTION_FORBIDDEN")
         self.assertIn("claim_tier", raised.exception.envelope.message)
-        self.assertEqual(runner.runtime.store.current(self.envelope.job_id).state, LifecycleState.PLANNING)
+        self.assertEqual(runner.runtime.store.current(self.envelope.job_id).state, LifecycleState.QUARANTINED)
         self.assertEqual(
             [event.method for event in runner.runtime.store.events(self.envelope.job_id)],
-            ["accept", "plan"],
+            ["accept", "plan", "quarantine"],
         )
 
     def test_exec_context_is_canonical_restricted_capability_handle(self) -> None:
@@ -1100,9 +1100,10 @@ class S1SDKBaseClassTests(unittest.TestCase):
 
         self.assertEqual(raised.exception.envelope.code, "EXEC_CONTEXT_CAPABILITY_DENIED")
         self.assertIn("dataset is not allowlisted", raised.exception.envelope.message)
+        self.assertEqual(runner.runtime.store.current(envelope.job_id).state, LifecycleState.QUARANTINED)
         self.assertEqual(
             [event.method for event in runner.runtime.store.events(envelope.job_id)],
-            ["accept", "plan"],
+            ["accept", "plan", "quarantine"],
         )
 
     def test_exec_context_submit_sandbox_job_fails_closed_without_s10_marshaler(self) -> None:
@@ -1340,6 +1341,86 @@ class S1SDKBaseClassTests(unittest.TestCase):
         partial_payload = json.loads(artifacts.get_artifact(partial_record.artifact_ref).decode("utf-8"))
         self.assertEqual(partial_payload["reason"], "operator")
         self.assertEqual(partial_payload["terminated_state"], "TERMINATED")
+        self.assertEqual(partial_record.lineage.input_refs, (subagent.launch_provenance_ref,))
+
+    def test_runner_quarantines_sandbox_error_with_real_s10_forensic_partial_result(self) -> None:
+        from argus_core.s1 import S10SandboxMarshaler
+
+        adapter_rule = EgressRule("bounce.adapter.local", 8443, "grpc")
+        orchestrator, request, audit, artifacts = self._s10_orchestrator_and_request(
+            scope_allowed_adapters=("adapter:bounce",),
+            egress_allowlist=(EgressRule("store.local", 443, "https"), adapter_rule),
+        )
+
+        class QuarantinedSandboxBuildSubagent(Subagent):
+            def __init__(self, descriptor: SubagentDescriptor) -> None:
+                super().__init__(descriptor)
+                self.sandbox_id: str | None = None
+                self.launch_provenance_ref: str | None = None
+
+            def plan(self, ctx: ExecContext, envelope: JobEnvelope) -> dict[str, object]:
+                return {
+                    "steps": [
+                        {
+                            "step_id": "sandbox-build",
+                            "kind": "feature",
+                            "description": "Run sandboxed build that trips a trust mount policy",
+                        }
+                    ],
+                    "adapters_required": ["adapter:bounce"],
+                }
+
+            def build(self, ctx: ExecContext, plan: dict[str, object]) -> dict[str, object]:
+                result = ctx.submit_sandbox_job({"launch_request": request})
+                self.sandbox_id = str(result["sandbox_id"])
+                self.launch_provenance_ref = str(result["launch_provenance_ref"])
+                raise LifecyclePolicyError(
+                    build_error_envelope(
+                        category="SANDBOX",
+                        code="TRUST_PATH_WRITE",
+                        message="sandbox attempted to write verifier trust-path",
+                    )
+                )
+
+        subagent = QuarantinedSandboxBuildSubagent(self.descriptor)
+        runner = SubagentSDKRunner(
+            subagent,
+            runtime=SubagentRuntime(
+                descriptor=self.descriptor,
+                sandbox_marshaler=S10SandboxMarshaler(orchestrator),
+                adapter_egress_allowlist={"adapter:bounce": adapter_rule},
+            ),
+        )
+
+        runner.accept(self.envelope)
+        planned = runner.plan(self.envelope)
+        with self.assertRaises(LifecyclePolicyError) as raised:
+            runner.build(self.envelope.job_id, planned.payload)
+
+        assert subagent.sandbox_id is not None
+        assert subagent.launch_provenance_ref is not None
+        self.assertEqual(raised.exception.envelope.category, "SANDBOX")
+        self.assertEqual(raised.exception.envelope.code, "TRUST_PATH_WRITE")
+        self.assertEqual(runner.runtime.store.current(self.envelope.job_id).state, LifecycleState.QUARANTINED)
+        self.assertEqual(
+            [event.method for event in runner.runtime.store.events(self.envelope.job_id)],
+            ["accept", "plan", "quarantine"],
+        )
+        self.assertEqual(orchestrator.get(subagent.sandbox_id).state, "QUARANTINED")
+        event_types = [item.event_type for item in audit.events()]
+        self.assertIn("sandbox.partial_result", event_types)
+        self.assertIn("sandbox.quarantined", event_types)
+        partial_records = artifacts.query_artifacts({"kind": "sandbox.partial_result"})
+        self.assertEqual(len(partial_records), 1)
+        partial_record = partial_records[0]
+        partial_payload = json.loads(artifacts.get_artifact(partial_record.artifact_ref).decode("utf-8"))
+        self.assertEqual(partial_payload["reason"], "SANDBOX:TRUST_PATH_WRITE")
+        self.assertEqual(partial_payload["error"]["code"], "TRUST_PATH_WRITE")
+        self.assertEqual(partial_payload["frozen_state"], "FROZEN")
+        self.assertEqual(partial_payload["terminated_state"], "TERMINATED")
+        self.assertTrue(partial_payload["captured_after_freeze"])
+        self.assertTrue(partial_payload["freeze_succeeded"])
+        self.assertTrue(partial_payload["terminate_succeeded"])
         self.assertEqual(partial_record.lineage.input_refs, (subagent.launch_provenance_ref,))
 
     def test_build_context_records_runtime_heartbeat_spend(self) -> None:
