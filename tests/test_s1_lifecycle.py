@@ -7,6 +7,7 @@ from pathlib import Path
 import unittest
 
 from argus_core import (
+    Acceptance,
     C3ReportSigner,
     C3ReportVerifier,
     ExecContext,
@@ -460,19 +461,32 @@ class S1AcceptGateTests(unittest.TestCase):
         )
 
     def test_default_accept_refuses_missing_adapter_no_verifier_and_major_version(self) -> None:
-        missing_adapter = default_accept(
-            self.descriptor,
-            self._envelope(required_adapters=("adapter:missing",)),
-        )
-        no_verifier = default_accept(self.descriptor, self._envelope(verifier_profile_ref=None))
-        major_mismatch = default_accept(self.descriptor, self._envelope(envelope_version="2.0.0"))
+        cases = {
+            "missing-adapter": (self._envelope(required_adapters=("adapter:missing",)), "MISSING_ADAPTER"),
+            "no-verifier": (self._envelope(verifier_profile_ref=None), "NO_VERIFIER"),
+            "major-mismatch": (self._envelope(envelope_version="2.0.0"), "VERSION_UNSUPPORTED"),
+            "out-of-scope": (self._envelope(subtopic="other"), "OUT_OF_SCOPE"),
+            "budget-too-small": (self._envelope(estimated_cost=3, budget_cost=2), "BUDGET_TOO_SMALL"),
+        }
+        for name, (envelope, reason) in cases.items():
+            with self.subTest(name=name):
+                acceptance = default_accept(self.descriptor, envelope)
 
-        self.assertEqual(missing_adapter.reason, "MISSING_ADAPTER")
-        self.assertEqual(no_verifier.reason, "NO_VERIFIER")
-        self.assertEqual(major_mismatch.reason, "VERSION_UNSUPPORTED")
-        self.assertFalse(missing_adapter.accepted)
-        self.assertFalse(no_verifier.accepted)
-        self.assertFalse(major_mismatch.accepted)
+                self.assertFalse(acceptance.accepted)
+                self.assertEqual(acceptance.reason, reason)
+                self.assertEqual(acceptance.state, LifecycleState.REJECTED)
+                self.assertEqual(acceptance.as_c1_payload()["accepted"], False)
+                self.assertNotIn("error", acceptance.as_c1_payload())
+
+    def test_acceptance_rejects_inconsistent_refusal_payloads(self) -> None:
+        with self.assertRaises(ValueError):
+            Acceptance("job-1", True, "NO_VERIFIER", LifecycleState.ACCEPTED, "accept:job-1")
+        with self.assertRaises(ValueError):
+            Acceptance("job-1", True, None, LifecycleState.REJECTED, "accept:job-1")
+        with self.assertRaises(ValueError):
+            Acceptance("job-1", False, None, LifecycleState.REJECTED, "accept:job-1")
+        with self.assertRaises(ValueError):
+            Acceptance("job-1", False, "NO_VERIFIER", LifecycleState.ACCEPTED, "accept:job-1")
 
     def test_runtime_accept_is_idempotent_for_same_envelope(self) -> None:
         idempotency = InMemoryIdempotencyStore()
@@ -490,6 +504,26 @@ class S1AcceptGateTests(unittest.TestCase):
         self.assertEqual(
             [(record.method, record.idempotency_key) for record in idempotency.records("job-1")],
             [("accept", "accept:job-1"), ("lifecycle.accept", "accept:job-1")],
+        )
+
+    def test_runtime_accept_refusal_is_non_error_and_idempotent(self) -> None:
+        idempotency = InMemoryIdempotencyStore()
+        runtime = SubagentRuntime(descriptor=self.descriptor, idempotency_store=idempotency)
+        envelope = self._envelope(verifier_profile_ref=None)
+
+        first = runtime.accept(envelope)
+        second = runtime.accept(envelope)
+
+        self.assertEqual(first, second)
+        self.assertFalse(first.accepted)
+        self.assertEqual(first.reason, "NO_VERIFIER")
+        self.assertEqual(first.state, LifecycleState.REJECTED)
+        self.assertEqual(runtime.gate_invocations, 1)
+        self.assertEqual(runtime.store.current(envelope.job_id).state, LifecycleState.REJECTED)
+        self.assertEqual([(event.method, event.to_state) for event in runtime.store.events(envelope.job_id)], [("refuse", LifecycleState.REJECTED)])
+        self.assertEqual(
+            [(record.method, record.idempotency_key) for record in idempotency.records("job-1")],
+            [("accept", "accept:job-1"), ("lifecycle.refuse", "accept:job-1")],
         )
 
     def test_runtime_accept_rejects_same_job_different_envelope(self) -> None:
@@ -517,6 +551,8 @@ class S1AcceptGateTests(unittest.TestCase):
         required_adapters: tuple[str, ...] = ("adapter:bounce",),
         allowed_adapters: tuple[str, ...] = ("adapter:bounce",),
         verifier_profile_ref: str | None = "c4://profile/ewpt/v1",
+        estimated_cost: float = 1,
+        budget_cost: float = 2,
     ) -> JobEnvelope:
         return JobEnvelope(
             job_id=job_id,
@@ -525,8 +561,8 @@ class S1AcceptGateTests(unittest.TestCase):
             required_adapters=required_adapters,
             allowed_adapters=allowed_adapters,
             verifier_profile_ref=verifier_profile_ref,
-            estimated_cost=1,
-            budget_cost=2,
+            estimated_cost=estimated_cost,
+            budget_cost=budget_cost,
         )
 
 

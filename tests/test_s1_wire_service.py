@@ -103,6 +103,30 @@ class S1WireServiceHttpTests(unittest.TestCase):
         self.assertFalse(payload["error"]["retryable"])
         self.assertEqual(len(self.runtime.store.events(self.job_id)), 1)
 
+    def test_http_accept_refusal_is_non_error_c1_payload(self) -> None:
+        status, payload = self.app.handle(
+            JsonRequest(
+                method="POST",
+                path=f"/v1/jobs/{self.job_id}/accept",
+                query={},
+                body={
+                    "root_request_id": self.root_request_id,
+                    "trace_id": self.trace_id,
+                    "job_envelope": self._job_envelope_payload(verifier_profile_ref=None),
+                },
+            )
+        )
+
+        self.assertEqual(status, 200)
+        self.assertNotIn("error", payload)
+        self.assertFalse(payload["accepted"])
+        self.assertEqual(payload["reason"], "NO_VERIFIER")
+        self.assertEqual(payload["state"], "REJECTED")
+        self.assertEqual(self.runtime.store.current(self.job_id).state, LifecycleState.REJECTED)
+        self.assertEqual([(event.method, event.to_state) for event in self.runtime.store.events(self.job_id)], [("refuse", LifecycleState.REJECTED)])
+        errors = sorted(self.c1_validator.iter_errors(payload), key=lambda error: list(error.path))
+        self.assertEqual(errors, [], msg=[error.message for error in errors])
+
     def test_http_heartbeat_reports_current_state_without_transition(self) -> None:
         self._accept_job()
 
@@ -137,8 +161,8 @@ class S1WireServiceHttpTests(unittest.TestCase):
         )
         self.assertEqual(status, 200, payload)
 
-    def _job_envelope_payload(self) -> dict[str, object]:
-        return {
+    def _job_envelope_payload(self, **overrides: object) -> dict[str, object]:
+        payload = {
             "job_id": self.job_id,
             "envelope_version": "1.0.0",
             "subtopic": "ewpt",
@@ -148,6 +172,8 @@ class S1WireServiceHttpTests(unittest.TestCase):
             "estimated_cost": 1,
             "budget_cost": 2,
         }
+        payload.update(overrides)
+        return payload
 
 
 class S1WireServiceGrpcTests(unittest.TestCase):

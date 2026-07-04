@@ -138,6 +138,18 @@ METHOD_TARGETS = {
 }
 
 
+ACCEPTANCE_REFUSAL_REASONS = frozenset(
+    {
+        "OUT_OF_SCOPE",
+        "MISSING_ADAPTER",
+        "BUDGET_TOO_SMALL",
+        "NO_VERIFIER",
+        "VERSION_UNSUPPORTED",
+        "POLICY",
+    }
+)
+
+
 S1_LIFECYCLE_LEDGER_KIND = "s1_lifecycle_event"
 S1_LIFECYCLE_LEDGER_CODE_REF = "argus-core:s1.lifecycle-store"
 S1_LIFECYCLE_LEDGER_ENVIRONMENT_DIGEST = "python:s1-lifecycle-store:v1"
@@ -274,6 +286,20 @@ class Acceptance:
     state: LifecycleState
     idempotency_key: str
     estimated_cost: float = 0.0
+
+    def __post_init__(self) -> None:
+        if self.accepted:
+            if self.reason is not None:
+                raise ValueError("accepted Acceptance must not carry a refusal reason")
+            if self.state != LifecycleState.ACCEPTED:
+                raise ValueError("accepted Acceptance must have state ACCEPTED")
+        else:
+            if self.reason not in ACCEPTANCE_REFUSAL_REASONS:
+                raise ValueError("refused Acceptance must carry a C1 refusal reason")
+            if self.state != LifecycleState.REJECTED:
+                raise ValueError("refused Acceptance must have state REJECTED")
+        if self.estimated_cost < 0:
+            raise ValueError("estimated_cost cannot be negative")
 
     def as_c1_payload(self) -> dict[str, object]:
         payload: dict[str, object] = {
