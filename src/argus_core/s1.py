@@ -13,7 +13,7 @@ from uuid import NAMESPACE_URL, uuid5
 
 from argusverify import C3ReportVerifier
 from .hashing import hash_json
-from .s10 import LaunchRequest, S10Error, SandboxExecutionResult, SandboxHandle
+from .s10 import EgressRule, LaunchRequest, S10Error, SandboxExecutionResult, SandboxHandle
 from .s8 import ArtifactRecord, InMemoryArtifactStore, Lineage, Producer
 
 
@@ -157,6 +157,113 @@ ACCEPTANCE_REFUSAL_REASONS = frozenset(
 S1_LIFECYCLE_LEDGER_KIND = "s1_lifecycle_event"
 S1_LIFECYCLE_LEDGER_CODE_REF = "argus-core:s1.lifecycle-store"
 S1_LIFECYCLE_LEDGER_ENVIRONMENT_DIGEST = "python:s1-lifecycle-store:v1"
+S1_CONTENT_STORE_EGRESS_RULE = EgressRule("store.local", 443, "https")
+S1_EGRESS_PROTOCOLS = frozenset({"https", "grpc", "tcp"})
+
+
+def derive_sandbox_egress_allowlist(
+    allowed_adapters: tuple[str, ...],
+    adapter_egress_allowlist: Mapping[str, Any] | None = None,
+    *,
+    store_egress_rule: EgressRule = S1_CONTENT_STORE_EGRESS_RULE,
+) -> tuple[EgressRule, ...]:
+    normalized_map = _normalize_adapter_egress_mapping(adapter_egress_allowlist or {})
+    rules: list[EgressRule] = [store_egress_rule]
+    _assert_egress_rule_valid(store_egress_rule, "content store")
+    for adapter_ref in tuple(dict.fromkeys(allowed_adapters)):
+        adapter_rules = normalized_map.get(adapter_ref)
+        if adapter_rules is None:
+            raise LifecyclePolicyError(
+                build_error_envelope(
+                    category="SANDBOX",
+                    code="S10_EGRESS_ENDPOINT_UNAVAILABLE",
+                    message=f"no egress endpoint is registered for declared adapter {adapter_ref}",
+                )
+            )
+        rules.extend(adapter_rules)
+    return _dedupe_egress_rules(rules)
+
+
+def _normalize_adapter_egress_mapping(adapter_egress_allowlist: Mapping[str, Any]) -> dict[str, tuple[EgressRule, ...]]:
+    normalized: dict[str, tuple[EgressRule, ...]] = {}
+    for adapter_ref, value in adapter_egress_allowlist.items():
+        ref = str(adapter_ref)
+        rules = _normalize_egress_rule_sequence(ref, value)
+        if not rules:
+            raise LifecyclePolicyError(
+                build_error_envelope(
+                    category="SANDBOX",
+                    code="S10_EGRESS_ENDPOINT_UNAVAILABLE",
+                    message=f"no egress endpoint is registered for declared adapter {ref}",
+                )
+            )
+        normalized[ref] = rules
+    return normalized
+
+
+def _normalize_egress_rule_sequence(adapter_ref: str, value: Any) -> tuple[EgressRule, ...]:
+    if isinstance(value, EgressRule):
+        candidates = (value,)
+    elif isinstance(value, Mapping):
+        candidates = (_egress_rule_from_mapping(adapter_ref, value),)
+    else:
+        try:
+            candidates = tuple(value)
+        except TypeError as exc:
+            raise _invalid_egress_endpoint(adapter_ref, "endpoint must be an EgressRule or sequence") from exc
+    rules: list[EgressRule] = []
+    for candidate in candidates:
+        if isinstance(candidate, Mapping):
+            candidate = _egress_rule_from_mapping(adapter_ref, candidate)
+        if not isinstance(candidate, EgressRule):
+            raise _invalid_egress_endpoint(adapter_ref, "endpoint must be an EgressRule")
+        _assert_egress_rule_valid(candidate, adapter_ref)
+        rules.append(candidate)
+    return _dedupe_egress_rules(rules)
+
+
+def _egress_rule_from_mapping(adapter_ref: str, value: Mapping[str, Any]) -> EgressRule:
+    try:
+        return EgressRule(host=str(value["host"]), port=int(value["port"]), proto=str(value["proto"]))
+    except (KeyError, TypeError, ValueError) as exc:
+        raise _invalid_egress_endpoint(adapter_ref, "endpoint mapping must contain host, port, and proto") from exc
+
+
+def _assert_egress_rule_valid(rule: EgressRule, owner: str) -> None:
+    if not rule.host:
+        raise _invalid_egress_endpoint(owner, "endpoint host is required")
+    if isinstance(rule.port, bool) or rule.port < 1 or rule.port > 65535:
+        raise _invalid_egress_endpoint(owner, "endpoint port must be between 1 and 65535")
+    if rule.proto not in S1_EGRESS_PROTOCOLS:
+        raise _invalid_egress_endpoint(owner, f"endpoint proto must be one of {sorted(S1_EGRESS_PROTOCOLS)}")
+
+
+def _dedupe_egress_rules(rules: list[EgressRule] | tuple[EgressRule, ...]) -> tuple[EgressRule, ...]:
+    deduped: list[EgressRule] = []
+    seen: set[EgressRule] = set()
+    for rule in rules:
+        if rule not in seen:
+            deduped.append(rule)
+            seen.add(rule)
+    return tuple(deduped)
+
+
+def _egress_rule_sort_key(rule: EgressRule) -> tuple[str, int, str]:
+    return (rule.host, rule.port, rule.proto)
+
+
+def _format_egress_rules(rules: tuple[EgressRule, ...]) -> str:
+    return ", ".join(f"{rule.proto}://{rule.host}:{rule.port}" for rule in rules)
+
+
+def _invalid_egress_endpoint(owner: str, message: str) -> LifecyclePolicyError:
+    return LifecyclePolicyError(
+        build_error_envelope(
+            category="SANDBOX",
+            code="S10_EGRESS_ENDPOINT_INVALID",
+            message=f"invalid egress endpoint for {owner}: {message}",
+        )
+    )
 
 
 class S1Error(Exception):
@@ -279,6 +386,8 @@ class ExecContext:
     capabilities: tuple[str, ...]
     _allowed_adapters: tuple[str, ...] = field(repr=False, compare=False)
     _allowed_datasets: tuple[str, ...] = field(repr=False, compare=False)
+    _adapter_egress_allowlist: Mapping[str, tuple[EgressRule, ...]] = field(repr=False, compare=False)
+    _store_egress_rule: EgressRule = field(repr=False, compare=False)
     _artifact_store: InMemoryArtifactStore = field(init=False, repr=False, compare=False)
     _sandbox_marshaler: Any = field(init=False, repr=False, compare=False)
 
@@ -289,6 +398,8 @@ class ExecContext:
         capabilities: tuple[str, ...] = EXEC_CONTEXT_CAPABILITIES,
         allowed_adapters: tuple[str, ...] = (),
         allowed_datasets: tuple[str, ...] = (),
+        adapter_egress_allowlist: Mapping[str, Any] | None = None,
+        store_egress_rule: EgressRule = S1_CONTENT_STORE_EGRESS_RULE,
         artifact_store: InMemoryArtifactStore | None = None,
         sandbox_marshaler: Any | None = None,
     ) -> None:
@@ -300,6 +411,13 @@ class ExecContext:
         object.__setattr__(self, "capabilities", capabilities)
         object.__setattr__(self, "_allowed_adapters", tuple(allowed_adapters))
         object.__setattr__(self, "_allowed_datasets", tuple(allowed_datasets))
+        object.__setattr__(
+            self,
+            "_adapter_egress_allowlist",
+            _normalize_adapter_egress_mapping(adapter_egress_allowlist or {}),
+        )
+        _assert_egress_rule_valid(store_egress_rule, "content store")
+        object.__setattr__(self, "_store_egress_rule", store_egress_rule)
         object.__setattr__(self, "_artifact_store", artifact_store or InMemoryArtifactStore())
         object.__setattr__(self, "_sandbox_marshaler", sandbox_marshaler)
 
@@ -330,6 +448,8 @@ class ExecContext:
                     message="S10 sandbox marshaler must expose submit_sandbox_job",
                 )
             )
+        request = _launch_request_from_sandbox_spec(self.job_id, spec)
+        self._assert_sandbox_launch_scopes(request)
         result = self._sandbox_marshaler.submit_sandbox_job(job_id=self.job_id, spec=spec)
         return _normalize_sandbox_result(self.job_id, result)
 
@@ -398,6 +518,57 @@ class ExecContext:
                 message=f"ExecContext denied {capability}: {message}",
             )
         )
+
+    def _assert_sandbox_launch_scopes(self, request: LaunchRequest) -> None:
+        context_adapters = tuple(dict.fromkeys(self._allowed_adapters))
+        scope_adapters = tuple(dict.fromkeys(request.scope_token.scopes.allowed_adapters))
+        extra_adapters = tuple(sorted(set(scope_adapters) - set(context_adapters)))
+        if extra_adapters:
+            raise LifecyclePolicyError(
+                build_error_envelope(
+                    category="SANDBOX",
+                    code="S10_ADAPTER_SCOPE_WIDENED",
+                    message="S10 scope token includes undeclared adapters: " + ", ".join(extra_adapters),
+                )
+            )
+        missing_adapters = tuple(sorted(set(context_adapters) - set(scope_adapters)))
+        if missing_adapters:
+            raise LifecyclePolicyError(
+                build_error_envelope(
+                    category="SANDBOX",
+                    code="S10_ADAPTER_SCOPE_MISSING",
+                    message="S10 scope token is missing declared adapters: " + ", ".join(missing_adapters),
+                )
+            )
+
+        expected_egress = set(
+            derive_sandbox_egress_allowlist(
+                scope_adapters,
+                self._adapter_egress_allowlist,
+                store_egress_rule=self._store_egress_rule,
+            )
+        )
+        requested_egress = set(request.scope_token.scopes.egress_allowlist)
+        extra_egress = tuple(sorted(requested_egress - expected_egress, key=_egress_rule_sort_key))
+        if extra_egress:
+            raise LifecyclePolicyError(
+                build_error_envelope(
+                    category="SANDBOX",
+                    code="S10_EGRESS_SCOPE_WIDENED",
+                    message="S10 scope token includes non-derived egress endpoints: "
+                    + _format_egress_rules(extra_egress),
+                )
+            )
+        missing_egress = tuple(sorted(expected_egress - requested_egress, key=_egress_rule_sort_key))
+        if missing_egress:
+            raise LifecyclePolicyError(
+                build_error_envelope(
+                    category="SANDBOX",
+                    code="S10_EGRESS_SCOPE_MISSING",
+                    message="S10 scope token is missing derived egress endpoints: "
+                    + _format_egress_rules(missing_egress),
+                )
+            )
 
 
 def _launch_request_from_sandbox_spec(job_id: str, spec: Mapping[str, Any]) -> LaunchRequest:
@@ -1016,10 +1187,15 @@ class SubagentRuntime:
         idempotency_store: InMemoryIdempotencyStore | None = None,
         artifact_store: InMemoryArtifactStore | None = None,
         sandbox_marshaler: Any | None = None,
+        adapter_egress_allowlist: Mapping[str, Any] | None = None,
+        store_egress_rule: EgressRule = S1_CONTENT_STORE_EGRESS_RULE,
     ) -> None:
         self.descriptor = descriptor
         self.idempotency_store = idempotency_store or InMemoryIdempotencyStore()
         self.sandbox_marshaler = sandbox_marshaler
+        self.adapter_egress_allowlist = _normalize_adapter_egress_mapping(adapter_egress_allowlist or {})
+        _assert_egress_rule_valid(store_egress_rule, "content store")
+        self.store_egress_rule = store_egress_rule
         if store is not None:
             if artifact_store is not None:
                 raise ValueError("artifact_store cannot be provided with an explicit LifecycleStore")
@@ -1167,6 +1343,8 @@ class SubagentSDKRunner:
             job_id=job_id,
             allowed_adapters=allowed_adapters,
             allowed_datasets=allowed_datasets,
+            adapter_egress_allowlist=self.runtime.adapter_egress_allowlist,
+            store_egress_rule=self.runtime.store_egress_rule,
             artifact_store=self.runtime.artifact_store,
             sandbox_marshaler=self.runtime.sandbox_marshaler,
         )

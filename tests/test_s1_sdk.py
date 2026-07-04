@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import asdict
 import json
 import os
 from pathlib import Path
@@ -28,6 +29,7 @@ from argus_core import (
     Subagent,
     SubagentDescriptor,
     SubagentSDKRunner,
+    SubagentRuntime,
 )
 from argus_core.s1 import S1_LIFECYCLE_LEDGER_KIND
 
@@ -265,6 +267,144 @@ class S1SDKBaseClassTests(unittest.TestCase):
         self.assertEqual(audit.events()[-1].event_type, "sandbox.launched")
         self.assertEqual(artifacts.get_record(str(result["launch_provenance_ref"])).kind, "container")
 
+    def test_derive_sandbox_egress_allowlist_uses_store_and_declared_adapter_endpoints(self) -> None:
+        from argus_core.s1 import S1_CONTENT_STORE_EGRESS_RULE, derive_sandbox_egress_allowlist
+
+        adapter_rule = EgressRule("bounce.adapter.local", 8443, "grpc")
+
+        self.assertEqual(
+            derive_sandbox_egress_allowlist(
+                ("adapter:bounce", "adapter:bounce"),
+                {"adapter:bounce": adapter_rule},
+            ),
+            (S1_CONTENT_STORE_EGRESS_RULE, adapter_rule),
+        )
+
+    def test_exec_context_submit_sandbox_job_denies_non_derived_egress_before_s10_launch(self) -> None:
+        from argus_core.s1 import S10SandboxMarshaler
+
+        adapter_rule = EgressRule("bounce.adapter.local", 8443, "grpc")
+        evil_rule = EgressRule("evil.local", 443, "https")
+        orchestrator, request, audit, _artifacts = self._s10_orchestrator_and_request(
+            scope_allowed_adapters=("adapter:bounce",),
+            egress_allowlist=(EgressRule("store.local", 443, "https"), adapter_rule, evil_rule),
+        )
+        ctx = ExecContext(
+            job_id=self.envelope.job_id,
+            allowed_adapters=("adapter:bounce",),
+            adapter_egress_allowlist={"adapter:bounce": adapter_rule},
+            sandbox_marshaler=S10SandboxMarshaler(orchestrator),
+        )
+
+        with self.assertRaises(LifecyclePolicyError) as raised:
+            ctx.submit_sandbox_job({"launch_request": request})
+
+        self.assertEqual(raised.exception.envelope.code, "S10_EGRESS_SCOPE_WIDENED")
+        self.assertEqual(raised.exception.envelope.category, "SANDBOX")
+        self.assertNotIn("sandbox.launched", [event.event_type for event in audit.events()])
+
+    def test_exec_context_submit_sandbox_job_requires_declared_adapter_scope(self) -> None:
+        from argus_core.s1 import S10SandboxMarshaler
+
+        adapter_rule = EgressRule("bounce.adapter.local", 8443, "grpc")
+        orchestrator, request, audit, _artifacts = self._s10_orchestrator_and_request(
+            scope_allowed_adapters=(),
+            egress_allowlist=(EgressRule("store.local", 443, "https"), adapter_rule),
+        )
+        ctx = ExecContext(
+            job_id=self.envelope.job_id,
+            allowed_adapters=("adapter:bounce",),
+            adapter_egress_allowlist={"adapter:bounce": adapter_rule},
+            sandbox_marshaler=S10SandboxMarshaler(orchestrator),
+        )
+
+        with self.assertRaises(LifecyclePolicyError) as raised:
+            ctx.submit_sandbox_job({"launch_request": request})
+
+        self.assertEqual(raised.exception.envelope.code, "S10_ADAPTER_SCOPE_MISSING")
+        self.assertEqual(raised.exception.envelope.category, "SANDBOX")
+        self.assertNotIn("sandbox.launched", [event.event_type for event in audit.events()])
+
+    def test_exec_context_submit_sandbox_job_allows_declared_adapter_egress(self) -> None:
+        from argus_core.s1 import S10SandboxMarshaler
+
+        adapter_rule = EgressRule("bounce.adapter.local", 8443, "grpc")
+        store_rule = EgressRule("store.local", 443, "https")
+        orchestrator, request, audit, artifacts = self._s10_orchestrator_and_request(
+            scope_allowed_adapters=("adapter:bounce",),
+            egress_allowlist=(store_rule, adapter_rule),
+        )
+        ctx = ExecContext(
+            job_id=self.envelope.job_id,
+            allowed_adapters=("adapter:bounce",),
+            adapter_egress_allowlist={"adapter:bounce": adapter_rule},
+            sandbox_marshaler=S10SandboxMarshaler(orchestrator),
+        )
+
+        result = ctx.submit_sandbox_job({"launch_request": request})
+        record = artifacts.get_record(str(result["launch_provenance_ref"]))
+        payload = json.loads(artifacts.get_artifact(record.artifact_ref).decode("utf-8"))
+
+        self.assertEqual(result["state"], "ADMITTED")
+        self.assertEqual(audit.events()[-1].event_type, "sandbox.launched")
+        self.assertEqual(
+            {tuple(sorted(rule.items())) for rule in payload["exec_environment"]["egress_acl"]},
+            {tuple(sorted(asdict(store_rule).items())), tuple(sorted(asdict(adapter_rule).items()))},
+        )
+
+    def test_runner_passes_runtime_adapter_egress_registry_to_build_context(self) -> None:
+        from argus_core.s1 import S10SandboxMarshaler
+
+        adapter_rule = EgressRule("bounce.adapter.local", 8443, "grpc")
+        orchestrator, request, audit, _artifacts = self._s10_orchestrator_and_request(
+            scope_allowed_adapters=("adapter:bounce",),
+            egress_allowlist=(EgressRule("store.local", 443, "https"), adapter_rule),
+        )
+
+        class SandboxBuildSubagent(Subagent):
+            def __init__(self, descriptor: SubagentDescriptor) -> None:
+                super().__init__(descriptor)
+                self.sandbox_state: str | None = None
+
+            def plan(self, ctx: ExecContext, envelope: JobEnvelope) -> dict[str, object]:
+                return {
+                    "steps": [
+                        {
+                            "step_id": "sandbox-build",
+                            "kind": "feature",
+                            "description": "Run sandboxed adapter build",
+                        }
+                    ],
+                    "adapters_required": ["adapter:bounce"],
+                }
+
+            def build(self, ctx: ExecContext, plan: dict[str, object]) -> dict[str, object]:
+                result = ctx.submit_sandbox_job({"launch_request": request})
+                self.sandbox_state = str(result["state"])
+                return {
+                    "artifact_refs": ["c4://artifact/sandbox-model"],
+                    "diagnostics": {"sandbox_state": self.sandbox_state},
+                }
+
+        subagent = SandboxBuildSubagent(self.descriptor)
+        runner = SubagentSDKRunner(
+            subagent,
+            runtime=SubagentRuntime(
+                descriptor=self.descriptor,
+                sandbox_marshaler=S10SandboxMarshaler(orchestrator),
+                adapter_egress_allowlist={"adapter:bounce": adapter_rule},
+            ),
+        )
+
+        runner.accept(self.envelope)
+        planned = runner.plan(self.envelope)
+        built = runner.build(self.envelope.job_id, planned.payload)
+
+        self.assertEqual(subagent.sandbox_state, "ADMITTED")
+        self.assertEqual(audit.events()[-1].event_type, "sandbox.launched")
+        self.assertEqual(built.payload["diagnostics"], {"sandbox_state": "ADMITTED"})
+        self.assertEqual(runner.runtime.store.current(self.envelope.job_id).state, LifecycleState.BUILDING)
+
     def test_subagent_linter_flags_direct_in_process_exec_patterns(self) -> None:
         from argus_core.s1 import lint_subagent_for_direct_exec
 
@@ -390,13 +530,16 @@ class S1SDKBaseClassTests(unittest.TestCase):
 
     def _s10_orchestrator_and_request(
         self,
+        *,
+        scope_allowed_adapters: tuple[str, ...] = (),
+        egress_allowlist: tuple[EgressRule, ...] = (EgressRule("store.local", 443, "https"),),
     ) -> tuple[InMemorySandboxOrchestrator, LaunchRequest, InMemoryAuditLedger, InMemoryArtifactStore]:
         audit = InMemoryAuditLedger()
         artifacts = InMemoryArtifactStore()
         tokens = InMemoryTokenService(signing_key=b"s1-t11-token-key", now_fn=lambda: 1_000)
         policy = PolicyBundle(
             bundle_version="s1-t11-test",
-            egress_allowlist=(EgressRule("store.local", 443, "https"),),
+            egress_allowlist=egress_allowlist,
             resource_ceilings=ResourceCeilings(
                 cpu_m=2_000,
                 mem_bytes=4_000_000_000,
@@ -417,7 +560,8 @@ class S1SDKBaseClassTests(unittest.TestCase):
         scope = tokens.mint_scope(
             job_id=self.envelope.job_id,
             scopes=ScopeGrant(
-                egress_allowlist=(EgressRule("store.local", 443, "https"),),
+                allowed_adapters=scope_allowed_adapters,
+                egress_allowlist=egress_allowlist,
                 broker_audiences=("store",),
             ),
         )
