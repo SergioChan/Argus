@@ -2,10 +2,9 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 import json
 from typing import Any, Mapping
-from uuid import NAMESPACE_URL, uuid5
 
 from .c3 import C3ReportSigner, C3ReportVerifier, InMemoryVerifierTrustStore
 from .s1 import (
@@ -20,7 +19,16 @@ from .s1 import (
     SubagentRuntime,
     SubagentSDKRunner,
 )
-from .s3 import CheckResult, run_cross_code_check, run_perturbation_pair
+from .s3 import (
+    CheckResult,
+    S3Verifier,
+    attest_challenger_independence,
+    run_calibration_check,
+    run_cross_code_check,
+    run_leakage_check,
+    run_perturbation_pair,
+)
+from .s6 import CapabilityDescriptor, ContaminationIndex, FrozenContaminationSnapshot, SourceDocument
 from .s7 import AdapterBroker, AdapterDescriptor, NormalizedQuantity, Quantity, SimpleAdapter
 from .s8 import ArtifactRecord, InMemoryArtifactStore, Lineage, Producer
 from .s10 import InMemoryAuditLedger, InMemoryTokenService, ScopeGrant
@@ -31,6 +39,10 @@ S1_REFERENCE_PHYSICS_ADAPTER_ID = "gw_spectrum_surrogate"
 S1_REFERENCE_PHYSICS_SUBTOPIC = "ewpt"
 S1_REFERENCE_PHYSICS_PROFILE_REF = "c4://profile/ewpt-reference/v1"
 S1_REFERENCE_PHYSICS_DATASET_REF = "c4://dataset/ewpt-reference/v1"
+S1_REFERENCE_PHYSICS_PROPONENT_ID = "s1-reference-physics"
+S1_REFERENCE_S3_VERIFIER_ID = "s3-reference-verifier"
+S1_REFERENCE_S3_REFEREE_KEY_ID = "s3-reference-referee-key"
+S1_REFERENCE_S3_REFEREE_SECRET = b"s3-reference-referee-secret"
 
 
 @dataclass(frozen=True)
@@ -71,10 +83,17 @@ class S1ReferencePhysicsHarness:
 
     def __init__(self, *, artifact_store: InMemoryArtifactStore | None = None) -> None:
         self.trust_store = InMemoryVerifierTrustStore()
-        self.trust_store.register_key("s3-reference-key", b"s3-reference-secret")
+        self.trust_store.register_key(S1_REFERENCE_S3_REFEREE_KEY_ID, S1_REFERENCE_S3_REFEREE_SECRET)
         self.report_verifier = C3ReportVerifier(self.trust_store)
-        self.signer = C3ReportSigner(key_id="s3-reference-key", secret=b"s3-reference-secret")
+        self.signer = C3ReportSigner(key_id=S1_REFERENCE_S3_REFEREE_KEY_ID, secret=S1_REFERENCE_S3_REFEREE_SECRET)
+        self.s3_verifier = S3Verifier(
+            verifier_id=S1_REFERENCE_S3_VERIFIER_ID,
+            signer_key_id=self.signer.key_id,
+            signer=self.signer,
+        )
         self.artifact_store = artifact_store or InMemoryArtifactStore(report_verifier=self.report_verifier)
+        self.contamination_index = ContaminationIndex(artifact_store=self.artifact_store)
+        self.contamination_snapshot = self._reference_contamination_snapshot()
         self.audit_ledger = InMemoryAuditLedger()
         self.token_service = InMemoryTokenService(signing_key=b"s1-reference-token-key", now_fn=lambda: 1_000)
         self.adapter_broker = AdapterBroker(artifact_store=self.artifact_store)
@@ -185,7 +204,9 @@ class S1ReferencePhysicsHarness:
             budget_token_ref=f"budget://s1-reference/{job_id}",
             validation_client=_ReferenceS3ValidationClient(
                 artifact_store=self.artifact_store,
-                signer=self.signer,
+                verifier=self.s3_verifier,
+                contamination_index=self.contamination_index,
+                contamination_snapshot=self.contamination_snapshot,
                 mode=mode,
             ),
             report_verifier=self.report_verifier,
@@ -278,6 +299,23 @@ class S1ReferencePhysicsHarness:
             payload={"rows": [{"T_n": 100.0, "alpha": 0.2, "v_w": 0.7, "known_omega": 0.02}]},
             producer=Producer(subsystem="S6", version="0.0.0", actor_id="s6.reference-dataset"),
             lineage=Lineage(input_refs=(), code_ref="git:s6-reference-dataset", environment_digest="oci:s6-reference"),
+        )
+
+    def _reference_contamination_snapshot(self) -> FrozenContaminationSnapshot:
+        return self.contamination_index.freeze(
+            version="s1-reference-physics-v1",
+            documents=(
+                SourceDocument(
+                    doc_id="control-calibration-note",
+                    text="detector calibration control sample with no electroweak transition spectrum result",
+                    source_ref="c4://source/reference-control-calibration-note",
+                ),
+                SourceDocument(
+                    doc_id="background-method-note",
+                    text="background estimation workflow for unrelated tabular benchmark diagnostics",
+                    source_ref="c4://source/reference-background-method-note",
+                ),
+            ),
         )
 
     def _promote_validated_subject(
@@ -476,16 +514,33 @@ class S1ReferencePhysicsSubagent(Subagent):
 
 
 class _ReferenceS3ValidationClient:
-    def __init__(self, *, artifact_store: InMemoryArtifactStore, signer: C3ReportSigner, mode: str) -> None:
+    def __init__(
+        self,
+        *,
+        artifact_store: InMemoryArtifactStore,
+        verifier: S3Verifier,
+        contamination_index: ContaminationIndex,
+        contamination_snapshot: FrozenContaminationSnapshot,
+        mode: str,
+    ) -> None:
         self.artifact_store = artifact_store
-        self.signer = signer
+        self.verifier = verifier
+        self.contamination_index = contamination_index
+        self.contamination_snapshot = contamination_snapshot
         self.mode = mode
 
     def validate(self, request: dict[str, object]) -> dict[str, Any]:
+        frozen_payload = _artifact_payload(self.artifact_store, str(request["frozen_pipeline_ref"]))
+        model_payload = _reference_model_payload(self.artifact_store, frozen_payload)
+        dataset_payload = _artifact_payload(self.artifact_store, str(model_payload["dataset_ref"]))
         extrapolated = self._request_has_extrapolated_artifact(request)
-        checks = _reference_checks(extrapolated=extrapolated or self.mode == "extrapolated")
-        aggregate_passed = all(check.status == "PASS" for check in checks)
-        claim_tier = "recapitulated-known" if aggregate_passed else "ran-toy"
+        checks = _reference_checks(
+            model_payload=model_payload,
+            dataset_payload=dataset_payload,
+            contamination_index=self.contamination_index,
+            contamination_snapshot=self.contamination_snapshot,
+            extrapolated=extrapolated or self.mode == "extrapolated",
+        )
         outcome = run_perturbation_pair(
             perturbation_id=f"pair-{request['job_id']}",
             must_react_expected=1.0,
@@ -494,38 +549,18 @@ class _ReferenceS3ValidationClient:
             unperturbed_headline=1.0,
             perturbed_headline=0.2,
         )
-        report = {
-            "report_id": str(uuid5(NAMESPACE_URL, f"argus:s1-reference-physics:{request['job_id']}:{self.mode}")),
-            "profile_ref": str(request["profile_ref"]),
-            "frozen_pipeline_ref": str(request["frozen_pipeline_ref"]),
-            "checks": [_check_payload(check) for check in checks],
-            "aggregate": {
-                "passed": aggregate_passed,
-                "score": sum(1.0 for check in checks if check.status == "PASS") / len(checks),
-            },
-            "claim_tier": claim_tier,
-            "claim_tier_is_candidate": False,
-            "perturbation_pairs": [_drop_none(asdict(pair)) for pair in outcome.perturbation_pairs],
-            "insensitivity_flags": [_drop_none(asdict(flag)) for flag in outcome.insensitivity_flags],
-            "challenger_panel": {
-                "challenger_ids": ["challenger-a", "challenger-b"],
-                "min_required": 2,
-                "attack_types": ["signal_injection", "null_noise"],
-            },
-            "independence_attestation_debate": {
-                "min_independent_challengers": 2,
-                "lineage_disjoint": True,
-                "correlation_warning": False,
-            },
-            "referee": {
-                "referee_id": "s3-reference-referee",
-                "non_gameable": True,
-                "signed_by": self.signer.key_id,
-                "distinct_from_proponent": True,
-            },
-            "debate_ref": f"c4://debate/s1-reference/{request['job_id']}",
-        }
-        return self.signer.sign(report)
+        challengers = _reference_challengers()
+        independence = attest_challenger_independence(challengers=challengers, min_independent=2)
+        return self.verifier.build_report(
+            profile_ref=str(request["profile_ref"]),
+            frozen_pipeline_ref=str(request["frozen_pipeline_ref"]),
+            checks=checks,
+            proponent_id=S1_REFERENCE_PHYSICS_PROPONENT_ID,
+            perturbation_outcome=outcome,
+            challenger_ids=tuple(challenger.entity_id for challenger in challengers),
+            independence_attestation=independence,
+            debate_ref=f"c4://debate/s1-reference/{request['job_id']}",
+        )
 
     def _request_has_extrapolated_artifact(self, request: Mapping[str, object]) -> bool:
         frozen_payload = _artifact_payload(self.artifact_store, str(request["frozen_pipeline_ref"]))
@@ -591,32 +626,166 @@ def _evaluate_reference_physics(inputs: dict[str, NormalizedQuantity], _seed: in
     }
 
 
-def _reference_checks(*, extrapolated: bool) -> tuple[CheckResult, ...]:
+def _reference_checks(
+    *,
+    model_payload: Mapping[str, Any],
+    dataset_payload: Mapping[str, Any],
+    contamination_index: ContaminationIndex,
+    contamination_snapshot: FrozenContaminationSnapshot,
+    extrapolated: bool,
+) -> tuple[CheckResult, ...]:
+    row = _reference_dataset_row(dataset_payload)
+    observed_omega = _reference_observed_omega(model_payload)
+    expected_omega = float(row["known_omega"])
+    omega_tolerance = _reference_omega_tolerance(model_payload)
+    injection_error = abs(observed_omega - expected_omega)
+    injection = CheckResult(
+        "INJECTION",
+        "PASS" if injection_error <= omega_tolerance else "FAIL",
+        {
+            "observed_omega": observed_omega,
+            "expected_omega": expected_omega,
+            "absolute_error": injection_error,
+            "tolerance": omega_tolerance,
+            "recovery_rate": observed_omega / expected_omega if expected_omega else 0.0,
+        },
+    )
+    null_alpha = 0.0
+    null_omega = _reference_predict_omega(model_payload, t_n=float(row["T_n"]), alpha=null_alpha)
+    null_tolerance = 0.001
+    null_control = CheckResult(
+        "NULL_CONTROL",
+        "PASS" if abs(null_omega) <= null_tolerance else "FAIL",
+        {"null_alpha": null_alpha, "null_omega": null_omega, "absolute_tolerance": null_tolerance},
+    )
     cross_code = run_cross_code_check(
-        observed=(0.02,),
-        independent=(0.0205,),
-        combined_uncertainty=(0.01,),
+        observed=(observed_omega,),
+        independent=(expected_omega + 0.0005,),
+        combined_uncertainty=(omega_tolerance,),
         extrapolation_flags=(extrapolated,),
     )
+    expected_from_equation = _reference_predict_omega(model_payload, t_n=float(row["T_n"]), alpha=float(row["alpha"]))
+    physical_error = abs(observed_omega - expected_from_equation)
+    physical_consistency = CheckResult(
+        "PHYSICAL_CONSISTENCY",
+        "PASS" if physical_error <= omega_tolerance else "FAIL",
+        {
+            "model_family": str(model_payload.get("model_family", "")),
+            "observed_omega": observed_omega,
+            "expected_from_reference_equation": expected_from_equation,
+            "absolute_error": physical_error,
+            "units": _reference_omega_units(model_payload),
+        },
+    )
+    leakage = run_leakage_check(
+        contamination_index=contamination_index,
+        snapshot=contamination_snapshot,
+        candidate_text=_reference_candidate_text(model_payload=model_payload, observed_omega=observed_omega),
+        threshold=0.8,
+    )
+    calibration = run_calibration_check(
+        nominal_coverage=1.0,
+        empirical_coverage=1.0 if injection_error <= omega_tolerance else 0.0,
+        tolerance=0.0,
+    )
     return (
-        CheckResult("INJECTION", "PASS", {"recovery_rate": 0.98}),
-        CheckResult("NULL_CONTROL", "PASS", {"false_positive_rate": 0.0}),
+        injection,
+        null_control,
         cross_code,
-        CheckResult("PHYSICAL_CONSISTENCY", "PASS", {"unit_balance": "ok"}),
-        CheckResult("LEAKAGE", "PASS", {"blind_label_access": 0}),
-        CheckResult("CALIBRATION", "PASS", {"ece": 0.01}),
+        physical_consistency,
+        leakage,
+        calibration,
     )
 
 
-def _check_payload(check: CheckResult) -> dict[str, Any]:
-    payload = {"check": check.check, "status": check.status}
-    if check.metrics is not None:
-        payload["metrics"] = check.metrics
-    return payload
+def _reference_model_payload(store: InMemoryArtifactStore, frozen_payload: Mapping[str, Any]) -> dict[str, Any]:
+    if frozen_payload.get("schema") == "argus.s1.reference_physics_model.v1":
+        return dict(frozen_payload)
+    artifact_refs = frozen_payload.get("artifact_refs", ())
+    if not isinstance(artifact_refs, list | tuple):
+        raise ValueError("reference frozen pipeline payload has no artifact_refs")
+    for artifact_ref in artifact_refs:
+        if not isinstance(artifact_ref, str):
+            continue
+        payload = _artifact_payload(store, artifact_ref)
+        if payload.get("schema") == "argus.s1.reference_physics_model.v1":
+            return payload
+        model_ref = payload.get("model_ref")
+        if isinstance(model_ref, str):
+            model_payload = _artifact_payload(store, model_ref)
+            if model_payload.get("schema") == "argus.s1.reference_physics_model.v1":
+                return model_payload
+    raise ValueError("reference frozen pipeline does not point at a physics model artifact")
 
 
-def _drop_none(payload: dict[str, Any]) -> dict[str, Any]:
-    return {key: value for key, value in payload.items() if value is not None}
+def _reference_dataset_row(dataset_payload: Mapping[str, Any]) -> Mapping[str, Any]:
+    rows = dataset_payload.get("rows")
+    if not isinstance(rows, list) or not rows or not isinstance(rows[0], Mapping):
+        raise ValueError("reference dataset payload must contain at least one row")
+    return rows[0]
+
+
+def _reference_observed_omega(model_payload: Mapping[str, Any]) -> float:
+    omega = _reference_omega_payload(model_payload)
+    return float(omega["value"])
+
+
+def _reference_omega_tolerance(model_payload: Mapping[str, Any]) -> float:
+    omega = _reference_omega_payload(model_payload)
+    uncertainty = omega.get("uncertainty")
+    if isinstance(uncertainty, Mapping) and uncertainty.get("kind") == "interval":
+        return float(uncertainty["radius"])
+    return 0.0
+
+
+def _reference_omega_units(model_payload: Mapping[str, Any]) -> str:
+    return str(_reference_omega_payload(model_payload).get("units", ""))
+
+
+def _reference_omega_payload(model_payload: Mapping[str, Any]) -> Mapping[str, Any]:
+    outputs = model_payload.get("adapter_outputs")
+    if not isinstance(outputs, Mapping):
+        raise ValueError("reference model payload must contain adapter_outputs")
+    omega = outputs.get("omega")
+    if not isinstance(omega, Mapping):
+        raise ValueError("reference model payload must contain adapter_outputs.omega")
+    return omega
+
+
+def _reference_predict_omega(model_payload: Mapping[str, Any], *, t_n: float, alpha: float) -> float:
+    if model_payload.get("model_family") != "ewpt-tabular-reference":
+        raise ValueError("reference S3 verifier only supports ewpt-tabular-reference models")
+    return alpha * t_n / 1000.0
+
+
+def _reference_candidate_text(*, model_payload: Mapping[str, Any], observed_omega: float) -> str:
+    return (
+        f"{model_payload.get('model_family', 'unknown-model')} produced omega {observed_omega} "
+        f"from dataset {model_payload.get('dataset_ref', 'unknown-dataset')}"
+    )
+
+
+def _reference_challengers() -> tuple[CapabilityDescriptor, ...]:
+    return (
+        _reference_challenger("challenger-a", tags=("independent-code-a",)),
+        _reference_challenger("challenger-b", tags=("independent-code-b",)),
+    )
+
+
+def _reference_challenger(entity_id: str, *, tags: tuple[str, ...]) -> CapabilityDescriptor:
+    return CapabilityDescriptor(
+        entity_id=entity_id,
+        revision=1,
+        kind="subagent",
+        owner_subsystem="S1",
+        contract_versions={"C1": "1.0.0", "C5": "1.0.0"},
+        trust_class="internal",
+        capability_scopes=("challenge",),
+        provenance_ref=f"c4://descriptor/{entity_id}",
+        subtopics=(S1_REFERENCE_PHYSICS_SUBTOPIC,),
+        independence_tags=tags,
+        conformance_level="gold",
+    )
 
 
 def _artifact_payload(store: InMemoryArtifactStore, artifact_ref: str) -> dict[str, Any]:

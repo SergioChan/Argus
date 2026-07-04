@@ -260,6 +260,8 @@ class S3VerifierReportTests(unittest.TestCase):
         self.assertEqual(report["signature"]["key_id"], "s3-key")
         self.assertNotEqual(report["signature"]["value"], "placeholder")
         self.assertTrue(report["referee"]["distinct_from_proponent"])
+        self.assertNotIn("observed_degradation", report["perturbation_pairs"][0])
+        self.assertNotIn("amplitude_linearity", report["perturbation_pairs"][1])
 
     def test_insensitivity_forces_aggregate_fail_and_ran_toy(self) -> None:
         outcome = run_perturbation_pair(

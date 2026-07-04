@@ -205,8 +205,8 @@ class S3Verifier:
             },
             "claim_tier": claim_tier,
             "claim_tier_is_candidate": claim_tier == "novel-needs-human",
-            "perturbation_pairs": [asdict(pair) for pair in perturbation_outcome.perturbation_pairs],
-            "insensitivity_flags": [asdict(flag) for flag in perturbation_outcome.insensitivity_flags],
+            "perturbation_pairs": [_dataclass_contract(pair) for pair in perturbation_outcome.perturbation_pairs],
+            "insensitivity_flags": [_dataclass_contract(flag) for flag in perturbation_outcome.insensitivity_flags],
             "challenger_panel": {
                 "challenger_ids": list(challenger_ids),
                 "min_required": len(challenger_ids) if challenger_ids else 1,
@@ -645,6 +645,10 @@ def _check_to_contract(check: CheckResult) -> dict[str, Any]:
     if check.metrics is not None:
         payload["metrics"] = check.metrics
     return payload
+
+
+def _dataclass_contract(value: Any) -> dict[str, Any]:
+    return {key: item for key, item in asdict(value).items() if item is not None}
 
 
 def _default_independence_attestation(challenger_ids: tuple[str, ...]) -> IndependenceAttestation:
