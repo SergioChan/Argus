@@ -176,6 +176,10 @@ ACCEPTANCE_REFUSAL_REASONS = frozenset(
 S1_LIFECYCLE_LEDGER_KIND = "s1_lifecycle_event"
 S1_LIFECYCLE_LEDGER_CODE_REF = "argus-core:s1.lifecycle-store"
 S1_LIFECYCLE_LEDGER_ENVIRONMENT_DIGEST = "python:s1-lifecycle-store:v1"
+S1_FROZEN_PIPELINE_KIND = "frozen_pipeline"
+S1_VALIDATION_REQUEST_KIND = "validation_request"
+S1_VALIDATION_HANDOFF_CODE_REF = "argus-core:s1.validation-handoff"
+S1_VALIDATION_HANDOFF_ENVIRONMENT_DIGEST = "python:s1-validation-handoff:v1"
 S1_CONTENT_STORE_EGRESS_RULE = EgressRule("store.local", 443, "https")
 S1_EGRESS_PROTOCOLS = frozenset({"https", "grpc", "tcp"})
 
@@ -1880,6 +1884,49 @@ class SubagentSDKRunner:
         )
         return SDKInvocationResult(event=event, payload=payload)
 
+    def validate(
+        self,
+        job_id: str,
+        build_result: Mapping[str, Any],
+        *,
+        profile_ref: str,
+        blind_dataset_handle: str,
+        budget_token_ref: str,
+        validation_client: Any | None = None,
+        report_verifier: C3ReportVerifier | None = None,
+        idempotency_key: str | None = None,
+        root_request_id: str | None = None,
+        trace_id: str | None = None,
+    ) -> SDKInvocationResult:
+        self._assert_can_apply(job_id, "validate")
+        payload = _build_validation_handoff_payload(
+            job_id=job_id,
+            build_result=build_result,
+            profile_ref=profile_ref,
+            blind_dataset_handle=blind_dataset_handle,
+            budget_token_ref=budget_token_ref,
+            trace_id=trace_id or f"trace:{job_id}",
+            subagent_id=self.descriptor.subagent_id,
+            artifact_store=self.runtime.artifact_store,
+            validation_client=validation_client,
+            report_verifier=report_verifier,
+        )
+        event = self.runtime.store.apply_method(
+            job_id,
+            "validate",
+            trigger="S3",
+            payload={
+                "frozen_pipeline_ref": payload["frozen_pipeline_ref"],
+                "validation_request_ref": payload["validation_request_ref"],
+                "validation_report_ref": payload["validation_report_ref"],
+                "claim_tier": payload["subagent_report"]["claim_tier"],
+            },
+            idempotency_key=idempotency_key,
+            root_request_id=root_request_id,
+            trace_id=trace_id,
+        )
+        return SDKInvocationResult(event=event, payload=payload)
+
     def _exec_context(
         self,
         job_id: str,
@@ -2120,6 +2167,195 @@ def _normalize_build_payload(job_id: str, value: Mapping[str, Any] | Any) -> dic
             + ", ".join(sorted(str(field) for field in extra)),
         )
     return payload
+
+
+def _build_validation_handoff_payload(
+    *,
+    job_id: str,
+    build_result: Mapping[str, Any],
+    profile_ref: str,
+    blind_dataset_handle: str,
+    budget_token_ref: str,
+    trace_id: str,
+    subagent_id: str,
+    artifact_store: InMemoryArtifactStore | None,
+    validation_client: Any | None,
+    report_verifier: C3ReportVerifier | None,
+) -> dict[str, Any]:
+    if artifact_store is None:
+        raise LifecyclePolicyError(
+            build_error_envelope(
+                category="POLICY",
+                code="S1_VALIDATION_ARTIFACT_STORE_REQUIRED",
+                message="validate requires a C4 artifact store for frozen-pipeline and S3 report provenance",
+            )
+        )
+    if validation_client is None or not hasattr(validation_client, "validate"):
+        raise LifecyclePolicyError(
+            build_error_envelope(
+                category="VERIFIER_UNAVAILABLE",
+                code="S1_VALIDATION_CLIENT_REQUIRED",
+                message="validate requires an S3 validation client",
+            )
+        )
+    if report_verifier is None:
+        raise LifecyclePolicyError(
+            build_error_envelope(
+                category="VERIFIER_UNAVAILABLE",
+                code="S1_REPORT_VERIFIER_REQUIRED",
+                message="validate requires a C3 report verifier for S3 tier relay",
+            )
+        )
+    build_payload = _normalize_build_payload(job_id, build_result)
+    artifact_refs = tuple(str(ref) for ref in build_payload.get("artifact_refs", ()))
+    if not artifact_refs:
+        _raise_policy("S1_VALIDATION_ARTIFACT_REFS_REQUIRED", "validate requires at least one build artifact_ref")
+    profile_ref = _non_empty_string(profile_ref, "profile_ref")
+    blind_dataset_handle = _non_empty_string(blind_dataset_handle, "blind_dataset_handle")
+    budget_token_ref = _non_empty_string(budget_token_ref, "budget_token_ref")
+    trace_id = _non_empty_string(trace_id, "trace_id")
+
+    frozen_pipeline_record = artifact_store.create_artifact(
+        kind=S1_FROZEN_PIPELINE_KIND,
+        payload=_frozen_pipeline_payload(job_id=job_id, build_payload=build_payload, artifact_refs=artifact_refs),
+        producer=Producer(subsystem="S1", version="0.0.0", actor_id="s1.validate", job_id=job_id),
+        lineage=Lineage(
+            input_refs=artifact_refs,
+            code_ref=S1_VALIDATION_HANDOFF_CODE_REF,
+            environment_digest=S1_VALIDATION_HANDOFF_ENVIRONMENT_DIGEST,
+            job_id=job_id,
+        ),
+    )
+    validation_request = {
+        "job_id": job_id,
+        "frozen_pipeline_ref": frozen_pipeline_record.artifact_ref,
+        "artifact_refs": list(artifact_refs),
+        "profile_ref": profile_ref,
+        "blind_dataset_handle": blind_dataset_handle,
+        "budget_token_ref": budget_token_ref,
+        "trace_id": trace_id,
+    }
+    validation_request_record = artifact_store.create_artifact(
+        kind=S1_VALIDATION_REQUEST_KIND,
+        payload=validation_request,
+        producer=Producer(subsystem="S1", version="0.0.0", actor_id="s1.validate", job_id=job_id),
+        lineage=Lineage(
+            input_refs=(frozen_pipeline_record.artifact_ref, profile_ref),
+            code_ref=S1_VALIDATION_HANDOFF_CODE_REF,
+            environment_digest=S1_VALIDATION_HANDOFF_ENVIRONMENT_DIGEST,
+            job_id=job_id,
+        ),
+    )
+    validation_report_payload = _call_s3_validation_client(validation_client, validation_request)
+    verification = report_verifier.verify(validation_report_payload)
+    if not verification.valid:
+        raise LifecyclePolicyError(
+            build_error_envelope(
+                category="VALIDATION",
+                code="S1_VALIDATION_REPORT_REJECTED",
+                message=f"S3 validation report was rejected: {verification.reason or 'invalid'}",
+            )
+        )
+    report_record = artifact_store.create_artifact(
+        kind="report",
+        payload=validation_report_payload,
+        producer=Producer(subsystem="S3", version="0.0.0", actor_id="s3.validate"),
+        lineage=Lineage(
+            input_refs=(validation_request_record.artifact_ref, frozen_pipeline_record.artifact_ref),
+            code_ref="argus-core:s3.validate",
+            environment_digest="python:s3-validate:v1",
+            job_id=job_id,
+        ),
+    )
+    report = build_subagent_report(
+        artifact_refs=artifact_refs,
+        validation_report_ref=report_record.artifact_ref,
+        validation_report_payload=validation_report_payload,
+        report_verifier=report_verifier,
+        uncertainty_summary=build_payload["uncertainty_summary"],
+    )
+    return {
+        "job_id": job_id,
+        "frozen_pipeline_ref": frozen_pipeline_record.artifact_ref,
+        "validation_request_ref": validation_request_record.artifact_ref,
+        "validation_request": validation_request,
+        "validation_report_ref": report_record.artifact_ref,
+        "validation_report_payload": validation_report_payload,
+        "subagent_report": _subagent_report_payload(job_id=job_id, subagent_id=subagent_id, report=report),
+    }
+
+
+def _frozen_pipeline_payload(
+    *,
+    job_id: str,
+    build_payload: Mapping[str, Any],
+    artifact_refs: tuple[str, ...],
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "schema": "argus.s1.frozen_pipeline.v1",
+        "job_id": job_id,
+        "artifact_refs": list(artifact_refs),
+        "build_result_hash": hash_json(build_payload),
+        "diagnostics_hash": hash_json(build_payload.get("diagnostics", {})),
+        "self_checks_hash": hash_json(build_payload.get("self_checks", ())),
+        "uncertainty_summary": build_payload["uncertainty_summary"],
+    }
+    training_log_ref = build_payload.get("training_log_ref")
+    if training_log_ref is not None:
+        payload["training_log_ref"] = str(training_log_ref)
+    return payload
+
+
+def _call_s3_validation_client(validation_client: Any, validation_request: Mapping[str, Any]) -> dict[str, Any]:
+    try:
+        raw_report = validation_client.validate(dict(validation_request))
+    except LifecyclePolicyError:
+        raise
+    except Exception as exc:
+        raise LifecyclePolicyError(
+            build_error_envelope(
+                category="VALIDATION",
+                code="S1_VALIDATION_HANDOFF_FAILED",
+                message=f"S3 validation handoff failed: {exc}",
+            )
+        ) from exc
+    report_payload = _json_compatible_payload(raw_report)
+    if not isinstance(report_payload, dict):
+        raise LifecyclePolicyError(
+            build_error_envelope(
+                category="VALIDATION",
+                code="S1_VALIDATION_REPORT_INVALID",
+                message="S3 validation client must return a C3 report mapping",
+            )
+        )
+    return report_payload
+
+
+def _subagent_report_payload(*, job_id: str, subagent_id: str, report: SubagentReport) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "job_id": job_id,
+        "subagent_id": subagent_id,
+        "status": LifecycleState.REPORTED.value,
+        "claim_tier": report.claim_tier,
+        "artifact_refs": list(report.artifact_refs),
+        "uncertainty_summary": report.uncertainty_summary,
+        "cost_actual": {"cost_usd": 0.0},
+        "reproducibility_manifest": {
+            "lineage_ref": report.artifact_refs[0],
+            "environment_digest": S1_VALIDATION_HANDOFF_ENVIRONMENT_DIGEST,
+            "code_ref": S1_VALIDATION_HANDOFF_CODE_REF,
+            "seeds": [],
+        },
+    }
+    if report.validation_report_ref is not None:
+        payload["validation_report_ref"] = report.validation_report_ref
+    return payload
+
+
+def _non_empty_string(value: Any, name: str) -> str:
+    if not isinstance(value, str) or not value:
+        _raise_policy("S1_VALIDATION_REQUEST_FIELD_REQUIRED", f"{name} must be a non-empty string")
+    return value
 
 
 def _json_compatible_payload(value: Any) -> Any:

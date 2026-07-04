@@ -14,6 +14,9 @@ from argus_core import (
     AdapterBroker,
     AdapterDescriptor,
     BudgetCaps,
+    C3ReportSigner,
+    C3ReportVerifier,
+    CheckResult,
     EgressRule,
     ExecContext,
     InMemoryArtifactStore,
@@ -21,6 +24,7 @@ from argus_core import (
     InMemoryQuotaLedger,
     InMemorySandboxOrchestrator,
     InMemoryTokenService,
+    InMemoryVerifierTrustStore,
     JobEnvelope,
     LaunchEnvelope,
     LaunchRequest,
@@ -33,12 +37,14 @@ from argus_core import (
     ResourceCeilings,
     S1AdapterBrokerProxy,
     ScopeGrant,
+    S3Verifier,
     SimpleAdapter,
     Subagent,
     SubagentDescriptor,
     SubagentSDKRunner,
     SubagentRuntime,
     hash_bytes,
+    run_perturbation_pair,
     tag_uncertainty,
     uncertainty_tag_for_artifact,
 )
@@ -684,6 +690,177 @@ class S1SDKBaseClassTests(unittest.TestCase):
         self.assertIs(runtime.store.artifact_store, artifacts)
         self.assertEqual(len(artifacts), 1)
         self.assertEqual(artifacts.get_record(str(event.ledger_ref)).kind, S1_LIFECYCLE_LEDGER_KIND)
+
+    def test_runner_validate_packages_frozen_pipeline_for_s3_without_blind_labels(self) -> None:
+        trust_store = InMemoryVerifierTrustStore()
+        trust_store.register_key("s3-key", b"s3-secret")
+        c3_verifier = C3ReportVerifier(trust_store)
+        artifacts = InMemoryArtifactStore(report_verifier=c3_verifier)
+
+        class ValidatingBuildSubagent(Subagent):
+            def plan(self, ctx: ExecContext, envelope: JobEnvelope) -> dict[str, object]:
+                return {
+                    "steps": [{"step_id": "fit", "kind": "train", "description": "Fit toy model"}],
+                    "adapters_required": list(envelope.required_adapters),
+                    "datasets_required": ["c4://dataset/ewpt-toy"],
+                    "verifier_profile_ref": envelope.verifier_profile_ref,
+                    "budget_breakdown": {"total": {"cost_usd": envelope.estimated_cost}},
+                    "risk_notes": [],
+                }
+
+            def build(self, ctx: ExecContext, _plan: dict[str, object]) -> dict[str, object]:
+                artifact = ctx.emit_artifact(
+                    {"weights": [1.0], "headline": 1.0},
+                    kind="model",
+                    lineage=Lineage(
+                        input_refs=(),
+                        code_ref="git:project-argus@s1-t17",
+                        environment_digest="oci:s1-build@sha256-s1-t17",
+                        seeds=("seed-s1-t17",),
+                    ),
+                )
+                return {
+                    "artifact_refs": [str(artifact["artifact_ref"])],
+                    "diagnostics": {"blind_labels": ["secret-label-must-not-leak"]},
+                    "self_checks": [{"type": "smoke", "status": "PASS", "advisory": True}],
+                    "uncertainty_summary": tag_uncertainty(
+                        "interval",
+                        {"radius": 0.01, "source": "build-output"},
+                    ),
+                }
+
+        class RecordingS3ValidationClient:
+            def __init__(self) -> None:
+                signer = C3ReportSigner(key_id="s3-key", secret=b"s3-secret")
+                self.s3 = S3Verifier(verifier_id="s3-referee", signer_key_id="s3-key", signer=signer)
+                self.request: dict[str, object] | None = None
+
+            def validate(self, request: dict[str, object]) -> dict[str, object]:
+                self.request = request
+                self_test.assertNotIn("blind_labels", request)
+                outcome = run_perturbation_pair(
+                    perturbation_id="pair-s1-t17",
+                    must_react_expected=1.0,
+                    must_react_observed=1.0,
+                    must_not_react_observed=0.0,
+                    unperturbed_headline=1.0,
+                    perturbed_headline=0.2,
+                )
+                return self.s3.build_report(
+                    profile_ref=str(request["profile_ref"]),
+                    frozen_pipeline_ref=str(request["frozen_pipeline_ref"]),
+                    proponent_id="sdk-subagent",
+                    checks=(
+                        CheckResult("INJECTION", "PASS"),
+                        CheckResult("NULL_CONTROL", "PASS"),
+                        CheckResult("PHYSICAL_CONSISTENCY", "PASS"),
+                        CheckResult("CALIBRATION", "PASS"),
+                    ),
+                    perturbation_outcome=outcome,
+                    challenger_ids=("challenger-a", "challenger-b"),
+                    debate_ref="c4://debate/s1-t17",
+                )
+
+        self_test = self
+        subagent = ValidatingBuildSubagent(self.descriptor)
+        runtime = SubagentRuntime(descriptor=self.descriptor, artifact_store=artifacts)
+        runner = SubagentSDKRunner(subagent, runtime=runtime)
+        s3_client = RecordingS3ValidationClient()
+
+        runner.accept(self.envelope)
+        plan = runner.plan(self.envelope)
+        build = runner.build(self.envelope.job_id, plan.payload)
+        validated = runner.validate(
+            self.envelope.job_id,
+            build.payload,
+            profile_ref=str(self.envelope.verifier_profile_ref),
+            blind_dataset_handle="blind://s3/labels/job-555",
+            budget_token_ref="budget://token/job-555",
+            validation_client=s3_client,
+            report_verifier=c3_verifier,
+            trace_id="trace-s1-t17",
+        )
+
+        assert s3_client.request is not None
+        request = s3_client.request
+        self._assert_c1_def_valid("ValidationRequest", request)
+        self.assertEqual(request["blind_dataset_handle"], "blind://s3/labels/job-555")
+        self.assertEqual(request["budget_token_ref"], "budget://token/job-555")
+        self.assertEqual(validated.event.to_state, LifecycleState.VALIDATING)
+        self.assertEqual(
+            [event.method for event in runner.runtime.store.events(self.envelope.job_id)],
+            ["accept", "plan", "build", "validate"],
+        )
+
+        frozen_payload = json.loads(
+            artifacts.get_artifact(str(validated.payload["frozen_pipeline_ref"])).decode("utf-8")
+        )
+        validation_request_payload = json.loads(
+            artifacts.get_artifact(str(validated.payload["validation_request_ref"])).decode("utf-8")
+        )
+        report_payload = json.loads(
+            artifacts.get_artifact(str(validated.payload["validation_report_ref"])).decode("utf-8")
+        )
+        serialized_handoff = json.dumps(
+            {
+                "frozen": frozen_payload,
+                "request": validation_request_payload,
+                "runner_payload": validated.payload,
+            },
+            sort_keys=True,
+        )
+
+        self.assertEqual(frozen_payload["artifact_refs"], build.payload["artifact_refs"])
+        self.assertEqual(validation_request_payload, request)
+        self.assertNotIn("secret-label-must-not-leak", serialized_handoff)
+        self.assertEqual(report_payload["frozen_pipeline_ref"], request["frozen_pipeline_ref"])
+        self.assertTrue(c3_verifier.verify(report_payload).valid)
+        self._assert_c1_def_valid("SubagentReport", validated.payload["subagent_report"])
+        self.assertEqual(validated.payload["subagent_report"]["claim_tier"], "recapitulated-known")
+        self.assertEqual(validated.payload["subagent_report"]["validation_report_ref"], validated.payload["validation_report_ref"])
+
+    def test_runner_validate_fails_closed_without_s3_validation_client(self) -> None:
+        class ArtifactBuildSubagent(ExampleSubagent):
+            def build(self, ctx: ExecContext, plan: dict[str, object]) -> dict[str, object]:
+                payload = super().build(ctx, plan)
+                payload["artifact_refs"] = [
+                    str(
+                        ctx.emit_artifact(
+                            {"weights": [1]},
+                            kind="model",
+                            lineage=Lineage(
+                                input_refs=(),
+                                code_ref="git:project-argus@s1-t17-missing-client",
+                                environment_digest="oci:s1-build@sha256-missing-client",
+                                seeds=("seed-missing-client",),
+                            ),
+                        )["artifact_ref"]
+                    )
+                ]
+                payload["uncertainty_summary"] = tag_uncertainty("interval", {"radius": 0.01})
+                return payload
+
+        runner = SubagentSDKRunner(ArtifactBuildSubagent(self.descriptor))
+
+        runner.accept(self.envelope)
+        plan = runner.plan(self.envelope)
+        build = runner.build(self.envelope.job_id, plan.payload)
+
+        with self.assertRaises(LifecyclePolicyError) as raised:
+            runner.validate(
+                self.envelope.job_id,
+                build.payload,
+                profile_ref=str(self.envelope.verifier_profile_ref),
+                blind_dataset_handle="blind://s3/labels/job-555",
+                budget_token_ref="budget://token/job-555",
+            )
+
+        self.assertEqual(raised.exception.envelope.code, "S1_VALIDATION_CLIENT_REQUIRED")
+        self.assertEqual(runner.runtime.store.current(self.envelope.job_id).state, LifecycleState.BUILDING)
+        self.assertEqual(
+            [event.method for event in runner.runtime.store.events(self.envelope.job_id)],
+            ["accept", "plan", "build"],
+        )
 
     def test_runner_plan_context_default_denies_empty_adapter_allowlist(self) -> None:
         class UndeclaredAdapterPlanSubagent(Subagent):
