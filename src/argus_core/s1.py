@@ -555,7 +555,7 @@ class ExecContext:
 
     def call_adapter(self, adapter_ref: str, request: dict[str, Any]) -> dict[str, Any]:
         self._require_capability("call_adapter")
-        if self._allowed_adapters and adapter_ref not in self._allowed_adapters:
+        if adapter_ref not in self._allowed_adapters:
             self._deny_capability("call_adapter", f"adapter is not allowlisted: {adapter_ref}")
         return {
             "capability": "call_adapter",
@@ -566,7 +566,7 @@ class ExecContext:
 
     def read_dataset(self, dataset_ref: str) -> dict[str, str]:
         self._require_capability("read_dataset")
-        if self._allowed_datasets and dataset_ref not in self._allowed_datasets:
+        if dataset_ref not in self._allowed_datasets:
             self._deny_capability("read_dataset", f"dataset is not allowlisted: {dataset_ref}")
         return {"capability": "read_dataset", "job_id": self.job_id, "dataset_ref": dataset_ref}
 

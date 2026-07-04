@@ -198,7 +198,11 @@ class S1SDKBaseClassTests(unittest.TestCase):
             self.assertFalse(hasattr(ctx, forbidden), forbidden)
 
     def test_exec_context_denies_missing_and_unknown_capabilities(self) -> None:
-        ctx = ExecContext(job_id=self.envelope.job_id, capabilities=("read_dataset",))
+        ctx = ExecContext(
+            job_id=self.envelope.job_id,
+            capabilities=("read_dataset",),
+            allowed_datasets=("c4://dataset/ewpt-toy",),
+        )
 
         self.assertEqual(ctx.as_c1_payload(), {"job_id": self.envelope.job_id, "capabilities": ["read_dataset"]})
         self.assertEqual(ctx.read_dataset("c4://dataset/ewpt-toy")["capability"], "read_dataset")
@@ -210,6 +214,19 @@ class S1SDKBaseClassTests(unittest.TestCase):
         self.assertIn("call_adapter", raised.exception.envelope.message)
         with self.assertRaisesRegex(ValueError, "unknown ExecContext capability"):
             ExecContext(job_id=self.envelope.job_id, capabilities=("set_claim_tier",))
+
+    def test_exec_context_empty_allowlists_default_deny_adapter_and_dataset_handles(self) -> None:
+        ctx = ExecContext(job_id=self.envelope.job_id)
+
+        with self.assertRaises(LifecyclePolicyError) as adapter_denied:
+            ctx.call_adapter("adapter:undeclared", {"input": 1})
+        with self.assertRaises(LifecyclePolicyError) as dataset_denied:
+            ctx.read_dataset("c4://dataset/undeclared")
+
+        self.assertEqual(adapter_denied.exception.envelope.code, "EXEC_CONTEXT_CAPABILITY_DENIED")
+        self.assertEqual(dataset_denied.exception.envelope.code, "EXEC_CONTEXT_CAPABILITY_DENIED")
+        self.assertIn("adapter is not allowlisted", adapter_denied.exception.envelope.message)
+        self.assertIn("dataset is not allowlisted", dataset_denied.exception.envelope.message)
 
     def test_exec_context_brokers_documented_capabilities_with_allowlists(self) -> None:
         ctx = ExecContext(
@@ -384,6 +401,70 @@ class S1SDKBaseClassTests(unittest.TestCase):
         self.assertEqual(
             {node.artifact_ref for node in lineage_graph.nodes},
             {source.artifact_ref, record.artifact_ref},
+        )
+
+    def test_runner_plan_context_default_denies_empty_adapter_allowlist(self) -> None:
+        class UndeclaredAdapterPlanSubagent(Subagent):
+            def plan(self, ctx: ExecContext, envelope: JobEnvelope) -> dict[str, object]:
+                ctx.call_adapter("adapter:undeclared", {"input": 1})
+                return {}
+
+            def build(self, ctx: ExecContext, plan: dict[str, object]) -> dict[str, object]:
+                return {}
+
+        descriptor = SubagentDescriptor(
+            subagent_id="sdk-empty-adapter-subagent",
+            contract_version="1.0.0",
+            subtopics=("ewpt",),
+        )
+        envelope = JobEnvelope(
+            job_id="66666666-6666-4666-8666-666666666666",
+            envelope_version="1.0.0",
+            subtopic="ewpt",
+            verifier_profile_ref="c4://profile/ewpt/v1",
+        )
+        runner = SubagentSDKRunner(UndeclaredAdapterPlanSubagent(descriptor))
+
+        runner.accept(envelope)
+        with self.assertRaises(LifecyclePolicyError) as raised:
+            runner.plan(envelope)
+
+        self.assertEqual(raised.exception.envelope.code, "EXEC_CONTEXT_CAPABILITY_DENIED")
+        self.assertIn("adapter is not allowlisted", raised.exception.envelope.message)
+        self.assertEqual([event.method for event in runner.runtime.store.events(envelope.job_id)], ["accept"])
+
+    def test_runner_build_context_default_denies_undeclared_dataset(self) -> None:
+        class UndeclaredDatasetBuildSubagent(Subagent):
+            def plan(self, ctx: ExecContext, envelope: JobEnvelope) -> dict[str, object]:
+                return {"steps": []}
+
+            def build(self, ctx: ExecContext, plan: dict[str, object]) -> dict[str, object]:
+                ctx.read_dataset("c4://dataset/undeclared")
+                return {}
+
+        descriptor = SubagentDescriptor(
+            subagent_id="sdk-empty-dataset-subagent",
+            contract_version="1.0.0",
+            subtopics=("ewpt",),
+        )
+        envelope = JobEnvelope(
+            job_id="77777777-7777-4777-8777-777777777777",
+            envelope_version="1.0.0",
+            subtopic="ewpt",
+            verifier_profile_ref="c4://profile/ewpt/v1",
+        )
+        runner = SubagentSDKRunner(UndeclaredDatasetBuildSubagent(descriptor))
+
+        runner.accept(envelope)
+        planned = runner.plan(envelope)
+        with self.assertRaises(LifecyclePolicyError) as raised:
+            runner.build(envelope.job_id, planned.payload)
+
+        self.assertEqual(raised.exception.envelope.code, "EXEC_CONTEXT_CAPABILITY_DENIED")
+        self.assertIn("dataset is not allowlisted", raised.exception.envelope.message)
+        self.assertEqual(
+            [event.method for event in runner.runtime.store.events(envelope.job_id)],
+            ["accept", "plan"],
         )
 
     def test_exec_context_submit_sandbox_job_fails_closed_without_s10_marshaler(self) -> None:
