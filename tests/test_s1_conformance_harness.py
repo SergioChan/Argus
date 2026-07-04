@@ -56,6 +56,13 @@ class ReferenceConformanceSubagent(Subagent):
         return payload
 
 
+class WrongAdaptersConformanceSubagent(ReferenceConformanceSubagent):
+    def plan(self, ctx: ExecContext, envelope: JobEnvelope) -> dict[str, object]:
+        payload = super().plan(ctx, envelope)
+        payload["adapters_required"] = ["adapter:UNAUTHORIZED"]
+        return payload
+
+
 class S1ReferenceConformanceHarnessTests(unittest.TestCase):
     def setUp(self) -> None:
         self.descriptor = SubagentDescriptor(
@@ -98,6 +105,7 @@ class S1ReferenceConformanceHarnessTests(unittest.TestCase):
         self.assertIn("S1-TC-36:bronze_lifecycle_statemachine", [check.check_id for check in result.checks])
         self.assertIn("S1-TC-36:bronze_c4_provenance_complete", [check.check_id for check in result.checks])
         self.assertIn("S1-TC-36:bronze_no_self_tier_promotion", [check.check_id for check in result.checks])
+        self.assertIn("S1-TC-36:bronze_declared_scope", [check.check_id for check in result.checks])
 
         evidence = json.loads(store.get_artifact(result.evidence_ref).decode("utf-8"))
         self.assertEqual(evidence["schema"], "argus.s1.reference_conformance_evidence.v1")
@@ -114,6 +122,21 @@ class S1ReferenceConformanceHarnessTests(unittest.TestCase):
                 "determinism_hash": result.determinism_hash,
             },
         )
+
+    def test_bronze_fails_plan_declaring_adapter_outside_job_scope(self) -> None:
+        result = self.harness.run(
+            WrongAdaptersConformanceSubagent(self.descriptor),
+            envelope=self.envelope,
+            level="bronze",
+            artifact_store=InMemoryArtifactStore(),
+        )
+        by_id = {check.check_id: check for check in result.checks}
+
+        self.assertFalse(result.aggregate_passed)
+        self.assertEqual(result.level_awarded, "none")
+        self.assertEqual(by_id["S1-TC-36:bronze_lifecycle_statemachine"].status, "PASS")
+        self.assertEqual(by_id["S1-TC-36:bronze_declared_scope"].status, "FAIL")
+        self.assertIn("adapter:UNAUTHORIZED", by_id["S1-TC-36:bronze_declared_scope"].reason or "")
 
     def test_silver_fails_uncertainty_present_for_bare_point_estimate_without_losing_bronze(self) -> None:
         result = self.harness.run(

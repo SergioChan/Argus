@@ -1712,6 +1712,7 @@ def _s1_reference_conformance_checks(
         _s1_bronze_lifecycle_check(execution),
         _s1_bronze_provenance_check(execution),
         _s1_bronze_no_self_tier_check(execution),
+        _s1_bronze_declared_scope_check(execution),
     ]
     if _s1_conformance_rank(requested_level) >= _s1_conformance_rank("silver"):
         checks.append(_s1_silver_uncertainty_check(execution))
@@ -1818,6 +1819,48 @@ def _s1_bronze_no_self_tier_check(execution: _S1ConformanceExecution) -> S1Confo
         oracle,
         reason=reason,
         evidence_refs=artifact_refs,
+    )
+
+
+def _s1_bronze_declared_scope_check(execution: _S1ConformanceExecution) -> S1ConformanceCheck:
+    oracle = (
+        "plan.adapters_required subset envelope.allowed_adapters "
+        "AND plan.adapters_required subset descriptor.required_adapters"
+    )
+    if execution.plan_payload is None:
+        return _s1_check(
+            "S1-TC-36:bronze_declared_scope",
+            "bronze",
+            False,
+            oracle,
+            reason="plan_not_completed",
+        )
+    try:
+        plan_adapters = tuple(str(adapter) for adapter in execution.plan_payload.get("adapters_required", ()))
+    except Exception as exc:
+        return _s1_check(
+            "S1-TC-36:bronze_declared_scope",
+            "bronze",
+            False,
+            oracle,
+            reason=_s1_exception_reason(exc),
+        )
+    allowed_adapters = set(execution.envelope.allowed_adapters)
+    descriptor_adapters = set(execution.runner.descriptor.required_adapters)
+    outside_envelope = sorted(adapter for adapter in plan_adapters if adapter not in allowed_adapters)
+    outside_descriptor = sorted(adapter for adapter in plan_adapters if adapter not in descriptor_adapters)
+    passed = not outside_envelope and not outside_descriptor
+    reason = None
+    if outside_envelope:
+        reason = "outside_envelope_allowed_adapters:" + ",".join(outside_envelope)
+    elif outside_descriptor:
+        reason = "outside_descriptor_required_adapters:" + ",".join(outside_descriptor)
+    return _s1_check(
+        "S1-TC-36:bronze_declared_scope",
+        "bronze",
+        passed,
+        oracle,
+        reason=reason,
     )
 
 
