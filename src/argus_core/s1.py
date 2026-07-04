@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import inspect
+import json
 import textwrap
 from abc import ABC, abstractmethod
 from collections.abc import Mapping as CollectionsMapping
@@ -179,6 +180,9 @@ ACCEPTANCE_REFUSAL_REASONS = frozenset(
 S1_LIFECYCLE_LEDGER_KIND = "s1_lifecycle_event"
 S1_LIFECYCLE_LEDGER_CODE_REF = "argus-core:s1.lifecycle-store"
 S1_LIFECYCLE_LEDGER_ENVIRONMENT_DIGEST = "python:s1-lifecycle-store:v1"
+S1_SANDBOX_ATTACHMENT_KIND = "s1_sandbox_attachment"
+S1_SANDBOX_ATTACHMENT_CODE_REF = "argus-core:s1.sandbox-attachment"
+S1_SANDBOX_ATTACHMENT_ENVIRONMENT_DIGEST = "python:s1-sandbox-attachment:v1"
 S1_BUILD_REPAIR_ATTEMPT_KIND = "s1_build_repair_attempt"
 S1_BUILD_REPAIR_CODE_REF = "argus-core:s1.build-auto-repair"
 S1_BUILD_REPAIR_ENVIRONMENT_DIGEST = "python:s1-build-auto-repair:v1"
@@ -567,6 +571,27 @@ class S10SandboxMarshaler:
             "state": "CANCEL_REQUESTED",
             "terminate_succeeded": False,
         }
+
+    def get(self, sandbox_id: str) -> Any:
+        hook = getattr(self.launcher, "get", None)
+        if callable(hook):
+            try:
+                return hook(sandbox_id)
+            except S10Error as exc:
+                raise LifecyclePolicyError(
+                    build_error_envelope(
+                        category="SANDBOX",
+                        code="S10_SANDBOX_REATTACH_FAILED",
+                        message=f"S10 sandbox reattach failed: {exc}",
+                    )
+                ) from exc
+        raise LifecyclePolicyError(
+            build_error_envelope(
+                category="SANDBOX",
+                code="S10_SANDBOX_REATTACH_UNAVAILABLE",
+                message="S10 sandbox marshaler cannot resolve durable sandbox handles",
+            )
+        )
 
     def quarantine_sandbox_job(
         self,
@@ -2931,6 +2956,7 @@ class SubagentRuntime:
         self._heartbeats: dict[str, HeartbeatStatus] = {}
         self._cancel_flags: set[str] = set()
         self._active_sandboxes: dict[str, dict[str, dict[str, Any]]] = {}
+        self._sandbox_attachment_refs: dict[str, dict[str, str]] = {}
         self._cancel_events: dict[str, LifecycleEvent] = {}
         self._quarantine_events: dict[str, LifecycleEvent] = {}
 
@@ -3108,7 +3134,182 @@ class SubagentRuntime:
         sandbox_id = result.get("sandbox_id")
         if not isinstance(sandbox_id, str) or not sandbox_id:
             return
-        self._active_sandboxes.setdefault(job_id, {})[sandbox_id] = dict(_json_compatible_payload(result))
+        payload = dict(_json_compatible_payload(result))
+        attachment_ref = self._record_sandbox_attachment(job_id=job_id, sandbox_id=sandbox_id, payload=payload)
+        if attachment_ref is not None:
+            payload["attachment_ref"] = attachment_ref
+            self._sandbox_attachment_refs.setdefault(job_id, {})[sandbox_id] = attachment_ref
+        self._active_sandboxes.setdefault(job_id, {})[sandbox_id] = payload
+
+    def active_sandboxes(self, job_id: str) -> tuple[dict[str, Any], ...]:
+        return tuple(dict(payload) for _sandbox_id, payload in sorted(self._active_sandboxes.get(job_id, {}).items()))
+
+    def sandbox_attachment_refs(self, job_id: str) -> tuple[str, ...]:
+        refs = tuple(ref for _sandbox_id, ref in sorted(self._sandbox_attachment_refs.get(job_id, {}).items()))
+        if refs:
+            return refs
+        return tuple(record.artifact_ref for record, _payload in self._sandbox_attachment_records(job_id))
+
+    def recover_active_sandboxes(self, job_id: str) -> tuple[dict[str, Any], ...]:
+        current = self.store.current(job_id)
+        if current.state != LifecycleState.BUILDING:
+            self._active_sandboxes.pop(job_id, None)
+            return ()
+        recovered: dict[str, dict[str, Any]] = {}
+        attachment_refs: dict[str, str] = {}
+        for record, payload in self._sandbox_attachment_records(job_id):
+            sandbox_payload = payload.get("sandbox_result")
+            if not isinstance(sandbox_payload, dict):
+                raise LifecyclePolicyError(
+                    build_error_envelope(
+                        category="SANDBOX",
+                        code="S10_SANDBOX_ATTACHMENT_INVALID",
+                        message=f"sandbox attachment {record.artifact_ref} has no sandbox_result object",
+                    )
+                )
+            sandbox_id = sandbox_payload.get("sandbox_id")
+            if not isinstance(sandbox_id, str) or not sandbox_id:
+                raise LifecyclePolicyError(
+                    build_error_envelope(
+                        category="SANDBOX",
+                        code="S10_SANDBOX_ATTACHMENT_INVALID",
+                        message=f"sandbox attachment {record.artifact_ref} has no sandbox_id",
+                    )
+                )
+            restored = self._resolve_sandbox_attachment(job_id=job_id, active=sandbox_payload)
+            restored["attachment_ref"] = record.artifact_ref
+            recovered[sandbox_id] = restored
+            attachment_refs[sandbox_id] = record.artifact_ref
+        self._active_sandboxes[job_id] = recovered
+        self._sandbox_attachment_refs[job_id] = attachment_refs
+        return self.active_sandboxes(job_id)
+
+    def _record_sandbox_attachment(self, *, job_id: str, sandbox_id: str, payload: dict[str, Any]) -> str | None:
+        if self.artifact_store is None:
+            return None
+        attachment_payload = {
+            "schema": "argus.s1.sandbox_attachment.v1",
+            "job_id": job_id,
+            "sandbox_id": sandbox_id,
+            "sandbox_result": dict(payload),
+        }
+        input_refs = list(self.store.ledger_refs(job_id)[-1:])
+        launch_provenance_ref = payload.get("launch_provenance_ref")
+        if isinstance(launch_provenance_ref, str) and launch_provenance_ref and launch_provenance_ref not in input_refs:
+            input_refs.append(launch_provenance_ref)
+        record = self.artifact_store.create_artifact(
+            kind=S1_SANDBOX_ATTACHMENT_KIND,
+            payload=attachment_payload,
+            producer=Producer(subsystem="S1", version="0.0.0", actor_id="s1.sandbox-attachment", job_id=job_id),
+            lineage=Lineage(
+                input_refs=tuple(input_refs),
+                code_ref=S1_SANDBOX_ATTACHMENT_CODE_REF,
+                environment_digest=S1_SANDBOX_ATTACHMENT_ENVIRONMENT_DIGEST,
+                job_id=job_id,
+            ),
+        )
+        return record.artifact_ref
+
+    def _sandbox_attachment_records(self, job_id: str) -> tuple[tuple[ArtifactRecord, dict[str, Any]], ...]:
+        if self.artifact_store is None:
+            return ()
+        records = sorted(
+            self.artifact_store.query_artifacts({"kind": S1_SANDBOX_ATTACHMENT_KIND, "job_id": job_id}),
+            key=lambda record: (record.created_at, record.artifact_ref),
+        )
+        parsed: list[tuple[ArtifactRecord, dict[str, Any]]] = []
+        for record in records:
+            payload = json.loads(self.artifact_store.get_artifact(record.artifact_ref).decode("utf-8"))
+            if not isinstance(payload, dict):
+                raise LifecyclePolicyError(
+                    build_error_envelope(
+                        category="SANDBOX",
+                        code="S10_SANDBOX_ATTACHMENT_INVALID",
+                        message=f"sandbox attachment {record.artifact_ref} payload is not an object",
+                    )
+                )
+            if payload.get("job_id") != job_id:
+                raise LifecyclePolicyError(
+                    build_error_envelope(
+                        category="SANDBOX",
+                        code="S10_SANDBOX_ATTACHMENT_INVALID",
+                        message=f"sandbox attachment {record.artifact_ref} job_id does not match {job_id}",
+                    )
+                )
+            sandbox_payload = payload.get("sandbox_result")
+            declared_sandbox_id = payload.get("sandbox_id")
+            if isinstance(sandbox_payload, dict) and sandbox_payload.get("sandbox_id") != declared_sandbox_id:
+                raise LifecyclePolicyError(
+                    build_error_envelope(
+                        category="SANDBOX",
+                        code="S10_SANDBOX_ATTACHMENT_INVALID",
+                        message=f"sandbox attachment {record.artifact_ref} sandbox_id does not match sandbox_result",
+                    )
+                )
+            parsed.append((record, payload))
+        return tuple(parsed)
+
+    def _resolve_sandbox_attachment(self, *, job_id: str, active: Mapping[str, Any]) -> dict[str, Any]:
+        sandbox_id = str(active["sandbox_id"])
+        if self.sandbox_marshaler is None:
+            raise LifecyclePolicyError(
+                build_error_envelope(
+                    category="SANDBOX",
+                    code="S10_SANDBOX_REATTACH_UNAVAILABLE",
+                    message="cannot recover active sandbox without an S10 sandbox marshaler",
+                )
+            )
+        result = self._call_sandbox_resolver(job_id=job_id, sandbox_id=sandbox_id, active=active)
+        resolved = _normalize_sandbox_result(job_id, result)
+        if resolved.get("sandbox_id") != sandbox_id:
+            raise LifecyclePolicyError(
+                build_error_envelope(
+                    category="SANDBOX",
+                    code="S10_SANDBOX_REATTACH_MISMATCH",
+                    message=f"resolved sandbox {resolved.get('sandbox_id')} does not match attachment {sandbox_id}",
+                )
+            )
+        restored = dict(active)
+        restored.update(resolved)
+        restored["reattach_state"] = str(resolved.get("state", restored.get("state", "UNKNOWN")))
+        return restored
+
+    def _call_sandbox_resolver(self, *, job_id: str, sandbox_id: str, active: Mapping[str, Any]) -> Any:
+        reattach = getattr(self.sandbox_marshaler, "reattach_sandbox_job", None)
+        if callable(reattach):
+            try:
+                return reattach(job_id=job_id, sandbox_id=sandbox_id, attachment=dict(active))
+            except KeyError as exc:
+                raise self._sandbox_reattach_failed(sandbox_id, exc) from exc
+        resolve = getattr(self.sandbox_marshaler, "resolve_sandbox_job", None)
+        if callable(resolve):
+            try:
+                return resolve(job_id=job_id, sandbox_id=sandbox_id)
+            except KeyError as exc:
+                raise self._sandbox_reattach_failed(sandbox_id, exc) from exc
+        get = getattr(self.sandbox_marshaler, "get", None)
+        if callable(get):
+            try:
+                return get(sandbox_id)
+            except KeyError as exc:
+                raise self._sandbox_reattach_failed(sandbox_id, exc) from exc
+        raise LifecyclePolicyError(
+            build_error_envelope(
+                category="SANDBOX",
+                code="S10_SANDBOX_REATTACH_UNAVAILABLE",
+                message="S10 sandbox marshaler cannot resolve durable sandbox handles",
+            )
+        )
+
+    @staticmethod
+    def _sandbox_reattach_failed(sandbox_id: str, exc: Exception) -> LifecyclePolicyError:
+        return LifecyclePolicyError(
+            build_error_envelope(
+                category="SANDBOX",
+                code="S10_SANDBOX_REATTACH_FAILED",
+                message=f"S10 sandbox reattach failed for {sandbox_id}: {exc}",
+            )
+        )
 
     def cancel_requested(self, job_id: str) -> bool:
         return job_id in self._cancel_flags

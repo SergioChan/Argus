@@ -31,11 +31,13 @@ from argus_core import (
     LaunchRequest,
     LifecyclePolicyError,
     LifecycleState,
+    LifecycleStore,
     Lineage,
     PolicyBundle,
     Producer,
     Quantity,
     ResourceCeilings,
+    S1_SANDBOX_ATTACHMENT_KIND,
     S1AdapterBrokerProxy,
     ScopeGrant,
     S3Verifier,
@@ -1374,6 +1376,89 @@ class S1SDKBaseClassTests(unittest.TestCase):
         self.assertEqual(partial_payload["reason"], "operator")
         self.assertEqual(partial_payload["terminated_state"], "TERMINATED")
         self.assertEqual(partial_record.lineage.input_refs, (subagent.launch_provenance_ref,))
+
+    def test_restart_recovery_reattaches_real_s10_handle_and_cancel_uses_recovered_sandbox(self) -> None:
+        from argus_core.s1 import S10SandboxMarshaler
+
+        adapter_rule = EgressRule("bounce.adapter.local", 8443, "grpc")
+        orchestrator, request, audit, s10_artifacts = self._s10_orchestrator_and_request(
+            scope_allowed_adapters=("adapter:bounce",),
+            egress_allowlist=(EgressRule("store.local", 443, "https"), adapter_rule),
+        )
+
+        class SandboxBuildSubagent(Subagent):
+            def __init__(self, descriptor: SubagentDescriptor) -> None:
+                super().__init__(descriptor)
+                self.sandbox_id: str | None = None
+
+            def plan(self, ctx: ExecContext, envelope: JobEnvelope) -> dict[str, object]:
+                return {
+                    "steps": [
+                        {
+                            "step_id": "sandbox-build",
+                            "kind": "feature",
+                            "description": "Run restart-recoverable sandbox build",
+                        }
+                    ],
+                    "adapters_required": ["adapter:bounce"],
+                }
+
+            def build(self, ctx: ExecContext, plan: dict[str, object]) -> dict[str, object]:
+                result = ctx.submit_sandbox_job({"launch_request": request})
+                self.sandbox_id = str(result["sandbox_id"])
+                return {
+                    "artifact_refs": ["c4://artifact/restart-recovered-sandbox-model"],
+                    "diagnostics": {"sandbox_id": self.sandbox_id},
+                }
+
+        subagent = SandboxBuildSubagent(self.descriptor)
+        runner = SubagentSDKRunner(
+            subagent,
+            runtime=SubagentRuntime(
+                descriptor=self.descriptor,
+                sandbox_marshaler=S10SandboxMarshaler(orchestrator),
+                adapter_egress_allowlist={"adapter:bounce": adapter_rule},
+            ),
+        )
+
+        runner.accept(self.envelope)
+        planned = runner.plan(self.envelope)
+        runner.build(self.envelope.job_id, planned.payload)
+
+        assert subagent.sandbox_id is not None
+        runtime_artifacts = runner.runtime.artifact_store
+        attachment_refs = runner.runtime.sandbox_attachment_refs(self.envelope.job_id)
+        self.assertEqual(len(attachment_refs), 1)
+        self.assertEqual(runtime_artifacts.get_record(attachment_refs[0]).kind, S1_SANDBOX_ATTACHMENT_KIND)
+        before_ledger_refs = runner.runtime.store.ledger_refs(self.envelope.job_id)
+        rebuilt_store = LifecycleStore.from_event_log(
+            {self.envelope.job_id: runner.runtime.store.events(self.envelope.job_id)},
+            artifact_store=runtime_artifacts,
+        )
+        restarted_runtime = SubagentRuntime(
+            descriptor=self.descriptor,
+            store=rebuilt_store,
+            sandbox_marshaler=S10SandboxMarshaler(orchestrator),
+            adapter_egress_allowlist={"adapter:bounce": adapter_rule},
+        )
+
+        recovered = restarted_runtime.recover_active_sandboxes(self.envelope.job_id)
+        cancel_event = restarted_runtime.cancel(self.envelope.job_id, reason="operator-restart", grace_seconds=0.25)
+
+        self.assertEqual(restarted_runtime.store.current(self.envelope.job_id).state, LifecycleState.CANCELLED)
+        self.assertEqual(recovered[0]["sandbox_id"], subagent.sandbox_id)
+        self.assertEqual(recovered[0]["reattach_state"], "ADMITTED")
+        self.assertEqual(restarted_runtime.sandbox_attachment_refs(self.envelope.job_id), attachment_refs)
+        self.assertEqual(before_ledger_refs, restarted_runtime.store.ledger_refs(self.envelope.job_id)[:-1])
+        self.assertEqual(cancel_event.to_state, LifecycleState.CANCELLED)
+        self.assertEqual(orchestrator.get(subagent.sandbox_id).state, "TERMINATED")
+        event_types = [item.event_type for item in audit.events()]
+        self.assertIn("sandbox.cancelled", event_types)
+        partial_records = s10_artifacts.query_artifacts({"kind": "sandbox.partial_result"})
+        self.assertEqual(len(partial_records), 1)
+        partial_payload = json.loads(s10_artifacts.get_artifact(partial_records[0].artifact_ref).decode("utf-8"))
+        self.assertEqual(partial_payload["reason"], "operator-restart")
+        self.assertEqual(partial_records[0].lineage.input_refs, (recovered[0]["launch_provenance_ref"],))
 
     def test_runner_quarantines_sandbox_error_with_real_s10_forensic_partial_result(self) -> None:
         from argus_core.s1 import S10SandboxMarshaler

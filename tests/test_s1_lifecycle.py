@@ -19,9 +19,11 @@ from argus_core import (
     InMemoryVerifierTrustStore,
     JobEnvelope,
     LEGAL_TRANSITIONS,
+    Lineage,
     LifecyclePolicyError,
     LifecycleState,
     LifecycleStore,
+    Producer,
     SubagentDescriptor,
     SubagentRuntime,
     TERMINAL_STATES,
@@ -33,7 +35,7 @@ from argus_core import (
     reduce_lifecycle,
     tag_uncertainty,
 )
-from argus_core.s1 import METHOD_TARGETS, NON_TRANSITION_METHODS, S1_LIFECYCLE_LEDGER_KIND
+from argus_core.s1 import METHOD_TARGETS, NON_TRANSITION_METHODS, S1_LIFECYCLE_LEDGER_KIND, S1_SANDBOX_ATTACHMENT_KIND
 
 
 def _test_descriptor() -> SubagentDescriptor:
@@ -103,6 +105,17 @@ class _QuarantineSandboxMarshaler:
             "terminate_succeeded": True,
             "partial_result_ref": "c4://artifact/partial-quarantine-1",
         }
+
+
+class _ReattachSandboxMarshaler:
+    def __init__(self, handles: dict[str, dict[str, object]]) -> None:
+        self.handles = handles
+        self.resolved: list[dict[str, object]] = []
+
+    def get(self, sandbox_id: str) -> dict[str, object]:
+        payload = dict(self.handles[sandbox_id])
+        self.resolved.append(payload)
+        return payload
 
 
 class S1LifecycleStoreTests(unittest.TestCase):
@@ -608,6 +621,134 @@ class S1LifecycleStoreTests(unittest.TestCase):
         self.assertEqual(rebuilt.current("job-1"), store.current("job-1"))
         self.assertEqual(rebuilt.replay("job-1"), store.current("job-1"))
         self.assertEqual(rebuilt.ledger_refs("job-1"), store.ledger_refs("job-1"))
+
+    def test_runtime_restart_recovers_building_state_and_active_sandbox_from_c4_attachment(self) -> None:
+        artifacts = InMemoryArtifactStore()
+        descriptor = _test_descriptor()
+        runtime = SubagentRuntime(descriptor=descriptor, artifact_store=artifacts)
+        job_id = "24242424-2424-4424-8424-242424242424"
+        runtime.store.create_job(job_id)
+        runtime.store.apply_method(job_id, "accept")
+        runtime.store.apply_method(job_id, "plan")
+        runtime.store.apply_method(job_id, "build")
+        runtime.register_sandbox_result(
+            job_id,
+            {
+                "sandbox_id": "sandbox-restart-1",
+                "runtime_class": "gvisor",
+                "budget_epoch": 7,
+                "policy_bundle_version": "s1-t27-test",
+                "state": "ADMITTED",
+                "launch_provenance_ref": "c4://artifact/launch-restart-1",
+            },
+        )
+        attachment_refs = runtime.sandbox_attachment_refs(job_id)
+        before_refs = tuple(record.artifact_ref for record in artifacts.query_artifacts())
+
+        rebuilt_store = LifecycleStore.from_event_log(
+            {job_id: runtime.store.events(job_id)},
+            artifact_store=artifacts,
+        )
+        reattach = _ReattachSandboxMarshaler(
+            {
+                "sandbox-restart-1": {
+                    "sandbox_id": "sandbox-restart-1",
+                    "job_id": job_id,
+                    "runtime_class": "gvisor",
+                    "budget_epoch": 7,
+                    "policy_bundle_version": "s1-t27-test",
+                    "state": "ADMITTED",
+                    "launch_provenance_ref": "c4://artifact/launch-restart-1",
+                }
+            }
+        )
+        restarted = SubagentRuntime(
+            descriptor=descriptor,
+            store=rebuilt_store,
+            sandbox_marshaler=reattach,
+        )
+
+        recovered = restarted.recover_active_sandboxes(job_id)
+
+        self.assertEqual(restarted.store.current(job_id).state, LifecycleState.BUILDING)
+        self.assertEqual(recovered, restarted.active_sandboxes(job_id))
+        self.assertEqual(recovered[0]["sandbox_id"], "sandbox-restart-1")
+        self.assertEqual(recovered[0]["reattach_state"], "ADMITTED")
+        self.assertEqual(reattach.resolved[0]["sandbox_id"], "sandbox-restart-1")
+        self.assertEqual(restarted.sandbox_attachment_refs(job_id), attachment_refs)
+        self.assertEqual(artifacts.get_record(attachment_refs[0]).kind, S1_SANDBOX_ATTACHMENT_KIND)
+        self.assertEqual(tuple(record.artifact_ref for record in artifacts.query_artifacts()), before_refs)
+        self.assertEqual(restarted.store.ledger_refs(job_id), runtime.store.ledger_refs(job_id))
+
+    def test_runtime_restart_recovery_fails_closed_when_durable_sandbox_handle_is_missing(self) -> None:
+        artifacts = InMemoryArtifactStore()
+        descriptor = _test_descriptor()
+        runtime = SubagentRuntime(descriptor=descriptor, artifact_store=artifacts)
+        job_id = "25252525-2525-4525-8525-252525252525"
+        runtime.store.create_job(job_id)
+        runtime.store.apply_method(job_id, "accept")
+        runtime.store.apply_method(job_id, "plan")
+        runtime.store.apply_method(job_id, "build")
+        runtime.register_sandbox_result(
+            job_id,
+            {
+                "sandbox_id": "sandbox-missing-after-restart",
+                "state": "ADMITTED",
+                "launch_provenance_ref": "c4://artifact/launch-missing-after-restart",
+            },
+        )
+        restarted = SubagentRuntime(
+            descriptor=descriptor,
+            store=LifecycleStore.from_event_log({job_id: runtime.store.events(job_id)}, artifact_store=artifacts),
+            sandbox_marshaler=_ReattachSandboxMarshaler({}),
+        )
+
+        with self.assertRaises(LifecyclePolicyError) as raised:
+            restarted.recover_active_sandboxes(job_id)
+
+        self.assertEqual(raised.exception.envelope.category, "SANDBOX")
+        self.assertEqual(raised.exception.envelope.code, "S10_SANDBOX_REATTACH_FAILED")
+        self.assertEqual(restarted.active_sandboxes(job_id), ())
+
+    def test_runtime_restart_recovery_fails_closed_on_mismatched_attachment_job(self) -> None:
+        artifacts = InMemoryArtifactStore()
+        descriptor = _test_descriptor()
+        runtime = SubagentRuntime(descriptor=descriptor, artifact_store=artifacts)
+        job_id = "26262626-2626-4626-8626-262626262626"
+        runtime.store.create_job(job_id)
+        runtime.store.apply_method(job_id, "accept")
+        runtime.store.apply_method(job_id, "plan")
+        runtime.store.apply_method(job_id, "build")
+        artifacts.create_artifact(
+            kind=S1_SANDBOX_ATTACHMENT_KIND,
+            payload={
+                "schema": "argus.s1.sandbox_attachment.v1",
+                "job_id": "other-job",
+                "sandbox_id": "sandbox-corrupt-attachment",
+                "sandbox_result": {"sandbox_id": "sandbox-corrupt-attachment", "state": "ADMITTED"},
+            },
+            producer=Producer(subsystem="S1", version="0.0.0", actor_id="s1.sandbox-attachment", job_id=job_id),
+            lineage=Lineage(
+                input_refs=runtime.store.ledger_refs(job_id)[-1:],
+                code_ref="test:s1-corrupt-attachment",
+                environment_digest="test:s1-corrupt-attachment",
+                job_id=job_id,
+            ),
+        )
+        restarted = SubagentRuntime(
+            descriptor=descriptor,
+            store=LifecycleStore.from_event_log({job_id: runtime.store.events(job_id)}, artifact_store=artifacts),
+            sandbox_marshaler=_ReattachSandboxMarshaler(
+                {"sandbox-corrupt-attachment": {"sandbox_id": "sandbox-corrupt-attachment", "state": "ADMITTED"}}
+            ),
+        )
+
+        with self.assertRaises(LifecyclePolicyError) as raised:
+            restarted.recover_active_sandboxes(job_id)
+
+        self.assertEqual(raised.exception.envelope.category, "SANDBOX")
+        self.assertEqual(raised.exception.envelope.code, "S10_SANDBOX_ATTACHMENT_INVALID")
+        self.assertEqual(restarted.active_sandboxes(job_id), ())
 
     def test_event_log_rebuild_restores_lifecycle_idempotency_records(self) -> None:
         artifacts = InMemoryArtifactStore()
