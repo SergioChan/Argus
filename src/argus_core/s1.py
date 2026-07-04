@@ -398,6 +398,89 @@ EXEC_CONTEXT_CAPABILITIES = (
     "span",
 )
 _EXEC_CONTEXT_CAPABILITY_SET = frozenset(EXEC_CONTEXT_CAPABILITIES)
+UNCERTAINTY_REPRESENTATIONS = frozenset(
+    {"covariance", "interval", "samples", "conformal", "ensemble", "none"}
+)
+UNCERTAINTY_REQUIRED_CLAIM_TIERS = frozenset({"recapitulated-known", "novel-needs-human"})
+
+
+def no_uncertainty_summary() -> dict[str, Any]:
+    return {"representation": "none", "value": {}}
+
+
+def tag_uncertainty(representation: str, value: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    return _normalize_uncertainty_summary({"representation": representation, "value": dict(value or {})})
+
+
+def uncertainty_tag_for_artifact(summary: Mapping[str, Any]) -> dict[str, Any]:
+    normalized = _normalize_uncertainty_summary(summary)
+    representation = normalized["representation"]
+    if representation == "none":
+        _raise_uncertainty_policy(
+            "S1_UNCERTAINTY_TAG_REQUIRED",
+            "C4 uncertainty_tag cannot be built from a none uncertainty summary",
+        )
+    return {"kind": representation, **normalized["value"]}
+
+
+def _normalize_uncertainty_summary(value: Mapping[str, Any] | Any) -> dict[str, Any]:
+    if value is None:
+        return no_uncertainty_summary()
+    payload = _json_compatible_payload(value)
+    if not isinstance(payload, Mapping):
+        _raise_uncertainty_policy(
+            "S1_UNCERTAINTY_SUMMARY_INVALID",
+            "uncertainty_summary must be a mapping",
+        )
+    extra = set(payload) - {"representation", "value"}
+    if extra:
+        _raise_uncertainty_policy(
+            "S1_UNCERTAINTY_SUMMARY_INVALID",
+            "uncertainty_summary contains unsupported fields: " + ", ".join(sorted(str(key) for key in extra)),
+        )
+    representation = payload.get("representation", "none")
+    if representation not in UNCERTAINTY_REPRESENTATIONS:
+        _raise_uncertainty_policy(
+            "S1_UNCERTAINTY_REPRESENTATION_INVALID",
+            f"unsupported uncertainty representation: {representation}",
+        )
+    raw_value = payload.get("value", {})
+    if not isinstance(raw_value, Mapping):
+        _raise_uncertainty_policy(
+            "S1_UNCERTAINTY_VALUE_INVALID",
+            "uncertainty_summary.value must be a mapping",
+        )
+    normalized_value = dict(raw_value)
+    if representation == "none" and normalized_value:
+        _raise_uncertainty_policy(
+            "S1_UNCERTAINTY_VALUE_INVALID",
+            "uncertainty_summary.value must be empty when representation is none",
+        )
+    if representation != "none" and not normalized_value:
+        _raise_uncertainty_policy(
+            "S1_UNCERTAINTY_VALUE_REQUIRED",
+            f"uncertainty representation {representation} requires a non-empty value",
+        )
+    return {"representation": str(representation), "value": normalized_value}
+
+
+def _assert_uncertainty_for_claim_tier(summary: Mapping[str, Any], claim_tier: str) -> None:
+    normalized = _normalize_uncertainty_summary(summary)
+    if claim_tier in UNCERTAINTY_REQUIRED_CLAIM_TIERS and normalized["representation"] == "none":
+        _raise_uncertainty_policy(
+            "S1_UNCERTAINTY_REQUIRED_FOR_TIER",
+            f"claim tier {claim_tier} requires explicit uncertainty_summary; bare point estimates are rejected at Silver",
+        )
+
+
+def _raise_uncertainty_policy(code: str, message: str) -> NoReturn:
+    raise LifecyclePolicyError(
+        build_error_envelope(
+            category="POLICY",
+            code=code,
+            message=message,
+        )
+    )
 
 
 @dataclass(frozen=True)
@@ -777,6 +860,9 @@ class ExecContext:
         payload = {"name": name, "attributes": dict(attributes or {})}
         return {"capability": "span", "job_id": self.job_id, "span_hash": hash_json(payload)}
 
+    def tag_uncertainty(self, representation: str, value: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        return tag_uncertainty(representation, value)
+
     def _require_capability(self, capability: str) -> None:
         if capability not in self.capabilities:
             self._deny_capability(capability, f"capability is not enabled: {capability}")
@@ -1085,6 +1171,7 @@ class SubagentReport:
     artifact_refs: tuple[str, ...]
     validation_report_ref: str | None
     claim_tier: str
+    uncertainty_summary: dict[str, Any] = field(default_factory=no_uncertainty_summary)
     warnings: tuple[str, ...] = ()
 
 
@@ -1960,7 +2047,9 @@ def _normalize_build_payload(job_id: str, value: Mapping[str, Any] | Any) -> dic
         raise ValueError("build payload job_id must match the lifecycle job")
     payload.setdefault("diagnostics", {})
     payload.setdefault("self_checks", [])
-    payload.setdefault("uncertainty_summary", {"representation": "none", "value": {}})
+    payload["uncertainty_summary"] = _normalize_uncertainty_summary(
+        payload.get("uncertainty_summary", no_uncertainty_summary())
+    )
     return payload
 
 
@@ -1983,16 +2072,20 @@ def build_subagent_report(
     validation_report_ref: str | None = None,
     validation_report_payload: dict[str, Any] | None = None,
     report_verifier: C3ReportVerifier | None = None,
+    uncertainty_summary: Mapping[str, Any] | None = None,
 ) -> SubagentReport:
     """Build a C1 report whose tier can only come from a signed C3 report."""
     warnings: list[str] = []
+    normalized_uncertainty = _normalize_uncertainty_summary(uncertainty_summary or no_uncertainty_summary())
     if validation_report_payload is not None and report_verifier is not None:
         verification = report_verifier.verify(validation_report_payload)
         if verification.valid and verification.claim_tier:
+            _assert_uncertainty_for_claim_tier(normalized_uncertainty, verification.claim_tier)
             return SubagentReport(
                 artifact_refs=artifact_refs,
                 validation_report_ref=validation_report_ref,
                 claim_tier=verification.claim_tier,
+                uncertainty_summary=normalized_uncertainty,
                 warnings=(),
             )
         warnings.append("validation_report_rejected")
@@ -2002,5 +2095,6 @@ def build_subagent_report(
         artifact_refs=artifact_refs,
         validation_report_ref=None,
         claim_tier="ran-toy",
+        uncertainty_summary=normalized_uncertainty,
         warnings=tuple(warnings),
     )

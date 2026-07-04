@@ -27,6 +27,7 @@ from argus_core import (
     canonical_json_bytes,
     default_accept,
     reduce_lifecycle,
+    tag_uncertainty,
 )
 from argus_core.s1 import METHOD_TARGETS, NON_TRANSITION_METHODS, S1_LIFECYCLE_LEDGER_KIND
 
@@ -367,6 +368,10 @@ class S1TierRelayTests(unittest.TestCase):
 
     def test_signed_report_tier_is_relayed_verbatim(self) -> None:
         signed = self.signer.sign(self._report("recapitulated-known"))
+        uncertainty_summary = tag_uncertainty(
+            "interval",
+            {"radius": 0.1, "confidence": 0.95, "source": "signed-c3-report"},
+        )
 
         report = build_subagent_report(
             artifact_refs=("c4://artifact/model",),
@@ -374,11 +379,29 @@ class S1TierRelayTests(unittest.TestCase):
             validation_report_ref="c4://report/signed",
             validation_report_payload=signed,
             report_verifier=self.verifier,
+            uncertainty_summary=uncertainty_summary,
         )
 
         self.assertEqual(report.claim_tier, "recapitulated-known")
         self.assertEqual(report.validation_report_ref, "c4://report/signed")
+        self.assertEqual(report.uncertainty_summary, uncertainty_summary)
         self.assertEqual(report.warnings, ())
+
+    def test_signed_report_tier_requires_uncertainty_summary_at_silver(self) -> None:
+        signed = self.signer.sign(self._report("recapitulated-known"))
+
+        with self.assertRaises(LifecyclePolicyError) as raised:
+            build_subagent_report(
+                artifact_refs=("c4://artifact/model",),
+                attempted_claim_tier="recapitulated-known",
+                validation_report_ref="c4://report/signed",
+                validation_report_payload=signed,
+                report_verifier=self.verifier,
+            )
+
+        self.assertEqual(raised.exception.envelope.category, "POLICY")
+        self.assertEqual(raised.exception.envelope.code, "S1_UNCERTAINTY_REQUIRED_FOR_TIER")
+        self.assertIn("recapitulated-known", raised.exception.envelope.message)
 
     def test_unsigned_report_is_rejected_and_tier_stays_ran_toy(self) -> None:
         signed = self.signer.sign(self._report("recapitulated-known"))

@@ -26,6 +26,7 @@ from argus_core import (
     SubagentRuntime,
     build_subagent_report,
     run_perturbation_pair,
+    tag_uncertainty,
 )
 
 
@@ -119,6 +120,10 @@ class M1OracleGatedVerticalSliceTests(unittest.TestCase):
                 environment_digest="oci:s3-verify",
             ),
         )
+        uncertainty_summary = tag_uncertainty(
+            "interval",
+            {"radius": 0.01, "source": "signed-c3-report"},
+        )
 
         promoted = artifacts.create_artifact(
             kind="model",
@@ -142,6 +147,7 @@ class M1OracleGatedVerticalSliceTests(unittest.TestCase):
             validation_report_ref=report_record.artifact_ref,
             validation_report_payload=signed_report,
             report_verifier=c3_verifier,
+            uncertainty_summary=uncertainty_summary,
         )
 
         promoted_lineage = artifacts.get_lineage(promoted.artifact_ref, direction="ancestors")
@@ -152,6 +158,7 @@ class M1OracleGatedVerticalSliceTests(unittest.TestCase):
         self.assertEqual(promoted.validation_report_ref, report_record.artifact_ref)
         self.assertEqual(subagent_report.claim_tier, "recapitulated-known")
         self.assertEqual(subagent_report.validation_report_ref, report_record.artifact_ref)
+        self.assertEqual(subagent_report.uncertainty_summary, uncertainty_summary)
         self.assertTrue(c3_verifier.verify(stored_report).valid)
         self.assertIn(dataset.artifact_ref, promoted_lineage_refs)
         self.assertIn(report_record.artifact_ref, promoted_lineage_refs)

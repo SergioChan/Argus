@@ -38,6 +38,8 @@ from argus_core import (
     SubagentSDKRunner,
     SubagentRuntime,
     hash_bytes,
+    tag_uncertainty,
+    uncertainty_tag_for_artifact,
 )
 from argus_core.s1 import S1_LIFECYCLE_LEDGER_KIND
 
@@ -212,6 +214,58 @@ class S1SDKBaseClassTests(unittest.TestCase):
             "artifact_store",
         ):
             self.assertFalse(hasattr(ctx, forbidden), forbidden)
+
+    def test_exec_context_tags_canonical_uncertainty_without_expanding_capabilities(self) -> None:
+        ctx = ExecContext(job_id=self.envelope.job_id)
+
+        summary = ctx.tag_uncertainty(
+            "interval",
+            {"radius": 0.1, "confidence": 0.95, "source": "adapter:bounce"},
+        )
+        c4_tag = uncertainty_tag_for_artifact(summary)
+
+        self.assertEqual(
+            ctx.capability_methods(),
+            ("submit_sandbox_job", "emit_artifact", "call_adapter", "read_dataset", "log", "span"),
+        )
+        self.assertEqual(
+            summary,
+            {
+                "representation": "interval",
+                "value": {"radius": 0.1, "confidence": 0.95, "source": "adapter:bounce"},
+            },
+        )
+        self.assertEqual(
+            c4_tag,
+            {"kind": "interval", "radius": 0.1, "confidence": 0.95, "source": "adapter:bounce"},
+        )
+        self._assert_c1_def_valid("UncertaintySummary", summary)
+
+    def test_runner_preserves_author_uncertainty_summary(self) -> None:
+        class UncertaintySubagent(ExampleSubagent):
+            def build(self, ctx: ExecContext, plan: dict[str, object]) -> dict[str, object]:
+                payload = super().build(ctx, plan)
+                payload["uncertainty_summary"] = ctx.tag_uncertainty(
+                    "interval",
+                    {"radius": 0.05, "confidence": 0.9, "source": "self-check"},
+                )
+                return payload
+
+        subagent = UncertaintySubagent(self.descriptor)
+        runner = SubagentSDKRunner(subagent)
+
+        runner.accept(self.envelope)
+        planned = runner.plan(self.envelope)
+        built = runner.build(self.envelope.job_id, planned.payload)
+
+        self.assertEqual(
+            built.payload["uncertainty_summary"],
+            {
+                "representation": "interval",
+                "value": {"radius": 0.05, "confidence": 0.9, "source": "self-check"},
+            },
+        )
+        self._assert_c1_valid(built.payload)
 
     def test_exec_context_denies_missing_and_unknown_capabilities(self) -> None:
         ctx = ExecContext(
