@@ -83,6 +83,7 @@ def main() -> int:
         "ARGUS_M0_MINIO_CONSOLE_PORT": str(_free_port()),
         "ARGUS_M0_S8_PORT": str(_free_port()),
         "ARGUS_M0_S10_PORT": str(_free_port()),
+        "ARGUS_M0_S1_DEMO_PORT": str(_free_port()),
     }
     env = {
         **os.environ,
@@ -109,10 +110,12 @@ def main() -> int:
     }
     s8_url = f"http://127.0.0.1:{ports['ARGUS_M0_S8_PORT']}"
     s10_url = f"http://127.0.0.1:{ports['ARGUS_M0_S10_PORT']}"
+    s1_reference_demo_url = f"http://127.0.0.1:{ports['ARGUS_M0_S1_DEMO_PORT']}"
     evidence["target"] = {
         "compose_file": str(Path(args.compose_file).resolve()),
         "s8_url": s8_url,
         "s10_url": s10_url,
+        "s1_reference_demo_url": s1_reference_demo_url,
         "ports": ports,
         "persistence": "postgres-minio",
         "auth_callers": list(_m0_identity_requests().keys()),
@@ -124,6 +127,8 @@ def main() -> int:
             _run([docker, "compose", "-f", args.compose_file, "up", "-d", "--build", "--wait"], env=env, timeout=240)
         _wait_health(f"{s8_url}/healthz", token=runtime_secrets["health_token"])
         _wait_health(f"{s10_url}/healthz", token=runtime_secrets["health_token"])
+        _wait_health(f"{s1_reference_demo_url}/healthz", token=None)
+        _battery_s1_reference_physics_demo(evidence, s1_reference_demo_url)
         _battery_runtime_identity_mint_policy(evidence, s10_url, bootstrap_token=runtime_secrets["bootstrap_token"])
         auth_tokens = _mint_m0_runtime_identities(s10_url=s10_url, bootstrap_token=runtime_secrets["bootstrap_token"])
         _ensure_image(docker, args.image)
@@ -1475,6 +1480,63 @@ def _battery_deployed_report_verifier(
             "claim_tier": promoted["claim_tier"],
             "tampered_report_rejected": tampered_rejected["message"],
             "tier_mismatch_rejected": mismatch_rejected["message"],
+        },
+    )
+
+
+def _battery_s1_reference_physics_demo(evidence: dict[str, Any], s1_reference_demo_url: str) -> None:
+    response = _post_json(
+        f"{s1_reference_demo_url}/v1/s1-reference-physics-demo",
+        {"job_id": "m0-s1-reference-demo"},
+        expected_status=200,
+    )
+    expected_checks = {
+        "INJECTION",
+        "NULL_CONTROL",
+        "CROSS_CODE",
+        "PHYSICAL_CONSISTENCY",
+        "LEAKAGE",
+        "CALIBRATION",
+    }
+    checks = response.get("checks")
+    if not isinstance(checks, list):
+        raise AssertionError(f"S1 reference demo did not return checks: {response}")
+    statuses = {
+        str(check.get("check")): str(check.get("status"))
+        for check in checks
+        if isinstance(check, dict)
+    }
+    if statuses != {check: "PASS" for check in expected_checks}:
+        raise AssertionError(f"S1 reference demo did not return six PASS checks: {statuses}")
+    if response.get("final_state") != "REPORTED":
+        raise AssertionError(f"S1 reference demo did not reach REPORTED: {response}")
+    if response.get("claim_tier") != "novel-needs-human" or response.get("claim_tier_is_candidate") is not True:
+        raise AssertionError(f"S1 reference demo did not preserve S3 verifier tier semantics: {response}")
+    if response.get("observatory_trusted") is not True:
+        raise AssertionError(f"S1 reference demo Observatory render was not trusted: {response}")
+    if 'data-verdict="VERIFIED"' not in str(response.get("observatory_html", "")):
+        raise AssertionError("S1 reference demo Observatory HTTP face did not render VERIFIED HTML")
+    if response.get("referee_id") != "s3-reference-verifier":
+        raise AssertionError(f"S1 reference demo did not use the reference S3 referee id: {response}")
+    if response.get("signature_key_id") != "s3-reference-referee-key":
+        raise AssertionError(f"S1 reference demo did not use the reference S3 referee key: {response}")
+    _record(
+        evidence,
+        "s1-reference-demo",
+        "deployed S1 reference physics demo reached Observatory VERIFIED through the HTTP face",
+        {
+            "job_id": response["job_id"],
+            "final_state": response["final_state"],
+            "claim_tier": response["claim_tier"],
+            "claim_tier_is_candidate": response["claim_tier_is_candidate"],
+            "validation_report_ref": response["validation_report_ref"],
+            "promoted_artifact_ref": response["promoted_artifact_ref"],
+            "observatory_html_ref": response["observatory_html_ref"],
+            "observatory_trusted": response["observatory_trusted"],
+            "observatory_html_verified": True,
+            "referee_id": response["referee_id"],
+            "signature_key_id": response["signature_key_id"],
+            "checks": statuses,
         },
     )
 

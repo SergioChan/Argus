@@ -4,6 +4,7 @@ from copy import deepcopy
 from dataclasses import asdict, replace
 from decimal import Decimal
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -41,6 +42,7 @@ from argus_core import (
     recommend_pause,
     run_planted_spurious_model_harness,
 )
+from argus_core import s11 as s11_module
 from argus_core.s8 import ArtifactRecord
 
 
@@ -321,6 +323,38 @@ class S11ObservatoryV0Tests(unittest.TestCase):
             self.assertIn("FAIL", result.stderr)
             self.assertIn("referee.distinct_from_proponent", out_path.read_text(encoding="utf-8"))
             self.assertIn('data-verdict="FAIL"', out_path.read_text(encoding="utf-8"))
+
+    def test_schema_validator_can_use_runtime_schema_root(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            schema_root = Path(tmp)
+            contracts = schema_root / "contracts"
+            contracts.mkdir()
+            (contracts / "c3.validation-report.schema.json").write_text(
+                json.dumps(
+                    {
+                        "$schema": "https://json-schema.org/draft/2020-12/schema",
+                        "$id": "https://example.invalid/env-c3",
+                        "$defs": {"ValidationReport": {"type": "object"}},
+                    },
+                    sort_keys=True,
+                ),
+                encoding="utf-8",
+            )
+            old_root = os.environ.get("ARGUS_SCHEMA_ROOT")
+            os.environ["ARGUS_SCHEMA_ROOT"] = str(schema_root)
+            s11_module._c3_validation_report_validator.cache_clear()
+            try:
+                validator = s11_module._c3_validation_report_validator()
+                self.assertEqual(
+                    validator.schema["$id"],
+                    "https://example.invalid/env-c3#/$defs/ValidationReport",
+                )
+            finally:
+                if old_root is None:
+                    os.environ.pop("ARGUS_SCHEMA_ROOT", None)
+                else:
+                    os.environ["ARGUS_SCHEMA_ROOT"] = old_root
+                s11_module._c3_validation_report_validator.cache_clear()
 
 
 class S11TelemetryAndKpiTests(unittest.TestCase):

@@ -8,6 +8,7 @@ from decimal import Decimal
 from functools import lru_cache
 from html import escape
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -348,7 +349,7 @@ def _c3_validation_report_schema_failures(report_payload: Mapping[str, Any]) -> 
 
 @lru_cache(maxsize=1)
 def _c3_validation_report_validator() -> Draft202012Validator:
-    schema_path = Path(__file__).resolve().parents[2] / "schemas" / "contracts" / "c3.validation-report.schema.json"
+    schema_path = _schema_path("contracts", "c3.validation-report.schema.json")
     with schema_path.open(encoding="utf-8") as handle:
         c3_schema = json.load(handle)
     report_schema = dict(c3_schema["$defs"]["ValidationReport"])
@@ -356,6 +357,24 @@ def _c3_validation_report_validator() -> Draft202012Validator:
     report_schema["$id"] = c3_schema["$id"] + "#/$defs/ValidationReport"
     report_schema["$defs"] = c3_schema["$defs"]
     return Draft202012Validator(report_schema)
+
+
+def _schema_path(*parts: str) -> Path:
+    candidates: list[Path] = []
+    env_root = os.environ.get("ARGUS_SCHEMA_ROOT")
+    if env_root:
+        candidates.append(Path(env_root).joinpath(*parts))
+    candidates.extend(
+        (
+            Path(__file__).resolve().parents[2] / "schemas" / Path(*parts),
+            Path.cwd() / "schemas" / Path(*parts),
+        )
+    )
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    attempted = ", ".join(str(candidate) for candidate in candidates)
+    raise FileNotFoundError(f"schema file not found: {Path(*parts)}; attempted: {attempted}")
 
 
 def _json_path(path: Any) -> str:

@@ -12,6 +12,7 @@ WORKDIR /app
 
 COPY pyproject.toml ./
 COPY src ./src
+COPY schemas ./schemas
 COPY db ./db
 COPY --from=rust-builder /app/bindings/rust/target/release/argus-s8-ledger-writer /usr/local/bin/argus-s8-ledger-writer
 

@@ -229,6 +229,55 @@ class ArgusM0RuntimeServiceTests(unittest.TestCase):
         self.assertEqual(policy["m0-partial-capture"]["job_id"], "m0-partial-capture-job")
         self.assertEqual(policy["m0-partial-capture"]["budget_caps"]["max_wallclock_s"], 10)
 
+    def test_s1_reference_physics_demo_battery_requires_verified_http_face(self) -> None:
+        evidence: dict[str, object] = {"results": []}
+        posted: list[tuple[str, dict[str, object]]] = []
+
+        def fake_post_json(
+            url: str,
+            body: dict[str, object],
+            *,
+            expected_status: int = 200,
+            token: str | None = None,
+        ) -> dict[str, object]:
+            del token
+            posted.append((url, body))
+            self.assertEqual(expected_status, 200)
+            self.assertEqual(url, "http://s1-demo/v1/s1-reference-physics-demo")
+            self.assertEqual(body["job_id"], "m0-s1-reference-demo")
+            return {
+                "demo": "s1-reference-physics",
+                "job_id": "m0-s1-reference-demo",
+                "final_state": "REPORTED",
+                "claim_tier": "novel-needs-human",
+                "claim_tier_is_candidate": True,
+                "validation_report_ref": "c4://report/demo",
+                "promoted_artifact_ref": "c4://artifact/demo",
+                "observatory_html_ref": "c4://observatory/demo",
+                "observatory_trusted": True,
+                "observatory_html": '<html data-verdict="VERIFIED"></html>',
+                "referee_id": "s3-reference-verifier",
+                "signature_key_id": "s3-reference-referee-key",
+                "checks": [
+                    {"check": "INJECTION", "status": "PASS"},
+                    {"check": "NULL_CONTROL", "status": "PASS"},
+                    {"check": "CROSS_CODE", "status": "PASS"},
+                    {"check": "PHYSICAL_CONSISTENCY", "status": "PASS"},
+                    {"check": "LEAKAGE", "status": "PASS"},
+                    {"check": "CALIBRATION", "status": "PASS"},
+                ],
+            }
+
+        with patch.object(m0_battery, "_post_json", side_effect=fake_post_json):
+            m0_battery._battery_s1_reference_physics_demo(evidence, "http://s1-demo")
+
+        self.assertEqual(posted, [("http://s1-demo/v1/s1-reference-physics-demo", {"job_id": "m0-s1-reference-demo"})])
+        result = evidence["results"][-1]  # type: ignore[index]
+        self.assertEqual(result["item"], "s1-reference-demo")
+        self.assertEqual(result["status"], "pass")
+        self.assertEqual(result["detail"]["claim_tier"], "novel-needs-human")
+        self.assertTrue(result["detail"]["observatory_trusted"])
+
     def test_s8_writer_service_commits_and_replays_c4_records(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             app = S8WriterApp(FileSystemArtifactStore(tmp))
@@ -2100,11 +2149,15 @@ class ArgusM0ComposeTests(unittest.TestCase):
 
         rendered = json.loads(config.stdout)
         services = rendered["services"]
-        self.assertEqual({"postgres", "minio", "s8-writer", "s10-supervisor"}, set(services))
+        self.assertEqual({"postgres", "minio", "s8-writer", "s10-supervisor", "s1-reference-demo"}, set(services))
         self.assertTrue(services["postgres"]["image"].startswith("postgres@sha256:"))
         self.assertTrue(services["minio"]["image"].startswith("minio/minio@sha256:"))
         self.assertEqual(services["s8-writer"]["command"], ["python", "-m", "argus_runtime.s8_writer_service"])
         self.assertEqual(services["s10-supervisor"]["command"], ["python", "-m", "argus_runtime.s10_supervisor_service"])
+        self.assertEqual(
+            services["s1-reference-demo"]["command"],
+            ["python", "-m", "argus_runtime.s1_reference_demo_service", "--serve"],
+        )
         self.assertEqual(services["s8-writer"]["environment"]["ARGUS_S8_HOST"], "0.0.0.0")
         self.assertEqual(
             services["s8-writer"]["environment"]["ARGUS_S8_POSTGRES_DSN"],
@@ -2148,8 +2201,12 @@ class ArgusM0ComposeTests(unittest.TestCase):
         self.assertEqual(services["s8-writer"]["environment"]["ARGUS_S8_MINIO_BUCKET"], "argus-s8-objects")
         self.assertNotIn("ARGUS_S8_DATA_DIR", services["s8-writer"]["environment"])
         self.assertEqual(services["s10-supervisor"]["environment"]["ARGUS_S10_HOST"], "0.0.0.0")
+        self.assertEqual(services["s1-reference-demo"]["environment"]["ARGUS_S1_REFERENCE_DEMO_HOST"], "0.0.0.0")
+        self.assertEqual(services["s1-reference-demo"]["environment"]["ARGUS_S1_REFERENCE_DEMO_PORT"], "8080")
+        self.assertEqual(services["s1-reference-demo"]["environment"]["ARGUS_SCHEMA_ROOT"], "/app/schemas")
         self.assertEqual(services["s8-writer"]["ports"][0]["host_ip"], "127.0.0.1")
         self.assertEqual(services["s10-supervisor"]["ports"][0]["host_ip"], "127.0.0.1")
+        self.assertEqual(services["s1-reference-demo"]["ports"][0]["host_ip"], "127.0.0.1")
         self.assertNotIn("volumes", services["s8-writer"])
         self.assertIn("ARGUS_RUNTIME_BOOTSTRAP_TOKEN", services["s8-writer"]["environment"])
         self.assertIn("ARGUS_RUNTIME_IDENTITY_SIGNING_KEY", services["s8-writer"]["environment"])
@@ -2243,9 +2300,13 @@ class ArgusM0ComposeTests(unittest.TestCase):
         )
         self.assertEqual(s10_volumes[0]["source"], "/var/run/docker.sock")
         self.assertIn("postgres", services["s10-supervisor"]["depends_on"])
+        self.assertIn("s8-writer", services["s1-reference-demo"]["depends_on"])
+        self.assertIn("s10-supervisor", services["s1-reference-demo"]["depends_on"])
         self.assertNotIn("s8-data", rendered["volumes"])
         self.assertIn("postgres-data", rendered["volumes"])
         self.assertIn("minio-data", rendered["volumes"])
+        dockerfile = Path("deploy/argus-m0/python-service.Dockerfile").read_text(encoding="utf-8")
+        self.assertIn("COPY schemas ./schemas", dockerfile)
 
     def _skip_or_fail(self, reason: str) -> None:
         if os.environ.get("ARGUS_REQUIRE_DOCKER_TESTS") == "1":
