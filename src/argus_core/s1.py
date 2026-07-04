@@ -13,6 +13,7 @@ from uuid import NAMESPACE_URL, uuid4, uuid5
 
 from argusverify import C3ReportVerifier
 from .hashing import hash_json
+from .s6 import CapabilityDescriptor
 from .s7 import AdapterBroker, EvalRequest, EvalResult, Quantity, S7Error
 from .s10 import (
     EgressRule,
@@ -180,6 +181,13 @@ S1_FROZEN_PIPELINE_KIND = "frozen_pipeline"
 S1_VALIDATION_REQUEST_KIND = "validation_request"
 S1_VALIDATION_HANDOFF_CODE_REF = "argus-core:s1.validation-handoff"
 S1_VALIDATION_HANDOFF_ENVIRONMENT_DIGEST = "python:s1-validation-handoff:v1"
+S1_REFERENCE_CONFORMANCE_EVIDENCE_KIND = "s1_reference_conformance_evidence"
+S1_REFERENCE_CONFORMANCE_CODE_REF = "argus-core:s1.reference-conformance"
+S1_REFERENCE_CONFORMANCE_ENVIRONMENT_DIGEST = "python:s1-reference-conformance:v1"
+S1_REFERENCE_CONFORMANCE_CREATED_AT = "1970-01-01T00:00:00Z"
+S1_REFERENCE_CONFORMANCE_SUITE_VERSION = "s1-reference-conformance.v1"
+S1_REFERENCE_CONFORMANCE_STANDARD_REF = "c4://standard/c1/1.0.0"
+S1_CONFORMANCE_LEVEL_ORDER = {"none": 0, "bronze": 1, "silver": 2, "gold": 3}
 S1_CONTENT_STORE_EGRESS_RULE = EgressRule("store.local", 443, "https")
 S1_EGRESS_PROTOCOLS = frozenset({"https", "grpc", "tcp"})
 
@@ -1382,6 +1390,463 @@ def _ast_call_name(node: ast.AST) -> str | None:
 class SDKInvocationResult:
     event: LifecycleEvent
     payload: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class S1ConformanceCheck:
+    check_id: str
+    level: str
+    status: str
+    oracle_spec: str
+    reason: str | None = None
+    evidence_refs: tuple[str, ...] = ()
+
+    def as_payload(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "check_id": self.check_id,
+            "level": self.level,
+            "status": self.status,
+            "oracle_spec": self.oracle_spec,
+            "evidence_refs": list(self.evidence_refs),
+        }
+        if self.reason is not None:
+            payload["reason"] = self.reason
+        return payload
+
+
+@dataclass(frozen=True)
+class S1ConformanceResult:
+    subagent_id: str
+    level_requested: str
+    level_awarded: str
+    suite_version: str
+    standard_release_ref: str
+    checks: tuple[S1ConformanceCheck, ...]
+    aggregate_passed: bool
+    determinism_hash: str
+    evidence_ref: str
+
+    def descriptor_conformance_block(self) -> dict[str, str]:
+        return {
+            "level": self.level_awarded,
+            "suite_version": self.suite_version,
+            "standard_release_ref": self.standard_release_ref,
+            "evidence_ref": self.evidence_ref,
+            "determinism_hash": self.determinism_hash,
+        }
+
+    def as_payload(self) -> dict[str, Any]:
+        return {
+            "schema": "argus.s1.reference_conformance_result.v1",
+            "subagent_id": self.subagent_id,
+            "level_requested": self.level_requested,
+            "level_awarded": self.level_awarded,
+            "suite_version": self.suite_version,
+            "standard_release_ref": self.standard_release_ref,
+            "aggregate_passed": self.aggregate_passed,
+            "determinism_hash": self.determinism_hash,
+            "evidence_ref": self.evidence_ref,
+            "checks": [check.as_payload() for check in self.checks],
+        }
+
+
+class S1ReferenceConformanceHarness:
+    """Executable Bronze/Silver/Gold reference harness for real S1 SDK subjects."""
+
+    def __init__(
+        self,
+        *,
+        suite_version: str = S1_REFERENCE_CONFORMANCE_SUITE_VERSION,
+        standard_release_ref: str = S1_REFERENCE_CONFORMANCE_STANDARD_REF,
+    ) -> None:
+        self.suite_version = _non_empty_conformance_string(suite_version, "suite_version")
+        self.standard_release_ref = _non_empty_conformance_string(standard_release_ref, "standard_release_ref")
+
+    def run(
+        self,
+        subagent: "Subagent",
+        *,
+        envelope: JobEnvelope,
+        level: str,
+        artifact_store: InMemoryArtifactStore | None = None,
+        capability_descriptor: CapabilityDescriptor | None = None,
+    ) -> S1ConformanceResult:
+        requested_level = _normalize_s1_conformance_level(level)
+        store = artifact_store if artifact_store is not None else InMemoryArtifactStore()
+        runtime = SubagentRuntime(descriptor=subagent.descriptor, artifact_store=store)
+        runner = SubagentSDKRunner(subagent, runtime=runtime)
+        execution = _run_s1_reference_conformance_subject(runner, envelope)
+        checks = _s1_reference_conformance_checks(
+            execution=execution,
+            requested_level=requested_level,
+            capability_descriptor=capability_descriptor,
+        )
+        level_awarded = _s1_conformance_level_awarded(checks, requested_level)
+        aggregate_passed = level_awarded == requested_level
+        evidence_payload = _s1_reference_conformance_evidence_payload(
+            subagent_id=subagent.descriptor.subagent_id,
+            level_requested=requested_level,
+            level_awarded=level_awarded,
+            suite_version=self.suite_version,
+            standard_release_ref=self.standard_release_ref,
+            aggregate_passed=aggregate_passed,
+            checks=checks,
+            capability_descriptor=capability_descriptor,
+        )
+        determinism_hash = hash_json(evidence_payload)
+        evidence_payload["determinism_hash"] = determinism_hash
+        evidence_record = store.create_artifact(
+            kind=S1_REFERENCE_CONFORMANCE_EVIDENCE_KIND,
+            payload=evidence_payload,
+            producer=Producer(
+                subsystem="S1",
+                version=self.suite_version,
+                actor_id="s1.reference_conformance",
+                job_id=envelope.job_id,
+            ),
+            lineage=Lineage(
+                input_refs=_s1_conformance_evidence_inputs(execution, capability_descriptor),
+                code_ref=S1_REFERENCE_CONFORMANCE_CODE_REF,
+                environment_digest=S1_REFERENCE_CONFORMANCE_ENVIRONMENT_DIGEST,
+                seeds=("s1-reference-conformance-seed-v1",),
+                job_id=envelope.job_id,
+            ),
+            created_at=S1_REFERENCE_CONFORMANCE_CREATED_AT,
+        )
+        return S1ConformanceResult(
+            subagent_id=subagent.descriptor.subagent_id,
+            level_requested=requested_level,
+            level_awarded=level_awarded,
+            suite_version=self.suite_version,
+            standard_release_ref=self.standard_release_ref,
+            checks=checks,
+            aggregate_passed=aggregate_passed,
+            determinism_hash=determinism_hash,
+            evidence_ref=evidence_record.artifact_ref,
+        )
+
+
+@dataclass(frozen=True)
+class _S1ConformanceExecution:
+    runner: SubagentSDKRunner
+    envelope: JobEnvelope
+    accepted: Acceptance | None
+    plan_payload: dict[str, Any] | None
+    build_payload: dict[str, Any] | None
+    error: Exception | None
+
+
+def _run_s1_reference_conformance_subject(
+    runner: SubagentSDKRunner,
+    envelope: JobEnvelope,
+) -> _S1ConformanceExecution:
+    accepted: Acceptance | None = None
+    plan_payload: dict[str, Any] | None = None
+    build_payload: dict[str, Any] | None = None
+    error: Exception | None = None
+    try:
+        accepted = runner.accept(
+            envelope,
+            idempotency_key=f"s1-conformance:accept:{envelope.job_id}",
+            root_request_id="s1-reference-conformance",
+            trace_id=f"trace:s1-reference-conformance:{envelope.job_id}",
+        )
+        if accepted.accepted:
+            planned = runner.plan(
+                envelope,
+                idempotency_key=f"s1-conformance:plan:{envelope.job_id}",
+                root_request_id="s1-reference-conformance",
+                trace_id=f"trace:s1-reference-conformance:{envelope.job_id}",
+            )
+            plan_payload = planned.payload
+            built = runner.build(
+                envelope.job_id,
+                plan_payload,
+                idempotency_key=f"s1-conformance:build:{envelope.job_id}",
+                root_request_id="s1-reference-conformance",
+                trace_id=f"trace:s1-reference-conformance:{envelope.job_id}",
+            )
+            build_payload = built.payload
+    except Exception as exc:
+        error = exc
+    return _S1ConformanceExecution(
+        runner=runner,
+        envelope=envelope,
+        accepted=accepted,
+        plan_payload=plan_payload,
+        build_payload=build_payload,
+        error=error,
+    )
+
+
+def _s1_reference_conformance_checks(
+    *,
+    execution: _S1ConformanceExecution,
+    requested_level: str,
+    capability_descriptor: CapabilityDescriptor | None,
+) -> tuple[S1ConformanceCheck, ...]:
+    checks = [
+        _s1_bronze_lifecycle_check(execution),
+        _s1_bronze_provenance_check(execution),
+        _s1_bronze_no_self_tier_check(execution),
+    ]
+    if _s1_conformance_rank(requested_level) >= _s1_conformance_rank("silver"):
+        checks.append(_s1_silver_uncertainty_check(execution))
+    if _s1_conformance_rank(requested_level) >= _s1_conformance_rank("gold"):
+        checks.append(_s1_gold_cross_code_check(execution, capability_descriptor))
+    return tuple(checks)
+
+
+def _s1_bronze_lifecycle_check(execution: _S1ConformanceExecution) -> S1ConformanceCheck:
+    oracle = "accepted=true AND lifecycle_methods==['accept','plan','build'] AND final_state=='BUILDING'"
+    if execution.error is not None:
+        return _s1_check(
+            "S1-TC-36:bronze_lifecycle_statemachine",
+            "bronze",
+            False,
+            oracle,
+            reason=_s1_exception_reason(execution.error),
+        )
+    if execution.accepted is None or not execution.accepted.accepted:
+        reason = execution.accepted.reason if execution.accepted is not None else "accept_not_run"
+        return _s1_check(
+            "S1-TC-36:bronze_lifecycle_statemachine",
+            "bronze",
+            False,
+            oracle,
+            reason=f"acceptance_refused:{reason}",
+        )
+    methods = [event.method for event in execution.runner.runtime.store.events(execution.envelope.job_id)]
+    current = execution.runner.runtime.store.current(execution.envelope.job_id)
+    passed = methods == ["accept", "plan", "build"] and current.state == LifecycleState.BUILDING
+    reason = None if passed else f"methods={methods};state={current.state.value}"
+    return _s1_check("S1-TC-36:bronze_lifecycle_statemachine", "bronze", passed, oracle, reason=reason)
+
+
+def _s1_bronze_provenance_check(execution: _S1ConformanceExecution) -> S1ConformanceCheck:
+    oracle = "artifact_refs non-empty AND every referenced C4 record exists with complete lineage"
+    artifact_refs = _s1_build_artifact_refs(execution.build_payload)
+    if not artifact_refs:
+        return _s1_check(
+            "S1-TC-36:bronze_c4_provenance_complete",
+            "bronze",
+            False,
+            oracle,
+            reason="build payload emitted no artifact_refs",
+        )
+    for artifact_ref in artifact_refs:
+        try:
+            record = execution.runner.runtime.artifact_store.get_record(artifact_ref)
+            assert_lineage_complete(record.lineage)
+        except Exception as exc:
+            return _s1_check(
+                "S1-TC-36:bronze_c4_provenance_complete",
+                "bronze",
+                False,
+                oracle,
+                reason=f"{artifact_ref}:{_s1_exception_reason(exc)}",
+                evidence_refs=artifact_refs,
+            )
+    return _s1_check(
+        "S1-TC-36:bronze_c4_provenance_complete",
+        "bronze",
+        True,
+        oracle,
+        evidence_refs=artifact_refs,
+    )
+
+
+def _s1_bronze_no_self_tier_check(execution: _S1ConformanceExecution) -> S1ConformanceCheck:
+    oracle = "build payload omits tier/validation self-promotion fields AND artifact claim_tier=='ran-toy'"
+    if isinstance(execution.error, LifecyclePolicyError) and execution.error.envelope.code in {
+        "S1_BUILD_TIER_SELF_PROMOTION_FORBIDDEN",
+        "S1_ARTIFACT_TIER_SELF_PROMOTION_FORBIDDEN",
+    }:
+        return _s1_check(
+            "S1-TC-36:bronze_no_self_tier_promotion",
+            "bronze",
+            False,
+            oracle,
+            reason=execution.error.envelope.code,
+        )
+    payload = execution.build_payload or {}
+    forbidden = sorted(set(payload) & BUILD_RESULT_TIER_SELF_PROMOTION_FIELDS)
+    artifact_refs = _s1_build_artifact_refs(execution.build_payload)
+    promoted_refs: list[str] = []
+    for artifact_ref in artifact_refs:
+        try:
+            record = execution.runner.runtime.artifact_store.get_record(artifact_ref)
+        except Exception:
+            continue
+        if record.claim_tier != "ran-toy":
+            promoted_refs.append(record.artifact_ref)
+    passed = not forbidden and not promoted_refs and execution.build_payload is not None
+    reason = None
+    if forbidden:
+        reason = "forbidden_fields:" + ",".join(forbidden)
+    elif promoted_refs:
+        reason = "promoted_artifacts:" + ",".join(promoted_refs)
+    elif execution.build_payload is None:
+        reason = "build_not_completed"
+    return _s1_check(
+        "S1-TC-36:bronze_no_self_tier_promotion",
+        "bronze",
+        passed,
+        oracle,
+        reason=reason,
+        evidence_refs=artifact_refs,
+    )
+
+
+def _s1_silver_uncertainty_check(execution: _S1ConformanceExecution) -> S1ConformanceCheck:
+    oracle = "uncertainty_summary.representation != 'none' for predictive build outputs"
+    try:
+        summary = _normalize_uncertainty_summary(
+            (execution.build_payload or {}).get("uncertainty_summary", no_uncertainty_summary())
+        )
+        passed = summary["representation"] != "none"
+        reason = None if passed else "uncertainty_summary.representation is none"
+    except Exception as exc:
+        passed = False
+        reason = _s1_exception_reason(exc)
+    return _s1_check("S1-TC-12:uncertainty_present", "silver", passed, oracle, reason=reason)
+
+
+def _s1_gold_cross_code_check(
+    execution: _S1ConformanceExecution,
+    capability_descriptor: CapabilityDescriptor | None,
+) -> S1ConformanceCheck:
+    oracle = (
+        "C5 descriptor entity matches the S1 descriptor AND independence_tags non-empty "
+        "AND the S1 descriptor declares at least one cross-code adapter"
+    )
+    descriptor = capability_descriptor
+    missing: list[str] = []
+    if descriptor is None:
+        missing.append("capability_descriptor")
+    else:
+        if descriptor.entity_id != execution.runner.descriptor.subagent_id:
+            missing.append("entity_id")
+        if descriptor.kind != "subagent":
+            missing.append("kind")
+        if not descriptor.independence_tags:
+            missing.append("independence_tags")
+        if execution.envelope.subtopic not in descriptor.subtopics:
+            missing.append("subtopics")
+    if not execution.runner.descriptor.required_adapters:
+        missing.append("required_adapters")
+    passed = not missing
+    return _s1_check(
+        "S1-TC-37:cross_code_ready",
+        "gold",
+        passed,
+        oracle,
+        reason=None if passed else "missing_or_mismatched:" + ",".join(missing),
+    )
+
+
+def _s1_check(
+    check_id: str,
+    level: str,
+    passed: bool,
+    oracle_spec: str,
+    *,
+    reason: str | None = None,
+    evidence_refs: tuple[str, ...] = (),
+) -> S1ConformanceCheck:
+    return S1ConformanceCheck(
+        check_id=check_id,
+        level=level,
+        status="PASS" if passed else "FAIL",
+        oracle_spec=oracle_spec,
+        reason=None if passed else (reason or "predicate failed"),
+        evidence_refs=tuple(sorted(dict.fromkeys(evidence_refs))),
+    )
+
+
+def _s1_reference_conformance_evidence_payload(
+    *,
+    subagent_id: str,
+    level_requested: str,
+    level_awarded: str,
+    suite_version: str,
+    standard_release_ref: str,
+    aggregate_passed: bool,
+    checks: tuple[S1ConformanceCheck, ...],
+    capability_descriptor: CapabilityDescriptor | None,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "schema": "argus.s1.reference_conformance_evidence.v1",
+        "subagent_id": subagent_id,
+        "level_requested": level_requested,
+        "level_awarded": level_awarded,
+        "suite_version": suite_version,
+        "standard_release_ref": standard_release_ref,
+        "aggregate_passed": aggregate_passed,
+        "checks": [check.as_payload() for check in checks],
+    }
+    if capability_descriptor is not None:
+        payload["capability_descriptor_hash"] = hash_json(asdict(capability_descriptor))
+    return payload
+
+
+def _s1_conformance_evidence_inputs(
+    execution: _S1ConformanceExecution,
+    capability_descriptor: CapabilityDescriptor | None,
+) -> tuple[str, ...]:
+    refs = list(_s1_build_artifact_refs(execution.build_payload))
+    if capability_descriptor is not None and capability_descriptor.provenance_ref:
+        refs.append(capability_descriptor.provenance_ref)
+    return tuple(sorted(dict.fromkeys(refs)))
+
+
+def _s1_build_artifact_refs(build_payload: Mapping[str, Any] | None) -> tuple[str, ...]:
+    if build_payload is None:
+        return ()
+    raw_refs = build_payload.get("artifact_refs", ())
+    try:
+        return tuple(str(ref) for ref in raw_refs)
+    except TypeError:
+        return ()
+
+
+def _s1_conformance_level_awarded(checks: tuple[S1ConformanceCheck, ...], requested_level: str) -> str:
+    for candidate in ("gold", "silver", "bronze"):
+        if _s1_conformance_rank(candidate) > _s1_conformance_rank(requested_level):
+            continue
+        if all(
+            check.status == "PASS"
+            for check in checks
+            if _s1_conformance_rank(check.level) <= _s1_conformance_rank(candidate)
+        ):
+            return candidate
+    return "none"
+
+
+def _normalize_s1_conformance_level(level: str) -> str:
+    normalized = str(level).strip().lower()
+    if normalized not in {"bronze", "silver", "gold"}:
+        raise ValueError("S1 conformance level must be one of: bronze, silver, gold")
+    return normalized
+
+
+def _s1_conformance_rank(level: str) -> int:
+    try:
+        return S1_CONFORMANCE_LEVEL_ORDER[level]
+    except KeyError as exc:
+        raise ValueError(f"unknown S1 conformance level: {level}") from exc
+
+
+def _non_empty_conformance_string(value: str, name: str) -> str:
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"{name} must be a non-empty string")
+    return value
+
+
+def _s1_exception_reason(exc: Exception) -> str:
+    if isinstance(exc, LifecyclePolicyError):
+        return f"{exc.envelope.category}:{exc.envelope.code}:{exc.envelope.message}"
+    return f"{type(exc).__name__}:{exc}"
 
 
 class Subagent(ABC):
