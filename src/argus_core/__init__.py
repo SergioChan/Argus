@@ -88,6 +88,7 @@ from .s2 import (
 )
 from .s3 import (
     CheckResult,
+    FrozenPipelineEntrypointContractError,
     InsensitivityFlag,
     PerturbationPairOutcome,
     PerturbationResult,
@@ -96,6 +97,7 @@ from .s3 import (
     S3Verifier,
     SignerIdentityError,
     attest_challenger_independence,
+    build_frozen_pipeline_entrypoint_request,
     build_referee_block,
     run_calibration_check,
     run_cross_code_check,
@@ -547,6 +549,7 @@ __all__ = [
     "FederationGovernanceVerification",
     "FederationIdentity",
     "Finding",
+    "FrozenPipelineEntrypointContractError",
     "FrozenContaminationSnapshot",
     "GovernanceLedger",
     "GovernanceLedgerEntry",
@@ -741,6 +744,7 @@ __all__ = [
     "admit_signed_reward",
     "build_subagent_report",
     "build_error_envelope",
+    "build_frozen_pipeline_entrypoint_request",
     "build_referee_block",
     "canonical_json_bytes",
     "canonical_record_bytes",

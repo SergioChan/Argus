@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import json
+from pathlib import Path
 import unittest
+
+from jsonschema import Draft202012Validator
 
 from argus_core import (
     C3_SIGNATURE_ALGORITHM,
@@ -9,20 +13,29 @@ from argus_core import (
     CapabilityDescriptor,
     CheckResult,
     ContaminationIndex,
+    FrozenPipelineEntrypointContractError,
     InMemoryArtifactStore,
     InMemoryVerifierTrustStore,
+    Lineage,
+    Producer,
     RefereePolicyError,
     S3Verifier,
     SignerIdentityError,
     SourceDocument,
     attest_challenger_independence,
+    build_frozen_pipeline_entrypoint_request,
     build_referee_block,
+    canonical_json_bytes,
     run_calibration_check,
     run_cross_code_check,
     run_leakage_check,
     run_perturbation_pair,
     tier_from_checks,
 )
+
+
+ROOT = Path(__file__).resolve().parents[1]
+C3_SCHEMA_PATH = ROOT / "schemas" / "contracts" / "c3.validation-report.schema.json"
 
 
 class S3PerturbationOracleTests(unittest.TestCase):
@@ -64,6 +77,124 @@ class S3PerturbationOracleTests(unittest.TestCase):
 
         self.assertEqual(len(outcome.insensitivity_flags), 1)
         self.assertEqual(outcome.insensitivity_flags[0].severity, "fail")
+
+
+class S3FrozenPipelineEntrypointContractTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.c3_schema = json.loads(C3_SCHEMA_PATH.read_text(encoding="utf-8"))
+        Draft202012Validator.check_schema(cls.c3_schema)
+        cls.c3_validator = Draft202012Validator(cls.c3_schema)
+
+    def test_contract_normalizes_c1_handoff_to_c3_verification_request(self) -> None:
+        store = InMemoryArtifactStore()
+        frozen_record = self._frozen_pipeline_record(store)
+        c1_request = self._c1_validation_request(frozen_record.artifact_ref)
+
+        request = build_frozen_pipeline_entrypoint_request(c1_request, artifact_store=store)
+        repeated = build_frozen_pipeline_entrypoint_request(dict(reversed(c1_request.items())), artifact_store=store)
+        verification_request = request["verification_request"]
+
+        self._assert_c3_valid(verification_request)
+        self.assertEqual(request, repeated)
+        self.assertEqual(canonical_json_bytes(request), canonical_json_bytes(repeated))
+        self.assertEqual(verification_request["blind_data_handle"], "blind://vault/job-1/features")
+        self.assertNotIn("blind_dataset_handle", verification_request)
+        self.assertEqual(verification_request["frozen_pipeline_ref"], frozen_record.artifact_ref)
+        self.assertEqual(verification_request["budget_token_ref"], "budget://token/job-1")
+        self.assertEqual(request["entrypoint"]["method"], "predict")
+        self.assertEqual(request["entrypoint"]["entrypoint_ref"], "argus_core.s2.baseline.predict")
+        self.assertEqual(request["entrypoint"]["content_hash"], frozen_record.content_hash)
+        self.assertEqual(request["artifact_refs"], ["c4://artifact/model"])
+        self.assertNotIn("secret-label", json.dumps(request, sort_keys=True))
+
+    def test_contract_rejects_non_c4_frozen_pipeline_ref_with_typed_error(self) -> None:
+        store = InMemoryArtifactStore()
+        c1_request = self._c1_validation_request("file:///tmp/pipeline")
+
+        with self.assertRaises(FrozenPipelineEntrypointContractError) as raised:
+            build_frozen_pipeline_entrypoint_request(c1_request, artifact_store=store)
+
+        error = raised.exception.as_c1_payload()
+        self.assertEqual(error["category"], "POLICY")
+        self.assertEqual(error["code"], "S3_FROZEN_PIPELINE_REF_INVALID")
+        self.assertFalse(error["retryable"])
+
+    def test_contract_rejects_pipeline_without_predict_entrypoint(self) -> None:
+        store = InMemoryArtifactStore()
+        frozen_record = self._frozen_pipeline_record(store, entrypoint="train")
+
+        with self.assertRaises(FrozenPipelineEntrypointContractError) as raised:
+            build_frozen_pipeline_entrypoint_request(
+                self._c1_validation_request(frozen_record.artifact_ref),
+                artifact_store=store,
+            )
+
+        self.assertEqual(raised.exception.as_c1_payload()["code"], "S3_FROZEN_PIPELINE_ENTRYPOINT_INVALID")
+
+    def test_contract_rejects_raw_blind_label_material_without_echoing_secret(self) -> None:
+        store = InMemoryArtifactStore()
+        frozen_record = self._frozen_pipeline_record(store)
+        c1_request = {
+            **self._c1_validation_request(frozen_record.artifact_ref),
+            "blind_labels": ["secret-label-must-not-leak"],
+        }
+
+        with self.assertRaises(FrozenPipelineEntrypointContractError) as raised:
+            build_frozen_pipeline_entrypoint_request(c1_request, artifact_store=store)
+
+        payload = raised.exception.as_c1_payload()
+        self.assertEqual(payload["code"], "S3_VERIFICATION_REQUEST_LABEL_MATERIAL_FORBIDDEN")
+        self.assertNotIn("secret-label-must-not-leak", str(raised.exception))
+        self.assertNotIn("secret-label-must-not-leak", json.dumps(payload, sort_keys=True))
+
+    def _assert_c3_valid(self, payload: dict[str, object]) -> None:
+        errors = sorted(self.c3_validator.iter_errors(payload), key=lambda error: list(error.path))
+        self.assertEqual(errors, [], msg=[error.message for error in errors])
+
+    def _frozen_pipeline_record(
+        self,
+        store: InMemoryArtifactStore,
+        *,
+        entrypoint: str = "argus_core.s2.baseline.predict",
+    ):
+        return store.create_artifact(
+            kind="frozen_pipeline",
+            payload={
+                "schema": "argus.s3.frozen_pipeline_entrypoint.v1",
+                "entrypoint": entrypoint,
+                "artifact_refs": ["c4://artifact/model"],
+                "model_ref": "c4://artifact/model",
+                "io_signature": {
+                    "inputs": [{"name": "x", "dtype": "float64"}],
+                    "outputs": [{"name": "prediction", "dtype": "float64"}],
+                    "uncertainty": {"representation": "interval"},
+                },
+                "code_ref": "git:project-argus@s3-t11",
+                "environment_digest": "oci:s3-frozen-pipeline@sha256-s3-t11",
+                "seeds": ["seed-s3-t11"],
+                "self_replay_passed": True,
+            },
+            producer=Producer(subsystem="S3", version="0.0.0", actor_id="s3-t11"),
+            lineage=Lineage(
+                input_refs=("c4://artifact/model",),
+                code_ref="git:project-argus@s3-t11",
+                environment_digest="oci:s3-frozen-pipeline@sha256-s3-t11",
+                seeds=("seed-s3-t11",),
+            ),
+        )
+
+    @staticmethod
+    def _c1_validation_request(frozen_pipeline_ref: str) -> dict[str, object]:
+        return {
+            "job_id": "11111111-1111-4111-8111-000000000111",
+            "frozen_pipeline_ref": frozen_pipeline_ref,
+            "artifact_refs": ["c4://artifact/model"],
+            "profile_ref": "c4://profile/ewpt/v1",
+            "blind_dataset_handle": "blind://vault/job-1/features",
+            "budget_token_ref": "budget://token/job-1",
+            "trace_id": "trace-s3-t11",
+        }
 
 
 class S3VerifierReportTests(unittest.TestCase):

@@ -2293,12 +2293,16 @@ def _frozen_pipeline_payload(
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "schema": "argus.s1.frozen_pipeline.v1",
+        "entrypoint": "predict",
+        "entrypoint_contract_version": "argus.s3.frozen_pipeline_entrypoint.v1",
         "job_id": job_id,
         "artifact_refs": list(artifact_refs),
         "build_result_hash": hash_json(build_payload),
         "diagnostics_hash": hash_json(build_payload.get("diagnostics", {})),
         "self_checks_hash": hash_json(build_payload.get("self_checks", ())),
         "uncertainty_summary": build_payload["uncertainty_summary"],
+        "code_ref": S1_VALIDATION_HANDOFF_CODE_REF,
+        "environment_digest": S1_VALIDATION_HANDOFF_ENVIRONMENT_DIGEST,
     }
     training_log_ref = build_payload.get("training_log_ref")
     if training_log_ref is not None:

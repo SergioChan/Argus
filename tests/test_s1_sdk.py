@@ -43,6 +43,7 @@ from argus_core import (
     SubagentDescriptor,
     SubagentSDKRunner,
     SubagentRuntime,
+    build_frozen_pipeline_entrypoint_request,
     hash_bytes,
     run_perturbation_pair,
     tag_uncertainty,
@@ -812,7 +813,18 @@ class S1SDKBaseClassTests(unittest.TestCase):
 
         self.assertEqual(frozen_payload["artifact_refs"], build.payload["artifact_refs"])
         self.assertEqual(validation_request_payload, request)
+        s3_entrypoint_request = build_frozen_pipeline_entrypoint_request(
+            validation_request_payload,
+            artifact_store=artifacts,
+        )
+        self.assertEqual(s3_entrypoint_request["entrypoint"]["method"], "predict")
+        self.assertEqual(
+            s3_entrypoint_request["verification_request"]["blind_data_handle"],
+            "blind://s3/labels/job-555",
+        )
+        self.assertNotIn("blind_dataset_handle", s3_entrypoint_request["verification_request"])
         self.assertNotIn("secret-label-must-not-leak", serialized_handoff)
+        self.assertNotIn("secret-label-must-not-leak", json.dumps(s3_entrypoint_request, sort_keys=True))
         self.assertEqual(report_payload["frozen_pipeline_ref"], request["frozen_pipeline_ref"])
         self.assertTrue(c3_verifier.verify(report_payload).valid)
         self._assert_c1_def_valid("SubagentReport", validated.payload["subagent_report"])
