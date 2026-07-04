@@ -33,8 +33,33 @@ class CapabilityDescriptor:
     provenance_ref: str
     subtopics: tuple[str, ...] = ()
     independence_tags: tuple[str, ...] = ()
+    conformance: dict[str, str] | None = None
     conformance_level: str | None = None
     status: str = "active"
+
+    def as_c5_payload(self) -> dict[str, object]:
+        payload: dict[str, object] = {
+            "entity_id": self.entity_id,
+            "revision": self.revision,
+            "kind": self.kind,
+            "owner_subsystem": self.owner_subsystem,
+            "contract_versions": dict(self.contract_versions),
+            "trust_class": self.trust_class,
+            "capability_scopes": list(self.capability_scopes),
+            "provenance_ref": self.provenance_ref,
+        }
+        if self.subtopics:
+            payload["subtopics"] = list(self.subtopics)
+        if self.independence_tags:
+            payload["independence_tags"] = list(self.independence_tags)
+        conformance = dict(self.conformance or {})
+        if self.conformance_level is not None and "level" not in conformance:
+            conformance["level"] = self.conformance_level
+        if conformance:
+            payload["conformance"] = conformance
+        if self.status != "active":
+            payload["status"] = self.status
+        return payload
 
 
 @dataclass(frozen=True)
@@ -214,17 +239,24 @@ class InMemoryRegistry:
     def _write_descriptor_artifact(self, descriptor: CapabilityDescriptor) -> ArtifactRecord:
         return self._artifact_store.create_artifact(
             kind="capability_descriptor",
-            payload=asdict(descriptor),
+            payload=descriptor.as_c5_payload(),
             producer=Producer(subsystem="S6", version="0.0.0"),
             lineage=Lineage(input_refs=(), code_ref="git:s6-registry", environment_digest="oci:s6-registry"),
         )
 
     @staticmethod
     def _validate_descriptor(descriptor: CapabilityDescriptor) -> None:
+        payload = descriptor.as_c5_payload()
         if descriptor.revision < 1:
             raise RegistryError("descriptor revision must be positive")
         if not descriptor.entity_id:
             raise RegistryError("descriptor entity_id is required")
+        if payload["owner_subsystem"] != descriptor.owner_subsystem:
+            raise RegistryError("descriptor owner_subsystem payload mismatch")
+        if not descriptor.capability_scopes:
+            raise RegistryError("descriptor capability_scopes is required")
+        if "C5" not in descriptor.contract_versions:
+            raise RegistryError("descriptor contract_versions must include C5")
         if descriptor.status not in {"active", "deprecated", "revoked", "suspended"}:
             raise RegistryError("descriptor status is invalid")
 

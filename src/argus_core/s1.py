@@ -13,7 +13,7 @@ from uuid import NAMESPACE_URL, uuid4, uuid5
 
 from argusverify import C3ReportVerifier
 from .hashing import hash_json
-from .s6 import CapabilityDescriptor
+from .s6 import CapabilityDescriptor, InMemoryRegistry
 from .s7 import AdapterBroker, EvalRequest, EvalResult, Quantity, S7Error
 from .s10 import (
     EgressRule,
@@ -188,6 +188,7 @@ S1_REFERENCE_CONFORMANCE_CREATED_AT = "1970-01-01T00:00:00Z"
 S1_REFERENCE_CONFORMANCE_SUITE_VERSION = "s1-reference-conformance.v1"
 S1_REFERENCE_CONFORMANCE_STANDARD_REF = "c4://standard/c1/1.0.0"
 S1_CONFORMANCE_LEVEL_ORDER = {"none": 0, "bronze": 1, "silver": 2, "gold": 3}
+S1_CAPABILITY_DESCRIPTOR_DEFAULT_SCOPES = ("c1.accept", "c1.plan", "c1.build", "c1.validate", "c1.report")
 S1_CONTENT_STORE_EGRESS_RULE = EgressRule("store.local", 443, "https")
 S1_EGRESS_PROTOCOLS = frozenset({"https", "grpc", "tcp"})
 
@@ -1448,6 +1449,74 @@ class S1ConformanceResult:
             "evidence_ref": self.evidence_ref,
             "checks": [check.as_payload() for check in self.checks],
         }
+
+
+def build_s1_capability_descriptor(
+    descriptor: SubagentDescriptor,
+    *,
+    revision: int,
+    capability_scopes: tuple[str, ...] | None = None,
+    independence_tags: tuple[str, ...] = (),
+    trust_class: str = "internal",
+    provenance_ref: str = "c4://pending",
+) -> CapabilityDescriptor:
+    """Build an S1-owned C5 descriptor from the C1 subagent descriptor."""
+
+    scopes = _normalize_s1_descriptor_values(
+        capability_scopes if capability_scopes is not None else S1_CAPABILITY_DESCRIPTOR_DEFAULT_SCOPES,
+        "capability_scopes",
+    )
+    _assert_s1_descriptor_scopes(scopes)
+    return CapabilityDescriptor(
+        entity_id=_non_empty_conformance_string(descriptor.subagent_id, "subagent_id"),
+        revision=revision,
+        kind="subagent",
+        owner_subsystem="S1",
+        contract_versions={"C1": descriptor.contract_version, "C5": "1.0.0"},
+        trust_class=trust_class,
+        capability_scopes=scopes,
+        provenance_ref=provenance_ref,
+        subtopics=_normalize_s1_descriptor_values(descriptor.subtopics, "subtopics"),
+        independence_tags=_normalize_s1_descriptor_values(independence_tags, "independence_tags"),
+    )
+
+
+def publish_s1_capability_descriptor(
+    registry: InMemoryRegistry,
+    descriptor: SubagentDescriptor,
+    *,
+    revision: int,
+    capability_scopes: tuple[str, ...] | None = None,
+    independence_tags: tuple[str, ...] = (),
+    trust_class: str = "internal",
+) -> CapabilityDescriptor:
+    """Publish an S1 C5 descriptor through the registry with C4 provenance."""
+
+    return registry.publish(
+        build_s1_capability_descriptor(
+            descriptor,
+            revision=revision,
+            capability_scopes=capability_scopes,
+            independence_tags=independence_tags,
+            trust_class=trust_class,
+        )
+    )
+
+
+def _normalize_s1_descriptor_values(values: tuple[str, ...], name: str) -> tuple[str, ...]:
+    normalized: list[str] = []
+    for value in values:
+        item = str(value).strip()
+        if not item:
+            raise ValueError(f"{name} entries must be non-empty")
+        normalized.append(item)
+    return tuple(dict.fromkeys(normalized))
+
+
+def _assert_s1_descriptor_scopes(scopes: tuple[str, ...]) -> None:
+    missing = [scope for scope in S1_CAPABILITY_DESCRIPTOR_DEFAULT_SCOPES if scope not in scopes]
+    if missing:
+        raise ValueError("S1 capability descriptor missing required scope(s): " + ", ".join(missing))
 
 
 class S1ReferenceConformanceHarness:
