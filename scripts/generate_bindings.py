@@ -16,20 +16,24 @@ ROOT = Path(__file__).resolve().parents[1]
 CONTRACTS_DIR = ROOT / "schemas" / "contracts"
 MANIFEST_PATH = CONTRACTS_DIR / "manifest.json"
 PYTHON_CONTRACTS = ROOT / "bindings" / "python" / "argus_contracts" / "contracts.py"
+PYTHON_C1 = ROOT / "bindings" / "python" / "argus_contracts" / "c1.py"
 PYTHON_C4 = ROOT / "bindings" / "python" / "argus_contracts" / "c4.py"
 PYTHON_S10 = ROOT / "bindings" / "python" / "argus_contracts" / "s10.py"
 PYTHON_INIT = ROOT / "bindings" / "python" / "argus_contracts" / "__init__.py"
 TYPESCRIPT_PACKAGE = ROOT / "bindings" / "typescript" / "package.json"
 TYPESCRIPT_CONTRACTS = ROOT / "bindings" / "typescript" / "src" / "contracts.ts"
+TYPESCRIPT_C1 = ROOT / "bindings" / "typescript" / "src" / "c1.ts"
 TYPESCRIPT_C4 = ROOT / "bindings" / "typescript" / "src" / "c4.ts"
 TYPESCRIPT_S10 = ROOT / "bindings" / "typescript" / "src" / "s10.ts"
 TYPESCRIPT_ARGUSVERIFY = ROOT / "bindings" / "typescript" / "src" / "argusverify.ts"
 TYPESCRIPT_TSCONFIG = ROOT / "bindings" / "typescript" / "tsconfig.json"
+TYPESCRIPT_C1_SMOKE = ROOT / "bindings" / "typescript" / "test" / "c1-smoke.ts"
 TYPESCRIPT_C4_SMOKE = ROOT / "bindings" / "typescript" / "test" / "c4-smoke.ts"
 TYPESCRIPT_S10_SMOKE = ROOT / "bindings" / "typescript" / "test" / "s10-smoke.ts"
 TYPESCRIPT_ARGUSVERIFY_SMOKE = ROOT / "bindings" / "typescript" / "test" / "argusverify-smoke.ts"
 RUST_MANIFEST = ROOT / "bindings" / "rust" / "Cargo.toml"
 RUST_LIB = ROOT / "bindings" / "rust" / "src" / "lib.rs"
+RUST_C1 = ROOT / "bindings" / "rust" / "src" / "c1.rs"
 RUST_C4 = ROOT / "bindings" / "rust" / "src" / "c4.rs"
 RUST_S10 = ROOT / "bindings" / "rust" / "src" / "s10.rs"
 RUST_ARGUSVERIFY = ROOT / "bindings" / "rust" / "src" / "argusverify.rs"
@@ -263,6 +267,20 @@ def render_python_init() -> str:
         [
             f'"""{HEADER}"""',
             "",
+            "from .c1 import (",
+            "    Acceptance,",
+            "    C1_SCHEMA_SHA256,",
+            "    ClaimTier as C1ClaimTier,",
+            "    CostEstimate as C1CostEstimate,",
+            "    LifecycleEvent,",
+            "    LifecycleMethod,",
+            "    LifecycleState,",
+            "    SubagentEnvelope,",
+            "    TypedError,",
+            "    validate_acceptance,",
+            "    validate_c1_payload,",
+            "    validate_subagent_envelope,",
+            ")",
             "from .c4 import (",
             "    ArtifactRecord,",
             "    ArtifactRef,",
@@ -308,12 +326,18 @@ def render_python_init() -> str:
             '    "BudgetToken",',
             '    "BudgetUsage",',
             '    "C10_SCHEMA_SHA256",',
+            '    "C1ClaimTier",',
+            '    "C1CostEstimate",',
+            '    "C1_SCHEMA_SHA256",',
             '    "C4_SCHEMA_SHA256",',
             '    "ClaimTier",',
             '    "CONTRACTS",',
             '    "CONTRACT_BY_ID",',
             '    "Contract",',
             '    "HashRef",',
+            '    "LifecycleEvent",',
+            '    "LifecycleMethod",',
+            '    "LifecycleState",',
             '    "Lineage",',
             '    "LaunchEnvelope",',
             '    "LaunchRequest",',
@@ -332,9 +356,14 @@ def render_python_init() -> str:
             '    "ScopeGrant",',
             '    "ScopeToken",',
             '    "StoreBrokerHandle",',
+            '    "SubagentEnvelope",',
+            '    "TypedError",',
             '    "validate_artifact_record",',
+            '    "validate_acceptance",',
+            '    "validate_c1_payload",',
             '    "validate_launch_request",',
             '    "validate_policy_bundle",',
+            '    "validate_subagent_envelope",',
             "]",
             "",
         ]
@@ -349,11 +378,12 @@ def render_typescript_package() -> str:
         "type": "module",
         "scripts": {
             "build": "tsc --project tsconfig.json",
-            "test": "npm run build && node dist/test/c4-smoke.js && node dist/test/s10-smoke.js && node dist/test/argusverify-smoke.js",
+            "test": "npm run build && node dist/test/c1-smoke.js && node dist/test/c4-smoke.js && node dist/test/s10-smoke.js && node dist/test/argusverify-smoke.js",
         },
         "exports": {
             ".": "./src/contracts.ts",
             "./argusverify": "./src/argusverify.ts",
+            "./c1": "./src/c1.ts",
             "./c4": "./src/c4.ts",
             "./s10": "./src/s10.ts",
         },
@@ -797,6 +827,841 @@ assert.throws(
   /validation_report_ref/,
 );
 '''
+
+
+def render_python_c1(c1_schema_sha256: str) -> str:
+    return '''"""__HEADER__"""
+
+from __future__ import annotations
+
+from datetime import datetime
+from typing import Annotated, Any, Literal, Mapping
+
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
+
+
+C1_SCHEMA_SHA256 = "__C1_SCHEMA_SHA256__"
+
+Uuid = Annotated[
+    str,
+    Field(
+        pattern=r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    ),
+]
+ArtifactRef = Annotated[str, Field(pattern=r"^c4://[A-Za-z0-9._:/-]+$")]
+HashRef = Annotated[str, Field(pattern=r"^(blake3|c4):[A-Za-z0-9._:/-]+$")]
+LifecycleState = Literal[
+    "REGISTERED",
+    "ACCEPTED",
+    "PLANNING",
+    "BUILDING",
+    "VALIDATING",
+    "REPORTED",
+    "FAILED",
+    "REJECTED",
+    "CANCELLED",
+    "QUARANTINED",
+]
+LifecycleMethod = Literal[
+    "register",
+    "accept",
+    "refuse",
+    "plan",
+    "build",
+    "validate",
+    "report",
+    "heartbeat",
+    "cancel",
+    "fail",
+    "quarantine",
+]
+ClaimTier = Literal["ran-toy", "recapitulated-known", "novel-needs-human"]
+ErrorCategory = Literal[
+    "RETRYABLE",
+    "PERMANENT",
+    "BUDGET",
+    "POLICY",
+    "VERIFIER_UNAVAILABLE",
+    "SANDBOX",
+    "VALIDATION",
+    "VERSION_UNSUPPORTED",
+    "QUARANTINE",
+    "NOT_FOUND",
+]
+
+
+class CostEstimate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    compute_units: float | None = Field(default=None, ge=0)
+    gpu_seconds: float | None = Field(default=None, ge=0)
+    model_tokens: float | None = Field(default=None, ge=0)
+    cost_usd: float = Field(ge=0)
+
+
+class UncertaintySummary(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    representation: Literal["covariance", "interval", "samples", "conformal", "ensemble", "none"]
+    value: dict[str, Any]
+
+
+class SelfCheck(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    type: str = Field(min_length=1)
+    status: Literal["PASS", "FAIL", "INCONCLUSIVE"]
+    advisory: bool
+    evidence_ref: ArtifactRef | None = None
+
+
+class TypedError(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    category: ErrorCategory
+    code: str = Field(min_length=1)
+    message: str = Field(min_length=1)
+    retryable: bool
+    retry_after_seconds: int | None = Field(default=None, ge=0)
+    provenance_ref: ArtifactRef | None = None
+
+    @model_validator(mode="after")
+    def _retryable_requires_retry_after(self) -> TypedError:
+        if self.retryable and self.retry_after_seconds is None:
+            raise ValueError("retryable errors require retry_after_seconds")
+        return self
+
+
+class SubagentEnvelope(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    contract_version: Annotated[str, Field(pattern=r"^1\\.\\d+\\.\\d+$")]
+    method: LifecycleMethod
+    job_id: Uuid
+    trace_id: str = Field(min_length=1)
+    state: LifecycleState
+    idempotency_key: str = Field(min_length=1)
+    capability_descriptor_ref: ArtifactRef | None = None
+    job_envelope_ref: ArtifactRef | None = None
+    payload: dict[str, Any] | None = None
+
+
+class Acceptance(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    job_id: Uuid
+    accepted: bool
+    reason: Literal[
+        "OUT_OF_SCOPE",
+        "MISSING_ADAPTER",
+        "BUDGET_TOO_SMALL",
+        "NO_VERIFIER",
+        "VERSION_UNSUPPORTED",
+        "POLICY",
+    ] | None = None
+    state: Literal["ACCEPTED", "REJECTED"]
+    estimated_cost: CostEstimate | None = None
+    plan_eta_seconds: int | None = Field(default=None, ge=0)
+    idempotency_key: str = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def _state_and_reason_match_acceptance(self) -> Acceptance:
+        if self.accepted:
+            if self.state != "ACCEPTED" or self.reason is not None:
+                raise ValueError("accepted Acceptance must have state ACCEPTED and reason null")
+        else:
+            if self.state != "REJECTED" or self.reason is None:
+                raise ValueError("refused Acceptance must have state REJECTED and a reason")
+        return self
+
+
+class PlanStep(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    step_id: str = Field(min_length=1)
+    kind: Literal["feature", "train", "eval", "selfcheck", "freeze"]
+    description: str = Field(min_length=1)
+    est_cost: CostEstimate
+
+
+class BudgetBreakdown(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    per_step: list[CostEstimate] | None = None
+    total: CostEstimate
+
+
+class Plan(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    job_id: Uuid
+    steps: list[PlanStep] = Field(min_length=1)
+    adapters_required: list[str]
+    datasets_required: list[ArtifactRef]
+    verifier_profile_ref: ArtifactRef
+    budget_breakdown: BudgetBreakdown
+    risk_notes: list[str]
+    plan_hash: HashRef
+
+
+class BuildResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    job_id: Uuid
+    artifact_refs: list[ArtifactRef] = Field(min_length=1)
+    training_log_ref: ArtifactRef | None = None
+    diagnostics: dict[str, Any]
+    self_checks: list[SelfCheck]
+    uncertainty_summary: UncertaintySummary
+
+
+class ValidationRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    job_id: Uuid
+    frozen_pipeline_ref: ArtifactRef
+    artifact_refs: list[ArtifactRef]
+    profile_ref: ArtifactRef
+    blind_dataset_handle: str = Field(min_length=1)
+    budget_token_ref: str = Field(min_length=1)
+    trace_id: str = Field(min_length=1)
+
+
+class ReproducibilityManifest(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    lineage_ref: ArtifactRef
+    environment_digest: str = Field(min_length=1)
+    code_ref: str = Field(min_length=1)
+    seeds: list[str]
+
+
+class SubagentReport(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    job_id: Uuid
+    subagent_id: str = Field(min_length=1)
+    status: Literal["REPORTED", "FAILED", "REJECTED", "CANCELLED", "QUARANTINED"]
+    claim_tier: ClaimTier
+    artifact_refs: list[ArtifactRef]
+    validation_report_ref: ArtifactRef | None = None
+    uncertainty_summary: UncertaintySummary | None = None
+    cost_actual: CostEstimate
+    reproducibility_manifest: ReproducibilityManifest
+    error: TypedError | None = None
+
+    @model_validator(mode="after")
+    def _promoted_tier_requires_validation_report(self) -> SubagentReport:
+        if self.claim_tier in {"recapitulated-known", "novel-needs-human"} and self.validation_report_ref is None:
+            raise ValueError("promoted claim_tier requires validation_report_ref")
+        return self
+
+
+class LifecycleEvent(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    event_id: Uuid
+    job_id: Uuid
+    root_request_id: Uuid
+    seq: int = Field(ge=1)
+    from_state: LifecycleState
+    to_state: LifecycleState
+    method: LifecycleMethod
+    trigger: Literal["S5", "S4", "internal", "cancel"]
+    payload_hash: HashRef
+    spend_delta: CostEstimate | None = None
+    trace_id: str = Field(min_length=1)
+    idempotency_key: str = Field(min_length=1)
+
+
+class Heartbeat(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    job_id: Uuid
+    status: LifecycleState
+    progress: float = Field(ge=0, le=1)
+    spend_so_far: CostEstimate
+    last_heartbeat_at: datetime
+
+
+class ExecContext(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    job_id: Uuid
+    capabilities: list[
+        Literal["submit_sandbox_job", "emit_artifact", "call_adapter", "read_dataset", "log", "span"]
+    ]
+
+    @field_validator("capabilities")
+    @classmethod
+    def _capabilities_are_unique(cls, value: list[str]) -> list[str]:
+        if len(value) != len(set(value)):
+            raise ValueError("capabilities must be unique")
+        return value
+
+
+C1_PAYLOAD_MODELS: tuple[type[BaseModel], ...] = (
+    SubagentEnvelope,
+    Acceptance,
+    Plan,
+    BuildResult,
+    ValidationRequest,
+    SubagentReport,
+    LifecycleEvent,
+    Heartbeat,
+    TypedError,
+)
+
+
+def validate_subagent_envelope(payload: Mapping[str, Any]) -> SubagentEnvelope:
+    return SubagentEnvelope.model_validate(payload)
+
+
+def validate_acceptance(payload: Mapping[str, Any]) -> Acceptance:
+    return Acceptance.model_validate(payload)
+
+
+def validate_c1_payload(payload: Mapping[str, Any]) -> BaseModel:
+    errors: list[ValidationError] = []
+    for model in C1_PAYLOAD_MODELS:
+        try:
+            return model.model_validate(payload)
+        except ValidationError as exc:
+            errors.append(exc)
+    raise ValueError(f"payload did not match any C1 public model ({len(errors)} validation attempts)")
+'''.replace("__HEADER__", HEADER).replace("__C1_SCHEMA_SHA256__", c1_schema_sha256)
+
+
+def render_typescript_c1(c1_schema_sha256: str) -> str:
+    return '''// __HEADER__
+
+export const C1_SCHEMA_SHA256 = "__C1_SCHEMA_SHA256__";
+
+export type ArtifactRef = `c4://${string}`;
+export type HashRef = `${"blake3" | "c4"}:${string}`;
+export type LifecycleState =
+  | "REGISTERED"
+  | "ACCEPTED"
+  | "PLANNING"
+  | "BUILDING"
+  | "VALIDATING"
+  | "REPORTED"
+  | "FAILED"
+  | "REJECTED"
+  | "CANCELLED"
+  | "QUARANTINED";
+export type LifecycleMethod =
+  | "register"
+  | "accept"
+  | "refuse"
+  | "plan"
+  | "build"
+  | "validate"
+  | "report"
+  | "heartbeat"
+  | "cancel"
+  | "fail"
+  | "quarantine";
+export type AcceptanceReason =
+  | "OUT_OF_SCOPE"
+  | "MISSING_ADAPTER"
+  | "BUDGET_TOO_SMALL"
+  | "NO_VERIFIER"
+  | "VERSION_UNSUPPORTED"
+  | "POLICY";
+
+export interface CostEstimate {
+  compute_units?: number;
+  gpu_seconds?: number;
+  model_tokens?: number;
+  cost_usd: number;
+}
+
+export interface SubagentEnvelope {
+  contract_version: string;
+  method: LifecycleMethod;
+  job_id: string;
+  trace_id: string;
+  state: LifecycleState;
+  idempotency_key: string;
+  capability_descriptor_ref?: ArtifactRef;
+  job_envelope_ref?: ArtifactRef;
+  payload?: Record<string, unknown>;
+}
+
+export interface Acceptance {
+  job_id: string;
+  accepted: boolean;
+  reason?: AcceptanceReason | null;
+  state: "ACCEPTED" | "REJECTED";
+  estimated_cost?: CostEstimate;
+  plan_eta_seconds?: number;
+  idempotency_key: string;
+}
+
+const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+const c4RefPattern = /^c4:\\/\\/[A-Za-z0-9._:/-]+$/;
+const contractVersionPattern = /^1\\.\\d+\\.\\d+$/;
+const lifecycleMethods = [
+  "register",
+  "accept",
+  "refuse",
+  "plan",
+  "build",
+  "validate",
+  "report",
+  "heartbeat",
+  "cancel",
+  "fail",
+  "quarantine",
+] as const;
+const lifecycleStates = [
+  "REGISTERED",
+  "ACCEPTED",
+  "PLANNING",
+  "BUILDING",
+  "VALIDATING",
+  "REPORTED",
+  "FAILED",
+  "REJECTED",
+  "CANCELLED",
+  "QUARANTINED",
+] as const;
+const acceptanceReasons = [
+  "OUT_OF_SCOPE",
+  "MISSING_ADAPTER",
+  "BUDGET_TOO_SMALL",
+  "NO_VERIFIER",
+  "VERSION_UNSUPPORTED",
+  "POLICY",
+] as const;
+
+export function assertSubagentEnvelope(payload: unknown): asserts payload is SubagentEnvelope {
+  const record = assertRecord(payload, "subagent_envelope");
+  assertKeys(record, [
+    "contract_version",
+    "method",
+    "job_id",
+    "trace_id",
+    "state",
+    "idempotency_key",
+  ], [
+    "contract_version",
+    "method",
+    "job_id",
+    "trace_id",
+    "state",
+    "idempotency_key",
+    "capability_descriptor_ref",
+    "job_envelope_ref",
+    "payload",
+  ], "subagent_envelope");
+  assertPattern(record.contract_version, contractVersionPattern, "subagent_envelope.contract_version");
+  assertOneOf(record.method, lifecycleMethods, "subagent_envelope.method");
+  assertPattern(record.job_id, uuidPattern, "subagent_envelope.job_id");
+  assertMinString(record.trace_id, 1, "subagent_envelope.trace_id");
+  assertOneOf(record.state, lifecycleStates, "subagent_envelope.state");
+  assertMinString(record.idempotency_key, 1, "subagent_envelope.idempotency_key");
+  if (record.capability_descriptor_ref !== undefined) {
+    assertPattern(record.capability_descriptor_ref, c4RefPattern, "subagent_envelope.capability_descriptor_ref");
+  }
+  if (record.job_envelope_ref !== undefined) {
+    assertPattern(record.job_envelope_ref, c4RefPattern, "subagent_envelope.job_envelope_ref");
+  }
+  if (record.payload !== undefined) {
+    assertRecord(record.payload, "subagent_envelope.payload");
+  }
+}
+
+export function assertAcceptance(payload: unknown): asserts payload is Acceptance {
+  const record = assertRecord(payload, "acceptance");
+  assertKeys(record, [
+    "job_id",
+    "accepted",
+    "state",
+    "idempotency_key",
+  ], [
+    "job_id",
+    "accepted",
+    "reason",
+    "state",
+    "estimated_cost",
+    "plan_eta_seconds",
+    "idempotency_key",
+  ], "acceptance");
+  assertPattern(record.job_id, uuidPattern, "acceptance.job_id");
+  assertBoolean(record.accepted, "acceptance.accepted");
+  assertOneOf(record.state, ["ACCEPTED", "REJECTED"] as const, "acceptance.state");
+  assertMinString(record.idempotency_key, 1, "acceptance.idempotency_key");
+  if (record.reason !== undefined && record.reason !== null) {
+    assertOneOf(record.reason, acceptanceReasons, "acceptance.reason");
+  }
+  if (record.estimated_cost !== undefined) {
+    assertCostEstimate(record.estimated_cost, "acceptance.estimated_cost");
+  }
+  if (record.plan_eta_seconds !== undefined) {
+    assertNonNegativeInteger(record.plan_eta_seconds, "acceptance.plan_eta_seconds");
+  }
+  if (record.accepted) {
+    if (record.state !== "ACCEPTED" || (record.reason !== undefined && record.reason !== null)) {
+      throw new TypeError("accepted Acceptance must have state ACCEPTED and null/absent reason");
+    }
+  } else if (record.state !== "REJECTED" || record.reason === undefined || record.reason === null) {
+    throw new TypeError("refused Acceptance must have state REJECTED and a reason");
+  }
+}
+
+function assertCostEstimate(value: unknown, path: string): void {
+  const record = assertRecord(value, path);
+  assertKeys(record, ["cost_usd"], ["compute_units", "gpu_seconds", "model_tokens", "cost_usd"], path);
+  for (const key of ["compute_units", "gpu_seconds", "model_tokens", "cost_usd"]) {
+    if (record[key] !== undefined) {
+      assertNonNegativeNumber(record[key], path + "." + key);
+    }
+  }
+}
+
+function assertRecord(value: unknown, path: string): Record<string, unknown> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new TypeError(path + " must be an object");
+  }
+  return value as Record<string, unknown>;
+}
+
+function assertKeys(record: Record<string, unknown>, required: readonly string[], allowed: readonly string[], path: string): void {
+  const allowedKeys = new Set(allowed);
+  for (const key of Object.keys(record)) {
+    if (!allowedKeys.has(key)) {
+      throw new TypeError(path + "." + key + " is not allowed");
+    }
+  }
+  for (const key of required) {
+    if (!(key in record)) {
+      throw new TypeError(path + "." + key + " is required");
+    }
+  }
+}
+
+function assertPattern(value: unknown, pattern: RegExp, path: string): asserts value is string {
+  assertMinString(value, 0, path);
+  if (!pattern.test(value)) {
+    throw new TypeError(path + " does not match required pattern");
+  }
+}
+
+function assertMinString(value: unknown, minLength: number, path: string): asserts value is string {
+  if (typeof value !== "string" || value.length < minLength) {
+    throw new TypeError(path + " must be a string with length >= " + minLength);
+  }
+}
+
+function assertBoolean(value: unknown, path: string): asserts value is boolean {
+  if (typeof value !== "boolean") {
+    throw new TypeError(path + " must be a boolean");
+  }
+}
+
+function assertOneOf<T extends string>(value: unknown, allowed: readonly T[], path: string): asserts value is T {
+  if (typeof value !== "string" || !allowed.includes(value as T)) {
+    throw new TypeError(path + " must be one of " + allowed.join(", "));
+  }
+}
+
+function assertNonNegativeNumber(value: unknown, path: string): asserts value is number {
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
+    throw new TypeError(path + " must be a non-negative finite number");
+  }
+}
+
+function assertNonNegativeInteger(value: unknown, path: string): asserts value is number {
+  if (!Number.isSafeInteger(value) || (value as number) < 0) {
+    throw new TypeError(path + " must be a non-negative integer");
+  }
+}
+'''.replace("__HEADER__", HEADER).replace("__C1_SCHEMA_SHA256__", c1_schema_sha256)
+
+
+def render_typescript_c1_smoke(c1_schema_sha256: str) -> str:
+    envelope = json.dumps(
+        json.loads((CONTRACTS_DIR / "examples" / "c1.example.json").read_text(encoding="utf-8")),
+        indent=2,
+    )
+    return '''// __HEADER__
+
+import assert from "node:assert/strict";
+
+import {
+  C1_SCHEMA_SHA256,
+  assertAcceptance,
+  assertSubagentEnvelope,
+  type Acceptance,
+  type SubagentEnvelope,
+} from "../src/c1.js";
+
+const envelope = __C1_ENVELOPE__ satisfies SubagentEnvelope;
+const acceptance: Acceptance = {
+  job_id: envelope.job_id,
+  accepted: true,
+  reason: null,
+  state: "ACCEPTED",
+  idempotency_key: envelope.idempotency_key,
+  estimated_cost: { cost_usd: 0.01 },
+};
+
+assert.equal(C1_SCHEMA_SHA256, "__C1_SCHEMA_SHA256__");
+assert.doesNotThrow(() => assertSubagentEnvelope(envelope));
+assert.doesNotThrow(() => assertAcceptance(acceptance));
+
+assert.throws(
+  () => assertSubagentEnvelope({
+    ...envelope,
+    idempotency_key: "",
+  }),
+  /idempotency_key/,
+);
+
+assert.throws(
+  () => assertAcceptance({
+    ...acceptance,
+    accepted: false,
+    state: "ACCEPTED",
+  }),
+  /refused Acceptance/,
+);
+'''.replace("__HEADER__", HEADER).replace("__C1_SCHEMA_SHA256__", c1_schema_sha256).replace("__C1_ENVELOPE__", envelope)
+
+
+def render_rust_c1(c1_schema_sha256: str) -> str:
+    envelope = json.dumps(
+        json.loads((CONTRACTS_DIR / "examples" / "c1.example.json").read_text(encoding="utf-8")),
+        indent=12,
+    )
+    return '''// __HEADER__
+
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+pub const C1_SCHEMA_SHA256: &str = "__C1_SCHEMA_SHA256__";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum LifecycleState {
+    Registered,
+    Accepted,
+    Planning,
+    Building,
+    Validating,
+    Reported,
+    Failed,
+    Rejected,
+    Cancelled,
+    Quarantined,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LifecycleMethod {
+    Register,
+    Accept,
+    Refuse,
+    Plan,
+    Build,
+    Validate,
+    Report,
+    Heartbeat,
+    Cancel,
+    Fail,
+    Quarantine,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ClaimTier {
+    RanToy,
+    RecapitulatedKnown,
+    NovelNeedsHuman,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum AcceptanceReason {
+    OutOfScope,
+    MissingAdapter,
+    BudgetTooSmall,
+    NoVerifier,
+    VersionUnsupported,
+    Policy,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CostEstimate {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compute_units: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gpu_seconds: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_tokens: Option<f64>,
+    pub cost_usd: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SubagentEnvelope {
+    pub contract_version: String,
+    pub method: LifecycleMethod,
+    pub job_id: String,
+    pub trace_id: String,
+    pub state: LifecycleState,
+    pub idempotency_key: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capability_descriptor_ref: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub job_envelope_ref: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub payload: Option<Value>,
+}
+
+impl SubagentEnvelope {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if !self.contract_version.starts_with("1.") {
+            return Err("contract_version must be C1 major 1");
+        }
+        if self.idempotency_key.is_empty() {
+            return Err("idempotency_key must be non-empty");
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Acceptance {
+    pub job_id: String,
+    pub accepted: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<AcceptanceReason>,
+    pub state: LifecycleState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub estimated_cost: Option<CostEstimate>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plan_eta_seconds: Option<u64>,
+    pub idempotency_key: String,
+}
+
+impl Acceptance {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        match (self.accepted, &self.state, self.reason.is_some()) {
+            (true, LifecycleState::Accepted, false) => Ok(()),
+            (false, LifecycleState::Rejected, true) => Ok(()),
+            _ => Err("Acceptance accepted/state/reason fields are inconsistent"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ErrorCategory {
+    Retryable,
+    Permanent,
+    Budget,
+    Policy,
+    VerifierUnavailable,
+    Sandbox,
+    Validation,
+    VersionUnsupported,
+    Quarantine,
+    NotFound,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TypedError {
+    pub category: ErrorCategory,
+    pub code: String,
+    pub message: String,
+    pub retryable: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retry_after_seconds: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provenance_ref: Option<String>,
+}
+
+impl TypedError {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.retryable && self.retry_after_seconds.is_none() {
+            return Err("retryable errors require retry_after_seconds");
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LifecycleEvent {
+    pub event_id: String,
+    pub job_id: String,
+    pub root_request_id: String,
+    pub seq: u64,
+    pub from_state: LifecycleState,
+    pub to_state: LifecycleState,
+    pub method: LifecycleMethod,
+    pub trigger: String,
+    pub payload_hash: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub spend_delta: Option<CostEstimate>,
+    pub trace_id: String,
+    pub idempotency_key: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn envelope_json() -> &'static str {
+        r#"__C1_ENVELOPE__"#
+    }
+
+    #[test]
+    fn c1_schema_digest_is_generated() {
+        assert!(C1_SCHEMA_SHA256.starts_with("sha256:"));
+    }
+
+    #[test]
+    fn serde_round_trips_c1_subagent_envelope_golden_sample() {
+        let envelope: SubagentEnvelope =
+            serde_json::from_str(envelope_json()).expect("deserialize C1 envelope");
+        envelope.validate().expect("C1 envelope validates");
+        let encoded = serde_json::to_string(&envelope).expect("serialize C1 envelope");
+        let decoded: SubagentEnvelope = serde_json::from_str(&encoded).expect("deserialize roundtrip");
+        assert_eq!(decoded, envelope);
+    }
+
+    #[test]
+    fn c1_acceptance_rejects_inconsistent_refusals() {
+        let accepted = Acceptance {
+            job_id: "11111111-1111-4111-8111-111111111111".to_string(),
+            accepted: true,
+            reason: None,
+            state: LifecycleState::Accepted,
+            estimated_cost: Some(CostEstimate {
+                compute_units: None,
+                gpu_seconds: None,
+                model_tokens: None,
+                cost_usd: 0.01,
+            }),
+            plan_eta_seconds: None,
+            idempotency_key: "accept-11111111".to_string(),
+        };
+        accepted.validate().expect("accepted shape validates");
+
+        let invalid = Acceptance {
+            accepted: false,
+            state: LifecycleState::Accepted,
+            ..accepted
+        };
+        assert_eq!(
+            invalid.validate(),
+            Err("Acceptance accepted/state/reason fields are inconsistent")
+        );
+    }
+}
+'''.replace("__HEADER__", HEADER).replace("__C1_SCHEMA_SHA256__", c1_schema_sha256).replace("__C1_ENVELOPE__", envelope)
 
 
 def render_python_s10(c10_schema_sha256: str) -> str:
@@ -2075,12 +2940,14 @@ def render_rust_lib(items: list[dict]) -> str:
             f"// {HEADER}",
             "",
             "pub mod argusverify;",
+            "pub mod c1;",
             "pub mod c4;",
             "pub mod hash;",
             "pub mod ledger;",
             "pub mod s10;",
             "",
             "pub use argusverify::{sign_report, verify_report, C3SignatureVerification, InMemoryVerifierTrustStore, VerifierKey, VerifierTrustStore, C3_SIGNATURE_ALGORITHM, C3_SIGNATURE_PREFIX, SIGNATURE_VERIFICATION_ABSTAIN, SIGNATURE_VERIFICATION_ACCEPTED};",
+            "pub use c1::{Acceptance, CostEstimate as C1CostEstimate, LifecycleEvent, LifecycleMethod, LifecycleState, SubagentEnvelope, TypedError, C1_SCHEMA_SHA256};",
             "pub use c4::{ArtifactRecord, ClaimTier, Lineage, Producer, RetentionPolicy, C4_SCHEMA_SHA256};",
             "pub use hash::{hash_blob, hash_blob_stream, hash_bytes, BlobHasher, HashBlob, HashBlobError, BLAKE3_PREFIX, CANON_VERSION};",
             "pub use ledger::{ArtifactRecordDraft, MerkleCheckpoint, PostgresLedgerWriter};",
@@ -3137,24 +4004,29 @@ mod tests {{
 
 def generated_files() -> dict[Path, str]:
     items = contracts()
+    c1 = next(item for item in items if item["id"] == "C1")
     c4 = next(item for item in items if item["id"] == "C4")
     c10 = next(item for item in items if item["id"] == "C10")
     return {
         PYTHON_CONTRACTS: render_python_contracts(items),
+        PYTHON_C1: render_python_c1(c1["schema_sha256"]),
         PYTHON_C4: render_python_c4(c4["schema_sha256"]),
         PYTHON_S10: render_python_s10(c10["schema_sha256"]),
         PYTHON_INIT: render_python_init(),
         TYPESCRIPT_PACKAGE: render_typescript_package(),
         TYPESCRIPT_CONTRACTS: render_typescript_contracts(items),
+        TYPESCRIPT_C1: render_typescript_c1(c1["schema_sha256"]),
         TYPESCRIPT_C4: render_typescript_c4(c4["schema_sha256"]),
         TYPESCRIPT_S10: render_typescript_s10(c10["schema_sha256"]),
         TYPESCRIPT_ARGUSVERIFY: render_typescript_argusverify(),
         TYPESCRIPT_TSCONFIG: render_typescript_tsconfig(),
+        TYPESCRIPT_C1_SMOKE: render_typescript_c1_smoke(c1["schema_sha256"]),
         TYPESCRIPT_C4_SMOKE: render_typescript_c4_smoke(c4["schema_sha256"]),
         TYPESCRIPT_S10_SMOKE: render_typescript_s10_smoke(c10["schema_sha256"]),
         TYPESCRIPT_ARGUSVERIFY_SMOKE: render_typescript_argusverify_smoke(),
         RUST_MANIFEST: render_rust_manifest(),
         RUST_LIB: render_rust_lib(items),
+        RUST_C1: render_rust_c1(c1["schema_sha256"]),
         RUST_C4: render_rust_c4(c4["schema_sha256"]),
         RUST_S10: render_rust_s10(c10["schema_sha256"]),
         RUST_ARGUSVERIFY: render_rust_argusverify(),
