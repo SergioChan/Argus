@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from enum import Enum
 from typing import Any, Mapping
+from uuid import NAMESPACE_URL, uuid5
 
 from argusverify import C3ReportVerifier
 from .hashing import hash_json
@@ -203,6 +204,9 @@ class LifecycleEvent:
     trigger: str
     payload_hash: str
     idempotency_key: str
+    root_request_id: str
+    trace_id: str
+    event_id: str
     ledger_ref: str | None = None
 
 
@@ -433,6 +437,8 @@ class LifecycleStore:
         trigger: str = "",
         payload: Any | None = None,
         idempotency_key: str | None = None,
+        root_request_id: str | None = None,
+        trace_id: str | None = None,
     ) -> LifecycleEvent:
         if method not in METHOD_TARGETS:
             raise ValueError(f"unknown lifecycle method: {method}")
@@ -443,6 +449,8 @@ class LifecycleStore:
             trigger=trigger,
             payload=payload,
             idempotency_key=idempotency_key,
+            root_request_id=root_request_id,
+            trace_id=trace_id,
         )
 
     def transition(
@@ -454,6 +462,8 @@ class LifecycleStore:
         trigger: str = "",
         payload: Any | None = None,
         idempotency_key: str | None = None,
+        root_request_id: str | None = None,
+        trace_id: str | None = None,
     ) -> LifecycleEvent:
         current = self._current.get(job_id)
         if current is None:
@@ -481,15 +491,24 @@ class LifecycleStore:
             return existing.response
 
         self._assert_legal_transition(current.state, to_state, method)
+        next_sequence = current.last_sequence + 1
         event = LifecycleEvent(
             job_id=job_id,
-            sequence=current.last_sequence + 1,
+            sequence=next_sequence,
             from_state=current.state,
             to_state=to_state,
             method=method,
             trigger=trigger,
             payload_hash=payload_hash,
             idempotency_key=resolved_idempotency_key,
+            root_request_id=root_request_id or job_id,
+            trace_id=trace_id or f"trace:{job_id}",
+            event_id=_derive_lifecycle_event_id(
+                job_id=job_id,
+                sequence=next_sequence,
+                method=method,
+                request_hash=request_hash,
+            ),
         )
         event = self._mirror_event(event)
         self._events[job_id].append(event)
@@ -587,7 +606,14 @@ class SubagentRuntime:
         self.store = store or LifecycleStore(idempotency_store=self.idempotency_store)
         self.gate_invocations = 0
 
-    def accept(self, envelope: JobEnvelope, *, idempotency_key: str | None = None) -> Acceptance:
+    def accept(
+        self,
+        envelope: JobEnvelope,
+        *,
+        idempotency_key: str | None = None,
+        root_request_id: str | None = None,
+        trace_id: str | None = None,
+    ) -> Acceptance:
         resolved_idempotency_key = idempotency_key or _default_accept_idempotency_key(envelope.job_id)
         request_hash = hash_json(envelope.__dict__)
         existing = self.idempotency_store.resolve(
@@ -607,6 +633,8 @@ class SubagentRuntime:
             "accept" if acceptance.accepted else "refuse",
             trigger="S5",
             idempotency_key=resolved_idempotency_key,
+            root_request_id=root_request_id,
+            trace_id=trace_id,
         )
         self.idempotency_store.record(
             job_id=envelope.job_id,
@@ -699,13 +727,17 @@ def reduce_lifecycle(events: tuple[LifecycleEvent, ...], *, job_id: str) -> JobC
 def _lifecycle_event_ledger_payload(event: LifecycleEvent) -> dict[str, object]:
     return {
         "schema": "argus.s1.lifecycle_event.v1",
+        "event_id": event.event_id,
         "job_id": event.job_id,
+        "root_request_id": event.root_request_id,
         "sequence": event.sequence,
+        "seq": event.sequence,
         "from_state": event.from_state.value,
         "to_state": event.to_state.value,
         "method": event.method,
         "trigger": event.trigger,
         "payload_hash": event.payload_hash,
+        "trace_id": event.trace_id,
         "idempotency_key": event.idempotency_key,
     }
 
@@ -739,6 +771,10 @@ def _lifecycle_request_hash(
 
 def _derive_lifecycle_idempotency_key(*, job_id: str, method: str, request_hash: str) -> str:
     return f"{method}:{job_id}:{request_hash}"
+
+
+def _derive_lifecycle_event_id(*, job_id: str, sequence: int, method: str, request_hash: str) -> str:
+    return str(uuid5(NAMESPACE_URL, f"argus:s1:lifecycle:{job_id}:{sequence}:{method}:{request_hash}"))
 
 
 def _idempotency_response_hash(response: Any) -> str:
