@@ -774,6 +774,21 @@ class InMemoryArtifactStore:
     def get_artifact_record(self, ref: str) -> ArtifactRecord:
         return self._record_by_ref(ref, require_unique_record=True)
 
+    def insert_lineage_edge(self, source_ref: str, target_ref: str, edge_type: str) -> LineageEdge:
+        if source_ref not in self._records:
+            raise KeyError(source_ref)
+        if target_ref not in self._records:
+            raise KeyError(target_ref)
+        if not edge_type:
+            raise ValueError("edge_type must be non-empty")
+        if source_ref == target_ref:
+            raise CycleDetectedError(f"lineage cycle detected through: {source_ref}")
+        descendants = {record.artifact_ref for record in self.query_impact_set((target_ref,))}
+        if source_ref in descendants:
+            raise CycleDetectedError(f"lineage cycle detected through: {source_ref}")
+        self._insert_edge(source_ref, target_ref, edge_type)
+        return LineageEdge(source_ref=source_ref, target_ref=target_ref, edge_type=edge_type)
+
     def query_artifacts(
         self,
         query: ArtifactQueryFilter | Mapping[str, Any] | None = None,

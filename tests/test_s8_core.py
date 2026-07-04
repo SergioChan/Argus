@@ -434,6 +434,28 @@ class InMemoryArtifactStoreTests(unittest.TestCase):
         self.assertEqual(impact_refs, {dataset.artifact_ref, model.artifact_ref})
         self.assertEqual(len(lineage_graph.edges), 2)
 
+    def test_insert_lineage_edge_records_derived_from_and_rejects_cycles(self) -> None:
+        base = self.store.create_artifact(
+            kind="model",
+            payload={"weights": [1]},
+            producer=self.producer,
+            lineage=Lineage(input_refs=(), code_ref="git:base", environment_digest="oci:base"),
+        )
+        variant = self.store.create_artifact(
+            kind="model",
+            payload={"weights": [2]},
+            producer=self.producer,
+            lineage=Lineage(input_refs=(), code_ref="git:variant", environment_digest="oci:variant"),
+        )
+
+        edge = self.store.insert_lineage_edge(base.artifact_ref, variant.artifact_ref, "derived_from")
+        lineage = self.store.get_lineage(variant.artifact_ref, direction="ancestors")
+
+        self.assertEqual(edge.edge_type, "derived_from")
+        self.assertIn(edge, lineage.edges)
+        with self.assertRaises(CycleDetectedError):
+            self.store.insert_lineage_edge(variant.artifact_ref, base.artifact_ref, "derived_from")
+
     def test_audit_slice_proofs_and_chain_detect_tampering(self) -> None:
         source = self.store.create_artifact(
             kind="external_source",

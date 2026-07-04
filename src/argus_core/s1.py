@@ -1884,6 +1884,16 @@ class Subagent(ABC):
             )
         )
 
+    @final
+    def report(self, *_args: Any, **_kwargs: Any) -> Mapping[str, Any]:
+        raise LifecyclePolicyError(
+            ErrorEnvelope(
+                code="SDK_REPORT_FRAMEWORK_OWNED",
+                category="POLICY",
+                message="report is framework-owned and cannot be implemented by subagent authors",
+            )
+        )
+
 
 @dataclass(frozen=True)
 class IdempotencyRecord:
@@ -2204,12 +2214,14 @@ class SubagentRuntime:
         idempotency_store: InMemoryIdempotencyStore | None = None,
         artifact_store: InMemoryArtifactStore | None = None,
         sandbox_marshaler: Any | None = None,
+        adapter_client: Any | None = None,
         adapter_egress_allowlist: Mapping[str, Any] | None = None,
         store_egress_rule: EgressRule = S1_CONTENT_STORE_EGRESS_RULE,
     ) -> None:
         self.descriptor = descriptor
         self.idempotency_store = idempotency_store or InMemoryIdempotencyStore()
         self.sandbox_marshaler = sandbox_marshaler
+        self.adapter_client = adapter_client
         self.adapter_egress_allowlist = _normalize_adapter_egress_mapping(adapter_egress_allowlist or {})
         _assert_egress_rule_valid(store_egress_rule, "content store")
         self.store_egress_rule = store_egress_rule
@@ -2392,6 +2404,33 @@ class SubagentSDKRunner:
         )
         return SDKInvocationResult(event=event, payload=payload)
 
+    def report(
+        self,
+        job_id: str,
+        subagent_report: Mapping[str, Any],
+        *,
+        idempotency_key: str | None = None,
+        root_request_id: str | None = None,
+        trace_id: str | None = None,
+    ) -> SDKInvocationResult:
+        self._assert_can_apply(job_id, "report")
+        payload = _normalize_report_payload(job_id, subagent_report)
+        event = self.runtime.store.apply_method(
+            job_id,
+            "report",
+            trigger="S1",
+            payload={
+                "artifact_refs": payload["artifact_refs"],
+                "validation_report_ref": payload.get("validation_report_ref"),
+                "claim_tier": payload["claim_tier"],
+                "reproducibility_manifest": payload["reproducibility_manifest"],
+            },
+            idempotency_key=idempotency_key,
+            root_request_id=root_request_id,
+            trace_id=trace_id,
+        )
+        return SDKInvocationResult(event=event, payload=payload)
+
     def _exec_context(
         self,
         job_id: str,
@@ -2407,6 +2446,7 @@ class SubagentSDKRunner:
             store_egress_rule=self.runtime.store_egress_rule,
             artifact_store=self.runtime.artifact_store,
             sandbox_marshaler=self.runtime.sandbox_marshaler,
+            adapter_client=self.runtime.adapter_client,
         )
 
     def _assert_no_direct_exec(self, job_id: str, method: str, hook: Any) -> None:
@@ -2634,6 +2674,31 @@ def _normalize_build_payload(job_id: str, value: Mapping[str, Any] | Any) -> dic
     return payload
 
 
+def _normalize_report_payload(job_id: str, value: Mapping[str, Any] | Any) -> dict[str, Any]:
+    payload = _mapping_payload("report", value)
+    payload.setdefault("job_id", job_id)
+    if payload["job_id"] != job_id:
+        raise ValueError("report payload job_id must match the lifecycle job")
+    payload.setdefault("status", LifecycleState.REPORTED.value)
+    if payload["status"] != LifecycleState.REPORTED.value:
+        _raise_policy("S1_REPORT_STATUS_INVALID", "report payload status must be REPORTED")
+    artifact_refs = payload.get("artifact_refs")
+    if not isinstance(artifact_refs, list) or not all(isinstance(ref, str) and ref for ref in artifact_refs):
+        _raise_policy("S1_REPORT_ARTIFACT_REFS_REQUIRED", "report payload requires non-empty string artifact_refs")
+    if not artifact_refs:
+        _raise_policy("S1_REPORT_ARTIFACT_REFS_REQUIRED", "report payload requires at least one artifact_ref")
+    claim_tier = payload.get("claim_tier")
+    if not isinstance(claim_tier, str) or not claim_tier:
+        _raise_policy("S1_REPORT_CLAIM_TIER_REQUIRED", "report payload requires claim_tier")
+    reproducibility = payload.get("reproducibility_manifest")
+    if not isinstance(reproducibility, Mapping):
+        _raise_policy("S1_REPORT_REPRODUCIBILITY_REQUIRED", "report payload requires reproducibility_manifest")
+    validation_ref = payload.get("validation_report_ref")
+    if validation_ref is not None and (not isinstance(validation_ref, str) or not validation_ref):
+        _raise_policy("S1_REPORT_VALIDATION_REF_INVALID", "validation_report_ref must be a non-empty string")
+    return payload
+
+
 def _build_validation_handoff_payload(
     *,
     job_id: str,
@@ -2726,7 +2791,7 @@ def _build_validation_handoff_payload(
         payload=validation_report_payload,
         producer=Producer(subsystem="S3", version="0.0.0", actor_id="s3.validate"),
         lineage=Lineage(
-            input_refs=(validation_request_record.artifact_ref, frozen_pipeline_record.artifact_ref),
+            input_refs=(validation_request_record.artifact_ref, frozen_pipeline_record.artifact_ref, profile_ref),
             code_ref="argus-core:s3.validate",
             environment_digest="python:s3-validate:v1",
             job_id=job_id,
