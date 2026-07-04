@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, replace
-from typing import Iterable
+from datetime import UTC, datetime
+import json
+from typing import Any, Iterable, Mapping
 
 from .hashing import hash_json
 from .s8 import ArtifactRecord, InMemoryArtifactStore, Lineage, Producer
@@ -244,8 +246,7 @@ class InMemoryRegistry:
             lineage=Lineage(input_refs=(), code_ref="git:s6-registry", environment_digest="oci:s6-registry"),
         )
 
-    @staticmethod
-    def _validate_descriptor(descriptor: CapabilityDescriptor) -> None:
+    def _validate_descriptor(self, descriptor: CapabilityDescriptor) -> None:
         payload = descriptor.as_c5_payload()
         if descriptor.revision < 1:
             raise RegistryError("descriptor revision must be positive")
@@ -259,6 +260,47 @@ class InMemoryRegistry:
             raise RegistryError("descriptor contract_versions must include C5")
         if descriptor.status not in {"active", "deprecated", "revoked", "suspended"}:
             raise RegistryError("descriptor status is invalid")
+        if descriptor.conformance is not None:
+            self._validate_conformance_block(descriptor)
+
+    def _validate_conformance_block(self, descriptor: CapabilityDescriptor) -> None:
+        conformance = descriptor.conformance or {}
+        required = {
+            "level",
+            "suite_version",
+            "standard_release_ref",
+            "evidence_ref",
+            "determinism_hash",
+            "expires_at",
+        }
+        missing = sorted(required - set(conformance))
+        if missing:
+            raise RegistryError("CONFORMANCE_MISSING: " + ", ".join(missing))
+        level = conformance["level"]
+        if level not in {"bronze", "silver", "gold"}:
+            raise RegistryError("CONFORMANCE_LEVEL_INVALID")
+        expires_at = _parse_conformance_expiry(conformance["expires_at"])
+        if expires_at <= datetime.now(UTC):
+            raise RegistryError("CONFORMANCE_EXPIRED")
+        if self._artifact_store is None:
+            return
+        evidence = self._load_conformance_evidence(conformance["evidence_ref"])
+        _assert_conformance_evidence_matches_descriptor(
+            descriptor=descriptor,
+            conformance=conformance,
+            evidence=evidence,
+        )
+
+    def _load_conformance_evidence(self, evidence_ref: str) -> Mapping[str, Any]:
+        try:
+            payload = json.loads(self._artifact_store.get_artifact(evidence_ref).decode("utf-8"))
+        except KeyError as exc:
+            raise RegistryError("CONFORMANCE_EVIDENCE_NOT_FOUND") from exc
+        except json.JSONDecodeError as exc:
+            raise RegistryError("CONFORMANCE_EVIDENCE_INVALID") from exc
+        if not isinstance(payload, Mapping):
+            raise RegistryError("CONFORMANCE_EVIDENCE_INVALID")
+        return payload
 
 
 class ContaminationIndex:
@@ -323,3 +365,40 @@ def _jaccard(left: Iterable[str], right: Iterable[str]) -> float:
     if not left_set or not right_set:
         return 0.0
     return len(left_set & right_set) / len(left_set | right_set)
+
+
+def _parse_conformance_expiry(value: str) -> datetime:
+    if not isinstance(value, str):
+        raise RegistryError("CONFORMANCE_EXPIRES_AT_INVALID")
+    try:
+        normalized = value.replace("Z", "+00:00") if value.endswith("Z") else value
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError as exc:
+        raise RegistryError("CONFORMANCE_EXPIRES_AT_INVALID") from exc
+    if parsed.tzinfo is None:
+        raise RegistryError("CONFORMANCE_EXPIRES_AT_INVALID")
+    return parsed.astimezone(UTC)
+
+
+def _assert_conformance_evidence_matches_descriptor(
+    *,
+    descriptor: CapabilityDescriptor,
+    conformance: Mapping[str, str],
+    evidence: Mapping[str, Any],
+) -> None:
+    expected = {
+        "subagent_id": descriptor.entity_id,
+        "level_awarded": conformance["level"],
+        "suite_version": conformance["suite_version"],
+        "standard_release_ref": conformance["standard_release_ref"],
+        "aggregate_passed": True,
+    }
+    for key, expected_value in expected.items():
+        if evidence.get(key) != expected_value:
+            raise RegistryError(f"CONFORMANCE_TAMPERED: {key}")
+    if evidence.get("determinism_hash") != conformance["determinism_hash"]:
+        raise RegistryError("CONFORMANCE_TAMPERED: determinism_hash")
+    unsigned_evidence = dict(evidence)
+    unsigned_evidence.pop("determinism_hash", None)
+    if hash_json(unsigned_evidence) != conformance["determinism_hash"]:
+        raise RegistryError("CONFORMANCE_TAMPERED: evidence_hash")

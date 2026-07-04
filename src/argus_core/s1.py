@@ -6,6 +6,7 @@ import ast
 import inspect
 import textwrap
 from abc import ABC, abstractmethod
+from collections.abc import Mapping as CollectionsMapping
 from dataclasses import asdict, dataclass, field, is_dataclass, replace
 from enum import Enum
 from typing import Any, Mapping, NoReturn, final
@@ -1427,14 +1428,17 @@ class S1ConformanceResult:
     determinism_hash: str
     evidence_ref: str
 
-    def descriptor_conformance_block(self) -> dict[str, str]:
-        return {
+    def descriptor_conformance_block(self, *, expires_at: str | None = None) -> dict[str, str]:
+        block = {
             "level": self.level_awarded,
             "suite_version": self.suite_version,
             "standard_release_ref": self.standard_release_ref,
             "evidence_ref": self.evidence_ref,
             "determinism_hash": self.determinism_hash,
         }
+        if expires_at is not None:
+            block["expires_at"] = _non_empty_conformance_string(expires_at, "expires_at")
+        return block
 
     def as_payload(self) -> dict[str, Any]:
         return {
@@ -1459,9 +1463,23 @@ def build_s1_capability_descriptor(
     independence_tags: tuple[str, ...] = (),
     trust_class: str = "internal",
     provenance_ref: str = "c4://pending",
+    conformance: Mapping[str, str] | None = None,
+    conformance_result: S1ConformanceResult | None = None,
+    conformance_expires_at: str | None = None,
 ) -> CapabilityDescriptor:
     """Build an S1-owned C5 descriptor from the C1 subagent descriptor."""
 
+    if conformance is not None and conformance_result is not None:
+        raise ValueError("provide either conformance or conformance_result, not both")
+    conformance_block = (
+        _s1_descriptor_conformance_from_result(
+            descriptor,
+            conformance_result,
+            expires_at=conformance_expires_at,
+        )
+        if conformance_result is not None
+        else _normalize_s1_descriptor_conformance(conformance)
+    )
     scopes = _normalize_s1_descriptor_values(
         capability_scopes if capability_scopes is not None else S1_CAPABILITY_DESCRIPTOR_DEFAULT_SCOPES,
         "capability_scopes",
@@ -1478,6 +1496,7 @@ def build_s1_capability_descriptor(
         provenance_ref=provenance_ref,
         subtopics=_normalize_s1_descriptor_values(descriptor.subtopics, "subtopics"),
         independence_tags=_normalize_s1_descriptor_values(independence_tags, "independence_tags"),
+        conformance=conformance_block,
     )
 
 
@@ -1489,6 +1508,9 @@ def publish_s1_capability_descriptor(
     capability_scopes: tuple[str, ...] | None = None,
     independence_tags: tuple[str, ...] = (),
     trust_class: str = "internal",
+    conformance: Mapping[str, str] | None = None,
+    conformance_result: S1ConformanceResult | None = None,
+    conformance_expires_at: str | None = None,
 ) -> CapabilityDescriptor:
     """Publish an S1 C5 descriptor through the registry with C4 provenance."""
 
@@ -1499,6 +1521,9 @@ def publish_s1_capability_descriptor(
             capability_scopes=capability_scopes,
             independence_tags=independence_tags,
             trust_class=trust_class,
+            conformance=conformance,
+            conformance_result=conformance_result,
+            conformance_expires_at=conformance_expires_at,
         )
     )
 
@@ -1517,6 +1542,35 @@ def _assert_s1_descriptor_scopes(scopes: tuple[str, ...]) -> None:
     missing = [scope for scope in S1_CAPABILITY_DESCRIPTOR_DEFAULT_SCOPES if scope not in scopes]
     if missing:
         raise ValueError("S1 capability descriptor missing required scope(s): " + ", ".join(missing))
+
+
+def _normalize_s1_descriptor_conformance(conformance: Mapping[str, str] | None) -> dict[str, str] | None:
+    if conformance is None:
+        return None
+    if not isinstance(conformance, CollectionsMapping):
+        raise ValueError("conformance must be a mapping")
+    normalized: dict[str, str] = {}
+    for key, value in conformance.items():
+        normalized[_non_empty_conformance_string(key, "conformance key")] = _non_empty_conformance_string(
+            value,
+            f"conformance.{key}",
+        )
+    return normalized
+
+
+def _s1_descriptor_conformance_from_result(
+    descriptor: SubagentDescriptor,
+    result: S1ConformanceResult,
+    *,
+    expires_at: str | None,
+) -> dict[str, str]:
+    if result.subagent_id != descriptor.subagent_id:
+        raise ValueError("S1 descriptor conformance result subagent_id mismatch")
+    if not result.aggregate_passed or result.level_awarded != result.level_requested:
+        raise ValueError("S1 descriptor requires a passing conformance result")
+    if expires_at is None:
+        raise ValueError("S1 descriptor conformance expires_at is required")
+    return result.descriptor_conformance_block(expires_at=expires_at)
 
 
 class S1ReferenceConformanceHarness:

@@ -56,7 +56,9 @@
           "properties": {
             "level": { "type": "string", "enum": ["bronze", "silver", "gold"] },
             "suite_version": { "type": "string" },
+            "standard_release_ref": { "$ref": "#/$defs/ArtifactRef" },
             "evidence_ref": { "$ref": "#/$defs/ArtifactRef" },
+            "determinism_hash": { "type": "string", "pattern": "^blake3:[a-f0-9]{64}$" },
             "expires_at": { "type": "string", "format": "date-time" }
           }
         },

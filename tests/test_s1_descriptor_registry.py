@@ -7,8 +7,13 @@ import unittest
 from jsonschema import Draft202012Validator
 
 from argus_core import (
+    ExecContext,
     InMemoryArtifactStore,
     InMemoryRegistry,
+    JobEnvelope,
+    Lineage,
+    S1ReferenceConformanceHarness,
+    Subagent,
     SubagentDescriptor,
     build_s1_capability_descriptor,
     publish_s1_capability_descriptor,
@@ -17,6 +22,35 @@ from argus_core import (
 
 ROOT = Path(__file__).resolve().parents[1]
 C5_SCHEMA_PATH = ROOT / "schemas" / "contracts" / "c5.capability-descriptor.schema.json"
+FUTURE_EXPIRES_AT = "2099-01-01T00:00:00Z"
+PAST_EXPIRES_AT = "1970-01-02T00:00:00Z"
+
+
+class DescriptorConformanceSubagent(Subagent):
+    def plan(self, ctx: ExecContext, envelope: JobEnvelope) -> dict[str, object]:
+        return {
+            "steps": [{"step_id": "fit", "kind": "train", "description": "Fit descriptor conformance model"}],
+            "adapters_required": list(envelope.required_adapters),
+            "datasets_required": [],
+            "risk_notes": [],
+        }
+
+    def build(self, ctx: ExecContext, plan: dict[str, object]) -> dict[str, object]:
+        artifact = ctx.emit_artifact(
+            {"weights": [1.0], "plan_hash": plan["plan_hash"]},
+            kind="model",
+            lineage=Lineage(
+                input_refs=(),
+                code_ref="git:project-argus@s1-t23-descriptor-conformance",
+                environment_digest="oci:s1-t23-descriptor-conformance@sha256-reference",
+                seeds=("s1-t23-conformance-seed",),
+            ),
+        )
+        return {
+            "artifact_refs": [str(artifact["artifact_ref"])],
+            "diagnostics": {"model_ref": str(artifact["artifact_ref"])},
+            "self_checks": [{"type": "smoke", "status": "PASS", "advisory": True}],
+        }
 
 
 class S1CapabilityDescriptorRegistryTests(unittest.TestCase):
@@ -32,6 +66,16 @@ class S1CapabilityDescriptorRegistryTests(unittest.TestCase):
             contract_version="1.0.0",
             subtopics=("ewpt", "gw-spectrum"),
             required_adapters=("adapter:bounce", "adapter:gw"),
+        )
+        self.envelope = JobEnvelope(
+            job_id="23232323-2323-4232-8232-232323232323",
+            envelope_version="1.0.0",
+            subtopic="ewpt",
+            required_adapters=("adapter:bounce",),
+            allowed_adapters=("adapter:bounce",),
+            verifier_profile_ref="c4://profile/ewpt/s1-t23",
+            estimated_cost=0.25,
+            budget_cost=1.0,
         )
 
     def test_builder_emits_schema_valid_c5_descriptor_for_s1_subagent(self) -> None:
@@ -91,6 +135,94 @@ class S1CapabilityDescriptorRegistryTests(unittest.TestCase):
 
         self.assertEqual(registry.events, ())
         self.assertEqual(store.record_count, 0)
+
+    def test_publish_populates_unexpired_conformance_block_from_passing_run(self) -> None:
+        store = InMemoryArtifactStore()
+        registry = InMemoryRegistry(artifact_store=store)
+        result = self._run_conformance(store, level="bronze")
+
+        published = publish_s1_capability_descriptor(
+            registry,
+            self.subagent_descriptor,
+            revision=1,
+            independence_tags=("impl-reference",),
+            conformance_result=result,
+            conformance_expires_at=FUTURE_EXPIRES_AT,
+        )
+
+        payload = published.as_c5_payload()
+        record_payload = json.loads(store.get_artifact(published.provenance_ref).decode("utf-8"))
+        expected = {
+            "level": "bronze",
+            "suite_version": result.suite_version,
+            "standard_release_ref": result.standard_release_ref,
+            "evidence_ref": result.evidence_ref,
+            "determinism_hash": result.determinism_hash,
+            "expires_at": FUTURE_EXPIRES_AT,
+        }
+
+        self._assert_valid(payload)
+        self.assertEqual(payload["conformance"], expected)
+        self.assertEqual(record_payload["conformance"], expected)
+        self.assertEqual(registry.get(self.subagent_descriptor.subagent_id).conformance, expected)
+
+    def test_publish_rejects_failed_conformance_result_before_registry_mutation(self) -> None:
+        store = InMemoryArtifactStore()
+        registry = InMemoryRegistry(artifact_store=store)
+        failed = self._run_conformance(store, level="silver")
+        evidence_records = store.record_count
+
+        with self.assertRaisesRegex(ValueError, "passing conformance"):
+            publish_s1_capability_descriptor(
+                registry,
+                self.subagent_descriptor,
+                revision=1,
+                independence_tags=("impl-reference",),
+                conformance_result=failed,
+                conformance_expires_at=FUTURE_EXPIRES_AT,
+            )
+
+        self.assertFalse(failed.aggregate_passed)
+        self.assertEqual(registry.events, ())
+        self.assertEqual(store.record_count, evidence_records)
+
+    def test_registry_rejects_expired_or_tampered_conformance_block(self) -> None:
+        store = InMemoryArtifactStore()
+        registry = InMemoryRegistry(artifact_store=store)
+        result = self._run_conformance(store, level="bronze")
+        valid_conformance = result.descriptor_conformance_block(expires_at=FUTURE_EXPIRES_AT)
+
+        expired = build_s1_capability_descriptor(
+            self.subagent_descriptor,
+            revision=1,
+            independence_tags=("impl-reference",),
+            conformance=valid_conformance | {"expires_at": PAST_EXPIRES_AT},
+        )
+        tampered = build_s1_capability_descriptor(
+            self.subagent_descriptor,
+            revision=1,
+            independence_tags=("impl-reference",),
+            conformance=valid_conformance | {"determinism_hash": "blake3:tampered"},
+        )
+
+        with self.assertRaisesRegex(Exception, "CONFORMANCE_EXPIRED"):
+            registry.publish(expired)
+        with self.assertRaisesRegex(Exception, "CONFORMANCE_TAMPERED"):
+            registry.publish(tampered)
+
+        self.assertEqual(registry.events, ())
+
+    def _run_conformance(self, store: InMemoryArtifactStore, *, level: str):
+        harness = S1ReferenceConformanceHarness(
+            suite_version="s1-reference-conformance.v1",
+            standard_release_ref="c4://standard/c1/1.0.0",
+        )
+        return harness.run(
+            DescriptorConformanceSubagent(self.subagent_descriptor),
+            envelope=self.envelope,
+            level=level,
+            artifact_store=store,
+        )
 
     def _assert_valid(self, payload: dict[str, object]) -> None:
         errors = sorted(self.validator.iter_errors(payload), key=lambda error: list(error.path))
