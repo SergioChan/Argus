@@ -7,6 +7,7 @@ from dataclasses import asdict, dataclass, field
 import hashlib
 from itertools import product
 import json
+import math
 import os
 from pathlib import Path
 import tempfile
@@ -33,6 +34,25 @@ class RewardSourceError(S2Error):
 
 class S2ContractModelError(S2Error):
     """Raised when S2's contract-bound model surface is missing or drifting."""
+
+
+class UncertaintyRequiredError(S2ContractModelError):
+    """Raised when S2 receives a point-estimate-only model without a UQ wrapper."""
+
+    def __init__(self, message: str = "S2 requires native or calibrated uncertainty before model finalization") -> None:
+        super().__init__(message)
+        self.category = "POLICY"
+        self.code = "MISSING_UNCERTAINTY"
+        self.message = message
+        self.retryable = False
+
+    def as_c1_payload(self) -> dict[str, Any]:
+        return {
+            "category": self.category,
+            "code": self.code,
+            "message": self.message,
+            "retryable": self.retryable,
+        }
 
 
 class S2SpecCompilerError(S2Error):
@@ -2463,6 +2483,372 @@ class TrainingRunResult:
     partial_checkpoint: PartialModelCheckpoint | None
     diagnostics: dict[str, Any]
     cost_actual: dict[str, float | int]
+
+
+@dataclass(frozen=True)
+class UQCalibrationSample:
+    sample_id: str
+    prediction: float
+    target: float
+    interval_lower: float | None = None
+    interval_upper: float | None = None
+
+    def __post_init__(self) -> None:
+        sample_id = self.sample_id.strip()
+        if not sample_id:
+            raise S2ContractModelError("S2 UQ calibration samples require sample_id")
+        prediction = float(self.prediction)
+        target = float(self.target)
+        if not math.isfinite(prediction) or not math.isfinite(target):
+            raise S2ContractModelError("S2 UQ calibration samples require finite prediction and target")
+        interval_lower = None if self.interval_lower is None else float(self.interval_lower)
+        interval_upper = None if self.interval_upper is None else float(self.interval_upper)
+        if interval_lower is not None and not math.isfinite(interval_lower):
+            raise S2ContractModelError("S2 UQ calibration samples require finite interval_lower")
+        if interval_upper is not None and not math.isfinite(interval_upper):
+            raise S2ContractModelError("S2 UQ calibration samples require finite interval_upper")
+        if interval_lower is not None and interval_upper is not None and interval_lower > interval_upper:
+            raise S2ContractModelError("S2 UQ calibration sample interval_lower cannot exceed interval_upper")
+        object.__setattr__(self, "sample_id", sample_id)
+        object.__setattr__(self, "prediction", prediction)
+        object.__setattr__(self, "target", target)
+        object.__setattr__(self, "interval_lower", interval_lower)
+        object.__setattr__(self, "interval_upper", interval_upper)
+
+    @property
+    def residual(self) -> float:
+        return abs(self.target - self.prediction)
+
+    def covered_by_interval(self, *, lower: float, upper: float) -> bool:
+        return lower <= self.target <= upper
+
+    def covered_by_radius(self, radius: float) -> bool:
+        return self.covered_by_interval(lower=self.prediction - radius, upper=self.prediction + radius)
+
+    def covered_by_native_interval(self) -> bool:
+        if self.interval_lower is None or self.interval_upper is None:
+            raise S2ContractModelError("S2 native interval UQ samples require interval_lower and interval_upper")
+        return self.covered_by_interval(lower=self.interval_lower, upper=self.interval_upper)
+
+
+@dataclass(frozen=True)
+class UQCalibrationRequest:
+    job_id: str
+    model_artifact_ref: str
+    split_manifest_ref: str
+    calibration_input_refs: tuple[str, ...]
+    validation_input_refs: tuple[str, ...]
+    calibration_samples: tuple[UQCalibrationSample, ...]
+    validation_samples: tuple[UQCalibrationSample, ...]
+    uncertainty_method: str
+    native_uq: str
+    nominal_coverage: float
+    coverage_tolerance: float
+    code_ref: str
+    environment_digest: str
+    seed: str
+    nondeterminism_tolerance: float = 0.0
+    replay_output_pairs: tuple[tuple[float, float], ...] = ()
+
+    def __post_init__(self) -> None:
+        job_id = self.job_id.strip()
+        model_artifact_ref = self.model_artifact_ref.strip()
+        split_manifest_ref = self.split_manifest_ref.strip()
+        calibration_input_refs = tuple(str(ref).strip() for ref in self.calibration_input_refs)
+        validation_input_refs = tuple(str(ref).strip() for ref in self.validation_input_refs)
+        uncertainty_method = self.uncertainty_method.strip()
+        native_uq = self.native_uq.strip()
+        code_ref = self.code_ref.strip()
+        environment_digest = self.environment_digest.strip()
+        seed = self.seed.strip()
+        nominal_coverage = float(self.nominal_coverage)
+        coverage_tolerance = float(self.coverage_tolerance)
+        nondeterminism_tolerance = float(self.nondeterminism_tolerance)
+        replay_output_pairs = tuple((float(left), float(right)) for left, right in self.replay_output_pairs)
+        if not job_id:
+            raise S2ContractModelError("S2 UQCalibrationRequest requires job_id")
+        if not model_artifact_ref:
+            raise S2ContractModelError("S2 UQCalibrationRequest requires model_artifact_ref")
+        if not split_manifest_ref:
+            raise S2ContractModelError("S2 UQCalibrationRequest requires split_manifest_ref")
+        if not calibration_input_refs or any(not ref for ref in calibration_input_refs):
+            raise S2ContractModelError("S2 UQCalibrationRequest requires calibration_input_refs")
+        if not validation_input_refs or any(not ref for ref in validation_input_refs):
+            raise S2ContractModelError("S2 UQCalibrationRequest requires validation_input_refs")
+        if not self.calibration_samples:
+            raise S2ContractModelError("S2 UQCalibrationRequest requires calibration_samples")
+        if not self.validation_samples:
+            raise S2ContractModelError("S2 UQCalibrationRequest requires validation_samples")
+        if uncertainty_method not in {"none", "split_conformal", "native_interval"}:
+            raise S2ContractModelError(f"unsupported S2 UQ uncertainty_method: {uncertainty_method}")
+        if not native_uq:
+            raise S2ContractModelError("S2 UQCalibrationRequest requires native_uq")
+        if not 0.0 < nominal_coverage < 1.0:
+            raise S2ContractModelError("S2 UQ nominal_coverage must be between 0 and 1")
+        if coverage_tolerance < 0 or coverage_tolerance >= 1:
+            raise S2ContractModelError("S2 UQ coverage_tolerance must be in [0, 1)")
+        if not code_ref:
+            raise S2ContractModelError("S2 UQCalibrationRequest requires code_ref")
+        if not environment_digest:
+            raise S2ContractModelError("S2 UQCalibrationRequest requires environment_digest")
+        if not seed:
+            raise S2ContractModelError("S2 UQCalibrationRequest requires seed")
+        if nondeterminism_tolerance < 0:
+            raise S2ContractModelError("S2 UQ nondeterminism_tolerance must be non-negative")
+        for left, right in replay_output_pairs:
+            if not math.isfinite(left) or not math.isfinite(right):
+                raise S2ContractModelError("S2 UQ replay outputs must be finite")
+        object.__setattr__(self, "job_id", job_id)
+        object.__setattr__(self, "model_artifact_ref", model_artifact_ref)
+        object.__setattr__(self, "split_manifest_ref", split_manifest_ref)
+        object.__setattr__(self, "calibration_input_refs", calibration_input_refs)
+        object.__setattr__(self, "validation_input_refs", validation_input_refs)
+        object.__setattr__(self, "calibration_samples", tuple(self.calibration_samples))
+        object.__setattr__(self, "validation_samples", tuple(self.validation_samples))
+        object.__setattr__(self, "uncertainty_method", uncertainty_method)
+        object.__setattr__(self, "native_uq", native_uq)
+        object.__setattr__(self, "nominal_coverage", nominal_coverage)
+        object.__setattr__(self, "coverage_tolerance", coverage_tolerance)
+        object.__setattr__(self, "code_ref", code_ref)
+        object.__setattr__(self, "environment_digest", environment_digest)
+        object.__setattr__(self, "seed", seed)
+        object.__setattr__(self, "nondeterminism_tolerance", nondeterminism_tolerance)
+        object.__setattr__(self, "replay_output_pairs", replay_output_pairs)
+
+
+@dataclass(frozen=True)
+class CalibrationAdvisoryCheck:
+    name: str
+    status: str
+    nominal_coverage: float
+    empirical_coverage: float
+    tolerance: float
+    calibration_error: float
+    message: str
+
+    def __post_init__(self) -> None:
+        status = self.status.strip()
+        if status not in {"PASS", "FAIL"}:
+            raise S2ContractModelError(f"unsupported S2 calibration advisory status: {status}")
+        object.__setattr__(self, "name", self.name.strip() or "calibration")
+        object.__setattr__(self, "status", status)
+        object.__setattr__(self, "nominal_coverage", float(self.nominal_coverage))
+        object.__setattr__(self, "empirical_coverage", float(self.empirical_coverage))
+        object.__setattr__(self, "tolerance", float(self.tolerance))
+        object.__setattr__(self, "calibration_error", float(self.calibration_error))
+
+
+@dataclass(frozen=True)
+class CalibrationRepairAction:
+    code: str
+    reason: str
+    severity: str = "required"
+
+    def __post_init__(self) -> None:
+        code = self.code.strip()
+        reason = self.reason.strip()
+        severity = self.severity.strip()
+        if not code:
+            raise S2ContractModelError("S2 calibration repair actions require code")
+        if not reason:
+            raise S2ContractModelError("S2 calibration repair actions require reason")
+        if not severity:
+            raise S2ContractModelError("S2 calibration repair actions require severity")
+        object.__setattr__(self, "code", code)
+        object.__setattr__(self, "reason", reason)
+        object.__setattr__(self, "severity", severity)
+
+
+@dataclass(frozen=True)
+class UQCalibrationResult:
+    job_id: str
+    status: str
+    uncertainty_method: str
+    native_uq: str
+    nominal_coverage: float
+    empirical_coverage: float
+    coverage_tolerance: float
+    calibration_error: float
+    interval_radius: float | None
+    passed_internal_coverage: bool
+    advisory_check: CalibrationAdvisoryCheck
+    repair_actions: tuple[CalibrationRepairAction, ...]
+    calibration_artifact_ref: str
+    uncertainty_tag: dict[str, Any]
+    self_replay_passed: bool
+    max_replay_delta: float
+    diagnostics: dict[str, Any] = field(default_factory=dict)
+
+
+class UQCalibrator:
+    """Calibrates and validates S2 uncertainty evidence without surfacing raw labels."""
+
+    def __init__(
+        self,
+        *,
+        artifact_store: InMemoryArtifactStore,
+        provenance_emitter: "ProvenanceEmitter" | None = None,
+    ) -> None:
+        self._artifact_store = artifact_store
+        self._provenance_emitter = provenance_emitter or ProvenanceEmitter(artifact_store=artifact_store)
+
+    def calibrate(self, request: UQCalibrationRequest) -> UQCalibrationResult:
+        self._assert_uncertainty_available(request)
+        self._assert_required_inputs_exist(request)
+        if request.uncertainty_method == "split_conformal":
+            interval_radius = self._split_conformal_radius(request.calibration_samples, request.nominal_coverage)
+            empirical_coverage = self._coverage_for_radius(request.validation_samples, interval_radius)
+            interval = {"kind": "symmetric_conformal", "radius": interval_radius}
+        elif request.uncertainty_method == "native_interval":
+            interval_radius = None
+            empirical_coverage = self._coverage_for_native_intervals(request.validation_samples)
+            interval = {"kind": "native_interval", "radius": None}
+        else:
+            raise UncertaintyRequiredError()
+
+        calibration_error = abs(empirical_coverage - request.nominal_coverage)
+        passed_internal_coverage = calibration_error <= request.coverage_tolerance
+        advisory_check = CalibrationAdvisoryCheck(
+            name="calibration",
+            status="PASS" if passed_internal_coverage else "FAIL",
+            nominal_coverage=request.nominal_coverage,
+            empirical_coverage=empirical_coverage,
+            tolerance=request.coverage_tolerance,
+            calibration_error=calibration_error,
+            message="coverage within tolerance" if passed_internal_coverage else "coverage outside tolerance",
+        )
+        repair_actions = () if passed_internal_coverage else (
+            CalibrationRepairAction(
+                code="calibration_fail",
+                reason="empirical coverage is outside the declared tolerance",
+            ),
+        )
+        self_replay_passed, max_replay_delta = self._self_replay_status(request)
+        if not self_replay_passed:
+            repair_actions = repair_actions + (
+                CalibrationRepairAction(
+                    code="nondeterminism_tolerance_fail",
+                    reason="self replay delta exceeds declared nondeterminism_tolerance",
+                ),
+            )
+        status = "CALIBRATED" if passed_internal_coverage and self_replay_passed else "NEEDS_REPAIR"
+        uncertainty_tag = {
+            "kind": "interval",
+            "source": request.uncertainty_method,
+            "native_uq": request.native_uq,
+            "nominal_coverage": request.nominal_coverage,
+            "calibrated": status == "CALIBRATED",
+            "claim_tier": "ran-toy",
+        }
+        payload = {
+            "job_id": request.job_id,
+            "status": status,
+            "model_artifact_ref": request.model_artifact_ref,
+            "split_manifest_ref": request.split_manifest_ref,
+            "uncertainty_method": request.uncertainty_method,
+            "native_uq": request.native_uq,
+            "nominal_coverage": request.nominal_coverage,
+            "empirical_coverage": empirical_coverage,
+            "coverage_tolerance": request.coverage_tolerance,
+            "calibration_error": calibration_error,
+            "calibration_sample_count": len(request.calibration_samples),
+            "validation_sample_count": len(request.validation_samples),
+            "passed_internal_coverage": passed_internal_coverage,
+            "interval": interval,
+            "advisory_check": asdict(advisory_check),
+            "repair_actions": [asdict(action) for action in repair_actions],
+            "self_replay": {
+                "evaluated": bool(request.replay_output_pairs),
+                "status": "PASS" if self_replay_passed else "FAIL",
+                "max_delta": max_replay_delta,
+                "nondeterminism_tolerance": request.nondeterminism_tolerance,
+            },
+            "uncertainty_tag": uncertainty_tag,
+            "label_policy": {
+                "raw_labels_materialized": False,
+                "payload_contains_sample_rows": False,
+            },
+        }
+        record = self._provenance_emitter.emit_artifact(
+            kind="uq_calibration",
+            payload=payload,
+            producer=Producer(subsystem="S2", version="0.0.0", job_id=request.job_id),
+            lineage=Lineage(
+                input_refs=(
+                    request.model_artifact_ref,
+                    request.split_manifest_ref,
+                )
+                + request.calibration_input_refs
+                + request.validation_input_refs,
+                code_ref=request.code_ref,
+                environment_digest=request.environment_digest,
+                seeds=(request.seed,),
+                job_id=request.job_id,
+            ),
+            claim_tier="ran-toy",
+        )
+        return UQCalibrationResult(
+            job_id=request.job_id,
+            status=status,
+            uncertainty_method=request.uncertainty_method,
+            native_uq=request.native_uq,
+            nominal_coverage=request.nominal_coverage,
+            empirical_coverage=empirical_coverage,
+            coverage_tolerance=request.coverage_tolerance,
+            calibration_error=calibration_error,
+            interval_radius=interval_radius,
+            passed_internal_coverage=passed_internal_coverage,
+            advisory_check=advisory_check,
+            repair_actions=repair_actions,
+            calibration_artifact_ref=record.artifact_ref,
+            uncertainty_tag=uncertainty_tag,
+            self_replay_passed=self_replay_passed,
+            max_replay_delta=max_replay_delta,
+            diagnostics={
+                "calibration_sample_count": len(request.calibration_samples),
+                "validation_sample_count": len(request.validation_samples),
+                "claim_tier": "ran-toy",
+            },
+        )
+
+    @staticmethod
+    def _assert_uncertainty_available(request: UQCalibrationRequest) -> None:
+        if request.uncertainty_method == "none" and request.native_uq in {"none", "point_estimate", "point-estimate"}:
+            raise UncertaintyRequiredError()
+
+    def _assert_required_inputs_exist(self, request: UQCalibrationRequest) -> None:
+        model_record = self._artifact_store.get_record(request.model_artifact_ref)
+        if model_record.kind not in {"model", "model_checkpoint"}:
+            raise S2ContractModelError(f"S2 UQCalibrator requires model or model_checkpoint input, got {model_record.kind!r}")
+        split_record = self._artifact_store.get_record(request.split_manifest_ref)
+        if split_record.kind != "dataset_split":
+            raise S2ContractModelError(f"S2 UQCalibrator requires dataset_split input, got {split_record.kind!r}")
+
+    @staticmethod
+    def _split_conformal_radius(samples: tuple[UQCalibrationSample, ...], nominal_coverage: float) -> float:
+        residuals = sorted(sample.residual for sample in samples)
+        if not residuals:
+            raise S2ContractModelError("S2 split conformal calibration requires residuals")
+        rank = math.ceil((len(residuals) + 1) * nominal_coverage)
+        index = min(max(rank, 1), len(residuals)) - 1
+        return residuals[index]
+
+    @staticmethod
+    def _coverage_for_radius(samples: tuple[UQCalibrationSample, ...], radius: float) -> float:
+        covered = sum(1 for sample in samples if sample.covered_by_radius(radius))
+        return covered / float(len(samples))
+
+    @staticmethod
+    def _coverage_for_native_intervals(samples: tuple[UQCalibrationSample, ...]) -> float:
+        covered = sum(1 for sample in samples if sample.covered_by_native_interval())
+        return covered / float(len(samples))
+
+    @staticmethod
+    def _self_replay_status(request: UQCalibrationRequest) -> tuple[bool, float]:
+        if not request.replay_output_pairs:
+            return True, 0.0
+        max_delta = max(abs(left - right) for left, right in request.replay_output_pairs)
+        return max_delta <= request.nondeterminism_tolerance, max_delta
 
 
 class DeterministicLinearTrainingBackend:
