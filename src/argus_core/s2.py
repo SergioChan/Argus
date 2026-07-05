@@ -86,6 +86,282 @@ class FieldSpec:
             raise S2ContractModelError(f"S2 field {self.name!r} requires units")
 
 
+S2_DIMENSION_BASES = ("energy", "length", "time", "mass", "temperature", "charge")
+S2_UNIT_REGISTRY_VERSION = "argus-s2-units@1"
+
+
+class DimensionalError(S2Error):
+    """Raised when a derived S2 feature has the wrong physical dimension."""
+
+    def __init__(
+        self,
+        *,
+        node_id: str,
+        expected: "DimensionVector",
+        actual: "DimensionVector",
+        valid_nodes: tuple["FeatureNode", ...] = (),
+    ) -> None:
+        super().__init__(f"feature {node_id!r} has dimension {actual}, expected {expected}")
+        self.category = "POLICY"
+        self.code = "DIMENSIONAL_INCONSISTENCY"
+        self.node_id = node_id
+        self.expected = expected
+        self.actual = actual
+        self.valid_nodes = valid_nodes
+        self.valid_node_count = len(valid_nodes)
+        self.retryable = False
+
+
+@dataclass(frozen=True)
+class DimensionVector:
+    exponents: tuple[int, ...]
+
+    def __post_init__(self) -> None:
+        normalized = tuple(int(value) for value in self.exponents)
+        if len(normalized) != len(S2_DIMENSION_BASES):
+            raise S2ContractModelError(
+                f"dimension vector must have {len(S2_DIMENSION_BASES)} exponents, got {len(normalized)}"
+            )
+        object.__setattr__(self, "exponents", normalized)
+
+    @classmethod
+    def dimensionless(cls) -> "DimensionVector":
+        return cls((0,) * len(S2_DIMENSION_BASES))
+
+    @property
+    def is_dimensionless(self) -> bool:
+        return all(value == 0 for value in self.exponents)
+
+    def __mul__(self, other: "DimensionVector") -> "DimensionVector":
+        return DimensionVector(tuple(left + right for left, right in zip(self.exponents, other.exponents)))
+
+    def __truediv__(self, other: "DimensionVector") -> "DimensionVector":
+        return DimensionVector(tuple(left - right for left, right in zip(self.exponents, other.exponents)))
+
+    def __pow__(self, exponent: int) -> "DimensionVector":
+        return DimensionVector(tuple(value * int(exponent) for value in self.exponents))
+
+    def __str__(self) -> str:
+        if self.is_dimensionless:
+            return "dimensionless"
+        parts = []
+        for name, exponent in zip(S2_DIMENSION_BASES, self.exponents):
+            if exponent == 0:
+                continue
+            parts.append(name if exponent == 1 else f"{name}^{exponent}")
+        return "*".join(parts)
+
+
+@dataclass(frozen=True)
+class UnitDefinition:
+    symbol: str
+    dimension: DimensionVector
+
+
+@dataclass(frozen=True)
+class UnitRegistry:
+    version: str
+    units: dict[str, UnitDefinition]
+
+    @classmethod
+    def default(cls) -> "UnitRegistry":
+        dimensionless = DimensionVector.dimensionless()
+        energy = _base_dimension("energy")
+        length = _base_dimension("length")
+        time = _base_dimension("time")
+        mass = _base_dimension("mass")
+        temperature = _base_dimension("temperature")
+        charge = _base_dimension("charge")
+        definitions = {
+            "1": UnitDefinition("1", dimensionless),
+            "dimensionless": UnitDefinition("dimensionless", dimensionless),
+            "GeV": UnitDefinition("GeV", energy),
+            "TeV": UnitDefinition("TeV", energy),
+            "MeV": UnitDefinition("MeV", energy),
+            "eV": UnitDefinition("eV", energy),
+            "Hz": UnitDefinition("Hz", time ** -1),
+            "mHz": UnitDefinition("mHz", time ** -1),
+            "m": UnitDefinition("m", length),
+            "cm": UnitDefinition("cm", length),
+            "mm": UnitDefinition("mm", length),
+            "s": UnitDefinition("s", time),
+            "kg": UnitDefinition("kg", mass),
+            "K": UnitDefinition("K", temperature),
+            "C": UnitDefinition("C", charge),
+            "pb": UnitDefinition("pb", length ** 2),
+            "fb": UnitDefinition("fb", length ** 2),
+            "barn": UnitDefinition("barn", length ** 2),
+        }
+        return cls(version=S2_UNIT_REGISTRY_VERSION, units=definitions)
+
+    def dimension(self, symbol: str) -> DimensionVector:
+        try:
+            return self.units[symbol].dimension
+        except KeyError as exc:
+            raise S2ContractModelError(f"unknown S2 unit: {symbol}") from exc
+
+
+class UnitsAlgebra:
+    """Deterministic dimension arithmetic over the frozen S2 unit registry."""
+
+    def __init__(self, registry: UnitRegistry | None = None) -> None:
+        self.registry = registry or UnitRegistry.default()
+
+    def dimension(self, unit_expression: str) -> DimensionVector:
+        expression = unit_expression.replace(" ", "")
+        if expression in {"", "1", "dimensionless"}:
+            return DimensionVector.dimensionless()
+        result = DimensionVector.dimensionless()
+        operator = 1
+        for raw_token in _unit_expression_tokens(expression):
+            if raw_token == "*":
+                operator = 1
+                continue
+            if raw_token == "/":
+                operator = -1
+                continue
+            symbol, exponent = _unit_token_power(raw_token)
+            result = result * (self.registry.dimension(symbol) ** (operator * exponent))
+            operator = 1
+        return result
+
+    def multiply(self, left: str | DimensionVector, right: str | DimensionVector) -> DimensionVector:
+        return self._dimension_value(left) * self._dimension_value(right)
+
+    def divide(self, left: str | DimensionVector, right: str | DimensionVector) -> DimensionVector:
+        return self._dimension_value(left) / self._dimension_value(right)
+
+    def power(self, value: str | DimensionVector, exponent: int) -> DimensionVector:
+        return self._dimension_value(value) ** exponent
+
+    def feature_dimension(self, node: "FeatureNode") -> DimensionVector:
+        result = DimensionVector.dimensionless()
+        for term in node.terms:
+            result = result * (self.dimension(term.units) ** term.exponent)
+        return result
+
+    def _dimension_value(self, value: str | DimensionVector) -> DimensionVector:
+        return value if isinstance(value, DimensionVector) else self.dimension(value)
+
+
+@dataclass(frozen=True)
+class FeatureTerm:
+    field_name: str
+    units: str
+    exponent: int = 1
+
+    def __post_init__(self) -> None:
+        if not self.field_name:
+            raise S2ContractModelError("feature terms require field_name")
+        if not self.units:
+            raise S2ContractModelError(f"feature term {self.field_name!r} requires units")
+        object.__setattr__(self, "exponent", int(self.exponent))
+
+
+@dataclass(frozen=True)
+class FeatureNode:
+    node_id: str
+    terms: tuple[FeatureTerm, ...]
+    declared_units: str
+
+    def __post_init__(self) -> None:
+        if not self.node_id:
+            raise S2ContractModelError("feature nodes require node_id")
+        if not self.terms:
+            raise S2ContractModelError(f"feature node {self.node_id!r} requires at least one term")
+        if not self.declared_units:
+            raise S2ContractModelError(f"feature node {self.node_id!r} requires declared_units")
+        object.__setattr__(self, "terms", tuple(self.terms))
+
+
+@dataclass(frozen=True)
+class FeatureDimensionValidation:
+    valid_nodes: tuple[FeatureNode, ...]
+    rejected_nodes: tuple[FeatureNode, ...]
+    errors: tuple[DimensionalError, ...]
+
+
+def validate_feature_graph_dimensions(
+    nodes: tuple[FeatureNode, ...],
+    *,
+    algebra: UnitsAlgebra | None = None,
+    raise_on_error: bool = True,
+) -> FeatureDimensionValidation:
+    units = algebra or UnitsAlgebra()
+    valid_nodes: list[FeatureNode] = []
+    rejected_nodes: list[FeatureNode] = []
+    errors: list[DimensionalError] = []
+    for node in nodes:
+        actual = units.feature_dimension(node)
+        expected = units.dimension(node.declared_units)
+        if actual != expected:
+            rejected_nodes.append(node)
+            errors.append(
+                DimensionalError(
+                    node_id=node.node_id,
+                    expected=expected,
+                    actual=actual,
+                    valid_nodes=tuple(valid_nodes),
+                )
+            )
+            continue
+        valid_nodes.append(node)
+    validation = FeatureDimensionValidation(
+        valid_nodes=tuple(valid_nodes),
+        rejected_nodes=tuple(rejected_nodes),
+        errors=tuple(errors),
+    )
+    if raise_on_error and validation.errors:
+        raise validation.errors[0]
+    return validation
+
+
+def _base_dimension(name: str) -> DimensionVector:
+    values = [0] * len(S2_DIMENSION_BASES)
+    values[S2_DIMENSION_BASES.index(name)] = 1
+    return DimensionVector(tuple(values))
+
+
+def _unit_expression_tokens(expression: str) -> tuple[str, ...]:
+    tokens: list[str] = []
+    current: list[str] = []
+    expect_operand = True
+    for char in expression:
+        if char in "*/":
+            if not current:
+                if expect_operand:
+                    raise S2ContractModelError(f"invalid unit expression: {expression}")
+            else:
+                tokens.append("".join(current))
+                current = []
+            tokens.append(char)
+            expect_operand = True
+        else:
+            current.append(char)
+            expect_operand = False
+    if current:
+        tokens.append("".join(current))
+    elif tokens and tokens[-1] in {"*", "/"}:
+        raise S2ContractModelError(f"invalid unit expression: {expression}")
+    if not tokens:
+        raise S2ContractModelError("unit expression is empty")
+    return tuple(tokens)
+
+
+def _unit_token_power(token: str) -> tuple[str, int]:
+    if token == "1":
+        return "1", 1
+    if "^" not in token:
+        return token, 1
+    symbol, exponent = token.split("^", 1)
+    if not symbol or not exponent:
+        raise S2ContractModelError(f"invalid unit power expression: {token}")
+    try:
+        return symbol, int(exponent)
+    except ValueError as exc:
+        raise S2ContractModelError(f"unit exponents must be integers: {token}") from exc
+
+
 @dataclass(frozen=True)
 class C3VerifierProfile:
     profile_ref: str
