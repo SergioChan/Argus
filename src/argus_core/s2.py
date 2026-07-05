@@ -290,6 +290,10 @@ class FeatureNode:
     node_id: str
     terms: tuple[FeatureTerm, ...]
     declared_units: str
+    uncertainty_propagated: bool = False
+    uncertainty: Mapping[str, Any] | None = field(default=None, hash=False)
+    extrapolation_flag: bool = False
+    diagnostics: Mapping[str, Any] = field(default_factory=dict, hash=False)
 
     def __post_init__(self) -> None:
         if not self.node_id:
@@ -298,7 +302,12 @@ class FeatureNode:
             raise S2ContractModelError(f"feature node {self.node_id!r} requires at least one term")
         if not self.declared_units:
             raise S2ContractModelError(f"feature node {self.node_id!r} requires declared_units")
+        if self.uncertainty_propagated and self.uncertainty is None:
+            raise S2ContractModelError(f"feature node {self.node_id!r} requires propagated uncertainty")
         object.__setattr__(self, "terms", tuple(self.terms))
+        object.__setattr__(self, "diagnostics", dict(self.diagnostics))
+        if self.uncertainty is not None:
+            object.__setattr__(self, "uncertainty", dict(self.uncertainty))
 
 
 @dataclass(frozen=True)
@@ -639,6 +648,131 @@ class AsymptoticLimitInjector:
             evaluations=tuple(evaluations),
             max_abs_error=max_abs_error,
             status="PASS" if max_abs_error <= anchor.tolerance else "FAIL",
+        )
+
+
+@dataclass(frozen=True)
+class ForwardModelFeatureRequest:
+    feature_node_id: str
+    adapter_request: EvalRequest
+    output_field: str
+    declared_units: str | None = None
+    out_of_domain_policy: str = "flag"
+
+    def __post_init__(self) -> None:
+        feature_node_id = self.feature_node_id.strip()
+        output_field = self.output_field.strip()
+        declared_units = self.declared_units.strip() if self.declared_units is not None else None
+        out_of_domain_policy = self.out_of_domain_policy.strip()
+        if not feature_node_id:
+            raise S2ContractModelError("forward-model feature requires feature_node_id")
+        if not output_field:
+            raise S2ContractModelError("forward-model feature requires output_field")
+        if declared_units == "":
+            raise S2ContractModelError("forward-model feature declared_units cannot be empty")
+        if out_of_domain_policy not in {"flag", "drop"}:
+            raise S2ContractModelError("forward-model feature out_of_domain_policy must be flag or drop")
+        object.__setattr__(self, "feature_node_id", feature_node_id)
+        object.__setattr__(self, "output_field", output_field)
+        object.__setattr__(self, "declared_units", declared_units)
+        object.__setattr__(self, "out_of_domain_policy", out_of_domain_policy)
+
+
+@dataclass(frozen=True)
+class ForwardModelFeatureResult:
+    feature_node: FeatureNode | None
+    value: float | None
+    units: str | None
+    uncertainty: Mapping[str, Any] | None = field(hash=False)
+    adapter_provenance_ref: str
+    adapter_id: str
+    extrapolation_flag: bool
+    violated_fields: tuple[str, ...]
+    diagnostics: Mapping[str, Any] = field(hash=False)
+    status: str
+    advisory: bool = True
+    claim_tier: str = "ran-toy"
+
+    def __post_init__(self) -> None:
+        if self.status not in {"PASS", "EXTRAPOLATED", "DROPPED"}:
+            raise S2ContractModelError(f"unsupported forward-model feature status: {self.status}")
+        object.__setattr__(self, "violated_fields", tuple(self.violated_fields))
+        object.__setattr__(self, "diagnostics", dict(self.diagnostics))
+        if self.uncertainty is not None:
+            object.__setattr__(self, "uncertainty", dict(self.uncertainty))
+
+
+class ForwardModelFeatureInjector:
+    """Injects C6 forward-model outputs as S2 feature nodes with explicit uncertainty."""
+
+    def __init__(self, *, adapter_broker: AdapterBroker, algebra: UnitsAlgebra | None = None) -> None:
+        self._adapter_broker = adapter_broker
+        self._algebra = algebra or UnitsAlgebra()
+
+    def inject(self, request: ForwardModelFeatureRequest) -> ForwardModelFeatureResult:
+        adapter_result = self._adapter_broker.evaluate(request.adapter_request)
+        try:
+            quantity = adapter_result.outputs[request.output_field]
+        except KeyError as exc:
+            raise S2ContractModelError(f"forward-model adapter output missing field: {request.output_field}") from exc
+
+        value = float(quantity.value)
+        if not math.isfinite(value):
+            raise S2ContractModelError("forward-model adapter output value must be finite")
+        if quantity.uncertainty is None:
+            raise S2ContractModelError("forward-model adapter output must carry uncertainty")
+
+        declared_units = request.declared_units or quantity.units
+        if self._algebra.dimension(quantity.units) != self._algebra.dimension(declared_units):
+            raise S2ContractModelError(
+                f"forward-model output units {quantity.units!r} do not match declared units {declared_units!r}"
+            )
+
+        uncertainty = dict(quantity.uncertainty)
+        diagnostics = {
+            "adapter_id": adapter_result.adapter_id,
+            "adapter_provenance_ref": adapter_result.provenance_ref,
+            "output_field": request.output_field,
+            "in_validity_domain": adapter_result.in_validity_domain,
+            "extrapolation_flag": adapter_result.extrapolation_flag,
+            "violated_fields": adapter_result.violated_fields,
+            "out_of_domain_policy": request.out_of_domain_policy,
+            "uncertainty_propagated": True,
+        }
+        if adapter_result.extrapolation_flag and request.out_of_domain_policy == "drop":
+            return ForwardModelFeatureResult(
+                feature_node=None,
+                value=None,
+                units=None,
+                uncertainty=None,
+                adapter_provenance_ref=adapter_result.provenance_ref,
+                adapter_id=adapter_result.adapter_id,
+                extrapolation_flag=True,
+                violated_fields=adapter_result.violated_fields,
+                diagnostics=diagnostics,
+                status="DROPPED",
+            )
+
+        feature_node = FeatureNode(
+            node_id=request.feature_node_id,
+            terms=(FeatureTerm(field_name=request.output_field, units=quantity.units),),
+            declared_units=declared_units,
+            uncertainty_propagated=True,
+            uncertainty=uncertainty,
+            extrapolation_flag=adapter_result.extrapolation_flag,
+            diagnostics=diagnostics,
+        )
+        return ForwardModelFeatureResult(
+            feature_node=feature_node,
+            value=value,
+            units=quantity.units,
+            uncertainty=uncertainty,
+            adapter_provenance_ref=adapter_result.provenance_ref,
+            adapter_id=adapter_result.adapter_id,
+            extrapolation_flag=adapter_result.extrapolation_flag,
+            violated_fields=adapter_result.violated_fields,
+            diagnostics=diagnostics,
+            status="EXTRAPOLATED" if adapter_result.extrapolation_flag else "PASS",
         )
 
 
