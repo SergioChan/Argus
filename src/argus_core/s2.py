@@ -589,6 +589,220 @@ class HPOSelection:
 
 
 @dataclass(frozen=True)
+class ComplexityEscalationPolicy:
+    min_absolute_gain: float = 0.0
+    min_relative_gain: float = 0.0
+    standard_error_margin: float = 0.0
+    max_cost: float | None = None
+    objective: str = "maximize"
+
+    def __post_init__(self) -> None:
+        if self.objective not in {"maximize", "minimize"}:
+            raise S2ContractModelError(f"unsupported S2 escalation objective: {self.objective}")
+        if self.min_absolute_gain < 0:
+            raise S2ContractModelError("S2 escalation min_absolute_gain must be non-negative")
+        if self.min_relative_gain < 0:
+            raise S2ContractModelError("S2 escalation min_relative_gain must be non-negative")
+        if self.standard_error_margin < 0:
+            raise S2ContractModelError("S2 escalation standard_error_margin must be non-negative")
+        if self.max_cost is not None and self.max_cost < 0:
+            raise S2ContractModelError("S2 escalation max_cost must be non-negative")
+
+    def gain(self, *, incumbent_score: float, candidate_score: float) -> float:
+        if self.objective == "maximize":
+            return candidate_score - incumbent_score
+        return incumbent_score - candidate_score
+
+    def significant(
+        self,
+        *,
+        incumbent_score: float,
+        candidate_score: float,
+        incumbent_standard_error: float = 0.0,
+    ) -> bool:
+        gain = self.gain(incumbent_score=incumbent_score, candidate_score=candidate_score)
+        required_gain = max(self.min_absolute_gain, self.standard_error_margin * incumbent_standard_error)
+        if gain <= required_gain:
+            return False
+        if self.min_relative_gain == 0:
+            return True
+        denominator = abs(incumbent_score)
+        if denominator == 0:
+            return False
+        return gain / denominator > self.min_relative_gain
+
+
+@dataclass(frozen=True)
+class ModelCandidateResult:
+    family_id: str
+    heldout_score: float | None
+    cost: float
+    heldout_standard_error: float = 0.0
+    diagnostics: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        family_id = self.family_id.strip()
+        if not family_id:
+            raise S2ContractModelError("S2 model candidate requires family_id")
+        if self.cost < 0:
+            raise S2ContractModelError(f"S2 model candidate {family_id!r} has negative cost")
+        if self.heldout_standard_error < 0:
+            raise S2ContractModelError(f"S2 model candidate {family_id!r} has negative held-out standard error")
+        object.__setattr__(self, "family_id", family_id)
+        object.__setattr__(self, "diagnostics", dict(self.diagnostics))
+
+
+@dataclass(frozen=True)
+class CandidateRejection:
+    family_id: str
+    code: str
+    message: str
+    heldout_gain: float | None = None
+    cost: float | None = None
+
+
+@dataclass(frozen=True)
+class ModelSynthesisDecision:
+    incumbent_family_id: str
+    selected_family_id: str
+    escalated: bool
+    reason: str
+    heldout_gain: float
+    rejected_candidates: tuple[CandidateRejection, ...] = ()
+
+
+class ModelSynthesizer:
+    """Deterministic S2 family selector; it does not train or run HPO."""
+
+    _COST_CLASS_RANK = {
+        "low": 0,
+        "standard": 1,
+        "medium": 2,
+        "high": 3,
+    }
+
+    def __init__(
+        self,
+        *,
+        registry: ModelFamilyRegistry | None = None,
+        policy: ComplexityEscalationPolicy | None = None,
+    ) -> None:
+        self._registry = registry or _default_model_family_registry()
+        self._policy = policy or ComplexityEscalationPolicy()
+
+    def select_family(
+        self,
+        *,
+        incumbent_family_id: str,
+        candidates: tuple[ModelCandidateResult, ...],
+    ) -> ModelSynthesisDecision:
+        incumbent = self._registry.get(incumbent_family_id)
+        candidate_by_family = self._validated_candidates(candidates)
+        incumbent_candidate = candidate_by_family.get(incumbent.family_id)
+        if incumbent_candidate is None or incumbent_candidate.heldout_score is None:
+            raise S2ContractModelError("S2 ModelSynthesizer requires incumbent held-out evidence")
+
+        incumbent_rank = self._complexity_rank(incumbent)
+        eligible: list[tuple[float, ModelCandidateResult]] = []
+        rejected: list[CandidateRejection] = []
+        for candidate in candidates:
+            if candidate.family_id == incumbent.family_id:
+                continue
+            descriptor = self._registry.get(candidate.family_id)
+            if self._complexity_rank(descriptor) <= incumbent_rank:
+                rejected.append(
+                    CandidateRejection(
+                        family_id=candidate.family_id,
+                        code="NOT_HIGHER_COMPLEXITY",
+                        message="candidate is not a higher-complexity family than the incumbent",
+                        cost=candidate.cost,
+                    )
+                )
+                continue
+            if self._policy.max_cost is not None and candidate.cost > self._policy.max_cost:
+                rejected.append(
+                    CandidateRejection(
+                        family_id=candidate.family_id,
+                        code="COST_OVER_BUDGET",
+                        message="candidate cost exceeds the S2 complexity-escalation budget",
+                        cost=candidate.cost,
+                    )
+                )
+                continue
+            if candidate.heldout_score is None:
+                rejected.append(
+                    CandidateRejection(
+                        family_id=candidate.family_id,
+                        code="HELD_OUT_EVIDENCE_REQUIRED",
+                        message="candidate is missing held-out metric evidence",
+                        cost=candidate.cost,
+                    )
+                )
+                continue
+            gain = self._policy.gain(
+                incumbent_score=incumbent_candidate.heldout_score,
+                candidate_score=candidate.heldout_score,
+            )
+            if not self._policy.significant(
+                incumbent_score=incumbent_candidate.heldout_score,
+                candidate_score=candidate.heldout_score,
+                incumbent_standard_error=incumbent_candidate.heldout_standard_error,
+            ):
+                rejected.append(
+                    CandidateRejection(
+                        family_id=candidate.family_id,
+                        code="INSUFFICIENT_HELD_OUT_GAIN",
+                        message="candidate held-out gain is below the escalation threshold",
+                        heldout_gain=gain,
+                        cost=candidate.cost,
+                    )
+                )
+                continue
+            eligible.append((gain, candidate))
+
+        if eligible:
+            gain, selected = sorted(eligible, key=lambda item: (-item[0], item[1].cost, item[1].family_id))[0]
+            return ModelSynthesisDecision(
+                incumbent_family_id=incumbent.family_id,
+                selected_family_id=selected.family_id,
+                escalated=True,
+                reason="significant_held_out_gain",
+                heldout_gain=gain,
+                rejected_candidates=tuple(rejected),
+            )
+
+        reason = "insufficient_held_out_gain"
+        if any(rejection.code != "INSUFFICIENT_HELD_OUT_GAIN" for rejection in rejected):
+            reason = "no_eligible_escalation"
+        best_rejected_gain = max(
+            (rejection.heldout_gain for rejection in rejected if rejection.heldout_gain is not None),
+            default=0.0,
+        )
+        return ModelSynthesisDecision(
+            incumbent_family_id=incumbent.family_id,
+            selected_family_id=incumbent.family_id,
+            escalated=False,
+            reason=reason,
+            heldout_gain=best_rejected_gain,
+            rejected_candidates=tuple(rejected),
+        )
+
+    def _validated_candidates(self, candidates: tuple[ModelCandidateResult, ...]) -> dict[str, ModelCandidateResult]:
+        if not candidates:
+            raise S2ContractModelError("S2 ModelSynthesizer requires candidate metrics")
+        candidate_by_family: dict[str, ModelCandidateResult] = {}
+        for candidate in candidates:
+            self._registry.get(candidate.family_id)
+            if candidate.family_id in candidate_by_family:
+                raise S2ContractModelError(f"duplicate S2 model candidate: {candidate.family_id}")
+            candidate_by_family[candidate.family_id] = candidate
+        return candidate_by_family
+
+    def _complexity_rank(self, descriptor: ModelFamilyDescriptor) -> int:
+        return self._COST_CLASS_RANK.get(descriptor.cost_class, self._COST_CLASS_RANK["standard"])
+
+
+@dataclass(frozen=True)
 class MutationSpec:
     variant_id: str
     model_family: str
