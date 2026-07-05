@@ -1014,6 +1014,346 @@ class ModelSynthesizer:
 
 
 @dataclass(frozen=True)
+class DataSplitRequest:
+    job_id: str
+    dataset_ref: str
+    split_seed: str
+    code_ref: str
+    environment_digest: str
+    train_ratio: float = 0.7
+    validation_ratio: float = 0.15
+    test_ratio: float = 0.15
+    row_id_key: str = "row_id"
+    label_key: str | None = None
+    group_key: str | None = None
+    blind_role_key: str | None = None
+    blind_roles: tuple[str, ...] = ("blind",)
+    fold_count: int = 0
+
+    def __post_init__(self) -> None:
+        job_id = self.job_id.strip()
+        dataset_ref = self.dataset_ref.strip()
+        split_seed = self.split_seed.strip()
+        code_ref = self.code_ref.strip()
+        environment_digest = self.environment_digest.strip()
+        row_id_key = self.row_id_key.strip()
+        label_key = self.label_key.strip() if self.label_key is not None else None
+        group_key = self.group_key.strip() if self.group_key is not None else None
+        blind_role_key = self.blind_role_key.strip() if self.blind_role_key is not None else None
+        blind_roles = tuple(str(role).strip() for role in self.blind_roles if str(role).strip())
+        if not job_id:
+            raise S2ContractModelError("S2 DataSplitRequest requires job_id")
+        if not dataset_ref:
+            raise S2ContractModelError("S2 DataSplitRequest requires dataset_ref")
+        if not split_seed:
+            raise S2ContractModelError("S2 DataSplitRequest requires split_seed")
+        if not code_ref:
+            raise S2ContractModelError("S2 DataSplitRequest requires code_ref")
+        if not environment_digest:
+            raise S2ContractModelError("S2 DataSplitRequest requires environment_digest")
+        if not row_id_key:
+            raise S2ContractModelError("S2 DataSplitRequest requires row_id_key")
+        if blind_role_key is not None and not blind_roles:
+            raise S2ContractModelError("S2 blind_role_key requires at least one blind role")
+        ratios = (float(self.train_ratio), float(self.validation_ratio), float(self.test_ratio))
+        if any(ratio <= 0 for ratio in ratios):
+            raise S2ContractModelError("S2 split ratios must be positive")
+        if abs(sum(ratios) - 1.0) > 1e-9:
+            raise S2ContractModelError("S2 split ratios must sum to 1.0")
+        if self.fold_count < 0 or self.fold_count == 1:
+            raise S2ContractModelError("S2 fold_count must be 0 or at least 2")
+        object.__setattr__(self, "job_id", job_id)
+        object.__setattr__(self, "dataset_ref", dataset_ref)
+        object.__setattr__(self, "split_seed", split_seed)
+        object.__setattr__(self, "code_ref", code_ref)
+        object.__setattr__(self, "environment_digest", environment_digest)
+        object.__setattr__(self, "train_ratio", ratios[0])
+        object.__setattr__(self, "validation_ratio", ratios[1])
+        object.__setattr__(self, "test_ratio", ratios[2])
+        object.__setattr__(self, "row_id_key", row_id_key)
+        object.__setattr__(self, "label_key", label_key)
+        object.__setattr__(self, "group_key", group_key)
+        object.__setattr__(self, "blind_role_key", blind_role_key)
+        object.__setattr__(self, "blind_roles", blind_roles)
+
+
+@dataclass(frozen=True)
+class FoldAssignment:
+    fold_id: str
+    train_indices: tuple[int, ...]
+    validation_indices: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class DataSplitResult:
+    job_id: str
+    dataset_ref: str
+    split_manifest_ref: str
+    split_indices: dict[str, tuple[int, ...]]
+    split_group_ids: dict[str, tuple[str, ...]]
+    folds: tuple[FoldAssignment, ...]
+    blind_input_indices: tuple[int, ...]
+    diagnostics: dict[str, Any]
+
+
+class DataManager:
+    """S2 deterministic split/fold manager that never materializes blind labels."""
+
+    def __init__(
+        self,
+        *,
+        artifact_store: InMemoryArtifactStore,
+        provenance_emitter: "ProvenanceEmitter" | None = None,
+    ) -> None:
+        self._artifact_store = artifact_store
+        self._provenance_emitter = provenance_emitter or ProvenanceEmitter(artifact_store=artifact_store)
+
+    def create_splits(self, request: DataSplitRequest) -> DataSplitResult:
+        dataset_record = self._artifact_store.get_record(request.dataset_ref)
+        if dataset_record.kind != "dataset":
+            raise S2ContractModelError(f"S2 DataManager requires a dataset artifact, got {dataset_record.kind!r}")
+        dataset_payload = json.loads(self._artifact_store.get_artifact(request.dataset_ref).decode("utf-8"))
+        rows = self._dataset_rows(dataset_payload)
+        row_ids = self._row_ids(rows, request.row_id_key)
+        units = self._split_units(rows, row_ids, request)
+        split_units = self._partition_units(units, request)
+        split_indices = {
+            role: tuple(sorted(index for _, indices in selected for index in indices))
+            for role, selected in split_units.items()
+        }
+        split_group_ids = self._split_group_ids(split_units, request)
+        folds = self._folds(units, request)
+        blind_input_indices = self._blind_input_indices(rows, request)
+        payload = self._manifest_payload(
+            request=request,
+            row_ids=row_ids,
+            split_indices=split_indices,
+            split_group_ids=split_group_ids,
+            folds=folds,
+            blind_input_indices=blind_input_indices,
+        )
+        record = self._provenance_emitter.emit_artifact(
+            kind="dataset_split",
+            payload=payload,
+            producer=Producer(subsystem="S2", version="0.0.0", job_id=request.job_id),
+            lineage=Lineage(
+                input_refs=(request.dataset_ref,),
+                code_ref=request.code_ref,
+                environment_digest=request.environment_digest,
+                seeds=(request.split_seed,),
+                job_id=request.job_id,
+            ),
+            claim_tier="ran-toy",
+        )
+        return DataSplitResult(
+            job_id=request.job_id,
+            dataset_ref=request.dataset_ref,
+            split_manifest_ref=record.artifact_ref,
+            split_indices=split_indices,
+            split_group_ids=split_group_ids,
+            folds=folds,
+            blind_input_indices=blind_input_indices,
+            diagnostics={
+                "row_count": len(rows),
+                "group_aware": request.group_key is not None,
+                "fold_count": request.fold_count,
+                "label_materialized": False,
+            },
+        )
+
+    @staticmethod
+    def _dataset_rows(payload: Mapping[str, Any]) -> tuple[Mapping[str, Any], ...]:
+        if not isinstance(payload, Mapping):
+            raise S2ContractModelError("S2 DataManager dataset payload must be an object")
+        rows = payload.get("rows")
+        if not isinstance(rows, list) or not rows:
+            raise S2ContractModelError("S2 DataManager dataset payload requires non-empty rows")
+        normalized: list[Mapping[str, Any]] = []
+        for row in rows:
+            if not isinstance(row, Mapping):
+                raise S2ContractModelError("S2 DataManager dataset rows must be objects")
+            normalized.append(dict(row))
+        return tuple(normalized)
+
+    @staticmethod
+    def _row_ids(rows: tuple[Mapping[str, Any], ...], row_id_key: str) -> tuple[str, ...]:
+        row_ids: list[str] = []
+        seen: set[str] = set()
+        for index, row in enumerate(rows):
+            if row_id_key not in row:
+                raise S2ContractModelError(f"S2 DataManager row {index} missing row_id_key {row_id_key!r}")
+            row_id = str(row[row_id_key]).strip()
+            if not row_id:
+                raise S2ContractModelError(f"S2 DataManager row {index} has an empty row id")
+            if row_id in seen:
+                raise S2ContractModelError(f"S2 DataManager duplicate row id: {row_id}")
+            row_ids.append(row_id)
+            seen.add(row_id)
+        return tuple(row_ids)
+
+    def _split_units(
+        self,
+        rows: tuple[Mapping[str, Any], ...],
+        row_ids: tuple[str, ...],
+        request: DataSplitRequest,
+    ) -> tuple[tuple[str, tuple[int, ...]], ...]:
+        if request.group_key is None:
+            return tuple((row_id, (index,)) for index, row_id in enumerate(row_ids))
+        groups: dict[str, list[int]] = {}
+        for index, row in enumerate(rows):
+            if request.group_key not in row:
+                raise S2ContractModelError(f"S2 DataManager row {index} missing group_key {request.group_key!r}")
+            group_id = str(row[request.group_key]).strip()
+            if not group_id:
+                raise S2ContractModelError(f"S2 DataManager row {index} has an empty group id")
+            groups.setdefault(group_id, []).append(index)
+        return tuple((group_id, tuple(indices)) for group_id, indices in groups.items())
+
+    def _partition_units(
+        self,
+        units: tuple[tuple[str, tuple[int, ...]], ...],
+        request: DataSplitRequest,
+    ) -> dict[str, tuple[tuple[str, tuple[int, ...]], ...]]:
+        if not units:
+            raise S2ContractModelError("S2 DataManager requires at least one split unit")
+        ordered = tuple(sorted(units, key=lambda unit: self._stable_key(request.split_seed, unit[0])))
+        train_count, validation_count, test_count = self._allocation_counts(
+            len(ordered),
+            (request.train_ratio, request.validation_ratio, request.test_ratio),
+        )
+        if min(train_count, validation_count, test_count) == 0:
+            raise S2ContractModelError("S2 DataManager requires non-empty train, validation, and test splits")
+        train_end = train_count
+        validation_end = train_end + validation_count
+        return {
+            "train": ordered[:train_end],
+            "validation": ordered[train_end:validation_end],
+            "test": ordered[validation_end : validation_end + test_count],
+        }
+
+    @staticmethod
+    def _allocation_counts(total: int, ratios: tuple[float, float, float]) -> tuple[int, int, int]:
+        raw = [ratio * total for ratio in ratios]
+        counts = [int(value) for value in raw]
+        remaining = total - sum(counts)
+        remainders = sorted(
+            ((raw[index] - counts[index], index) for index in range(len(raw))),
+            key=lambda item: (-item[0], item[1]),
+        )
+        for _, index in remainders[:remaining]:
+            counts[index] += 1
+        return counts[0], counts[1], counts[2]
+
+    def _folds(
+        self,
+        units: tuple[tuple[str, tuple[int, ...]], ...],
+        request: DataSplitRequest,
+    ) -> tuple[FoldAssignment, ...]:
+        if request.fold_count == 0:
+            return ()
+        if request.fold_count > len(units):
+            raise S2ContractModelError("S2 fold_count cannot exceed split unit count")
+        ordered = tuple(sorted(units, key=lambda unit: self._stable_key(f"{request.split_seed}:fold", unit[0])))
+        folds: list[FoldAssignment] = []
+        for fold_index in range(request.fold_count):
+            validation_indices = sorted(
+                index
+                for position, (_, indices) in enumerate(ordered)
+                if position % request.fold_count == fold_index
+                for index in indices
+            )
+            train_indices = sorted(
+                index
+                for position, (_, indices) in enumerate(ordered)
+                if position % request.fold_count != fold_index
+                for index in indices
+            )
+            folds.append(
+                FoldAssignment(
+                    fold_id=f"fold-{fold_index + 1}",
+                    train_indices=tuple(train_indices),
+                    validation_indices=tuple(validation_indices),
+                )
+            )
+        return tuple(folds)
+
+    @staticmethod
+    def _split_group_ids(
+        split_units: Mapping[str, tuple[tuple[str, tuple[int, ...]], ...]],
+        request: DataSplitRequest,
+    ) -> dict[str, tuple[str, ...]]:
+        if request.group_key is None:
+            return {role: () for role in split_units}
+        return {role: tuple(sorted(unit_id for unit_id, _ in units)) for role, units in split_units.items()}
+
+    @staticmethod
+    def _blind_input_indices(rows: tuple[Mapping[str, Any], ...], request: DataSplitRequest) -> tuple[int, ...]:
+        if request.blind_role_key is None:
+            return ()
+        blind_roles = set(request.blind_roles)
+        return tuple(
+            index
+            for index, row in enumerate(rows)
+            if str(row.get(request.blind_role_key, "")).strip() in blind_roles
+        )
+
+    @staticmethod
+    def _manifest_payload(
+        *,
+        request: DataSplitRequest,
+        row_ids: tuple[str, ...],
+        split_indices: Mapping[str, tuple[int, ...]],
+        split_group_ids: Mapping[str, tuple[str, ...]],
+        folds: tuple[FoldAssignment, ...],
+        blind_input_indices: tuple[int, ...],
+    ) -> dict[str, Any]:
+        return {
+            "job_id": request.job_id,
+            "dataset_ref": request.dataset_ref,
+            "split_seed": request.split_seed,
+            "row_count": len(row_ids),
+            "split_ratios": {
+                "train": request.train_ratio,
+                "validation": request.validation_ratio,
+                "test": request.test_ratio,
+            },
+            "row_id_key": request.row_id_key,
+            "group_key": request.group_key,
+            "splits": {
+                role: {
+                    "indices": list(indices),
+                    "row_ids": [row_ids[index] for index in indices],
+                    "group_ids": list(split_group_ids.get(role, ())),
+                }
+                for role, indices in split_indices.items()
+            },
+            "folds": [
+                {
+                    "fold_id": fold.fold_id,
+                    "train_indices": list(fold.train_indices),
+                    "validation_indices": list(fold.validation_indices),
+                }
+                for fold in folds
+            ],
+            "blind_inputs": {
+                "indices": list(blind_input_indices),
+                "row_ids": [row_ids[index] for index in blind_input_indices],
+                "role_key": request.blind_role_key,
+                "roles": list(request.blind_roles),
+                "label_materialized": False,
+            },
+            "label_policy": {
+                "label_key": request.label_key,
+                "materialized": False,
+            },
+        }
+
+    @staticmethod
+    def _stable_key(seed: str, unit_id: str) -> str:
+        return hashlib.sha256(f"{seed}\0{unit_id}".encode("utf-8")).hexdigest()
+
+
+@dataclass(frozen=True)
 class TrainingRequest:
     job_id: str
     family_id: str
