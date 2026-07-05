@@ -15,6 +15,8 @@ import tempfile
 import time
 from typing import Any, Callable, Mapping
 
+from .canonical import canonical_json_bytes
+from .hashing import hash_bytes
 from .s5 import C2VersionPolicy, parse_c2_job_envelope
 from .s6 import CapabilityDescriptor, RegistryError
 from .s7 import AdapterBroker, EvalRequest, EvalResult
@@ -78,6 +80,17 @@ class S2SpecCompilerError(S2Error):
 
 
 S2_REQUIRED_CONTRACT_IDS = ("C1", "C2", "C4", "C6")
+S2_FEATURE_GRAPH_SCHEMA_VERSION = "argus-s2-featuregraph-v1"
+S2_FEATURE_SET_SCHEMA_VERSION = "argus-s2-featureset-v1"
+S2_FEATURE_GRAPH_OPS = (
+    "source",
+    "arithmetic",
+    "pi_group",
+    "invariant",
+    "transform",
+    "adapter_eval",
+    "aggregate",
+)
 
 
 @dataclass(frozen=True)
@@ -350,6 +363,425 @@ def validate_feature_graph_dimensions(
     if raise_on_error and validation.errors:
         raise validation.errors[0]
     return validation
+
+
+@dataclass(frozen=True)
+class FeatureGraphNode:
+    node_id: str
+    op: str
+    feature_node: FeatureNode
+    inputs: tuple[str, ...] = ()
+    params: Mapping[str, Any] = field(default_factory=dict, hash=False)
+    deterministic: bool = True
+    adapter_ref: str | None = None
+    uncertainty_propagated: bool = False
+    out_dim: DimensionVector | None = None
+
+    def __post_init__(self) -> None:
+        node_id = self.node_id.strip()
+        if not node_id:
+            raise S2ContractModelError("feature graph nodes require node_id")
+        if self.feature_node.node_id != node_id:
+            raise S2ContractModelError(
+                f"feature graph node {node_id!r} must wrap a FeatureNode with the same node_id"
+            )
+        op = self.op.strip()
+        if op not in S2_FEATURE_GRAPH_OPS:
+            raise S2ContractModelError(f"unsupported feature graph op for {node_id!r}: {op}")
+        inputs = tuple(str(input_id).strip() for input_id in self.inputs)
+        if any(not input_id for input_id in inputs):
+            raise S2ContractModelError(f"feature graph node {node_id!r} has an empty input node id")
+        if len(set(inputs)) != len(inputs):
+            raise S2ContractModelError(f"feature graph node {node_id!r} has duplicate inputs")
+        if node_id in inputs:
+            raise S2ContractModelError(f"feature graph node {node_id!r} cannot depend on itself")
+        params = _s2_jsonable(dict(self.params))
+        adapter_ref = self.adapter_ref.strip() if isinstance(self.adapter_ref, str) else self.adapter_ref
+        if adapter_ref == "":
+            raise S2ContractModelError(f"feature graph node {node_id!r} has an empty adapter_ref")
+        object.__setattr__(self, "node_id", node_id)
+        object.__setattr__(self, "op", op)
+        object.__setattr__(self, "inputs", inputs)
+        object.__setattr__(self, "params", params)
+        object.__setattr__(
+            self,
+            "uncertainty_propagated",
+            bool(self.uncertainty_propagated or self.feature_node.uncertainty_propagated),
+        )
+        object.__setattr__(self, "adapter_ref", adapter_ref)
+
+
+@dataclass(frozen=True)
+class FeatureGraph:
+    graph_id: str
+    nodes: tuple[FeatureGraphNode, ...]
+    content_hash: str
+    unit_registry_version: str
+    schema_version: str = S2_FEATURE_GRAPH_SCHEMA_VERSION
+
+    def __post_init__(self) -> None:
+        if not self.graph_id:
+            raise S2ContractModelError("FeatureGraph requires graph_id")
+        if not self.nodes:
+            raise S2ContractModelError(f"FeatureGraph {self.graph_id!r} requires at least one node")
+        if not self.content_hash:
+            raise S2ContractModelError(f"FeatureGraph {self.graph_id!r} requires content_hash")
+        object.__setattr__(self, "nodes", tuple(self.nodes))
+
+
+@dataclass(frozen=True)
+class FeatureSet:
+    feature_set_id: str
+    graph_ref: str
+    selected_nodes: tuple[str, ...]
+    content_hash: str
+    graph_content_hash: str
+    schema_version: str = S2_FEATURE_SET_SCHEMA_VERSION
+
+    def __post_init__(self) -> None:
+        if not self.feature_set_id:
+            raise S2ContractModelError("FeatureSet requires feature_set_id")
+        if not self.graph_ref:
+            raise S2ContractModelError(f"FeatureSet {self.feature_set_id!r} requires graph_ref")
+        if not self.selected_nodes:
+            raise S2ContractModelError(f"FeatureSet {self.feature_set_id!r} requires selected_nodes")
+        if len(set(self.selected_nodes)) != len(self.selected_nodes):
+            raise S2ContractModelError(f"FeatureSet {self.feature_set_id!r} has duplicate selected_nodes")
+        if not self.content_hash:
+            raise S2ContractModelError(f"FeatureSet {self.feature_set_id!r} requires content_hash")
+        object.__setattr__(self, "selected_nodes", tuple(self.selected_nodes))
+
+
+@dataclass(frozen=True)
+class FeatureGraphReplayResult:
+    graph_content_hash: str
+    selected_nodes: tuple[str, ...]
+    values: Mapping[str, float] = field(hash=False)
+    content_hash: str = ""
+
+    def __post_init__(self) -> None:
+        values = {str(key): _finite_feature_value(value, field_name=str(key)) for key, value in self.values.items()}
+        object.__setattr__(self, "values", values)
+        object.__setattr__(self, "selected_nodes", tuple(self.selected_nodes))
+        if not self.content_hash:
+            body = {
+                "schema_version": S2_FEATURE_GRAPH_SCHEMA_VERSION,
+                "graph_content_hash": self.graph_content_hash,
+                "selected_nodes": list(self.selected_nodes),
+                "values": values,
+            }
+            object.__setattr__(self, "content_hash", hash_bytes(canonical_json_bytes(body)))
+
+
+@dataclass(frozen=True)
+class FeatureSetEmissionResult:
+    feature_set: FeatureSet
+    artifact_record: ArtifactRecord
+    replay_probe: FeatureGraphReplayResult | None = None
+
+
+class FeatureGraphEngine:
+    """Build, replay, and persist deterministic S2 feature DAGs."""
+
+    def __init__(self, *, algebra: UnitsAlgebra | None = None) -> None:
+        self.algebra = algebra or UnitsAlgebra()
+
+    def build_graph(self, *, graph_id: str, nodes: tuple[FeatureGraphNode, ...]) -> FeatureGraph:
+        graph_id = graph_id.strip()
+        if not graph_id:
+            raise S2ContractModelError("FeatureGraph requires graph_id")
+        if not nodes:
+            raise S2ContractModelError(f"FeatureGraph {graph_id!r} requires at least one node")
+        ordered_nodes = self._topological_nodes(tuple(nodes))
+        for node in ordered_nodes:
+            if not node.deterministic:
+                raise S2ContractModelError(f"FeatureGraph node {node.node_id!r} is not deterministic")
+        validate_feature_graph_dimensions(tuple(node.feature_node for node in ordered_nodes), algebra=self.algebra)
+        checked_nodes = tuple(
+            replace(
+                node,
+                out_dim=self.algebra.feature_dimension(node.feature_node),
+                uncertainty_propagated=node.uncertainty_propagated or node.feature_node.uncertainty_propagated,
+            )
+            for node in ordered_nodes
+        )
+        payload = self._graph_payload(
+            graph_id=graph_id,
+            nodes=checked_nodes,
+            unit_registry_version=self.algebra.registry.version,
+            content_hash=None,
+        )
+        return FeatureGraph(
+            graph_id=graph_id,
+            nodes=checked_nodes,
+            content_hash=hash_bytes(canonical_json_bytes(payload)),
+            unit_registry_version=self.algebra.registry.version,
+        )
+
+    def replay(
+        self,
+        graph: FeatureGraph,
+        *,
+        inputs: Mapping[str, float | int],
+        selected_nodes: tuple[str, ...] | None = None,
+    ) -> FeatureGraphReplayResult:
+        selected = self._selected_nodes(graph, selected_nodes)
+        input_values = {
+            str(field_name): _finite_feature_value(value, field_name=str(field_name))
+            for field_name, value in inputs.items()
+        }
+        values: dict[str, float] = {}
+        for node in graph.nodes:
+            node_value = self._evaluate_feature(node.feature_node, values=values, inputs=input_values)
+            values[node.node_id] = node_value
+        selected_values = {node_id: values[node_id] for node_id in selected}
+        return FeatureGraphReplayResult(
+            graph_content_hash=graph.content_hash,
+            selected_nodes=selected,
+            values=selected_values,
+        )
+
+    def build_feature_set(
+        self,
+        graph: FeatureGraph,
+        *,
+        selected_nodes: tuple[str, ...],
+        feature_set_id: str | None = None,
+    ) -> FeatureSet:
+        selected = self._selected_nodes(graph, selected_nodes)
+        provisional_payload = {
+            "schema_version": S2_FEATURE_SET_SCHEMA_VERSION,
+            "graph_content_hash": graph.content_hash,
+            "selected_nodes": list(selected),
+        }
+        derived_id = "featureset://" + hash_bytes(canonical_json_bytes(provisional_payload)).removeprefix("blake3:")
+        feature_set_id = (feature_set_id or derived_id).strip()
+        graph_ref = f"featuregraph://{graph.content_hash}"
+        payload = self._feature_set_payload(
+            feature_set_id=feature_set_id,
+            graph_ref=graph_ref,
+            selected_nodes=selected,
+            graph_content_hash=graph.content_hash,
+            content_hash=None,
+        )
+        return FeatureSet(
+            feature_set_id=feature_set_id,
+            graph_ref=graph_ref,
+            selected_nodes=selected,
+            graph_content_hash=graph.content_hash,
+            content_hash=hash_bytes(canonical_json_bytes(payload)),
+        )
+
+    def emit_feature_set(
+        self,
+        graph: FeatureGraph,
+        *,
+        selected_nodes: tuple[str, ...],
+        emitter: ProvenanceEmitter,
+        lineage: Lineage,
+        feature_set_id: str | None = None,
+        replay_probe_input: Mapping[str, float | int] | None = None,
+    ) -> FeatureSetEmissionResult:
+        feature_set = self.build_feature_set(
+            graph,
+            selected_nodes=selected_nodes,
+            feature_set_id=feature_set_id,
+        )
+        replay_probe = (
+            self.replay(graph, inputs=replay_probe_input, selected_nodes=feature_set.selected_nodes)
+            if replay_probe_input is not None
+            else None
+        )
+        payload: dict[str, Any] = {
+            "schema_version": S2_FEATURE_SET_SCHEMA_VERSION,
+            "graph": self._graph_payload(
+                graph_id=graph.graph_id,
+                nodes=graph.nodes,
+                unit_registry_version=graph.unit_registry_version,
+                content_hash=graph.content_hash,
+            ),
+            "feature_set": self._feature_set_payload(
+                feature_set_id=feature_set.feature_set_id,
+                graph_ref=feature_set.graph_ref,
+                selected_nodes=feature_set.selected_nodes,
+                graph_content_hash=feature_set.graph_content_hash,
+                content_hash=feature_set.content_hash,
+            ),
+        }
+        if replay_probe is not None:
+            payload["replay_probe"] = {
+                "content_hash": replay_probe.content_hash,
+                "selected_nodes": list(replay_probe.selected_nodes),
+                "values": dict(replay_probe.values),
+            }
+        record = emitter.emit_artifact(
+            kind="feature_set",
+            payload=_s2_jsonable(payload),
+            lineage=lineage,
+            claim_tier="ran-toy",
+        )
+        return FeatureSetEmissionResult(feature_set=feature_set, artifact_record=record, replay_probe=replay_probe)
+
+    def _topological_nodes(self, nodes: tuple[FeatureGraphNode, ...]) -> tuple[FeatureGraphNode, ...]:
+        by_id: dict[str, FeatureGraphNode] = {}
+        for node in nodes:
+            if node.node_id in by_id:
+                raise S2ContractModelError(f"FeatureGraph has duplicate node_id: {node.node_id}")
+            by_id[node.node_id] = node
+        for node in nodes:
+            missing_inputs = tuple(input_id for input_id in node.inputs if input_id not in by_id)
+            if missing_inputs:
+                raise S2ContractModelError(
+                    f"FeatureGraph node {node.node_id!r} references missing inputs: {missing_inputs}"
+                )
+        visiting: set[str] = set()
+        visited: set[str] = set()
+        ordered: list[FeatureGraphNode] = []
+
+        def visit(node_id: str) -> None:
+            if node_id in visited:
+                return
+            if node_id in visiting:
+                raise S2ContractModelError(f"FeatureGraph cycle detected at node: {node_id}")
+            visiting.add(node_id)
+            for input_id in sorted(by_id[node_id].inputs):
+                visit(input_id)
+            visiting.remove(node_id)
+            visited.add(node_id)
+            ordered.append(by_id[node_id])
+
+        for node_id in sorted(by_id):
+            visit(node_id)
+        return tuple(ordered)
+
+    @staticmethod
+    def _selected_nodes(graph: FeatureGraph, selected_nodes: tuple[str, ...] | None) -> tuple[str, ...]:
+        node_ids = {node.node_id for node in graph.nodes}
+        selected = tuple(node.node_id for node in graph.nodes) if selected_nodes is None else tuple(selected_nodes)
+        if not selected:
+            raise S2ContractModelError(f"FeatureGraph {graph.graph_id!r} selected_nodes cannot be empty")
+        if len(set(selected)) != len(selected):
+            raise S2ContractModelError(f"FeatureGraph {graph.graph_id!r} selected_nodes has duplicates")
+        missing = tuple(node_id for node_id in selected if node_id not in node_ids)
+        if missing:
+            raise S2ContractModelError(f"FeatureGraph {graph.graph_id!r} selected_nodes missing: {missing}")
+        return selected
+
+    @staticmethod
+    def _evaluate_feature(
+        feature: FeatureNode,
+        *,
+        values: Mapping[str, float],
+        inputs: Mapping[str, float],
+    ) -> float:
+        result = 1.0
+        for term in feature.terms:
+            if term.field_name in values:
+                base = values[term.field_name]
+            elif term.field_name in inputs:
+                base = inputs[term.field_name]
+            else:
+                raise S2ContractModelError(
+                    f"FeatureGraph replay missing value for term {term.field_name!r} in node {feature.node_id!r}"
+                )
+            try:
+                result *= base ** term.exponent
+            except ZeroDivisionError as exc:
+                raise S2ContractModelError(
+                    f"FeatureGraph replay cannot apply negative exponent to zero for node {feature.node_id!r}"
+                ) from exc
+            if not math.isfinite(result):
+                raise S2ContractModelError(f"FeatureGraph replay produced non-finite value for {feature.node_id!r}")
+        return float(result)
+
+    @staticmethod
+    def _graph_payload(
+        *,
+        graph_id: str,
+        nodes: tuple[FeatureGraphNode, ...],
+        unit_registry_version: str,
+        content_hash: str | None,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "schema_version": S2_FEATURE_GRAPH_SCHEMA_VERSION,
+            "graph_id": graph_id,
+            "unit_registry_version": unit_registry_version,
+            "nodes": [_feature_graph_node_payload(node) for node in nodes],
+        }
+        if content_hash is not None:
+            payload["content_hash"] = content_hash
+        return payload
+
+    @staticmethod
+    def _feature_set_payload(
+        *,
+        feature_set_id: str,
+        graph_ref: str,
+        selected_nodes: tuple[str, ...],
+        graph_content_hash: str,
+        content_hash: str | None,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "schema_version": S2_FEATURE_SET_SCHEMA_VERSION,
+            "feature_set_id": feature_set_id,
+            "graph_ref": graph_ref,
+            "graph_content_hash": graph_content_hash,
+            "selected_nodes": list(selected_nodes),
+        }
+        if content_hash is not None:
+            payload["content_hash"] = content_hash
+        return payload
+
+
+def _feature_graph_node_payload(node: FeatureGraphNode) -> dict[str, Any]:
+    if node.out_dim is None:
+        raise S2ContractModelError(f"FeatureGraph node {node.node_id!r} has no checked dimension")
+    return {
+        "node_id": node.node_id,
+        "op": node.op,
+        "inputs": list(node.inputs),
+        "params": node.params,
+        "deterministic": node.deterministic,
+        "adapter_ref": node.adapter_ref,
+        "uncertainty_propagated": node.uncertainty_propagated,
+        "out_dim": _dimension_payload(node.out_dim, units=node.feature_node.declared_units),
+        "feature": {
+            "declared_units": node.feature_node.declared_units,
+            "terms": [
+                {
+                    "field_name": term.field_name,
+                    "units": term.units,
+                    "exponent": term.exponent,
+                }
+                for term in node.feature_node.terms
+            ],
+            "uncertainty": node.feature_node.uncertainty,
+            "extrapolation_flag": node.feature_node.extrapolation_flag,
+            "diagnostics": node.feature_node.diagnostics,
+        },
+    }
+
+
+def _dimension_payload(dimension: DimensionVector, *, units: str) -> dict[str, Any]:
+    return {
+        "bases": list(S2_DIMENSION_BASES),
+        "exponents": list(dimension.exponents),
+        "units": units,
+    }
+
+
+def _finite_feature_value(value: float | int, *, field_name: str) -> float:
+    numeric = float(value)
+    if not math.isfinite(numeric):
+        raise S2ContractModelError(f"FeatureGraph replay received non-finite value for {field_name!r}")
+    return numeric
+
+
+def _s2_jsonable(value: Any) -> Any:
+    try:
+        return json.loads(json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False))
+    except (TypeError, ValueError) as exc:
+        raise S2ContractModelError("S2 FeatureGraph payload must be canonical JSON serializable") from exc
 
 
 @dataclass(frozen=True)
