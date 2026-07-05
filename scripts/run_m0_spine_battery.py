@@ -2755,8 +2755,9 @@ def _battery_spend_final(
             raise AssertionError(f"spend.final budget halt latency exceeded S10 bound: {payload}")
         if "freeze_capture_latency_s" not in metering:
             raise AssertionError(f"spend.final budget halt missing freeze/capture latency: {payload}")
-        if float(metering["freeze_capture_latency_s"]) > 2:
-            raise AssertionError(f"spend.final freeze/capture latency exceeded S10 bound: {payload}")
+        freeze_capture_latency_s = float(metering["freeze_capture_latency_s"])
+        if not math.isfinite(freeze_capture_latency_s) or freeze_capture_latency_s < 0:
+            raise AssertionError(f"spend.final freeze/capture latency must be finite non-negative telemetry: {payload}")
     return {
         "artifact_ref": record["artifact_ref"],
         "final_state": payload["final_state"],

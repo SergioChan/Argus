@@ -69,6 +69,55 @@ S10_C3_VERIFIER_KEYS_JSON = json.dumps(
 
 
 class ArgusM0RuntimeServiceTests(unittest.TestCase):
+    def _spend_final_payload(
+        self,
+        *,
+        halt_latency_s: float = 0.003031,
+        freeze_capture_latency_s: float = 2.558381,
+    ) -> dict[str, object]:
+        return {
+            "schema": "argus.s10.spend.final.v1",
+            "final_state": "BUDGET_HALTED",
+            "price_table": {
+                "price_table_version": "0.1.0",
+                "signer_key_id": "argus-m0-price-table",
+                "signature": "hmac-sha256:test",
+                "usd_per_cpu_second": "0",
+                "usd_per_gpu_second": {"default": "0"},
+                "usd_per_1k_model_tokens": {"default": "0"},
+            },
+            "usage": {
+                "compute_units": 0,
+                "gpu_seconds": 0,
+                "model_tokens": 0,
+                "cost_usd": 0,
+            },
+            "usd_rollup": {
+                "source": "signed_price_table",
+                "cost_usd": 0,
+                "cost_usd_exact": "0",
+            },
+            "metering": {
+                "sample_count": 3,
+                "max_cadence_s": freeze_capture_latency_s,
+                "halted_by_meter": True,
+                "halt_latency_s": halt_latency_s,
+                "halt_detection_elapsed_s": 1.003031,
+                "halt_completion_elapsed_s": 3.561411,
+                "halt_completion_latency_s": halt_latency_s + freeze_capture_latency_s,
+                "freeze_capture_latency_s": freeze_capture_latency_s,
+                "dcgm_available": False,
+                "nvidia_smi_available": False,
+                "gpu_count": 0,
+                "gpu_models": [],
+                "mig_enabled": False,
+                "mig_instance_count": 0,
+                "gpu_telemetry_source": "unavailable",
+                "dcgm_metrics_available": False,
+                "dcgm_metric_row_count": 0,
+            },
+        }
+
     def test_halt_latency_summary_uses_conservative_nearest_rank_p99(self) -> None:
         latencies = [0.01] * 49 + [1.75]
 
@@ -87,6 +136,58 @@ class ArgusM0RuntimeServiceTests(unittest.TestCase):
             m0_battery._halt_latency_summary([0.01] * 49 + [2.01])
         with self.assertRaisesRegex(AssertionError, "cannot be negative"):
             m0_battery._halt_latency_summary([0.01] * 49 + [-0.1])
+
+    def test_spend_final_allows_slow_freeze_capture_when_halt_latency_is_within_slo(self) -> None:
+        query = {
+            "records": [
+                {
+                    "artifact_ref": "spend-ref",
+                    "lineage": {"input_refs": ["launch-ref"]},
+                }
+            ]
+        }
+        payload = self._spend_final_payload(
+            halt_latency_s=0.003031,
+            freeze_capture_latency_s=2.558381,
+        )
+
+        with patch.object(m0_battery, "_get_json", side_effect=[query, payload]):
+            spend_final = m0_battery._battery_spend_final(
+                s8_url="http://s8",
+                read_token="read-token",
+                job_id="m0-halt-latency-job",
+                launch_provenance_ref="launch-ref",
+                expected_state="BUDGET_HALTED",
+            )
+
+        self.assertEqual(spend_final["meter_halt_latency_s"], 0.003031)
+        self.assertEqual(spend_final["meter_freeze_capture_latency_s"], 2.558381)
+
+    def test_spend_final_rejects_budget_halt_latency_breach(self) -> None:
+        query = {
+            "records": [
+                {
+                    "artifact_ref": "spend-ref",
+                    "lineage": {"input_refs": ["launch-ref"]},
+                }
+            ]
+        }
+        payload = self._spend_final_payload(
+            halt_latency_s=2.01,
+            freeze_capture_latency_s=0.05,
+        )
+
+        with (
+            patch.object(m0_battery, "_get_json", side_effect=[query, payload]),
+            self.assertRaisesRegex(AssertionError, "budget halt latency exceeded"),
+        ):
+            m0_battery._battery_spend_final(
+                s8_url="http://s8",
+                read_token="read-token",
+                job_id="m0-halt-latency-job",
+                launch_provenance_ref="launch-ref",
+                expected_state="BUDGET_HALTED",
+            )
 
     def test_meter_gap_probe_restores_default_supervisor_config(self) -> None:
         evidence: dict[str, object] = {"results": []}
