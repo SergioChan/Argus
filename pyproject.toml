@@ -22,6 +22,7 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project.scripts]
+argus-s2 = "argus_runtime.s2_cli:main"
 argus-subagent = "argus_runtime.s1_subagent_cli:main"
 
 [tool.setuptools.packages.find]

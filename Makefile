@@ -36,4 +36,4 @@ test:
 	PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m unittest discover -s tests
 
 lint:
-	PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m py_compile scripts/apply_s8_migrations.py scripts/check.py scripts/generate_bindings.py scripts/run_s1_perf_scale_battery.py scripts/run_s8_read_query_scale_battery.py scripts/run_s8_lineage_scale_battery.py scripts/run_m0_spine_battery.py scripts/roadmap_audit.py scripts/schema_compatibility.py scripts/validate_docs.py scripts/validate_schemas.py src/argus_runtime/s1_subagent_cli.py
+	PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m py_compile scripts/apply_s8_migrations.py scripts/argus_s2.py scripts/check.py scripts/generate_bindings.py scripts/run_s1_perf_scale_battery.py scripts/run_s8_read_query_scale_battery.py scripts/run_s8_lineage_scale_battery.py scripts/run_m0_spine_battery.py scripts/roadmap_audit.py scripts/schema_compatibility.py scripts/validate_docs.py scripts/validate_schemas.py src/argus_runtime/s1_subagent_cli.py src/argus_runtime/s2_cli.py

@@ -66,6 +66,10 @@ class RewardSourceError(S2Error):
     """Raised when S2 is asked to accept a non-C3 score or reward."""
 
 
+class ExplainabilityReportError(S2Error):
+    """Raised when S2 cannot generate a build explainability report."""
+
+
 class S2ContractModelError(S2Error):
     """Raised when S2's contract-bound model surface is missing or drifting."""
 
@@ -141,6 +145,7 @@ S2_FEATURE_GRAPH_SCHEMA_VERSION = "argus-s2-featuregraph-v1"
 S2_FEATURE_SET_SCHEMA_VERSION = "argus-s2-featureset-v1"
 S2_FROZEN_PIPELINE_SCHEMA_VERSION = "argus-s2-frozen-pipeline-v1"
 S2_FROZEN_PIPELINE_ENTRYPOINT_CONTRACT_VERSION = "argus.s3.frozen_pipeline_entrypoint.v1"
+S2_EXPLAINABILITY_REPORT_SCHEMA_VERSION = "argus-s2-explainability-report-v1"
 S2_FEATURE_GRAPH_OPS = (
     "source",
     "arithmetic",
@@ -6135,6 +6140,393 @@ class ProvenanceEmitter:
             raise S2ContractModelError("S2 ProvenanceEmitter requires producer.subsystem")
         if not producer.version:
             raise S2ContractModelError("S2 ProvenanceEmitter requires producer.version")
+
+
+@dataclass(frozen=True)
+class ExplainabilityReportRequest:
+    build_ref: str
+    report_id: str | None = None
+    code_ref: str = "argus-core:s2.explainability_reporter"
+    environment_digest: str = "python:argus-s2-explainability:v1"
+    seed: str = "s2-explainability-report"
+
+    def __post_init__(self) -> None:
+        build_ref = self.build_ref.strip()
+        report_id = self.report_id.strip() if isinstance(self.report_id, str) else None
+        code_ref = self.code_ref.strip()
+        environment_digest = self.environment_digest.strip()
+        seed = self.seed.strip()
+        if not build_ref:
+            raise ExplainabilityReportError("S2 explainability requires build_ref")
+        if report_id == "":
+            raise ExplainabilityReportError("S2 explainability report_id cannot be empty")
+        if not code_ref or not environment_digest or not seed:
+            raise ExplainabilityReportError("S2 explainability requires code_ref, environment_digest, and seed")
+        object.__setattr__(self, "build_ref", build_ref)
+        object.__setattr__(self, "report_id", report_id)
+        object.__setattr__(self, "code_ref", code_ref)
+        object.__setattr__(self, "environment_digest", environment_digest)
+        object.__setattr__(self, "seed", seed)
+
+
+@dataclass(frozen=True)
+class ExplainabilityReportResult:
+    job_id: str
+    build_ref: str
+    report_ref: str
+    status: str
+    sections: tuple[str, ...]
+    diagnostics: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "sections", tuple(self.sections))
+        object.__setattr__(self, "diagnostics", dict(self.diagnostics))
+
+
+class ExplainabilityReporter:
+    """Generates deterministic S2 explainability reports from C4 build artifacts."""
+
+    REQUIRED_SECTIONS = ("rationale", "hpo_trace", "priors", "calibration_plot", "repair_log")
+
+    def __init__(
+        self,
+        *,
+        artifact_store: InMemoryArtifactStore,
+        provenance_emitter: ProvenanceEmitter | None = None,
+    ) -> None:
+        self._artifact_store = artifact_store
+        self._provenance_emitter = provenance_emitter or ProvenanceEmitter(artifact_store=artifact_store)
+
+    def explain(self, request: ExplainabilityReportRequest) -> ExplainabilityReportResult:
+        build_record, build_payload = self._load_required_artifact(
+            request.build_ref,
+            expected_kind="frozen_pipeline",
+            role="build_ref",
+        )
+        if build_payload.get("entrypoint") != "predict":
+            raise ExplainabilityReportError("S2 explainability requires a frozen predict pipeline")
+        component_refs = self._component_refs(build_payload)
+        config = self._mapping(build_payload.get("config"), role="frozen pipeline config", required=False)
+        input_refs = component_refs.get("input_refs", ())
+        feature_set_ref = self._required_component_ref(component_refs, "feature_set_ref")
+        model_checkpoint_ref = self._required_component_ref(component_refs, "model_checkpoint_ref")
+        calibration_ref = self._required_component_ref(component_refs, "calibration_artifact_ref")
+        hpo_ref = self._config_ref(config, "hpo_selection_ref") or self._first_ref_by_kind(input_refs, "hpo_selection")
+        advisory_ref = self._config_ref(config, "advisory_self_check_ref") or self._first_ref_by_kind(
+            input_refs,
+            "advisory_self_check",
+        )
+        training_log_ref = self._first_ref_by_kind(input_refs, "training_log")
+        dataset_split_ref = self._first_ref_by_kind(input_refs, "dataset_split")
+        base_pipeline_ref = self._config_ref(config, "base_pipeline_ref")
+        if hpo_ref is None:
+            raise ExplainabilityReportError("S2 explainability cannot resolve hpo_selection_ref")
+        if advisory_ref is None:
+            raise ExplainabilityReportError("S2 explainability cannot resolve advisory_self_check_ref")
+
+        _, feature_payload = self._load_required_artifact(feature_set_ref, expected_kind="feature_set", role="feature_set")
+        _, model_payload = self._load_required_artifact(
+            model_checkpoint_ref,
+            expected_kind="model_checkpoint",
+            role="model_checkpoint",
+        )
+        _, calibration_payload = self._load_required_artifact(
+            calibration_ref,
+            expected_kind="uq_calibration",
+            role="uq_calibration",
+        )
+        _, hpo_payload = self._load_required_artifact(hpo_ref, expected_kind="hpo_selection", role="hpo_selection")
+        _, advisory_payload = self._load_required_artifact(
+            advisory_ref,
+            expected_kind="advisory_self_check",
+            role="advisory_self_check",
+        )
+        training_payload = {}
+        if training_log_ref is not None:
+            _, training_payload = self._load_required_artifact(
+                training_log_ref,
+                expected_kind="training_log",
+                role="training_log",
+            )
+
+        job_id = str(build_record.producer.job_id or build_payload.get("job_id") or hpo_payload.get("job_id") or "")
+        if not job_id:
+            raise ExplainabilityReportError("S2 explainability cannot resolve build job_id")
+        sections = {
+            "rationale": self._rationale_section(
+                build_payload=build_payload,
+                feature_payload=feature_payload,
+                model_payload=model_payload,
+                hpo_payload=hpo_payload,
+            ),
+            "hpo_trace": self._hpo_trace_section(hpo_payload),
+            "priors": self._priors_section(
+                build_payload=build_payload,
+                feature_payload=feature_payload,
+                base_pipeline_ref=base_pipeline_ref,
+                dataset_split_ref=dataset_split_ref,
+            ),
+            "calibration_plot": self._calibration_plot_section(calibration_payload),
+            "repair_log": self._repair_log_section(
+                calibration_payload=calibration_payload,
+                advisory_payload=advisory_payload,
+                training_payload=training_payload,
+            ),
+        }
+        payload = {
+            "schema_version": S2_EXPLAINABILITY_REPORT_SCHEMA_VERSION,
+            "s2_tc39": True,
+            "report_id": request.report_id or f"s2-explainability:{hash_bytes(canonical_json_bytes(request.build_ref))}",
+            "status": "GENERATED",
+            "build_ref": request.build_ref,
+            "base_pipeline_ref": base_pipeline_ref,
+            "job_id": job_id,
+            "claim_tier": "ran-toy",
+            "section_order": list(self.REQUIRED_SECTIONS),
+            "sections": sections,
+            "component_refs": {
+                "feature_set_ref": feature_set_ref,
+                "model_checkpoint_ref": model_checkpoint_ref,
+                "hpo_selection_ref": hpo_ref,
+                "training_log_ref": training_log_ref,
+                "uq_calibration_ref": calibration_ref,
+                "advisory_self_check_ref": advisory_ref,
+                "dataset_split_ref": dataset_split_ref,
+            },
+            "score_authority": {
+                "s2_score_returned": False,
+                "authoritative_reward_source": "C3_ONLY",
+                "hpo_objective_values_are_advisory": True,
+                "frozen_pipeline_reward_source": str(config.get("reward_source") or "c3-only"),
+            },
+        }
+        lineage_refs = _unique_pipeline_refs(
+            tuple(
+                ref
+                for ref in (
+                    request.build_ref,
+                    feature_set_ref,
+                    model_checkpoint_ref,
+                    hpo_ref,
+                    training_log_ref,
+                    calibration_ref,
+                    advisory_ref,
+                    dataset_split_ref,
+                    base_pipeline_ref,
+                )
+                if isinstance(ref, str) and ref
+            )
+        )
+        record = self._provenance_emitter.emit_artifact(
+            kind="s2_explainability_report",
+            payload=_s2_jsonable(payload),
+            producer=Producer(subsystem="S2", version="0.0.0", job_id=job_id),
+            lineage=Lineage(
+                input_refs=lineage_refs,
+                code_ref=request.code_ref,
+                environment_digest=request.environment_digest,
+                seeds=(request.seed,),
+                job_id=job_id,
+            ),
+            claim_tier="ran-toy",
+        )
+        return ExplainabilityReportResult(
+            job_id=job_id,
+            build_ref=request.build_ref,
+            report_ref=record.artifact_ref,
+            status="GENERATED",
+            sections=self.REQUIRED_SECTIONS,
+            diagnostics={
+                "component_ref_count": len(lineage_refs),
+                "base_pipeline_ref": base_pipeline_ref,
+                "score_authority": payload["score_authority"],
+            },
+        )
+
+    def _load_required_artifact(
+        self,
+        artifact_ref: str,
+        *,
+        expected_kind: str,
+        role: str,
+    ) -> tuple[ArtifactRecord, dict[str, Any]]:
+        try:
+            record = self._artifact_store.get_record(artifact_ref)
+            payload = json.loads(self._artifact_store.get_artifact(artifact_ref).decode("utf-8"))
+        except (KeyError, json.JSONDecodeError) as exc:
+            raise ExplainabilityReportError(f"S2 explainability cannot load {role}: {artifact_ref}") from exc
+        if record.kind != expected_kind:
+            raise ExplainabilityReportError(
+                f"S2 explainability expected {role} kind {expected_kind!r}, got {record.kind!r}"
+            )
+        if not isinstance(payload, dict):
+            raise ExplainabilityReportError(f"S2 explainability {role} payload must be an object")
+        return record, payload
+
+    def _first_ref_by_kind(self, refs: tuple[str, ...], kind: str) -> str | None:
+        for ref in refs:
+            try:
+                record = self._artifact_store.get_record(ref)
+            except KeyError:
+                continue
+            if record.kind == kind:
+                return ref
+        return None
+
+    @staticmethod
+    def _component_refs(build_payload: Mapping[str, Any]) -> dict[str, Any]:
+        raw = build_payload.get("component_refs")
+        if not isinstance(raw, Mapping):
+            raise ExplainabilityReportError("S2 explainability requires frozen pipeline component_refs")
+        component_refs = dict(raw)
+        input_refs = component_refs.get("input_refs", ())
+        if not isinstance(input_refs, (list, tuple)):
+            raise ExplainabilityReportError("S2 explainability component_refs.input_refs must be a list")
+        component_refs["input_refs"] = tuple(str(ref).strip() for ref in input_refs if str(ref).strip())
+        return component_refs
+
+    @staticmethod
+    def _required_component_ref(component_refs: Mapping[str, Any], key: str) -> str:
+        ref = component_refs.get(key)
+        if not isinstance(ref, str) or not ref.strip():
+            raise ExplainabilityReportError(f"S2 explainability missing component ref: {key}")
+        return ref.strip()
+
+    @staticmethod
+    def _config_ref(config: Mapping[str, Any], key: str) -> str | None:
+        ref = config.get(key)
+        return ref.strip() if isinstance(ref, str) and ref.strip() else None
+
+    @staticmethod
+    def _mapping(value: Any, *, role: str, required: bool = True) -> dict[str, Any]:
+        if isinstance(value, Mapping):
+            return dict(value)
+        if not required:
+            return {}
+        raise ExplainabilityReportError(f"S2 explainability {role} must be an object")
+
+    def _rationale_section(
+        self,
+        *,
+        build_payload: Mapping[str, Any],
+        feature_payload: Mapping[str, Any],
+        model_payload: Mapping[str, Any],
+        hpo_payload: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        feature_set = self._mapping(feature_payload.get("feature_set"), role="feature_set")
+        io_signature = self._mapping(build_payload.get("io_signature"), role="io_signature")
+        selected_parameters = self._mapping(hpo_payload.get("selected_parameters"), role="selected_parameters")
+        return {
+            "status": "PRESENT",
+            "model_family": str(model_payload.get("family_id") or hpo_payload.get("selected_family_id") or ""),
+            "backend": str(model_payload.get("backend") or ""),
+            "selected_features": list(feature_set.get("selected_nodes", ())),
+            "selected_parameters": selected_parameters,
+            "io_signature": io_signature,
+            "self_replay": dict(build_payload.get("self_replay", {})),
+            "rationale": "Selected model and feature lineage are reconstructed from C4 component refs.",
+        }
+
+    def _hpo_trace_section(self, hpo_payload: Mapping[str, Any]) -> dict[str, Any]:
+        trials = []
+        trial_refs = hpo_payload.get("trial_artifact_refs", ())
+        if not isinstance(trial_refs, list):
+            raise ExplainabilityReportError("S2 explainability hpo_selection missing trial_artifact_refs")
+        for trial_ref in trial_refs:
+            if not isinstance(trial_ref, str) or not trial_ref.strip():
+                continue
+            _, trial_payload = self._load_required_artifact(
+                trial_ref.strip(),
+                expected_kind="hpo_trial",
+                role="hpo_trial",
+            )
+            trials.append(
+                {
+                    "trial_id": trial_payload.get("trial_id"),
+                    "family_id": trial_payload.get("family_id"),
+                    "status": trial_payload.get("status"),
+                    "parameters": dict(trial_payload.get("parameters", {})),
+                    "objective_metric": trial_payload.get("objective_metric"),
+                    "objective_value": trial_payload.get("score"),
+                    "calibration_error": trial_payload.get("calibration_error"),
+                    "cost": trial_payload.get("cost"),
+                    "warm_start_ref": dict(trial_payload.get("diagnostics", {})).get("warm_start_ref"),
+                }
+            )
+        return {
+            "status": "PRESENT",
+            "selected_trial_id": hpo_payload.get("selected_trial_id"),
+            "selected_family_id": hpo_payload.get("selected_family_id"),
+            "selected_parameters": dict(hpo_payload.get("selected_parameters", {})),
+            "objective": hpo_payload.get("objective"),
+            "objective_metric": hpo_payload.get("objective_metric"),
+            "policy": hpo_payload.get("policy"),
+            "pareto_front_trial_ids": list(hpo_payload.get("pareto_front_trial_ids", ())),
+            "trials": trials,
+        }
+
+    def _priors_section(
+        self,
+        *,
+        build_payload: Mapping[str, Any],
+        feature_payload: Mapping[str, Any],
+        base_pipeline_ref: str | None,
+        dataset_split_ref: str | None,
+    ) -> dict[str, Any]:
+        config = self._mapping(build_payload.get("config"), role="frozen pipeline config", required=False)
+        graph = self._mapping(feature_payload.get("graph"), role="feature graph")
+        return {
+            "status": "PRESENT",
+            "adapter_refs": list(build_payload.get("adapter_refs", ())),
+            "base_pipeline_ref": base_pipeline_ref,
+            "dataset_split_ref": dataset_split_ref,
+            "cache_reuse": dict(config.get("cache_reuse", {})),
+            "mutation_parameters": dict(config.get("mutation_parameters", {})),
+            "feature_graph": {
+                "graph_id": graph.get("graph_id"),
+                "node_count": len(graph.get("nodes", ())),
+                "nodes": list(graph.get("nodes", ())),
+            },
+        }
+
+    @staticmethod
+    def _calibration_plot_section(calibration_payload: Mapping[str, Any]) -> dict[str, Any]:
+        return {
+            "status": "PRESENT",
+            "calibration_status": calibration_payload.get("status"),
+            "advisory_check": dict(calibration_payload.get("advisory_check", {})),
+            "plot_data": {
+                "nominal_coverage": calibration_payload.get("nominal_coverage"),
+                "empirical_coverage": calibration_payload.get("empirical_coverage"),
+                "coverage_tolerance": calibration_payload.get("coverage_tolerance"),
+                "calibration_error": calibration_payload.get("calibration_error"),
+                "calibration_sample_count": calibration_payload.get("calibration_sample_count"),
+                "validation_sample_count": calibration_payload.get("validation_sample_count"),
+                "interval": dict(calibration_payload.get("interval", {})),
+                "points": [
+                    {"label": "nominal", "coverage": calibration_payload.get("nominal_coverage")},
+                    {"label": "empirical", "coverage": calibration_payload.get("empirical_coverage")},
+                ],
+            },
+        }
+
+    @staticmethod
+    def _repair_log_section(
+        *,
+        calibration_payload: Mapping[str, Any],
+        advisory_payload: Mapping[str, Any],
+        training_payload: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        return {
+            "status": "PRESENT",
+            "failure_doctor_status": "ARMED",
+            "training_status": training_payload.get("status"),
+            "repair_actions": list(calibration_payload.get("repair_actions", ())),
+            "advisory_status": advisory_payload.get("status"),
+            "advisory_warnings": list(advisory_payload.get("warnings", ())),
+            "advisory_checks": dict(advisory_payload.get("checks", {})),
+            "self_replay": dict(calibration_payload.get("self_replay", {})),
+        }
 
 
 def validate_s2_contract_model_set(
