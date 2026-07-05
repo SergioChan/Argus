@@ -4052,6 +4052,312 @@ class UQCalibrationResult:
     diagnostics: dict[str, Any] = field(default_factory=dict)
 
 
+@dataclass(frozen=True)
+class AdvisorySignalSample:
+    sample_id: str
+    template: float
+    observed: float
+
+    def __post_init__(self) -> None:
+        sample_id = self.sample_id.strip()
+        if not sample_id:
+            raise S2ContractModelError("S2 advisory signal samples require sample_id")
+        object.__setattr__(self, "sample_id", sample_id)
+        object.__setattr__(self, "template", _finite_advisory_value(self.template, name="template"))
+        object.__setattr__(self, "observed", _finite_advisory_value(self.observed, name="observed"))
+
+
+@dataclass(frozen=True)
+class AdvisoryLeakageSample:
+    sample_id: str
+    feature_value: float
+    target_value: float
+
+    def __post_init__(self) -> None:
+        sample_id = self.sample_id.strip()
+        if not sample_id:
+            raise S2ContractModelError("S2 advisory leakage samples require sample_id")
+        object.__setattr__(self, "sample_id", sample_id)
+        object.__setattr__(self, "feature_value", _finite_advisory_value(self.feature_value, name="feature_value"))
+        object.__setattr__(self, "target_value", _finite_advisory_value(self.target_value, name="target_value"))
+
+
+@dataclass(frozen=True)
+class AdvisoryCheck:
+    name: str
+    status: str
+    advisory: bool
+    statistic: float
+    threshold: float
+    message: str
+    recovered_value: float | None = None
+
+    def __post_init__(self) -> None:
+        name = self.name.strip()
+        status = self.status.strip()
+        message = self.message.strip()
+        if not name:
+            raise S2ContractModelError("S2 advisory checks require name")
+        if status not in {"PASS", "FAIL"}:
+            raise S2ContractModelError(f"unsupported S2 advisory check status: {status}")
+        if not message:
+            raise S2ContractModelError("S2 advisory checks require message")
+        object.__setattr__(self, "name", name)
+        object.__setattr__(self, "status", status)
+        object.__setattr__(self, "statistic", _finite_advisory_value(self.statistic, name=f"{name}.statistic"))
+        object.__setattr__(self, "threshold", _finite_advisory_value(self.threshold, name=f"{name}.threshold"))
+        if self.recovered_value is not None:
+            object.__setattr__(
+                self,
+                "recovered_value",
+                _finite_advisory_value(self.recovered_value, name=f"{name}.recovered_value"),
+            )
+        object.__setattr__(self, "message", message)
+
+
+@dataclass(frozen=True)
+class AdvisorySelfCheckRequest:
+    job_id: str
+    input_refs: tuple[str, ...]
+    code_ref: str
+    environment_digest: str
+    seed: str
+    injection_samples: tuple[AdvisorySignalSample, ...] = ()
+    known_amplitude: float = 0.0
+    amplitude_tolerance: float = 0.0
+    null_samples: tuple[AdvisorySignalSample, ...] = ()
+    null_detection_threshold: float = 0.0
+    leakage_samples: tuple[AdvisoryLeakageSample, ...] = ()
+    leakage_threshold: float = 0.99
+
+    def __post_init__(self) -> None:
+        job_id = self.job_id.strip()
+        input_refs = tuple(ref.strip() for ref in self.input_refs)
+        if not job_id:
+            raise S2ContractModelError("S2 AdvisorySelfCheck requires job_id")
+        if not input_refs or any(not ref for ref in input_refs):
+            raise S2ContractModelError("S2 AdvisorySelfCheck requires non-empty input_refs")
+        if not (self.injection_samples or self.null_samples or self.leakage_samples):
+            raise S2ContractModelError("S2 AdvisorySelfCheck requires at least one advisory sample group")
+        amplitude_tolerance = _finite_advisory_value(self.amplitude_tolerance, name="amplitude_tolerance")
+        null_detection_threshold = _finite_advisory_value(
+            self.null_detection_threshold,
+            name="null_detection_threshold",
+        )
+        leakage_threshold = _finite_advisory_value(self.leakage_threshold, name="leakage_threshold")
+        if amplitude_tolerance < 0:
+            raise S2ContractModelError("S2 advisory amplitude_tolerance must be non-negative")
+        if null_detection_threshold < 0:
+            raise S2ContractModelError("S2 advisory null_detection_threshold must be non-negative")
+        if not 0.0 <= leakage_threshold <= 1.0:
+            raise S2ContractModelError("S2 advisory leakage_threshold must be between 0 and 1")
+        object.__setattr__(self, "job_id", job_id)
+        object.__setattr__(self, "input_refs", input_refs)
+        object.__setattr__(self, "injection_samples", tuple(self.injection_samples))
+        object.__setattr__(self, "known_amplitude", _finite_advisory_value(self.known_amplitude, name="known_amplitude"))
+        object.__setattr__(self, "amplitude_tolerance", amplitude_tolerance)
+        object.__setattr__(self, "null_samples", tuple(self.null_samples))
+        object.__setattr__(self, "null_detection_threshold", null_detection_threshold)
+        object.__setattr__(self, "leakage_samples", tuple(self.leakage_samples))
+        object.__setattr__(self, "leakage_threshold", leakage_threshold)
+        object.__setattr__(self, "code_ref", self.code_ref.strip())
+        object.__setattr__(self, "environment_digest", self.environment_digest.strip())
+        object.__setattr__(self, "seed", self.seed.strip())
+        if not self.code_ref or not self.environment_digest:
+            raise S2ContractModelError("S2 AdvisorySelfCheck requires code_ref and environment_digest")
+
+
+@dataclass(frozen=True)
+class AdvisorySelfCheckResult:
+    job_id: str
+    status: str
+    claim_tier: str
+    checks: tuple[AdvisoryCheck, ...]
+    artifact_ref: str
+    warnings: tuple[str, ...]
+    diagnostics: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def checks_by_name(self) -> dict[str, AdvisoryCheck]:
+        return {check.name: check for check in self.checks}
+
+
+class AdvisorySelfCheck:
+    """Runs advisory-only S2 physics and leakage checks without promoting tier."""
+
+    def __init__(
+        self,
+        *,
+        artifact_store: InMemoryArtifactStore,
+        provenance_emitter: "ProvenanceEmitter" | None = None,
+    ) -> None:
+        self._artifact_store = artifact_store
+        self._provenance_emitter = provenance_emitter or ProvenanceEmitter(artifact_store=artifact_store)
+
+    def run(
+        self,
+        request: AdvisorySelfCheckRequest,
+        *,
+        attempted_claim_tier: str | None = None,
+    ) -> AdvisorySelfCheckResult:
+        if attempted_claim_tier and attempted_claim_tier != "ran-toy":
+            raise SelfGradeError("S2 AdvisorySelfCheck cannot raise claim_tier")
+        for input_ref in request.input_refs:
+            self._artifact_store.get_record(input_ref)
+        checks: list[AdvisoryCheck] = []
+        if request.injection_samples:
+            checks.append(self._injection_sanity(request))
+        if request.null_samples:
+            checks.append(self._null_sanity(request))
+        if request.leakage_samples:
+            checks.append(self._leakage_smell(request))
+        warnings = tuple(check.name for check in checks if check.status == "FAIL")
+        status = "PASS" if not warnings else "NEEDS_REVIEW"
+        payload = {
+            "job_id": request.job_id,
+            "status": status,
+            "advisory": True,
+            "claim_tier": "ran-toy",
+            "tier_raise_allowed": False,
+            "checks": {check.name: asdict(check) for check in checks},
+            "warnings": list(warnings),
+            "sample_counts": {
+                "injection": len(request.injection_samples),
+                "null": len(request.null_samples),
+                "leakage": len(request.leakage_samples),
+            },
+            "label_policy": {
+                "raw_labels_materialized": False,
+                "payload_contains_sample_rows": False,
+            },
+        }
+        record = self._provenance_emitter.emit_artifact(
+            kind="advisory_self_check",
+            payload=payload,
+            producer=Producer(subsystem="S2", version="0.0.0", job_id=request.job_id),
+            lineage=Lineage(
+                input_refs=request.input_refs,
+                code_ref=request.code_ref,
+                environment_digest=request.environment_digest,
+                seeds=(request.seed,),
+                job_id=request.job_id,
+            ),
+            claim_tier="ran-toy",
+        )
+        return AdvisorySelfCheckResult(
+            job_id=request.job_id,
+            status=status,
+            claim_tier="ran-toy",
+            checks=tuple(checks),
+            artifact_ref=record.artifact_ref,
+            warnings=warnings,
+            diagnostics={
+                "advisory": True,
+                "tier_raise_allowed": False,
+                "claim_tier": "ran-toy",
+            },
+        )
+
+    def _injection_sanity(self, request: AdvisorySelfCheckRequest) -> AdvisoryCheck:
+        recovered = _recover_signal_amplitude(request.injection_samples)
+        error = abs(recovered - request.known_amplitude)
+        passed = error <= request.amplitude_tolerance
+        return AdvisoryCheck(
+            name="injection_sanity",
+            status="PASS" if passed else "FAIL",
+            advisory=True,
+            statistic=error,
+            threshold=request.amplitude_tolerance,
+            recovered_value=recovered,
+            message="known injected signal recovered within tolerance" if passed else "injected signal recovery outside tolerance",
+        )
+
+    def _null_sanity(self, request: AdvisorySelfCheckRequest) -> AdvisoryCheck:
+        recovered = _recover_signal_amplitude(request.null_samples)
+        detection_statistic = abs(recovered)
+        passed = detection_statistic <= request.null_detection_threshold
+        return AdvisoryCheck(
+            name="null_sanity",
+            status="PASS" if passed else "FAIL",
+            advisory=True,
+            statistic=detection_statistic,
+            threshold=request.null_detection_threshold,
+            recovered_value=recovered,
+            message="null control below detection threshold" if passed else "null control produced a significant detection",
+        )
+
+    def _leakage_smell(self, request: AdvisorySelfCheckRequest) -> AdvisoryCheck:
+        score = _leakage_score(request.leakage_samples)
+        leaked = score >= request.leakage_threshold
+        return AdvisoryCheck(
+            name="leakage_smell",
+            status="FAIL" if leaked else "PASS",
+            advisory=True,
+            statistic=score,
+            threshold=request.leakage_threshold,
+            message="target leakage smell detected; defer tier decisions to S3" if leaked else "no target leakage smell above threshold",
+        )
+
+
+def _finite_advisory_value(value: Any, *, name: str) -> float:
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError) as exc:
+        raise S2ContractModelError(f"S2 advisory value {name!r} must be numeric") from exc
+    if not math.isfinite(numeric):
+        raise S2ContractModelError(f"S2 advisory value {name!r} must be finite")
+    return numeric
+
+
+def _recover_signal_amplitude(samples: tuple[AdvisorySignalSample, ...]) -> float:
+    denominator = sum(sample.template * sample.template for sample in samples)
+    if denominator <= 0.0:
+        raise S2ContractModelError("S2 advisory signal recovery requires a non-zero template")
+    numerator = sum(sample.template * sample.observed for sample in samples)
+    return numerator / denominator
+
+
+def _leakage_score(samples: tuple[AdvisoryLeakageSample, ...]) -> float:
+    targets = {sample.target_value for sample in samples}
+    if targets.issubset({0.0, 1.0}) and targets == {0.0, 1.0}:
+        auc = _binary_auc(samples)
+        return max(auc, 1.0 - auc)
+    return _absolute_pearson_correlation(
+        tuple(sample.feature_value for sample in samples),
+        tuple(sample.target_value for sample in samples),
+    )
+
+
+def _binary_auc(samples: tuple[AdvisoryLeakageSample, ...]) -> float:
+    positives = [sample.feature_value for sample in samples if sample.target_value == 1.0]
+    negatives = [sample.feature_value for sample in samples if sample.target_value == 0.0]
+    if not positives or not negatives:
+        raise S2ContractModelError("S2 advisory binary leakage AUC requires positive and negative labels")
+    wins = 0.0
+    for positive in positives:
+        for negative in negatives:
+            if positive > negative:
+                wins += 1.0
+            elif positive == negative:
+                wins += 0.5
+    return wins / float(len(positives) * len(negatives))
+
+
+def _absolute_pearson_correlation(left: tuple[float, ...], right: tuple[float, ...]) -> float:
+    if len(left) != len(right) or len(left) < 2:
+        raise S2ContractModelError("S2 advisory leakage correlation requires at least two paired samples")
+    left_mean = sum(left) / float(len(left))
+    right_mean = sum(right) / float(len(right))
+    left_centered = tuple(value - left_mean for value in left)
+    right_centered = tuple(value - right_mean for value in right)
+    left_norm = math.sqrt(sum(value * value for value in left_centered))
+    right_norm = math.sqrt(sum(value * value for value in right_centered))
+    if left_norm == 0.0 or right_norm == 0.0:
+        return 0.0
+    correlation = sum(lv * rv for lv, rv in zip(left_centered, right_centered)) / (left_norm * right_norm)
+    return abs(correlation)
+
+
 class UQCalibrator:
     """Calibrates and validates S2 uncertainty evidence without surfacing raw labels."""
 
