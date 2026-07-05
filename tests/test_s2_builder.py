@@ -10,8 +10,13 @@ from argus_core import (
     EvalRequest,
     HPOTrial,
     InMemoryArtifactStore,
+    IncompleteLineageError,
+    IllegalTierError,
+    Lineage,
     MutationSpec,
     NormalizedQuantity,
+    Producer,
+    ProvenanceEmitter,
     Quantity,
     RewardSourceError,
     SelfGradeError,
@@ -63,6 +68,53 @@ class S2BaselineBuilderTests(unittest.TestCase):
         self.assertIn(dataset.artifact_ref, {node.artifact_ref for node in model_lineage.nodes})
         self.assertIn(model.artifact_ref, {node.artifact_ref for node in pipeline_lineage.nodes})
         self.assertEqual(len(result.adapter_provenance_refs), 1)
+
+    def test_provenance_emitter_rejects_incomplete_lineage_without_record(self) -> None:
+        emitter = ProvenanceEmitter(artifact_store=self.store)
+
+        with self.assertRaises(IncompleteLineageError) as raised:
+            emitter.emit_artifact(
+                kind="model",
+                payload={"weights": [1]},
+                lineage=Lineage(input_refs=(), code_ref="git:model", environment_digest=""),
+            )
+
+        self.assertEqual(raised.exception.category, "INCOMPLETE_LINEAGE")
+        self.assertEqual(raised.exception.missing_fields, ("lineage.environment_digest",))
+        self.assertEqual(len(self.store), 0)
+
+    def test_provenance_emitter_rejects_promoted_tier_without_report_without_record(self) -> None:
+        emitter = ProvenanceEmitter(artifact_store=self.store)
+
+        with self.assertRaises(IllegalTierError) as raised:
+            emitter.emit_artifact(
+                kind="model",
+                payload={"weights": [1], "uncertainty_tag": {"kind": "interval", "radius": 0.1}},
+                lineage=Lineage(input_refs=(), code_ref="git:model", environment_digest="oci:model"),
+                claim_tier="recapitulated-known",
+            )
+
+        self.assertEqual(raised.exception.category, "ILLEGAL_TIER")
+        self.assertEqual(raised.exception.reason, "tier above ran-toy requires validation_report_ref")
+        self.assertEqual(len(self.store), 0)
+
+    def test_builder_writes_model_and_pipeline_through_provenance_emitter(self) -> None:
+        emitter = RecordingProvenanceEmitter(artifact_store=self.store)
+        builder = BaselineBuilder(
+            artifact_store=self.store,
+            adapter_broker=self.broker,
+            provenance_emitter=emitter,
+        )
+
+        result = builder.build(self._plan(job_id="job-through-emitter"))
+
+        self.assertEqual(result.artifact_refs, tuple(call["record"].artifact_ref for call in emitter.calls))
+        self.assertEqual([call["kind"] for call in emitter.calls], ["model", "container"])
+        self.assertTrue(all(call["claim_tier"] == "ran-toy" for call in emitter.calls))
+        self.assertTrue(all(call["producer"].subsystem == "S2" for call in emitter.calls))
+        self.assertTrue(all(call["producer"].job_id == "job-through-emitter" for call in emitter.calls))
+        self.assertTrue(all(call["record"].lineage.code_ref for call in emitter.calls))
+        self.assertTrue(all(call["record"].lineage.environment_digest for call in emitter.calls))
 
     def test_self_grade_above_ran_toy_is_rejected(self) -> None:
         with self.assertRaises(SelfGradeError):
@@ -181,9 +233,43 @@ class S2BaselineBuilderTests(unittest.TestCase):
 
     @staticmethod
     def _lineage():
-        from argus_core import Lineage
-
         return Lineage(input_refs=(), code_ref="git:test", environment_digest="oci:test")
+
+
+class RecordingProvenanceEmitter(ProvenanceEmitter):
+    def __init__(self, *, artifact_store: InMemoryArtifactStore) -> None:
+        super().__init__(artifact_store=artifact_store)
+        self.calls: list[dict[str, object]] = []
+
+    def emit_artifact(
+        self,
+        *,
+        kind: str,
+        payload: object,
+        lineage: Lineage,
+        claim_tier: str = "ran-toy",
+        validation_report_ref: str | None = None,
+        artifact_ref: str | None = None,
+        producer: Producer | None = None,
+    ):
+        record = super().emit_artifact(
+            kind=kind,
+            payload=payload,
+            lineage=lineage,
+            claim_tier=claim_tier,
+            validation_report_ref=validation_report_ref,
+            artifact_ref=artifact_ref,
+            producer=producer,
+        )
+        self.calls.append(
+            {
+                "kind": kind,
+                "claim_tier": claim_tier,
+                "producer": producer or self.producer,
+                "record": record,
+            }
+        )
+        return record
 
 
 if __name__ == "__main__":

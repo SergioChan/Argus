@@ -11,7 +11,7 @@ from typing import Any, Callable, Mapping
 from .s5 import C2VersionPolicy, parse_c2_job_envelope
 from .s6 import CapabilityDescriptor, RegistryError
 from .s7 import AdapterBroker, EvalRequest, EvalResult
-from .s8 import ArtifactRecord, InMemoryArtifactStore, Lineage, Producer
+from .s8 import ArtifactRecord, IllegalTierError, InMemoryArtifactStore, Lineage, Producer, assert_lineage_complete
 
 
 class S2Error(Exception):
@@ -841,6 +841,63 @@ class VariantBuildResult:
     diagnostics: dict[str, Any]
 
 
+class ProvenanceEmitter:
+    """S2 C4 writer client with fail-closed lineage and tier coupling checks."""
+
+    def __init__(
+        self,
+        *,
+        artifact_store: InMemoryArtifactStore,
+        producer: Producer | None = None,
+    ) -> None:
+        self._artifact_store = artifact_store
+        self._producer = producer or Producer(subsystem="S2", version="0.0.0")
+        self._assert_valid_producer(self._producer)
+
+    @property
+    def producer(self) -> Producer:
+        return self._producer
+
+    def emit_artifact(
+        self,
+        *,
+        kind: str,
+        payload: Any,
+        lineage: Lineage,
+        claim_tier: str = "ran-toy",
+        validation_report_ref: str | None = None,
+        artifact_ref: str | None = None,
+        producer: Producer | None = None,
+    ) -> ArtifactRecord:
+        if claim_tier != "ran-toy" and not validation_report_ref:
+            raise IllegalTierError("tier above ran-toy requires validation_report_ref")
+        artifact_producer = producer or self._producer
+        self._assert_valid_producer(artifact_producer)
+        assert_lineage_complete(
+            lineage,
+            kind=kind,
+            payload=payload if isinstance(payload, Mapping) else None,
+            claim_tier=claim_tier,
+            validation_report_ref=validation_report_ref,
+        )
+        return self._artifact_store.create_artifact(
+            kind=kind,
+            payload=payload,
+            producer=artifact_producer,
+            lineage=lineage,
+            artifact_ref=artifact_ref,
+            claim_tier=claim_tier,
+            validation_report_ref=validation_report_ref,
+        )
+
+    @staticmethod
+    def _assert_valid_producer(producer: Producer) -> None:
+        if not producer.subsystem:
+            raise S2ContractModelError("S2 ProvenanceEmitter requires producer.subsystem")
+        if not producer.version:
+            raise S2ContractModelError("S2 ProvenanceEmitter requires producer.version")
+
+
 def validate_s2_contract_model_set(
     contract_by_id: Mapping[str, Any],
     *,
@@ -1067,9 +1124,16 @@ class SpecCompiler:
 class BaselineBuilder:
     """Small deterministic S2 builder that emits C4 provenance and never self-grades."""
 
-    def __init__(self, *, artifact_store: InMemoryArtifactStore, adapter_broker: AdapterBroker) -> None:
+    def __init__(
+        self,
+        *,
+        artifact_store: InMemoryArtifactStore,
+        adapter_broker: AdapterBroker,
+        provenance_emitter: ProvenanceEmitter | None = None,
+    ) -> None:
         self._artifact_store = artifact_store
         self._adapter_broker = adapter_broker
+        self._provenance_emitter = provenance_emitter or ProvenanceEmitter(artifact_store=artifact_store)
 
     def build(self, plan: BuildPlan, *, attempted_claim_tier: str | None = None) -> BuildResult:
         if attempted_claim_tier and attempted_claim_tier != "ran-toy":
@@ -1134,15 +1198,16 @@ class BaselineBuilder:
                 "extrapolation_flag": adapter_result.extrapolation_flag,
             },
         }
-        return self._artifact_store.create_artifact(
+        return self._provenance_emitter.emit_artifact(
             kind="model",
             payload=payload,
-            producer=Producer(subsystem="S2", version="0.0.0"),
+            producer=Producer(subsystem="S2", version="0.0.0", job_id=plan.job_id),
             lineage=Lineage(
                 input_refs=plan.input_refs + (adapter_result.provenance_ref,),
                 code_ref=plan.code_ref,
                 environment_digest=plan.environment_digest,
                 seeds=(plan.seed,),
+                job_id=plan.job_id,
             ),
             claim_tier="ran-toy",
         )
@@ -1160,15 +1225,16 @@ class BaselineBuilder:
             "code_ref": plan.code_ref,
             "environment_digest": plan.environment_digest,
         }
-        return self._artifact_store.create_artifact(
+        return self._provenance_emitter.emit_artifact(
             kind="container",
             payload=payload,
-            producer=Producer(subsystem="S2", version="0.0.0"),
+            producer=Producer(subsystem="S2", version="0.0.0", job_id=plan.job_id),
             lineage=Lineage(
                 input_refs=(model_record.artifact_ref, adapter_result.provenance_ref),
                 code_ref=plan.code_ref,
                 environment_digest=plan.environment_digest,
                 seeds=(plan.seed,),
+                job_id=plan.job_id,
             ),
             claim_tier="ran-toy",
         )
