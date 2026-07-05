@@ -16,7 +16,7 @@ from uuid import NAMESPACE_URL, uuid4, uuid5
 
 from argusverify import C3ReportVerifier
 from .hashing import hash_json
-from .s6 import CapabilityDescriptor, InMemoryRegistry, sign_s1_reference_conformance_evidence
+from .s6 import CapabilityDescriptor, InMemoryRegistry, S1ConformanceAttestationSigner
 from .s7 import AdapterBroker, EvalRequest, EvalResult, Quantity, S7Error
 from .s10 import (
     EgressRule,
@@ -2097,9 +2097,11 @@ class S1ReferenceConformanceHarness:
         *,
         suite_version: str = S1_REFERENCE_CONFORMANCE_SUITE_VERSION,
         standard_release_ref: str = S1_REFERENCE_CONFORMANCE_STANDARD_REF,
+        attestation_signer: S1ConformanceAttestationSigner | None = None,
     ) -> None:
         self.suite_version = _non_empty_conformance_string(suite_version, "suite_version")
         self.standard_release_ref = _non_empty_conformance_string(standard_release_ref, "standard_release_ref")
+        self._attestation_signer = attestation_signer
 
     def run(
         self,
@@ -2134,7 +2136,8 @@ class S1ReferenceConformanceHarness:
         )
         determinism_hash = hash_json(evidence_payload)
         evidence_payload["determinism_hash"] = determinism_hash
-        evidence_payload = sign_s1_reference_conformance_evidence(evidence_payload)
+        if self._attestation_signer is not None:
+            evidence_payload = self._attestation_signer.sign_evidence(evidence_payload)
         evidence_record = store.create_artifact(
             kind=S1_REFERENCE_CONFORMANCE_EVIDENCE_KIND,
             payload=evidence_payload,

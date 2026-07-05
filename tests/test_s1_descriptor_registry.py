@@ -14,6 +14,7 @@ from argus_core import (
     Lineage,
     Producer,
     S1_REFERENCE_CONFORMANCE_EVIDENCE_KIND,
+    S1ConformanceAttestationAuthority,
     S1ReferenceConformanceHarness,
     Subagent,
     SubagentDescriptor,
@@ -64,6 +65,14 @@ class S1CapabilityDescriptorRegistryTests(unittest.TestCase):
         cls.validator = Draft202012Validator(cls.schema)
 
     def setUp(self) -> None:
+        self.conformance_authority = S1ConformanceAttestationAuthority.from_private_key_bytes(
+            key_id="s1-reference-conformance-key-v1",
+            private_key_bytes=bytes.fromhex("11" * 32),
+        )
+        self.attacker_authority = S1ConformanceAttestationAuthority.from_private_key_bytes(
+            key_id="s1-reference-conformance-key-v1",
+            private_key_bytes=bytes.fromhex("22" * 32),
+        )
         self.subagent_descriptor = SubagentDescriptor(
             subagent_id="s1-ewpt-reference",
             contract_version="1.0.0",
@@ -141,7 +150,10 @@ class S1CapabilityDescriptorRegistryTests(unittest.TestCase):
 
     def test_publish_populates_unexpired_conformance_block_from_passing_run(self) -> None:
         store = InMemoryArtifactStore()
-        registry = InMemoryRegistry(artifact_store=store)
+        registry = InMemoryRegistry(
+            artifact_store=store,
+            conformance_attestation_verifier=self.conformance_authority.verifier,
+        )
         result = self._run_conformance(store, level="bronze")
 
         published = publish_s1_capability_descriptor(
@@ -169,9 +181,9 @@ class S1CapabilityDescriptorRegistryTests(unittest.TestCase):
         self.assertEqual(record_payload["conformance"], expected)
         self.assertEqual(registry.get(self.subagent_descriptor.subagent_id).conformance, expected)
         evidence = json.loads(store.get_artifact(result.evidence_ref).decode("utf-8"))
-        self.assertEqual(evidence["attestation"]["algorithm"], "hmac-sha256")
+        self.assertEqual(evidence["attestation"]["algorithm"], "ed25519")
         self.assertEqual(evidence["attestation"]["key_id"], "s1-reference-conformance-key-v1")
-        self.assertTrue(evidence["attestation"]["value"].startswith("hmac-sha256:"))
+        self.assertTrue(evidence["attestation"]["value"].startswith("ed25519:"))
 
     def test_publish_rejects_failed_conformance_result_before_registry_mutation(self) -> None:
         store = InMemoryArtifactStore()
@@ -230,10 +242,29 @@ class S1CapabilityDescriptorRegistryTests(unittest.TestCase):
 
         self.assertEqual(registry.events, ())
 
-    def test_store_backed_registry_accepts_verified_raw_conformance_pass_through(self) -> None:
+    def test_store_backed_registry_requires_conformance_attestation_verifier(self) -> None:
         store = InMemoryArtifactStore()
         result = self._run_conformance(store, level="bronze")
         registry = InMemoryRegistry(artifact_store=store)
+
+        with self.assertRaisesRegex(Exception, "CONFORMANCE_UNTRUSTED: attestation_verifier"):
+            publish_s1_capability_descriptor(
+                registry,
+                self.subagent_descriptor,
+                revision=1,
+                independence_tags=("impl-reference",),
+                conformance=result.descriptor_conformance_block(expires_at=FUTURE_EXPIRES_AT),
+            )
+
+        self.assertEqual(registry.events, ())
+
+    def test_store_backed_registry_accepts_verified_raw_conformance_pass_through(self) -> None:
+        store = InMemoryArtifactStore()
+        result = self._run_conformance(store, level="bronze")
+        registry = InMemoryRegistry(
+            artifact_store=store,
+            conformance_attestation_verifier=self.conformance_authority.verifier,
+        )
 
         published = publish_s1_capability_descriptor(
             registry,
@@ -248,7 +279,10 @@ class S1CapabilityDescriptorRegistryTests(unittest.TestCase):
 
     def test_registry_rejects_expired_or_tampered_conformance_block(self) -> None:
         store = InMemoryArtifactStore()
-        registry = InMemoryRegistry(artifact_store=store)
+        registry = InMemoryRegistry(
+            artifact_store=store,
+            conformance_attestation_verifier=self.conformance_authority.verifier,
+        )
         result = self._run_conformance(store, level="bronze")
         valid_conformance = result.descriptor_conformance_block(expires_at=FUTURE_EXPIRES_AT)
 
@@ -274,7 +308,10 @@ class S1CapabilityDescriptorRegistryTests(unittest.TestCase):
 
     def test_registry_rejects_self_consistent_forged_conformance_evidence(self) -> None:
         store = InMemoryArtifactStore()
-        registry = InMemoryRegistry(artifact_store=store)
+        registry = InMemoryRegistry(
+            artifact_store=store,
+            conformance_attestation_verifier=self.conformance_authority.verifier,
+        )
         forged = {
             "schema": "argus.s1.reference_conformance_evidence.v1",
             "subagent_id": self.subagent_descriptor.subagent_id,
@@ -317,7 +354,10 @@ class S1CapabilityDescriptorRegistryTests(unittest.TestCase):
 
     def test_registry_rejects_forged_conformance_with_impersonated_record_metadata(self) -> None:
         store = InMemoryArtifactStore()
-        registry = InMemoryRegistry(artifact_store=store)
+        registry = InMemoryRegistry(
+            artifact_store=store,
+            conformance_attestation_verifier=self.conformance_authority.verifier,
+        )
         forged = {
             "schema": "argus.s1.reference_conformance_evidence.v1",
             "subagent_id": self.subagent_descriptor.subagent_id,
@@ -330,10 +370,63 @@ class S1CapabilityDescriptorRegistryTests(unittest.TestCase):
         }
         forged["determinism_hash"] = hash_json(forged)
         forged["attestation"] = {
-            "algorithm": "hmac-sha256",
+            "algorithm": "ed25519",
             "key_id": "s1-reference-conformance-key-v1",
-            "value": "hmac-sha256:forged",
+            "value": "ed25519:" + ("0" * 128),
         }
+        forged_record = store.create_artifact(
+            kind=S1_REFERENCE_CONFORMANCE_EVIDENCE_KIND,
+            payload=forged,
+            producer=Producer(
+                subsystem="S1",
+                version="s1-reference-conformance.v1",
+                actor_id="s1.reference_conformance",
+                job_id=self.envelope.job_id,
+            ),
+            lineage=Lineage(
+                input_refs=(),
+                code_ref="argus-core:s1.reference-conformance",
+                environment_digest="python:s1-reference-conformance:v1",
+                job_id=self.envelope.job_id,
+            ),
+        )
+        descriptor = build_s1_capability_descriptor(
+            self.subagent_descriptor,
+            revision=1,
+            independence_tags=("impl-reference",),
+            conformance={
+                "level": "gold",
+                "suite_version": "s1-reference-conformance.v1",
+                "standard_release_ref": "c4://standard/c1/1.0.0",
+                "evidence_ref": forged_record.artifact_ref,
+                "determinism_hash": forged["determinism_hash"],
+                "expires_at": FUTURE_EXPIRES_AT,
+            },
+        )
+
+        with self.assertRaisesRegex(Exception, "CONFORMANCE_UNTRUSTED: attestation_signature"):
+            registry.publish(descriptor)
+
+        self.assertEqual(registry.events, ())
+
+    def test_registry_rejects_attacker_signed_forgery_with_impersonated_record_metadata(self) -> None:
+        store = InMemoryArtifactStore()
+        registry = InMemoryRegistry(
+            artifact_store=store,
+            conformance_attestation_verifier=self.conformance_authority.verifier,
+        )
+        forged = {
+            "schema": "argus.s1.reference_conformance_evidence.v1",
+            "subagent_id": self.subagent_descriptor.subagent_id,
+            "level_requested": "gold",
+            "level_awarded": "gold",
+            "suite_version": "s1-reference-conformance.v1",
+            "standard_release_ref": "c4://standard/c1/1.0.0",
+            "aggregate_passed": True,
+            "checks": [],
+        }
+        forged["determinism_hash"] = hash_json(forged)
+        forged = self.attacker_authority.signer.sign_evidence(forged)
         forged_record = store.create_artifact(
             kind=S1_REFERENCE_CONFORMANCE_EVIDENCE_KIND,
             payload=forged,
@@ -373,6 +466,7 @@ class S1CapabilityDescriptorRegistryTests(unittest.TestCase):
         harness = S1ReferenceConformanceHarness(
             suite_version="s1-reference-conformance.v1",
             standard_release_ref="c4://standard/c1/1.0.0",
+            attestation_signer=self.conformance_authority.signer,
         )
         return harness.run(
             DescriptorConformanceSubagent(self.subagent_descriptor),

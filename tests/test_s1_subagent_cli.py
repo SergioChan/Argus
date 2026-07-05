@@ -128,6 +128,8 @@ class S1SubagentCliTests(unittest.TestCase):
                         str(bronze_path),
                         "--descriptor-output",
                         str(descriptor_out),
+                        "--attestation-private-key-hex",
+                        "11" * 32,
                     ]
                 ),
                 0,

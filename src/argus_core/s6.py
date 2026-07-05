@@ -5,10 +5,12 @@ from __future__ import annotations
 from copy import deepcopy
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
-from hashlib import sha256
-import hmac
 import json
 from typing import Any, Iterable, Mapping
+
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
 
 from .canonical import canonical_json_bytes
 from .hashing import hash_json
@@ -20,10 +22,9 @@ S1_TRUSTED_CONFORMANCE_PRODUCER_SUBSYSTEM = "S1"
 S1_TRUSTED_CONFORMANCE_PRODUCER_ACTOR_ID = "s1.reference_conformance"
 S1_TRUSTED_CONFORMANCE_CODE_REF = "argus-core:s1.reference-conformance"
 S1_TRUSTED_CONFORMANCE_ENVIRONMENT_DIGEST = "python:s1-reference-conformance:v1"
-S1_CONFORMANCE_ATTESTATION_ALGORITHM = "hmac-sha256"
-S1_CONFORMANCE_ATTESTATION_PREFIX = "hmac-sha256:"
+S1_CONFORMANCE_ATTESTATION_ALGORITHM = "ed25519"
+S1_CONFORMANCE_ATTESTATION_PREFIX = "ed25519:"
 S1_CONFORMANCE_ATTESTATION_KEY_ID = "s1-reference-conformance-key-v1"
-_S1_CONFORMANCE_ATTESTATION_SECRET = b"argus-s1-reference-conformance-dev-key-v1"
 
 
 class S6Error(Exception):
@@ -110,6 +111,102 @@ class SourceDocument:
     source_ref: str
 
 
+class S1ConformanceAttestationSigner:
+    """Private S1 conformance signer; only verifiers should be given to registries."""
+
+    algorithm = S1_CONFORMANCE_ATTESTATION_ALGORITHM
+
+    def __init__(self, *, key_id: str, private_key_bytes: bytes) -> None:
+        if not key_id:
+            raise ValueError("key_id is required")
+        if len(private_key_bytes) != 32:
+            raise ValueError("Ed25519 private key must be 32 raw bytes")
+        self.key_id = key_id
+        self._private_key = Ed25519PrivateKey.from_private_bytes(private_key_bytes)
+        self.public_key_bytes = self._private_key.public_key().public_bytes(
+            encoding=serialization.Encoding.Raw,
+            format=serialization.PublicFormat.Raw,
+        )
+
+    def sign_evidence(self, evidence: Mapping[str, Any]) -> dict[str, Any]:
+        signed = deepcopy(dict(evidence))
+        signed["attestation"] = {
+            "algorithm": S1_CONFORMANCE_ATTESTATION_ALGORITHM,
+            "key_id": self.key_id,
+            "value": "",
+        }
+        signature = self._private_key.sign(canonical_json_bytes(signed))
+        signed["attestation"]["value"] = f"{S1_CONFORMANCE_ATTESTATION_PREFIX}{signature.hex()}"
+        return signed
+
+    def verifier(self) -> "S1ConformanceAttestationVerifier":
+        return S1ConformanceAttestationVerifier(public_keys={self.key_id: self.public_key_bytes})
+
+
+class S1ConformanceAttestationVerifier:
+    """Offline verifier for S1 conformance evidence signatures."""
+
+    algorithm = S1_CONFORMANCE_ATTESTATION_ALGORITHM
+
+    def __init__(self, *, public_keys: Mapping[str, bytes]) -> None:
+        self._public_keys: dict[str, Ed25519PublicKey] = {}
+        for key_id, public_key_bytes in public_keys.items():
+            if not key_id:
+                raise ValueError("key_id is required")
+            if len(public_key_bytes) != 32:
+                raise ValueError("Ed25519 public key must be 32 raw bytes")
+            self._public_keys[key_id] = Ed25519PublicKey.from_public_bytes(bytes(public_key_bytes))
+
+    @property
+    def key_ids(self) -> tuple[str, ...]:
+        return tuple(sorted(self._public_keys))
+
+    def verify_evidence(self, evidence: Mapping[str, Any]) -> None:
+        attestation = evidence.get("attestation")
+        if not isinstance(attestation, Mapping):
+            raise RegistryError("CONFORMANCE_UNTRUSTED: attestation")
+        if attestation.get("algorithm") != S1_CONFORMANCE_ATTESTATION_ALGORITHM:
+            raise RegistryError("CONFORMANCE_UNTRUSTED: attestation_algorithm")
+        key_id = attestation.get("key_id")
+        if not isinstance(key_id, str) or not key_id:
+            raise RegistryError("CONFORMANCE_UNTRUSTED: attestation_key")
+        public_key = self._public_keys.get(key_id)
+        if public_key is None:
+            raise RegistryError("CONFORMANCE_UNTRUSTED: attestation_key")
+        value = attestation.get("value")
+        if not isinstance(value, str) or not value.startswith(S1_CONFORMANCE_ATTESTATION_PREFIX):
+            raise RegistryError("CONFORMANCE_UNTRUSTED: attestation_value")
+        signature = _s1_conformance_attestation_signature(value)
+        if signature is None:
+            raise RegistryError("CONFORMANCE_UNTRUSTED: attestation_value")
+        signed = deepcopy(dict(evidence))
+        signed["attestation"] = dict(attestation)
+        signed["attestation"]["value"] = ""
+        try:
+            public_key.verify(signature, canonical_json_bytes(signed))
+        except InvalidSignature as exc:
+            raise RegistryError("CONFORMANCE_UNTRUSTED: attestation_signature") from exc
+
+
+@dataclass(frozen=True)
+class S1ConformanceAttestationAuthority:
+    signer: S1ConformanceAttestationSigner
+    verifier: S1ConformanceAttestationVerifier
+
+    @classmethod
+    def from_private_key_bytes(
+        cls,
+        *,
+        key_id: str,
+        private_key_bytes: bytes,
+    ) -> "S1ConformanceAttestationAuthority":
+        signer = S1ConformanceAttestationSigner(
+            key_id=key_id,
+            private_key_bytes=private_key_bytes,
+        )
+        return cls(signer=signer, verifier=signer.verifier())
+
+
 @dataclass(frozen=True)
 class FrozenContaminationSnapshot:
     snapshot_ref: str
@@ -132,8 +229,14 @@ class InMemoryRegistry:
 
     _ACTIVE_STATUSES = frozenset({"active"})
 
-    def __init__(self, *, artifact_store: InMemoryArtifactStore | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        artifact_store: InMemoryArtifactStore | None = None,
+        conformance_attestation_verifier: S1ConformanceAttestationVerifier | None = None,
+    ) -> None:
         self._artifact_store = artifact_store
+        self._conformance_attestation_verifier = conformance_attestation_verifier
         self._descriptors: dict[tuple[str, int], CapabilityDescriptor] = {}
         self._latest_revision: dict[str, int] = {}
         self._events: list[RegistryEvent] = []
@@ -302,6 +405,8 @@ class InMemoryRegistry:
             raise RegistryError("CONFORMANCE_EXPIRED")
         if self._artifact_store is None:
             raise RegistryError("CONFORMANCE_EVIDENCE_STORE_REQUIRED")
+        if self._conformance_attestation_verifier is None:
+            raise RegistryError("CONFORMANCE_UNTRUSTED: attestation_verifier")
         evidence_ref = conformance["evidence_ref"]
         evidence_record = self._load_conformance_evidence_record(evidence_ref)
         evidence = self._load_conformance_evidence(evidence_ref)
@@ -310,6 +415,7 @@ class InMemoryRegistry:
             conformance=conformance,
             evidence=evidence,
             evidence_record=evidence_record,
+            attestation_verifier=self._conformance_attestation_verifier,
         )
 
     def _load_conformance_evidence_record(self, evidence_ref: str) -> ArtifactRecord:
@@ -407,26 +513,16 @@ def _parse_conformance_expiry(value: str) -> datetime:
     return parsed.astimezone(UTC)
 
 
-def sign_s1_reference_conformance_evidence(evidence: Mapping[str, Any]) -> dict[str, Any]:
-    signed = deepcopy(dict(evidence))
-    signed["attestation"] = {
-        "algorithm": S1_CONFORMANCE_ATTESTATION_ALGORITHM,
-        "key_id": S1_CONFORMANCE_ATTESTATION_KEY_ID,
-        "value": "",
-    }
-    signed["attestation"]["value"] = _s1_conformance_attestation_value(signed)
-    return signed
-
-
 def _assert_conformance_evidence_matches_descriptor(
     *,
     descriptor: CapabilityDescriptor,
     conformance: Mapping[str, str],
     evidence: Mapping[str, Any],
     evidence_record: ArtifactRecord,
+    attestation_verifier: S1ConformanceAttestationVerifier,
 ) -> None:
     _assert_trusted_s1_conformance_record(evidence_record, conformance=conformance)
-    _assert_s1_conformance_evidence_attestation(evidence)
+    attestation_verifier.verify_evidence(evidence)
     expected = {
         "subagent_id": descriptor.entity_id,
         "level_awarded": conformance["level"],
@@ -469,29 +565,11 @@ def _assert_trusted_s1_conformance_record(
         raise RegistryError("CONFORMANCE_UNTRUSTED: lineage_job")
 
 
-def _assert_s1_conformance_evidence_attestation(evidence: Mapping[str, Any]) -> None:
-    attestation = evidence.get("attestation")
-    if not isinstance(attestation, Mapping):
-        raise RegistryError("CONFORMANCE_UNTRUSTED: attestation")
-    if attestation.get("algorithm") != S1_CONFORMANCE_ATTESTATION_ALGORITHM:
-        raise RegistryError("CONFORMANCE_UNTRUSTED: attestation_algorithm")
-    if attestation.get("key_id") != S1_CONFORMANCE_ATTESTATION_KEY_ID:
-        raise RegistryError("CONFORMANCE_UNTRUSTED: attestation_key")
-    value = attestation.get("value")
-    if not isinstance(value, str) or not value.startswith(S1_CONFORMANCE_ATTESTATION_PREFIX):
-        raise RegistryError("CONFORMANCE_UNTRUSTED: attestation_value")
-    signed = deepcopy(dict(evidence))
-    signed["attestation"] = dict(attestation)
-    signed["attestation"]["value"] = ""
-    expected = _s1_conformance_attestation_value(signed)
-    if not hmac.compare_digest(value, expected):
-        raise RegistryError("CONFORMANCE_UNTRUSTED: attestation_signature")
-
-
-def _s1_conformance_attestation_value(evidence_with_empty_attestation: Mapping[str, Any]) -> str:
-    digest = hmac.new(
-        _S1_CONFORMANCE_ATTESTATION_SECRET,
-        canonical_json_bytes(evidence_with_empty_attestation),
-        sha256,
-    ).hexdigest()
-    return f"{S1_CONFORMANCE_ATTESTATION_PREFIX}{digest}"
+def _s1_conformance_attestation_signature(value: str) -> bytes | None:
+    signature_hex = value.removeprefix(S1_CONFORMANCE_ATTESTATION_PREFIX)
+    if len(signature_hex) != 128:
+        return None
+    try:
+        return bytes.fromhex(signature_hex)
+    except ValueError:
+        return None

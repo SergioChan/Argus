@@ -25,6 +25,7 @@ from argus_core import (
     LifecycleState,
     Lineage,
     Producer,
+    S1ConformanceAttestationAuthority,
     S1ReferenceConformanceHarness,
     S3Verifier,
     Subagent,
@@ -95,6 +96,8 @@ def _build_parser() -> argparse.ArgumentParser:
     conformance_parser.add_argument("--conformance-expires-at")
     conformance_parser.add_argument("--output")
     conformance_parser.add_argument("--descriptor-output")
+    conformance_parser.add_argument("--attestation-key-id", default="s1-reference-conformance-key-v1")
+    conformance_parser.add_argument("--attestation-private-key-hex")
     conformance_parser.add_argument("--independence-tag", action="append", default=())
     conformance_parser.set_defaults(func=_cmd_conformance)
 
@@ -249,7 +252,11 @@ def _cmd_conformance(args: argparse.Namespace, stdout: TextIO, _stderr: TextIO) 
         revision=1,
         independence_tags=tuple(args.independence_tag or ()),
     )
-    result = S1ReferenceConformanceHarness().run(
+    authority = _load_s1_conformance_attestation_authority(args)
+    harness = S1ReferenceConformanceHarness(
+        attestation_signer=authority.signer if authority is not None else None
+    )
+    result = harness.run(
         subagent,
         envelope=envelope,
         level=args.level,
@@ -262,7 +269,12 @@ def _cmd_conformance(args: argparse.Namespace, stdout: TextIO, _stderr: TextIO) 
     if args.descriptor_output:
         if args.conformance_expires_at is None:
             raise CliUsageError("--descriptor-output requires --conformance-expires-at")
-        registry = InMemoryRegistry(artifact_store=artifact_store)
+        if authority is None:
+            raise CliUsageError("--descriptor-output requires --attestation-private-key-hex")
+        registry = InMemoryRegistry(
+            artifact_store=artifact_store,
+            conformance_attestation_verifier=authority.verifier,
+        )
         published = publish_s1_capability_descriptor(
             registry,
             subagent.descriptor,
@@ -274,6 +286,23 @@ def _cmd_conformance(args: argparse.Namespace, stdout: TextIO, _stderr: TextIO) 
         _write_json(Path(args.descriptor_output), published.as_c5_payload())
     _emit_result(payload, stdout=stdout, output_path=args.output)
     return 0 if result.aggregate_passed else 1
+
+
+def _load_s1_conformance_attestation_authority(
+    args: argparse.Namespace,
+) -> S1ConformanceAttestationAuthority | None:
+    if args.attestation_private_key_hex is None:
+        return None
+    try:
+        private_key = bytes.fromhex(args.attestation_private_key_hex)
+    except ValueError as exc:
+        raise CliUsageError("--attestation-private-key-hex must be 32 raw bytes encoded as hex") from exc
+    if len(private_key) != 32:
+        raise CliUsageError("--attestation-private-key-hex must be 32 raw bytes encoded as hex")
+    return S1ConformanceAttestationAuthority.from_private_key_bytes(
+        key_id=args.attestation_key_id,
+        private_key_bytes=private_key,
+    )
 
 
 def _cmd_replay(args: argparse.Namespace, stdout: TextIO, _stderr: TextIO) -> int:
