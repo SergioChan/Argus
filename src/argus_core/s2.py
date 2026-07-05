@@ -1014,6 +1014,534 @@ class ModelSynthesizer:
 
 
 @dataclass(frozen=True)
+class TrainingRequest:
+    job_id: str
+    family_id: str
+    input_refs: tuple[str, ...]
+    training_rows: tuple[Mapping[str, Any], ...]
+    feature_names: tuple[str, ...]
+    target_name: str
+    max_epochs: int
+    code_ref: str
+    environment_digest: str
+    seed: str
+    learning_rate: float = 0.01
+    parameters: dict[str, Any] = field(default_factory=dict)
+    resume_from_checkpoint_ref: str | None = None
+    wallclock_seconds_per_epoch: float = 0.0
+    gpu_seconds_per_epoch: float = 0.0
+    model_tokens_per_epoch: int = 0
+    cost_usd_per_epoch: float = 0.0
+    on_epoch_complete: Callable[["TrainingProgress"], None] | None = field(default=None, compare=False, repr=False)
+
+    def __post_init__(self) -> None:
+        job_id = self.job_id.strip()
+        family_id = self.family_id.strip()
+        target_name = self.target_name.strip()
+        feature_names = tuple(str(name).strip() for name in self.feature_names)
+        if not job_id:
+            raise S2ContractModelError("S2 TrainingRequest requires job_id")
+        if not family_id:
+            raise S2ContractModelError("S2 TrainingRequest requires family_id")
+        if not self.input_refs:
+            raise S2ContractModelError("S2 TrainingRequest requires at least one input_ref")
+        if not self.training_rows:
+            raise S2ContractModelError("S2 TrainingRequest requires training_rows")
+        if not feature_names or any(not name for name in feature_names):
+            raise S2ContractModelError("S2 TrainingRequest requires feature_names")
+        if not target_name:
+            raise S2ContractModelError("S2 TrainingRequest requires target_name")
+        if self.max_epochs <= 0:
+            raise S2ContractModelError("S2 TrainingRequest max_epochs must be positive")
+        if self.learning_rate <= 0:
+            raise S2ContractModelError("S2 TrainingRequest learning_rate must be positive")
+        if not self.code_ref:
+            raise S2ContractModelError("S2 TrainingRequest requires code_ref")
+        if not self.environment_digest:
+            raise S2ContractModelError("S2 TrainingRequest requires environment_digest")
+        if not self.seed:
+            raise S2ContractModelError("S2 TrainingRequest requires seed")
+        if self.wallclock_seconds_per_epoch < 0:
+            raise S2ContractModelError("S2 TrainingRequest wallclock_seconds_per_epoch must be non-negative")
+        if self.gpu_seconds_per_epoch < 0:
+            raise S2ContractModelError("S2 TrainingRequest gpu_seconds_per_epoch must be non-negative")
+        if self.model_tokens_per_epoch < 0:
+            raise S2ContractModelError("S2 TrainingRequest model_tokens_per_epoch must be non-negative")
+        if self.cost_usd_per_epoch < 0:
+            raise S2ContractModelError("S2 TrainingRequest cost_usd_per_epoch must be non-negative")
+        normalized_rows: list[dict[str, Any]] = []
+        for row in self.training_rows:
+            normalized = dict(row)
+            for name in feature_names + (target_name,):
+                if name not in normalized:
+                    raise S2ContractModelError(f"S2 TrainingRequest row missing field: {name}")
+            normalized_rows.append(normalized)
+        object.__setattr__(self, "job_id", job_id)
+        object.__setattr__(self, "family_id", family_id)
+        object.__setattr__(self, "target_name", target_name)
+        object.__setattr__(self, "feature_names", feature_names)
+        object.__setattr__(self, "input_refs", tuple(str(ref) for ref in self.input_refs))
+        object.__setattr__(self, "training_rows", tuple(normalized_rows))
+        object.__setattr__(self, "parameters", dict(self.parameters))
+
+
+@dataclass(frozen=True)
+class TrainingProgress:
+    job_id: str
+    epoch: int
+    checkpoint_ref: str
+    metrics: dict[str, Any]
+    cost_actual: dict[str, float | int]
+
+
+@dataclass(frozen=True)
+class TrainingEpochResult:
+    epoch: int
+    model_state: dict[str, Any]
+    metrics: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class TrainingRunResult:
+    job_id: str
+    family_id: str
+    status: str
+    start_epoch: int
+    completed_epochs: int
+    checkpoint_refs: tuple[str, ...]
+    final_checkpoint_ref: str | None
+    training_log_ref: str | None
+    partial_checkpoint: PartialModelCheckpoint | None
+    diagnostics: dict[str, Any]
+    cost_actual: dict[str, float | int]
+
+
+class DeterministicLinearTrainingBackend:
+    """Small deterministic regression backend used by S2's runtime boundary."""
+
+    backend_id = "deterministic-linear"
+
+    def __init__(self, *, learning_rate: float | None = None) -> None:
+        if learning_rate is not None and learning_rate <= 0:
+            raise S2ContractModelError("S2 deterministic linear backend learning_rate must be positive")
+        self._learning_rate = learning_rate
+
+    def initial_state(self, request: TrainingRequest) -> dict[str, Any]:
+        return {
+            "feature_names": list(request.feature_names),
+            "target_name": request.target_name,
+            "weights": {name: 0.0 for name in request.feature_names},
+            "bias": 0.0,
+        }
+
+    def train_epoch(self, request: TrainingRequest, state: Mapping[str, Any], *, epoch: int) -> TrainingEpochResult:
+        feature_names = tuple(state.get("feature_names", request.feature_names))
+        weights = {name: float(dict(state.get("weights", {})).get(name, 0.0)) for name in feature_names}
+        bias = float(state.get("bias", 0.0))
+        count = float(len(request.training_rows))
+        errors: list[float] = []
+        for row in request.training_rows:
+            prediction = bias + sum(weights[name] * float(row[name]) for name in feature_names)
+            error = prediction - float(row[request.target_name])
+            errors.append(error)
+        grad_bias = 2.0 * sum(errors) / count
+        grad_weights = {
+            name: 2.0 * sum(error * float(row[name]) for error, row in zip(errors, request.training_rows)) / count
+            for name in feature_names
+        }
+        learning_rate = float(self._learning_rate if self._learning_rate is not None else request.learning_rate)
+        next_weights = {name: weights[name] - learning_rate * grad_weights[name] for name in feature_names}
+        next_bias = bias - learning_rate * grad_bias
+        loss = self._loss(request, feature_names=feature_names, weights=next_weights, bias=next_bias)
+        next_state = {
+            "feature_names": list(feature_names),
+            "target_name": request.target_name,
+            "weights": next_weights,
+            "bias": next_bias,
+        }
+        return TrainingEpochResult(
+            epoch=epoch,
+            model_state=next_state,
+            metrics={"loss": loss, "learning_rate": learning_rate},
+        )
+
+    @staticmethod
+    def _loss(
+        request: TrainingRequest,
+        *,
+        feature_names: tuple[str, ...],
+        weights: Mapping[str, float],
+        bias: float,
+    ) -> float:
+        total = 0.0
+        for row in request.training_rows:
+            prediction = bias + sum(float(weights[name]) * float(row[name]) for name in feature_names)
+            error = prediction - float(row[request.target_name])
+            total += error * error
+        return total / float(len(request.training_rows))
+
+
+class TrainingRuntime:
+    """S2 training runtime with checkpoint/restart, budget, and cancel semantics."""
+
+    def __init__(
+        self,
+        *,
+        artifact_store: InMemoryArtifactStore,
+        provenance_emitter: ProvenanceEmitter | None = None,
+        registry: ModelFamilyRegistry | None = None,
+        budget_meter: BudgetMeter | None = None,
+        backends: Mapping[str, DeterministicLinearTrainingBackend] | None = None,
+    ) -> None:
+        self._artifact_store = artifact_store
+        self._provenance_emitter = provenance_emitter or ProvenanceEmitter(artifact_store=artifact_store)
+        self._registry = registry or _default_model_family_registry()
+        self._budget_meter = budget_meter
+        self._backends: dict[str, DeterministicLinearTrainingBackend] = {
+            "tabular-baseline": DeterministicLinearTrainingBackend(),
+        }
+        if backends:
+            for family_id, backend in backends.items():
+                self.register_backend(family_id, backend)
+        self._cancel_reasons: dict[str, str] = {}
+        self._interrupt_reasons: dict[str, str] = {}
+
+    def register_backend(self, family_id: str, backend: DeterministicLinearTrainingBackend) -> None:
+        family_id = family_id.strip()
+        if not family_id:
+            raise S2ContractModelError("S2 TrainingRuntime backend registration requires family_id")
+        if not hasattr(backend, "train_epoch") or not hasattr(backend, "initial_state"):
+            raise S2ContractModelError("S2 TrainingRuntime backend must implement initial_state and train_epoch")
+        self._backends[family_id] = backend
+
+    def cancel(self, job_id: str, *, reason: str = "operator") -> dict[str, str]:
+        if not job_id:
+            raise S2ContractModelError("S2 TrainingRuntime cancel requires job_id")
+        if not reason:
+            raise S2ContractModelError("S2 TrainingRuntime cancel requires reason")
+        self._cancel_reasons[job_id] = reason
+        return {"job_id": job_id, "status": "CANCEL_REQUESTED", "reason": reason}
+
+    def interrupt(self, job_id: str, *, reason: str = "runtime-restart") -> dict[str, str]:
+        if not job_id:
+            raise S2ContractModelError("S2 TrainingRuntime interrupt requires job_id")
+        if not reason:
+            raise S2ContractModelError("S2 TrainingRuntime interrupt requires reason")
+        self._interrupt_reasons[job_id] = reason
+        return {"job_id": job_id, "status": "INTERRUPT_REQUESTED", "reason": reason}
+
+    def train(self, request: TrainingRequest) -> TrainingRunResult:
+        descriptor = self._registry.get(request.family_id)
+        backend = self._backend_for(descriptor.family_id)
+        self._assert_budget_job(request)
+        start_epoch, state = self._initial_training_state(request, backend)
+        completed_epoch = start_epoch
+        checkpoint_refs: list[str] = []
+        final_metrics: dict[str, Any] = {}
+        previous_checkpoint_ref = request.resume_from_checkpoint_ref
+
+        for epoch in range(start_epoch + 1, request.max_epochs + 1):
+            epoch_result = backend.train_epoch(request, state, epoch=epoch)
+            state = epoch_result.model_state
+            final_metrics = dict(epoch_result.metrics)
+            completed_epoch = epoch
+            checkpoint_status = "SUCCEEDED" if epoch == request.max_epochs else "RUNNING"
+            if self._would_budget_breach(request):
+                checkpoint_status = "BUDGET_HALTED"
+            checkpoint_ref = self._emit_checkpoint(
+                request=request,
+                descriptor=descriptor,
+                backend=backend,
+                epoch=epoch,
+                model_state=state,
+                metrics=final_metrics,
+                status=checkpoint_status,
+                previous_checkpoint_ref=previous_checkpoint_ref,
+            )
+            previous_checkpoint_ref = checkpoint_ref
+            checkpoint_refs.append(checkpoint_ref)
+            partial_checkpoint = PartialModelCheckpoint(
+                artifact_ref=checkpoint_ref,
+                reason="best-so-far",
+                metrics=final_metrics,
+            )
+            self._record_epoch_spend(request, partial_checkpoint=partial_checkpoint)
+
+            progress = TrainingProgress(
+                job_id=request.job_id,
+                epoch=epoch,
+                checkpoint_ref=checkpoint_ref,
+                metrics=final_metrics,
+                cost_actual=self._budget_snapshot(request).as_cost_actual(),
+            )
+            if request.on_epoch_complete is not None:
+                request.on_epoch_complete(progress)
+            if request.job_id in self._cancel_reasons:
+                reason = self._cancel_reasons.pop(request.job_id)
+                cancel_ref = self._emit_checkpoint(
+                    request=request,
+                    descriptor=descriptor,
+                    backend=backend,
+                    epoch=epoch,
+                    model_state=state,
+                    metrics=final_metrics,
+                    status="CANCELLED",
+                    previous_checkpoint_ref=checkpoint_ref,
+                    reason=reason,
+                )
+                checkpoint_refs.append(cancel_ref)
+                partial = PartialModelCheckpoint(artifact_ref=cancel_ref, reason=reason, metrics=final_metrics)
+                log_ref = self._emit_training_log(
+                    request=request,
+                    status="CANCELLED",
+                    start_epoch=start_epoch,
+                    completed_epochs=completed_epoch,
+                    checkpoint_refs=tuple(checkpoint_refs),
+                    final_checkpoint_ref=cancel_ref,
+                    diagnostics={"cancel_reason": reason, "final_metrics": final_metrics},
+                )
+                return TrainingRunResult(
+                    job_id=request.job_id,
+                    family_id=request.family_id,
+                    status="CANCELLED",
+                    start_epoch=start_epoch,
+                    completed_epochs=completed_epoch,
+                    checkpoint_refs=tuple(checkpoint_refs),
+                    final_checkpoint_ref=cancel_ref,
+                    training_log_ref=log_ref,
+                    partial_checkpoint=partial,
+                    diagnostics={"cancel_reason": reason, "final_metrics": final_metrics},
+                    cost_actual=self._budget_snapshot(request).as_cost_actual(),
+                )
+            if request.job_id in self._interrupt_reasons:
+                reason = self._interrupt_reasons.pop(request.job_id)
+                interrupt_ref = self._emit_checkpoint(
+                    request=request,
+                    descriptor=descriptor,
+                    backend=backend,
+                    epoch=epoch,
+                    model_state=state,
+                    metrics=final_metrics,
+                    status="INTERRUPTED",
+                    previous_checkpoint_ref=checkpoint_ref,
+                    reason=reason,
+                )
+                checkpoint_refs.append(interrupt_ref)
+                log_ref = self._emit_training_log(
+                    request=request,
+                    status="INTERRUPTED",
+                    start_epoch=start_epoch,
+                    completed_epochs=completed_epoch,
+                    checkpoint_refs=tuple(checkpoint_refs),
+                    final_checkpoint_ref=interrupt_ref,
+                    diagnostics={"interrupt_reason": reason, "final_metrics": final_metrics},
+                )
+                return TrainingRunResult(
+                    job_id=request.job_id,
+                    family_id=request.family_id,
+                    status="INTERRUPTED",
+                    start_epoch=start_epoch,
+                    completed_epochs=completed_epoch,
+                    checkpoint_refs=tuple(checkpoint_refs),
+                    final_checkpoint_ref=interrupt_ref,
+                    training_log_ref=log_ref,
+                    partial_checkpoint=PartialModelCheckpoint(
+                        artifact_ref=interrupt_ref,
+                        reason=reason,
+                        metrics=final_metrics,
+                    ),
+                    diagnostics={"interrupt_reason": reason, "final_metrics": final_metrics},
+                    cost_actual=self._budget_snapshot(request).as_cost_actual(),
+                )
+
+        final_checkpoint_ref = checkpoint_refs[-1] if checkpoint_refs else None
+        diagnostics = {
+            "final_metrics": final_metrics,
+            "backend": backend.backend_id,
+            "model_family": descriptor.family_id,
+        }
+        log_ref = self._emit_training_log(
+            request=request,
+            status="SUCCEEDED",
+            start_epoch=start_epoch,
+            completed_epochs=completed_epoch,
+            checkpoint_refs=tuple(checkpoint_refs),
+            final_checkpoint_ref=final_checkpoint_ref,
+            diagnostics=diagnostics,
+        )
+        return TrainingRunResult(
+            job_id=request.job_id,
+            family_id=request.family_id,
+            status="SUCCEEDED",
+            start_epoch=start_epoch,
+            completed_epochs=completed_epoch,
+            checkpoint_refs=tuple(checkpoint_refs),
+            final_checkpoint_ref=final_checkpoint_ref,
+            training_log_ref=log_ref,
+            partial_checkpoint=None,
+            diagnostics=diagnostics,
+            cost_actual=self._budget_snapshot(request).as_cost_actual(),
+        )
+
+    def _backend_for(self, family_id: str) -> DeterministicLinearTrainingBackend:
+        try:
+            return self._backends[family_id]
+        except KeyError as exc:
+            raise S2ContractModelError(f"S2 TrainingRuntime has no backend for model family: {family_id}") from exc
+
+    def _initial_training_state(
+        self,
+        request: TrainingRequest,
+        backend: DeterministicLinearTrainingBackend,
+    ) -> tuple[int, dict[str, Any]]:
+        if request.resume_from_checkpoint_ref is None:
+            return 0, backend.initial_state(request)
+        payload = self._artifact_payload(request.resume_from_checkpoint_ref)
+        if payload.get("job_id") != request.job_id:
+            raise S2ContractModelError("S2 TrainingRuntime checkpoint job_id does not match request")
+        if payload.get("family_id") != request.family_id:
+            raise S2ContractModelError("S2 TrainingRuntime checkpoint family_id does not match request")
+        epoch = int(payload.get("epoch", 0))
+        if epoch < 0 or epoch >= request.max_epochs:
+            raise S2ContractModelError("S2 TrainingRuntime checkpoint epoch is outside the requested run")
+        model_state = payload.get("model_state")
+        if not isinstance(model_state, Mapping):
+            raise S2ContractModelError("S2 TrainingRuntime checkpoint is missing model_state")
+        return epoch, dict(model_state)
+
+    def _artifact_payload(self, artifact_ref: str) -> dict[str, Any]:
+        try:
+            return json.loads(self._artifact_store.get_artifact(artifact_ref).decode("utf-8"))
+        except KeyError as exc:
+            raise S2ContractModelError(f"S2 TrainingRuntime checkpoint not found: {artifact_ref}") from exc
+
+    def _emit_checkpoint(
+        self,
+        *,
+        request: TrainingRequest,
+        descriptor: ModelFamilyDescriptor,
+        backend: DeterministicLinearTrainingBackend,
+        epoch: int,
+        model_state: Mapping[str, Any],
+        metrics: Mapping[str, Any],
+        status: str,
+        previous_checkpoint_ref: str | None,
+        reason: str | None = None,
+    ) -> str:
+        lineage_input_refs = tuple(request.input_refs)
+        if previous_checkpoint_ref:
+            lineage_input_refs = lineage_input_refs + (previous_checkpoint_ref,)
+        payload = {
+            "job_id": request.job_id,
+            "family_id": descriptor.family_id,
+            "backend": backend.backend_id,
+            "epoch": epoch,
+            "status": status,
+            "reason": reason,
+            "metrics": dict(metrics),
+            "model_state": dict(model_state),
+            "parameters": dict(request.parameters),
+            "training_entrypoint": descriptor.training_entrypoint,
+            "prediction_entrypoint": descriptor.prediction_entrypoint,
+        }
+        record = self._provenance_emitter.emit_artifact(
+            kind="model_checkpoint",
+            payload=payload,
+            producer=Producer(subsystem="S2", version="0.0.0", job_id=request.job_id),
+            lineage=Lineage(
+                input_refs=lineage_input_refs,
+                code_ref=request.code_ref,
+                environment_digest=request.environment_digest,
+                seeds=(request.seed, f"epoch:{epoch}"),
+                job_id=request.job_id,
+            ),
+            claim_tier="ran-toy",
+        )
+        return record.artifact_ref
+
+    def _emit_training_log(
+        self,
+        *,
+        request: TrainingRequest,
+        status: str,
+        start_epoch: int,
+        completed_epochs: int,
+        checkpoint_refs: tuple[str, ...],
+        final_checkpoint_ref: str | None,
+        diagnostics: Mapping[str, Any],
+    ) -> str:
+        payload = {
+            "job_id": request.job_id,
+            "family_id": request.family_id,
+            "status": status,
+            "start_epoch": start_epoch,
+            "completed_epochs": completed_epochs,
+            "checkpoint_refs": list(checkpoint_refs),
+            "final_checkpoint_ref": final_checkpoint_ref,
+            "diagnostics": dict(diagnostics),
+            "cost_actual": self._budget_snapshot(request).as_cost_actual(),
+        }
+        record = self._provenance_emitter.emit_artifact(
+            kind="training_log",
+            payload=payload,
+            producer=Producer(subsystem="S2", version="0.0.0", job_id=request.job_id),
+            lineage=Lineage(
+                input_refs=tuple(request.input_refs) + tuple(checkpoint_refs),
+                code_ref=request.code_ref,
+                environment_digest=request.environment_digest,
+                seeds=(request.seed,),
+                job_id=request.job_id,
+            ),
+            claim_tier="ran-toy",
+        )
+        return record.artifact_ref
+
+    def _assert_budget_job(self, request: TrainingRequest) -> None:
+        if self._budget_meter is not None and self._budget_meter.job_id != request.job_id:
+            raise S2ContractModelError("S2 BudgetMeter job_id must match TrainingRequest job_id")
+
+    def _would_budget_breach(self, request: TrainingRequest) -> bool:
+        if self._budget_meter is None:
+            return False
+        snapshot = self._budget_meter.snapshot()
+        budget = self._budget_meter.budget
+        if snapshot.wallclock_seconds + request.wallclock_seconds_per_epoch > budget.max_wallclock_seconds:
+            return True
+        if budget.max_gpu_seconds is not None and snapshot.gpu_seconds + request.gpu_seconds_per_epoch > budget.max_gpu_seconds:
+            return True
+        if budget.max_model_tokens is not None and snapshot.model_tokens + request.model_tokens_per_epoch > budget.max_model_tokens:
+            return True
+        return snapshot.cost_usd + request.cost_usd_per_epoch > budget.max_usd
+
+    def _record_epoch_spend(
+        self,
+        request: TrainingRequest,
+        *,
+        partial_checkpoint: PartialModelCheckpoint,
+    ) -> None:
+        if self._budget_meter is None:
+            return
+        self._budget_meter.record(
+            wallclock_seconds=request.wallclock_seconds_per_epoch,
+            gpu_seconds=request.gpu_seconds_per_epoch,
+            model_tokens=request.model_tokens_per_epoch,
+            cost_usd=request.cost_usd_per_epoch,
+            partial_checkpoint=partial_checkpoint,
+        )
+
+    def _budget_snapshot(self, request: TrainingRequest) -> SpendSnapshot:
+        if self._budget_meter is None:
+            return SpendSnapshot(
+                job_id=request.job_id,
+                wallclock_seconds=0.0,
+                gpu_seconds=0.0,
+                model_tokens=0,
+                cost_usd=0.0,
+            )
+        return self._budget_meter.snapshot()
+
+
+@dataclass(frozen=True)
 class MutationSpec:
     variant_id: str
     model_family: str
