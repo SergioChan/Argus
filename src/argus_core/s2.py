@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, field, replace
+from fractions import Fraction
 import hashlib
 from itertools import product
 import json
@@ -340,6 +341,382 @@ def validate_feature_graph_dimensions(
     if raise_on_error and validation.errors:
         raise validation.errors[0]
     return validation
+
+
+@dataclass(frozen=True)
+class BuckinghamPiVariable:
+    field_name: str
+    units: str
+
+    def __post_init__(self) -> None:
+        field_name = self.field_name.strip()
+        units = self.units.strip()
+        if not field_name:
+            raise S2ContractModelError("Buckingham-pi variables require field_name")
+        if not units:
+            raise S2ContractModelError(f"Buckingham-pi variable {field_name!r} requires units")
+        object.__setattr__(self, "field_name", field_name)
+        object.__setattr__(self, "units", units)
+
+
+@dataclass(frozen=True)
+class BuckinghamPiGroup:
+    group_id: str
+    variables: tuple[str, ...]
+    exponent_vector: tuple[int, ...]
+    feature_node: FeatureNode
+
+
+@dataclass(frozen=True)
+class BuckinghamPiResult:
+    variables: tuple[BuckinghamPiVariable, ...]
+    groups: tuple[BuckinghamPiGroup, ...]
+    dimension_matrix_rank: int
+    nullity: int
+    basis_rank: int
+    max_exponent: int
+    unit_registry_version: str
+
+
+class BuckinghamPiInjector:
+    """Enumerates exact integer Buckingham-pi groups from S2 dimensions."""
+
+    def __init__(self, *, algebra: UnitsAlgebra | None = None) -> None:
+        self._algebra = algebra or UnitsAlgebra()
+
+    def enumerate_groups(
+        self,
+        *,
+        variables: tuple[BuckinghamPiVariable, ...],
+        max_exponent: int,
+        node_prefix: str = "pi",
+    ) -> BuckinghamPiResult:
+        variables = tuple(variables)
+        node_prefix = node_prefix.strip()
+        if not variables:
+            raise S2ContractModelError("Buckingham-pi enumeration requires at least one variable")
+        if max_exponent <= 0:
+            raise S2ContractModelError("Buckingham-pi max_exponent must be positive")
+        if not node_prefix:
+            raise S2ContractModelError("Buckingham-pi node_prefix cannot be empty")
+        names = tuple(variable.field_name for variable in variables)
+        if len(set(names)) != len(names):
+            raise S2ContractModelError("Buckingham-pi variables must have unique field_name values")
+
+        dimensions = tuple(self._algebra.dimension(variable.units) for variable in variables)
+        matrix_rows = tuple(
+            tuple(dimension.exponents[index] for dimension in dimensions) for index in range(len(S2_DIMENSION_BASES))
+        )
+        dimension_matrix_rank = _matrix_rank(matrix_rows)
+        nullity = len(variables) - dimension_matrix_rank
+        if nullity == 0:
+            return BuckinghamPiResult(
+                variables=variables,
+                groups=(),
+                dimension_matrix_rank=dimension_matrix_rank,
+                nullity=0,
+                basis_rank=0,
+                max_exponent=max_exponent,
+                unit_registry_version=self._algebra.registry.version,
+            )
+
+        candidate_vectors: set[tuple[int, ...]] = set()
+        for vector in product(range(-max_exponent, max_exponent + 1), repeat=len(variables)):
+            if all(exponent == 0 for exponent in vector):
+                continue
+            if _dimension_sum(dimensions, tuple(vector)).is_dimensionless:
+                candidate_vectors.add(_canonical_pi_vector(tuple(vector)))
+        ordered_vectors = tuple(
+            sorted(candidate_vectors, key=lambda item: (sum(abs(value) for value in item), max(abs(value) for value in item), item))
+        )
+        selected: list[tuple[int, ...]] = []
+        for vector in ordered_vectors:
+            if _matrix_rank(tuple(selected) + (vector,)) > len(selected):
+                selected.append(vector)
+            if len(selected) == nullity:
+                break
+        if len(selected) != nullity:
+            raise S2ContractModelError(
+                f"Buckingham-pi exponent bound {max_exponent} produced {len(selected)} independent groups, expected {nullity}"
+            )
+
+        groups = tuple(
+            BuckinghamPiGroup(
+                group_id=f"{node_prefix}_{index}",
+                variables=names,
+                exponent_vector=vector,
+                feature_node=FeatureNode(
+                    node_id=f"{node_prefix}_{index}",
+                    terms=tuple(
+                        FeatureTerm(field_name=variable.field_name, units=variable.units, exponent=exponent)
+                        for variable, exponent in zip(variables, vector)
+                        if exponent != 0
+                    ),
+                    declared_units="dimensionless",
+                ),
+            )
+            for index, vector in enumerate(selected, start=1)
+        )
+        return BuckinghamPiResult(
+            variables=variables,
+            groups=groups,
+            dimension_matrix_rank=dimension_matrix_rank,
+            nullity=nullity,
+            basis_rank=_matrix_rank(tuple(group.exponent_vector for group in groups)),
+            max_exponent=max_exponent,
+            unit_registry_version=self._algebra.registry.version,
+        )
+
+
+@dataclass(frozen=True)
+class SymmetryInvariantFeature:
+    feature_node: FeatureNode
+    symmetry: str
+    power: int
+    advisory: bool = True
+    claim_tier: str = "ran-toy"
+
+    def transform(self, values: tuple[float, ...]) -> tuple[float, ...]:
+        transformed: list[float] = []
+        for value in values:
+            number = float(value)
+            if not math.isfinite(number):
+                raise S2ContractModelError("symmetry invariant transform received non-finite value")
+            transformed.append(number**self.power)
+        return tuple(transformed)
+
+
+class SymmetryInvariantInjector:
+    """Creates deterministic feature transforms invariant under simple physics symmetries."""
+
+    def __init__(self, *, algebra: UnitsAlgebra | None = None) -> None:
+        self._algebra = algebra or UnitsAlgebra()
+
+    def even_power(
+        self,
+        *,
+        field_name: str,
+        units: str,
+        power: int = 2,
+        node_id: str | None = None,
+    ) -> SymmetryInvariantFeature:
+        field_name = field_name.strip()
+        units = units.strip()
+        node_id = (node_id or f"{field_name}_even_power_{power}").strip()
+        if not field_name:
+            raise S2ContractModelError("symmetry invariant field_name cannot be empty")
+        if not units:
+            raise S2ContractModelError("symmetry invariant units cannot be empty")
+        if power <= 0 or power % 2 != 0:
+            raise S2ContractModelError("sign-flip invariant power must be a positive even integer")
+        declared_units = _power_unit_expression(units, power)
+        self._algebra.dimension(declared_units)
+        return SymmetryInvariantFeature(
+            feature_node=FeatureNode(
+                node_id=node_id,
+                terms=(FeatureTerm(field_name=field_name, units=units, exponent=power),),
+                declared_units=declared_units,
+            ),
+            symmetry="sign_flip",
+            power=power,
+        )
+
+
+@dataclass(frozen=True)
+class PositiveOutputConstraint:
+    target_name: str
+    units: str
+    minimum: float = 0.0
+
+    def __post_init__(self) -> None:
+        target_name = self.target_name.strip()
+        units = self.units.strip()
+        minimum = float(self.minimum)
+        if not target_name:
+            raise S2ContractModelError("positivity constraint requires target_name")
+        if not units:
+            raise S2ContractModelError(f"positivity constraint {target_name!r} requires units")
+        if minimum < 0 or not math.isfinite(minimum):
+            raise S2ContractModelError("positivity constraint minimum must be finite and non-negative")
+        object.__setattr__(self, "target_name", target_name)
+        object.__setattr__(self, "units", units)
+        object.__setattr__(self, "minimum", minimum)
+
+
+@dataclass(frozen=True)
+class PositivityEnforcementResult:
+    constraint: PositiveOutputConstraint
+    transformed_predictions: tuple[float, ...]
+    min_prediction: float
+    status: str
+    advisory: bool = True
+    claim_tier: str = "ran-toy"
+
+
+class PositivityArchitectureInjector:
+    """Applies a deterministic positive-output architecture transform."""
+
+    def enforce(
+        self,
+        *,
+        raw_predictions: tuple[float, ...],
+        constraint: PositiveOutputConstraint,
+    ) -> PositivityEnforcementResult:
+        if not raw_predictions:
+            raise S2ContractModelError("positivity enforcement requires at least one prediction")
+        transformed = tuple(_stable_softplus(float(value)) + constraint.minimum for value in raw_predictions)
+        if any(not math.isfinite(value) for value in transformed):
+            raise S2ContractModelError("positivity enforcement produced non-finite predictions")
+        min_prediction = min(transformed)
+        return PositivityEnforcementResult(
+            constraint=constraint,
+            transformed_predictions=transformed,
+            min_prediction=min_prediction,
+            status="PASS" if min_prediction >= constraint.minimum else "FAIL",
+        )
+
+
+@dataclass(frozen=True)
+class AsymptoticLimitAnchor:
+    variable_name: str
+    limit_value: float
+    known_output: float
+    tolerance: float
+    approach_points: tuple[float, ...]
+
+    def __post_init__(self) -> None:
+        variable_name = self.variable_name.strip()
+        limit_value = float(self.limit_value)
+        known_output = float(self.known_output)
+        tolerance = float(self.tolerance)
+        approach_points = tuple(float(point) for point in self.approach_points)
+        if not variable_name:
+            raise S2ContractModelError("asymptotic anchor requires variable_name")
+        if not math.isfinite(limit_value) or not math.isfinite(known_output):
+            raise S2ContractModelError("asymptotic anchor limit and known output must be finite")
+        if tolerance < 0 or not math.isfinite(tolerance):
+            raise S2ContractModelError("asymptotic anchor tolerance must be finite and non-negative")
+        if not approach_points:
+            raise S2ContractModelError("asymptotic anchor requires approach_points")
+        if any(not math.isfinite(point) for point in approach_points):
+            raise S2ContractModelError("asymptotic anchor approach_points must be finite")
+        object.__setattr__(self, "variable_name", variable_name)
+        object.__setattr__(self, "limit_value", limit_value)
+        object.__setattr__(self, "known_output", known_output)
+        object.__setattr__(self, "tolerance", tolerance)
+        object.__setattr__(self, "approach_points", approach_points)
+
+
+@dataclass(frozen=True)
+class AsymptoticLimitEvaluation:
+    anchor: AsymptoticLimitAnchor
+    evaluations: tuple[tuple[float, float, float], ...]
+    max_abs_error: float
+    status: str
+    advisory: bool = True
+    claim_tier: str = "ran-toy"
+
+
+class AsymptoticLimitInjector:
+    """Evaluates deterministic asymptotic-limit anchors for candidate predictors."""
+
+    def evaluate(
+        self,
+        *,
+        anchor: AsymptoticLimitAnchor,
+        predictor: Callable[[Mapping[str, float]], float],
+    ) -> AsymptoticLimitEvaluation:
+        evaluations: list[tuple[float, float, float]] = []
+        for point in anchor.approach_points:
+            prediction = float(predictor({anchor.variable_name: point}))
+            if not math.isfinite(prediction):
+                raise S2ContractModelError("asymptotic anchor predictor returned a non-finite value")
+            error = abs(prediction - anchor.known_output)
+            evaluations.append((point, prediction, error))
+        max_abs_error = max(error for _, _, error in evaluations)
+        return AsymptoticLimitEvaluation(
+            anchor=anchor,
+            evaluations=tuple(evaluations),
+            max_abs_error=max_abs_error,
+            status="PASS" if max_abs_error <= anchor.tolerance else "FAIL",
+        )
+
+
+def _dimension_sum(dimensions: tuple[DimensionVector, ...], exponents: tuple[int, ...]) -> DimensionVector:
+    result = DimensionVector.dimensionless()
+    for dimension, exponent in zip(dimensions, exponents):
+        result = result * (dimension ** exponent)
+    return result
+
+
+def _canonical_pi_vector(vector: tuple[int, ...]) -> tuple[int, ...]:
+    for value in vector:
+        if value == 0:
+            continue
+        return tuple(-item for item in vector) if value < 0 else vector
+    return vector
+
+
+def _matrix_rank(rows: tuple[tuple[int, ...], ...]) -> int:
+    if not rows:
+        return 0
+    matrix = [[Fraction(value) for value in row] for row in rows if any(value != 0 for value in row)]
+    if not matrix:
+        return 0
+    row_count = len(matrix)
+    col_count = len(matrix[0])
+    rank = 0
+    for col in range(col_count):
+        pivot = None
+        for row in range(rank, row_count):
+            if matrix[row][col] != 0:
+                pivot = row
+                break
+        if pivot is None:
+            continue
+        matrix[rank], matrix[pivot] = matrix[pivot], matrix[rank]
+        pivot_value = matrix[rank][col]
+        matrix[rank] = [value / pivot_value for value in matrix[rank]]
+        for row in range(row_count):
+            if row == rank or matrix[row][col] == 0:
+                continue
+            factor = matrix[row][col]
+            matrix[row] = [value - factor * pivot_entry for value, pivot_entry in zip(matrix[row], matrix[rank])]
+        rank += 1
+        if rank == row_count:
+            break
+    return rank
+
+
+def _stable_softplus(value: float) -> float:
+    if not math.isfinite(value):
+        raise S2ContractModelError("positive-output transform received non-finite value")
+    if value > 50:
+        return value
+    if value < -50:
+        return math.exp(value)
+    return math.log1p(math.exp(value))
+
+
+def _power_unit_expression(unit_expression: str, exponent: int) -> str:
+    expression = unit_expression.replace(" ", "")
+    if exponent <= 0:
+        raise S2ContractModelError("unit expression exponent must be positive")
+    if expression in {"", "1", "dimensionless"}:
+        return "dimensionless"
+
+    parts: list[str] = []
+    for token in _unit_expression_tokens(expression):
+        if token in {"*", "/"}:
+            parts.append(token)
+            continue
+        symbol, token_exponent = _unit_token_power(token)
+        if symbol == "1":
+            parts.append(symbol)
+            continue
+        powered_exponent = token_exponent * exponent
+        parts.append(symbol if powered_exponent == 1 else f"{symbol}^{powered_exponent}")
+    return "".join(parts)
 
 
 def _base_dimension(name: str) -> DimensionVector:
