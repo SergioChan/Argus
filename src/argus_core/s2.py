@@ -39,6 +39,32 @@ class S2ContractModelError(S2Error):
     """Raised when S2's contract-bound model surface is missing or drifting."""
 
 
+class PipelineFreezeError(S2ContractModelError):
+    """Raised when S2 refuses to emit a frozen pipeline artifact."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str,
+        category: str = "POLICY",
+        retryable: bool = False,
+    ) -> None:
+        super().__init__(message)
+        self.category = category
+        self.code = code
+        self.message = message
+        self.retryable = retryable
+
+    def as_c1_payload(self) -> dict[str, Any]:
+        return {
+            "category": self.category,
+            "code": self.code,
+            "message": self.message,
+            "retryable": self.retryable,
+        }
+
+
 class UncertaintyRequiredError(S2ContractModelError):
     """Raised when S2 receives a point-estimate-only model without a UQ wrapper."""
 
@@ -82,6 +108,8 @@ class S2SpecCompilerError(S2Error):
 S2_REQUIRED_CONTRACT_IDS = ("C1", "C2", "C4", "C6")
 S2_FEATURE_GRAPH_SCHEMA_VERSION = "argus-s2-featuregraph-v1"
 S2_FEATURE_SET_SCHEMA_VERSION = "argus-s2-featureset-v1"
+S2_FROZEN_PIPELINE_SCHEMA_VERSION = "argus-s2-frozen-pipeline-v1"
+S2_FROZEN_PIPELINE_ENTRYPOINT_CONTRACT_VERSION = "argus.s3.frozen_pipeline_entrypoint.v1"
 S2_FEATURE_GRAPH_OPS = (
     "source",
     "arithmetic",
@@ -4356,6 +4384,649 @@ def _absolute_pearson_correlation(left: tuple[float, ...], right: tuple[float, .
         return 0.0
     correlation = sum(lv * rv for lv, rv in zip(left_centered, right_centered)) / (left_norm * right_norm)
     return abs(correlation)
+
+
+@dataclass(frozen=True)
+class PipelineFreezeRequest:
+    job_id: str
+    feature_set_ref: str
+    model_checkpoint_ref: str
+    calibration_artifact_ref: str
+    input_refs: tuple[str, ...]
+    code_ref: str
+    environment_digest: str
+    seed: str
+    container_digest: str
+    probe_inputs_units_tagged: Mapping[str, Mapping[str, Any]] = field(hash=False)
+    output_name: str = "prediction"
+    output_units: str = "dimensionless"
+    nondeterminism_tolerance: float = 0.0
+    build_wallclock_seconds: float = 1.0
+    max_self_replay_fraction: float = 0.05
+    adapter_refs: tuple[str, ...] = ()
+    config: Mapping[str, Any] = field(default_factory=dict, hash=False)
+    nondeterministic_replay_jitter: float = 0.0
+
+    def __post_init__(self) -> None:
+        job_id = self.job_id.strip()
+        feature_set_ref = self.feature_set_ref.strip()
+        model_checkpoint_ref = self.model_checkpoint_ref.strip()
+        calibration_artifact_ref = self.calibration_artifact_ref.strip()
+        input_refs = tuple(str(ref).strip() for ref in self.input_refs)
+        code_ref = self.code_ref.strip()
+        environment_digest = self.environment_digest.strip()
+        seed = self.seed.strip()
+        container_digest = self.container_digest.strip()
+        output_name = self.output_name.strip()
+        output_units = self.output_units.strip()
+        adapter_refs = tuple(str(ref).strip() for ref in self.adapter_refs)
+        nondeterminism_tolerance = _finite_pipeline_value(
+            self.nondeterminism_tolerance,
+            name="nondeterminism_tolerance",
+        )
+        build_wallclock_seconds = _finite_pipeline_value(
+            self.build_wallclock_seconds,
+            name="build_wallclock_seconds",
+        )
+        max_self_replay_fraction = _finite_pipeline_value(
+            self.max_self_replay_fraction,
+            name="max_self_replay_fraction",
+        )
+        nondeterministic_replay_jitter = _finite_pipeline_value(
+            self.nondeterministic_replay_jitter,
+            name="nondeterministic_replay_jitter",
+        )
+        if not job_id:
+            raise S2ContractModelError("S2 PipelineFreezeRequest requires job_id")
+        if not feature_set_ref:
+            raise S2ContractModelError("S2 PipelineFreezeRequest requires feature_set_ref")
+        if not model_checkpoint_ref:
+            raise S2ContractModelError("S2 PipelineFreezeRequest requires model_checkpoint_ref")
+        if not calibration_artifact_ref:
+            raise S2ContractModelError("S2 PipelineFreezeRequest requires calibration_artifact_ref")
+        if not input_refs or any(not ref for ref in input_refs):
+            raise S2ContractModelError("S2 PipelineFreezeRequest requires non-empty input_refs")
+        if not code_ref or not environment_digest or not seed:
+            raise S2ContractModelError("S2 PipelineFreezeRequest requires code_ref, environment_digest, and seed")
+        if not container_digest:
+            raise S2ContractModelError("S2 PipelineFreezeRequest requires container_digest")
+        if not output_name or not output_units:
+            raise S2ContractModelError("S2 PipelineFreezeRequest requires output_name and output_units")
+        if nondeterminism_tolerance < 0:
+            raise S2ContractModelError("S2 PipelineFreezeRequest nondeterminism_tolerance must be non-negative")
+        if nondeterministic_replay_jitter < 0:
+            raise S2ContractModelError("S2 PipelineFreezeRequest nondeterministic_replay_jitter must be non-negative")
+        if build_wallclock_seconds <= 0:
+            raise S2ContractModelError("S2 PipelineFreezeRequest build_wallclock_seconds must be positive")
+        if max_self_replay_fraction <= 0:
+            raise S2ContractModelError("S2 PipelineFreezeRequest max_self_replay_fraction must be positive")
+        if any(not ref for ref in adapter_refs):
+            raise S2ContractModelError("S2 PipelineFreezeRequest adapter_refs cannot contain empty refs")
+        normalized_probe = _normalize_units_tagged_inputs(self.probe_inputs_units_tagged)
+        object.__setattr__(self, "job_id", job_id)
+        object.__setattr__(self, "feature_set_ref", feature_set_ref)
+        object.__setattr__(self, "model_checkpoint_ref", model_checkpoint_ref)
+        object.__setattr__(self, "calibration_artifact_ref", calibration_artifact_ref)
+        object.__setattr__(self, "input_refs", input_refs)
+        object.__setattr__(self, "code_ref", code_ref)
+        object.__setattr__(self, "environment_digest", environment_digest)
+        object.__setattr__(self, "seed", seed)
+        object.__setattr__(self, "container_digest", container_digest)
+        object.__setattr__(self, "probe_inputs_units_tagged", normalized_probe)
+        object.__setattr__(self, "output_name", output_name)
+        object.__setattr__(self, "output_units", output_units)
+        object.__setattr__(self, "nondeterminism_tolerance", nondeterminism_tolerance)
+        object.__setattr__(self, "build_wallclock_seconds", build_wallclock_seconds)
+        object.__setattr__(self, "max_self_replay_fraction", max_self_replay_fraction)
+        object.__setattr__(self, "adapter_refs", adapter_refs)
+        object.__setattr__(self, "config", _s2_jsonable(dict(self.config)))
+        object.__setattr__(self, "nondeterministic_replay_jitter", nondeterministic_replay_jitter)
+
+
+@dataclass(frozen=True)
+class FrozenPipelinePrediction:
+    outputs_units_tagged: dict[str, dict[str, Any]]
+    uncertainty: dict[str, Any]
+    io_signature: dict[str, Any]
+    diagnostics: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class PipelineFreezeResult:
+    job_id: str
+    artifact_ref: str
+    self_replay_passed: bool
+    max_replay_delta: float
+    self_replay_time_seconds: float
+    self_replay_fraction: float
+    io_signature: dict[str, Any]
+    diagnostics: dict[str, Any] = field(default_factory=dict)
+
+
+class FrozenPipelineRunner:
+    """Loads and executes S2 frozen pipeline predict artifacts from C4."""
+
+    def __init__(self, *, artifact_store: InMemoryArtifactStore) -> None:
+        self._artifact_store = artifact_store
+
+    def predict(
+        self,
+        frozen_pipeline_ref: str,
+        inputs_units_tagged: Mapping[str, Mapping[str, Any]],
+    ) -> FrozenPipelinePrediction:
+        record = self._artifact_store.get_record(frozen_pipeline_ref)
+        if record.kind != "frozen_pipeline":
+            raise PipelineFreezeError(
+                f"S2 FrozenPipelineRunner expected frozen_pipeline artifact, got {record.kind!r}",
+                code="INVALID_FROZEN_PIPELINE",
+            )
+        payload = self._artifact_payload(frozen_pipeline_ref)
+        return self.predict_payload(payload, inputs_units_tagged, loaded_from_c4=True)
+
+    def predict_payload(
+        self,
+        payload: Mapping[str, Any],
+        inputs_units_tagged: Mapping[str, Mapping[str, Any]],
+        *,
+        loaded_from_c4: bool = False,
+    ) -> FrozenPipelinePrediction:
+        self._assert_frozen_payload(payload)
+        io_signature = dict(payload["io_signature"])
+        normalized_inputs = _normalize_units_tagged_inputs(inputs_units_tagged)
+        self._assert_input_signature(io_signature, normalized_inputs)
+        scalar_inputs = {name: float(tagged["value"]) for name, tagged in normalized_inputs.items()}
+        feature_values = self._evaluate_feature_graph(
+            dict(payload["feature_graph"]),
+            dict(payload["feature_set"]),
+            scalar_inputs,
+        )
+        prediction = self._predict_model(dict(payload["model_checkpoint"]), feature_values)
+        output_name, output_units = self._output_contract(io_signature)
+        outputs_units_tagged = {
+            output_name: {
+                "value": prediction,
+                "units": output_units,
+            }
+        }
+        uncertainty = self._uncertainty(dict(payload["uq_calibration"]), prediction)
+        return FrozenPipelinePrediction(
+            outputs_units_tagged=outputs_units_tagged,
+            uncertainty=uncertainty,
+            io_signature=io_signature,
+            diagnostics={
+                "loaded_from_c4": loaded_from_c4,
+                "feature_count": len(feature_values),
+                "schema_version": payload.get("schema_version"),
+            },
+        )
+
+    def _artifact_payload(self, artifact_ref: str) -> dict[str, Any]:
+        try:
+            return json.loads(self._artifact_store.get_artifact(artifact_ref).decode("utf-8"))
+        except KeyError as exc:
+            raise PipelineFreezeError(
+                f"S2 FrozenPipelineRunner cannot load frozen pipeline artifact: {artifact_ref}",
+                code="INVALID_FROZEN_PIPELINE",
+            ) from exc
+
+    @staticmethod
+    def _assert_frozen_payload(payload: Mapping[str, Any]) -> None:
+        if payload.get("schema_version") != S2_FROZEN_PIPELINE_SCHEMA_VERSION:
+            raise PipelineFreezeError("S2 frozen pipeline schema_version is unsupported", code="INVALID_FROZEN_PIPELINE")
+        if payload.get("entrypoint") != "predict":
+            raise PipelineFreezeError("S2 frozen pipeline entrypoint must be predict", code="INVALID_FROZEN_PIPELINE")
+        if payload.get("entrypoint_contract_version") != S2_FROZEN_PIPELINE_ENTRYPOINT_CONTRACT_VERSION:
+            raise PipelineFreezeError(
+                "S2 frozen pipeline entrypoint contract version is unsupported",
+                code="INVALID_FROZEN_PIPELINE",
+            )
+        if not payload.get("s3_executable"):
+            raise PipelineFreezeError("S2 frozen pipeline is not marked S3 executable", code="INVALID_FROZEN_PIPELINE")
+        for key in ("io_signature", "feature_graph", "feature_set", "model_checkpoint", "uq_calibration"):
+            if not isinstance(payload.get(key), Mapping):
+                raise PipelineFreezeError(f"S2 frozen pipeline missing payload section: {key}", code="INVALID_FROZEN_PIPELINE")
+
+    @staticmethod
+    def _assert_input_signature(
+        io_signature: Mapping[str, Any],
+        normalized_inputs: Mapping[str, Mapping[str, Any]],
+    ) -> None:
+        expected = io_signature.get("inputs")
+        if not isinstance(expected, Mapping):
+            raise PipelineFreezeError("S2 frozen pipeline io_signature missing inputs", code="INVALID_FROZEN_PIPELINE")
+        expected_names = set(str(name) for name in expected)
+        observed_names = set(normalized_inputs)
+        if expected_names != observed_names:
+            raise PipelineFreezeError(
+                f"S2 frozen pipeline input names mismatch: expected {sorted(expected_names)}, got {sorted(observed_names)}",
+                code="IO_SIGNATURE_MISMATCH",
+            )
+        for name, expected_contract in expected.items():
+            if not isinstance(expected_contract, Mapping):
+                raise PipelineFreezeError("S2 frozen pipeline input contract is malformed", code="INVALID_FROZEN_PIPELINE")
+            expected_units = str(expected_contract.get("units", ""))
+            observed_units = str(normalized_inputs[str(name)].get("units", ""))
+            if expected_units != observed_units:
+                raise PipelineFreezeError(
+                    f"S2 frozen pipeline input {name!r} units mismatch: expected {expected_units}, got {observed_units}",
+                    code="IO_SIGNATURE_MISMATCH",
+                )
+
+    @staticmethod
+    def _evaluate_feature_graph(
+        graph_payload: Mapping[str, Any],
+        feature_set_payload: Mapping[str, Any],
+        inputs: Mapping[str, float],
+    ) -> dict[str, float]:
+        raw_nodes = graph_payload.get("nodes")
+        if not isinstance(raw_nodes, list):
+            raise PipelineFreezeError("S2 frozen feature graph missing nodes", code="INVALID_FROZEN_PIPELINE")
+        values: dict[str, float] = {}
+        for raw_node in raw_nodes:
+            if not isinstance(raw_node, Mapping):
+                raise PipelineFreezeError("S2 frozen feature graph node is malformed", code="INVALID_FROZEN_PIPELINE")
+            node_id = str(raw_node.get("node_id", "")).strip()
+            feature = raw_node.get("feature")
+            if not node_id or not isinstance(feature, Mapping):
+                raise PipelineFreezeError("S2 frozen feature graph node is missing feature payload", code="INVALID_FROZEN_PIPELINE")
+            terms = feature.get("terms")
+            if not isinstance(terms, list) or not terms:
+                raise PipelineFreezeError("S2 frozen feature graph node has no terms", code="INVALID_FROZEN_PIPELINE")
+            result = 1.0
+            for term in terms:
+                if not isinstance(term, Mapping):
+                    raise PipelineFreezeError("S2 frozen feature graph term is malformed", code="INVALID_FROZEN_PIPELINE")
+                field_name = str(term.get("field_name", "")).strip()
+                exponent = int(term.get("exponent", 1))
+                if field_name in values:
+                    base = values[field_name]
+                elif field_name in inputs:
+                    base = inputs[field_name]
+                else:
+                    raise PipelineFreezeError(
+                        f"S2 frozen feature graph missing input or dependency: {field_name}",
+                        code="IO_SIGNATURE_MISMATCH",
+                    )
+                try:
+                    result *= base ** exponent
+                except ZeroDivisionError as exc:
+                    raise PipelineFreezeError(
+                        f"S2 frozen feature graph cannot apply negative exponent to zero: {node_id}",
+                        code="INVALID_FROZEN_PIPELINE",
+                    ) from exc
+                if not math.isfinite(result):
+                    raise PipelineFreezeError(
+                        f"S2 frozen feature graph produced non-finite value: {node_id}",
+                        code="INVALID_FROZEN_PIPELINE",
+                    )
+            values[node_id] = float(result)
+        selected = feature_set_payload.get("selected_nodes")
+        if not isinstance(selected, list) or not selected:
+            raise PipelineFreezeError("S2 frozen feature set missing selected_nodes", code="INVALID_FROZEN_PIPELINE")
+        selected_values: dict[str, float] = {}
+        for node_id in selected:
+            key = str(node_id)
+            if key not in values:
+                raise PipelineFreezeError(
+                    f"S2 frozen feature set references missing node: {key}",
+                    code="INVALID_FROZEN_PIPELINE",
+                )
+            selected_values[key] = values[key]
+        return selected_values
+
+    @staticmethod
+    def _predict_model(model_payload: Mapping[str, Any], feature_values: Mapping[str, float]) -> float:
+        backend = model_payload.get("backend")
+        model_state = model_payload.get("model_state")
+        if not isinstance(model_state, Mapping):
+            raise PipelineFreezeError("S2 frozen model checkpoint missing model_state", code="INVALID_FROZEN_PIPELINE")
+        if backend == "deterministic-linear":
+            raw_feature_names = model_state.get("feature_names")
+            weights = model_state.get("weights")
+            if not isinstance(raw_feature_names, list) or not isinstance(weights, Mapping):
+                raise PipelineFreezeError("S2 frozen deterministic-linear state is malformed", code="INVALID_FROZEN_PIPELINE")
+            bias = _finite_pipeline_value(model_state.get("bias", 0.0), name="bias")
+            prediction = bias
+            for raw_name in raw_feature_names:
+                name = str(raw_name)
+                if name not in feature_values:
+                    raise PipelineFreezeError(
+                        f"S2 frozen model requires missing feature: {name}",
+                        code="IO_SIGNATURE_MISMATCH",
+                    )
+                prediction += _finite_pipeline_value(weights.get(name, 0.0), name=f"weight:{name}") * feature_values[name]
+            return float(prediction)
+        if backend == "physics-informed-analytic":
+            raw_feature_names = model_state.get("feature_names")
+            if not isinstance(raw_feature_names, list) or len(raw_feature_names) != 1:
+                raise PipelineFreezeError("S2 frozen physics-informed state is malformed", code="INVALID_FROZEN_PIPELINE")
+            name = str(raw_feature_names[0])
+            if name not in feature_values:
+                raise PipelineFreezeError(f"S2 frozen model requires missing feature: {name}", code="IO_SIGNATURE_MISMATCH")
+            scale = PhysicsInformedTrainingBackend._positive_scale(
+                _finite_pipeline_value(model_state.get("scale_raw", 0.0), name="scale_raw")
+            )
+            return float(scale * feature_values[name] * feature_values[name])
+        raise PipelineFreezeError(f"S2 frozen model backend is unsupported: {backend!r}", code="INVALID_FROZEN_PIPELINE")
+
+    @staticmethod
+    def _output_contract(io_signature: Mapping[str, Any]) -> tuple[str, str]:
+        outputs = io_signature.get("outputs")
+        if not isinstance(outputs, Mapping) or len(outputs) != 1:
+            raise PipelineFreezeError("S2 frozen pipeline requires exactly one output contract", code="INVALID_FROZEN_PIPELINE")
+        output_name, output_contract = next(iter(outputs.items()))
+        if not isinstance(output_contract, Mapping):
+            raise PipelineFreezeError("S2 frozen pipeline output contract is malformed", code="INVALID_FROZEN_PIPELINE")
+        output_units = str(output_contract.get("units", "")).strip()
+        if not output_units:
+            raise PipelineFreezeError("S2 frozen pipeline output contract missing units", code="INVALID_FROZEN_PIPELINE")
+        return str(output_name), output_units
+
+    @staticmethod
+    def _uncertainty(calibration_payload: Mapping[str, Any], prediction: float) -> dict[str, Any]:
+        interval = calibration_payload.get("interval")
+        if isinstance(interval, Mapping) and interval.get("kind") == "symmetric_conformal":
+            radius = _finite_pipeline_value(interval.get("radius", 0.0), name="uncertainty_radius")
+            return {
+                "kind": "interval",
+                "source": calibration_payload.get("uncertainty_method", "unknown"),
+                "radius": radius,
+                "lower": prediction - radius,
+                "upper": prediction + radius,
+            }
+        return {
+            "kind": "interval",
+            "source": calibration_payload.get("uncertainty_method", "unknown"),
+            "radius": None,
+            "lower": None,
+            "upper": None,
+        }
+
+
+class PipelineFreezer:
+    """Freezes S2 feature, model, and UQ artifacts into a deterministic S3 entrypoint."""
+
+    def __init__(
+        self,
+        *,
+        artifact_store: InMemoryArtifactStore,
+        provenance_emitter: ProvenanceEmitter | None = None,
+        runner: FrozenPipelineRunner | None = None,
+    ) -> None:
+        self._artifact_store = artifact_store
+        self._provenance_emitter = provenance_emitter or ProvenanceEmitter(artifact_store=artifact_store)
+        self._runner = runner or FrozenPipelineRunner(artifact_store=artifact_store)
+
+    def freeze(self, request: PipelineFreezeRequest) -> PipelineFreezeResult:
+        feature_record, model_record, calibration_record = self._component_records(request)
+        for input_ref in request.input_refs:
+            self._artifact_store.get_record(input_ref)
+        feature_payload = self._artifact_payload(request.feature_set_ref)
+        model_payload = self._artifact_payload(request.model_checkpoint_ref)
+        calibration_payload = self._artifact_payload(request.calibration_artifact_ref)
+        self._assert_uq_replay_passed(calibration_payload)
+        io_signature = self._io_signature(request)
+        payload = self._manifest_payload(
+            request=request,
+            feature_payload=feature_payload,
+            model_payload=model_payload,
+            calibration_payload=calibration_payload,
+            io_signature=io_signature,
+        )
+        first, second, self_replay_time = self._self_replay(request, payload)
+        max_delta = self._max_prediction_delta(first, second)
+        if max_delta > request.nondeterminism_tolerance:
+            raise PipelineFreezeError(
+                "S2 PipelineFreezer self replay exceeded nondeterminism_tolerance",
+                code="SELF_REPLAY_FAILED",
+            )
+        self_replay_fraction = self_replay_time / request.build_wallclock_seconds
+        if self_replay_fraction > request.max_self_replay_fraction:
+            raise PipelineFreezeError(
+                "S2 PipelineFreezer self replay overhead exceeded max_self_replay_fraction",
+                code="SELF_REPLAY_OVERHEAD_EXCEEDED",
+            )
+        payload["self_replay"] = {
+            "evaluated": True,
+            "status": "PASS",
+            "max_delta": max_delta,
+            "nondeterminism_tolerance": request.nondeterminism_tolerance,
+            "time_seconds": self_replay_time,
+            "build_wallclock_seconds": request.build_wallclock_seconds,
+            "fraction": self_replay_fraction,
+            "max_self_replay_fraction": request.max_self_replay_fraction,
+        }
+        payload["diagnostics"]["self_replay_passed"] = True
+        payload["diagnostics"]["self_replay_output"] = first.outputs_units_tagged
+        lineage_refs = _unique_pipeline_refs(
+            (
+                feature_record.artifact_ref,
+                model_record.artifact_ref,
+                calibration_record.artifact_ref,
+            )
+            + request.input_refs
+        )
+        record = self._provenance_emitter.emit_artifact(
+            kind="frozen_pipeline",
+            payload=_s2_jsonable(payload),
+            producer=Producer(subsystem="S2", version="0.0.0", job_id=request.job_id),
+            lineage=Lineage(
+                input_refs=lineage_refs,
+                code_ref=request.code_ref,
+                environment_digest=request.environment_digest,
+                seeds=(request.seed,),
+                job_id=request.job_id,
+            ),
+            claim_tier="ran-toy",
+        )
+        return PipelineFreezeResult(
+            job_id=request.job_id,
+            artifact_ref=record.artifact_ref,
+            self_replay_passed=True,
+            max_replay_delta=max_delta,
+            self_replay_time_seconds=self_replay_time,
+            self_replay_fraction=self_replay_fraction,
+            io_signature=io_signature,
+            diagnostics={
+                "claim_tier": "ran-toy",
+                "component_refs": dict(payload["component_refs"]),
+                "container_digest": request.container_digest,
+            },
+        )
+
+    def _component_records(
+        self,
+        request: PipelineFreezeRequest,
+    ) -> tuple[ArtifactRecord, ArtifactRecord, ArtifactRecord]:
+        feature_record = self._artifact_store.get_record(request.feature_set_ref)
+        model_record = self._artifact_store.get_record(request.model_checkpoint_ref)
+        calibration_record = self._artifact_store.get_record(request.calibration_artifact_ref)
+        if feature_record.kind != "feature_set":
+            raise PipelineFreezeError("S2 PipelineFreezer requires feature_set input", code="INVALID_COMPONENT")
+        if model_record.kind != "model_checkpoint":
+            raise PipelineFreezeError("S2 PipelineFreezer requires model_checkpoint input", code="INVALID_COMPONENT")
+        if calibration_record.kind != "uq_calibration":
+            raise PipelineFreezeError("S2 PipelineFreezer requires uq_calibration input", code="INVALID_COMPONENT")
+        return feature_record, model_record, calibration_record
+
+    def _artifact_payload(self, artifact_ref: str) -> dict[str, Any]:
+        try:
+            return json.loads(self._artifact_store.get_artifact(artifact_ref).decode("utf-8"))
+        except KeyError as exc:
+            raise PipelineFreezeError(
+                f"S2 PipelineFreezer cannot load required artifact: {artifact_ref}",
+                code="INVALID_COMPONENT",
+            ) from exc
+
+    @staticmethod
+    def _assert_uq_replay_passed(calibration_payload: Mapping[str, Any]) -> None:
+        replay = calibration_payload.get("self_replay")
+        if isinstance(replay, Mapping) and replay.get("evaluated") and replay.get("status") != "PASS":
+            raise PipelineFreezeError(
+                "S2 PipelineFreezer refuses calibration with failed self replay",
+                code="UPSTREAM_SELF_REPLAY_FAILED",
+            )
+
+    @staticmethod
+    def _io_signature(request: PipelineFreezeRequest) -> dict[str, Any]:
+        inputs = {
+            name: {
+                "units": tagged["units"],
+                "value_type": "float",
+            }
+            for name, tagged in sorted(request.probe_inputs_units_tagged.items())
+        }
+        return {
+            "contract_version": S2_FROZEN_PIPELINE_ENTRYPOINT_CONTRACT_VERSION,
+            "inputs": inputs,
+            "outputs": {
+                request.output_name: {
+                    "units": request.output_units,
+                    "value_type": "float",
+                }
+            },
+        }
+
+    @staticmethod
+    def _manifest_payload(
+        *,
+        request: PipelineFreezeRequest,
+        feature_payload: Mapping[str, Any],
+        model_payload: Mapping[str, Any],
+        calibration_payload: Mapping[str, Any],
+        io_signature: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        params_hash = hash_bytes(canonical_json_bytes(model_payload.get("parameters", {})))
+        config_hash = hash_bytes(canonical_json_bytes(request.config))
+        return {
+            "schema_version": S2_FROZEN_PIPELINE_SCHEMA_VERSION,
+            "job_id": request.job_id,
+            "entrypoint": "predict",
+            "entrypoint_contract_version": S2_FROZEN_PIPELINE_ENTRYPOINT_CONTRACT_VERSION,
+            "s3_executable": True,
+            "claim_tier": "ran-toy",
+            "component_refs": {
+                "feature_set_ref": request.feature_set_ref,
+                "model_checkpoint_ref": request.model_checkpoint_ref,
+                "calibration_artifact_ref": request.calibration_artifact_ref,
+                "input_refs": list(request.input_refs),
+            },
+            "container_digest": request.container_digest,
+            "adapter_refs": list(request.adapter_refs),
+            "seed": request.seed,
+            "seeds": [request.seed],
+            "config": dict(request.config),
+            "config_hash": config_hash,
+            "params_hash": params_hash,
+            "io_signature": dict(io_signature),
+            "feature_graph": dict(feature_payload["graph"]),
+            "feature_set": dict(feature_payload["feature_set"]),
+            "model_checkpoint": dict(model_payload),
+            "uq_calibration": dict(calibration_payload),
+            "nondeterminism_tolerance": request.nondeterminism_tolerance,
+            "self_replay": {
+                "evaluated": False,
+                "status": "PENDING",
+                "nondeterminism_tolerance": request.nondeterminism_tolerance,
+            },
+            "diagnostics": {
+                "nondeterministic_replay_jitter": request.nondeterministic_replay_jitter,
+                "self_replay_passed": False,
+                "feature_graph_schema_version": feature_payload.get("graph", {}).get("schema_version"),
+                "feature_set_schema_version": feature_payload.get("feature_set", {}).get("schema_version"),
+            },
+        }
+
+    def _self_replay(
+        self,
+        request: PipelineFreezeRequest,
+        payload: Mapping[str, Any],
+    ) -> tuple[FrozenPipelinePrediction, FrozenPipelinePrediction, float]:
+        start = time.perf_counter()
+        first = self._runner.predict_payload(payload, request.probe_inputs_units_tagged)
+        second = self._runner.predict_payload(payload, request.probe_inputs_units_tagged)
+        if request.nondeterministic_replay_jitter:
+            second = self._with_prediction_jitter(second, request.nondeterministic_replay_jitter)
+        elapsed = max(time.perf_counter() - start, 1e-12)
+        return first, second, elapsed
+
+    @staticmethod
+    def _with_prediction_jitter(
+        prediction: FrozenPipelinePrediction,
+        jitter: float,
+    ) -> FrozenPipelinePrediction:
+        outputs = json.loads(json.dumps(prediction.outputs_units_tagged, sort_keys=True))
+        for tagged in outputs.values():
+            tagged["value"] = _finite_pipeline_value(tagged["value"], name="replay_output") + jitter
+        return FrozenPipelinePrediction(
+            outputs_units_tagged=outputs,
+            uncertainty=dict(prediction.uncertainty),
+            io_signature=dict(prediction.io_signature),
+            diagnostics={**prediction.diagnostics, "nondeterministic_replay_jitter": jitter},
+        )
+
+    @staticmethod
+    def _max_prediction_delta(
+        first: FrozenPipelinePrediction,
+        second: FrozenPipelinePrediction,
+    ) -> float:
+        deltas: list[float] = []
+        for output_name, first_tagged in first.outputs_units_tagged.items():
+            if output_name not in second.outputs_units_tagged:
+                raise PipelineFreezeError(
+                    f"S2 PipelineFreezer self replay output missing: {output_name}",
+                    code="SELF_REPLAY_FAILED",
+                )
+            first_value = _finite_pipeline_value(first_tagged.get("value"), name=f"first:{output_name}")
+            second_value = _finite_pipeline_value(
+                second.outputs_units_tagged[output_name].get("value"),
+                name=f"second:{output_name}",
+            )
+            deltas.append(abs(first_value - second_value))
+        return max(deltas) if deltas else 0.0
+
+
+def _normalize_units_tagged_inputs(
+    raw_inputs: Mapping[str, Mapping[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    if not isinstance(raw_inputs, Mapping) or not raw_inputs:
+        raise S2ContractModelError("S2 pipeline inputs require a non-empty units-tagged mapping")
+    normalized: dict[str, dict[str, Any]] = {}
+    for raw_name, raw_tagged in raw_inputs.items():
+        name = str(raw_name).strip()
+        if not name:
+            raise S2ContractModelError("S2 pipeline input names cannot be empty")
+        if not isinstance(raw_tagged, Mapping):
+            raise S2ContractModelError(f"S2 pipeline input {name!r} must be a units-tagged mapping")
+        units = str(raw_tagged.get("units", "")).strip()
+        if not units:
+            raise S2ContractModelError(f"S2 pipeline input {name!r} requires units")
+        normalized[name] = {
+            "value": _finite_pipeline_value(raw_tagged.get("value"), name=name),
+            "units": units,
+        }
+    return normalized
+
+
+def _finite_pipeline_value(value: Any, *, name: str) -> float:
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError) as exc:
+        raise S2ContractModelError(f"S2 pipeline value {name!r} must be numeric") from exc
+    if not math.isfinite(numeric):
+        raise S2ContractModelError(f"S2 pipeline value {name!r} must be finite")
+    return numeric
+
+
+def _unique_pipeline_refs(refs: tuple[str, ...]) -> tuple[str, ...]:
+    seen: set[str] = set()
+    unique: list[str] = []
+    for ref in refs:
+        if ref in seen:
+            continue
+        seen.add(ref)
+        unique.append(ref)
+    return tuple(unique)
 
 
 class UQCalibrator:
