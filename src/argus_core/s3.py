@@ -193,7 +193,8 @@ class S3Verifier:
         perturbation_outcome = perturbation_outcome or PerturbationPairOutcome((), ())
         independence_attestation = independence_attestation or _default_independence_attestation(challenger_ids)
         aggregate_passed = _aggregate_passed(checks, perturbation_outcome)
-        claim_tier = tier_from_checks(checks) if aggregate_passed else "ran-toy"
+        base_claim_tier = tier_from_checks(checks) if aggregate_passed else "ran-toy"
+        claim_tier = _tier_after_independence_gate(base_claim_tier, independence_attestation)
         report = {
             "report_id": str(uuid4()),
             "profile_ref": profile_ref,
@@ -621,6 +622,28 @@ def tier_from_checks(checks: tuple[CheckResult, ...]) -> str:
     if statuses.get("CROSS_CODE") == "PASS" and statuses.get("LEAKAGE") == "PASS":
         return "novel-needs-human"
     return "recapitulated-known"
+
+
+def _tier_after_independence_gate(claim_tier: str, attestation: IndependenceAttestation) -> str:
+    if claim_tier != "novel-needs-human":
+        return claim_tier
+    if _novel_independence_satisfied(attestation):
+        return claim_tier
+    return "recapitulated-known"
+
+
+def _novel_independence_satisfied(attestation: IndependenceAttestation) -> bool:
+    selected_ids = tuple(attestation.selected_entity_ids)
+    selected = set(selected_ids)
+    candidates = set(attestation.candidate_ids)
+    return (
+        attestation.min_independent >= 2
+        and len(selected) >= attestation.min_independent
+        and selected.issubset(candidates)
+        and len(selected) == len(selected_ids)
+        and attestation.lineage_disjoint
+        and not attestation.correlation_warning
+    )
 
 
 def _aggregate_passed(checks: tuple[CheckResult, ...], perturbation_outcome: PerturbationPairOutcome) -> bool:

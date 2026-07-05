@@ -16,6 +16,7 @@ from argus_core import (
     FrozenPipelineEntrypointContractError,
     InMemoryArtifactStore,
     InMemoryVerifierTrustStore,
+    IndependenceAttestation,
     Lineage,
     Producer,
     RefereePolicyError,
@@ -359,6 +360,88 @@ class S3VerifierReportTests(unittest.TestCase):
         self.assertEqual(report["claim_tier"], "novel-needs-human")
         self.assertEqual(report["independence_attestation_debate"]["min_independent_challengers"], 2)
         self.assertFalse(report["independence_attestation_debate"]["correlation_warning"])
+
+    def test_challenger_independence_gate_downgrades_untrusted_novel_candidates(self) -> None:
+        cases = (
+            (
+                "lineage_not_disjoint",
+                IndependenceAttestation(
+                    candidate_ids=("challenger-a", "challenger-b"),
+                    selected_entity_ids=("challenger-a", "challenger-b"),
+                    min_independent=2,
+                    lineage_disjoint=False,
+                    correlation_warning=False,
+                    excluded_tags=(),
+                ),
+            ),
+            (
+                "correlation_warning",
+                IndependenceAttestation(
+                    candidate_ids=("challenger-a", "challenger-b"),
+                    selected_entity_ids=("challenger-a", "challenger-b"),
+                    min_independent=2,
+                    lineage_disjoint=True,
+                    correlation_warning=True,
+                    excluded_tags=(),
+                ),
+            ),
+            (
+                "selected_below_minimum",
+                IndependenceAttestation(
+                    candidate_ids=("challenger-a",),
+                    selected_entity_ids=("challenger-a",),
+                    min_independent=2,
+                    lineage_disjoint=True,
+                    correlation_warning=False,
+                    excluded_tags=(),
+                ),
+            ),
+            (
+                "below_novel_independence_floor",
+                IndependenceAttestation(
+                    candidate_ids=("challenger-a",),
+                    selected_entity_ids=("challenger-a",),
+                    min_independent=1,
+                    lineage_disjoint=True,
+                    correlation_warning=False,
+                    excluded_tags=(),
+                ),
+            ),
+            (
+                "selected_not_candidate",
+                IndependenceAttestation(
+                    candidate_ids=("challenger-a", "challenger-b"),
+                    selected_entity_ids=("challenger-a", "challenger-c"),
+                    min_independent=2,
+                    lineage_disjoint=True,
+                    correlation_warning=False,
+                    excluded_tags=(),
+                ),
+            ),
+        )
+
+        for name, attestation in cases:
+            with self.subTest(name=name):
+                report = self.verifier.build_report(
+                    profile_ref="c4://profile/ewpt/v1",
+                    frozen_pipeline_ref="c4://pipeline/ewpt/baseline",
+                    proponent_id="builder",
+                    checks=(
+                        CheckResult("INJECTION", "PASS"),
+                        CheckResult("NULL_CONTROL", "PASS"),
+                        CheckResult("PHYSICAL_CONSISTENCY", "PASS"),
+                        CheckResult("CALIBRATION", "PASS"),
+                        CheckResult("CROSS_CODE", "PASS"),
+                        CheckResult("LEAKAGE", "PASS"),
+                    ),
+                    challenger_ids=attestation.candidate_ids,
+                    independence_attestation=attestation,
+                )
+
+                self.assertTrue(report["aggregate"]["passed"])
+                self.assertEqual(report["claim_tier"], "recapitulated-known")
+                self.assertFalse(report["claim_tier_is_candidate"])
+                self.assertTrue(C3ReportVerifier(self.trust_store).verify(report).valid)
 
     @staticmethod
     def _challenger(entity_id: str, *, tags: tuple[str, ...]) -> CapabilityDescriptor:
