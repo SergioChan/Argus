@@ -93,6 +93,8 @@ from .s2 import (
     BuckinghamPiResult,
     BuckinghamPiVariable,
     BuildBudget,
+    BuildOrchestrationRequest,
+    BuildOrchestrator,
     BuildPlan,
     BuildResult,
     BuildSpec,

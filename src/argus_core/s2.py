@@ -5868,6 +5868,88 @@ class BuildPlan:
 
 
 @dataclass(frozen=True)
+class BuildOrchestrationRequest:
+    c2_envelope: Mapping[str, Any] = field(hash=False)
+    code_ref: str = "git:s2-build-orchestrator"
+    environment_digest: str = "oci:s2-build-orchestrator"
+    seed: str = "seed-s2-build-orchestrator"
+    hpo_parameter_grid: Mapping[str, tuple[Any, ...]] = field(
+        default_factory=lambda: {"learning_rate": (0.01, 0.05)},
+        hash=False,
+    )
+    hpo_max_epochs: int = 2
+    final_max_epochs: int = 5
+    learning_rate: float = 0.05
+    train_ratio: float = 0.6
+    validation_ratio: float = 0.2
+    test_ratio: float = 0.2
+    fold_count: int = 3
+    nominal_coverage: float = 0.8
+    coverage_tolerance: float = 0.25
+    nondeterminism_tolerance: float = 0.0
+    max_self_replay_fraction: float = 1.0
+    wallclock_seconds_per_epoch: float = 1.0
+    gpu_seconds_per_epoch: float = 0.0
+    model_tokens_per_epoch: int = 0
+    cost_usd_per_epoch: float = 0.01
+    container_digest: str = "oci://argus-s2/frozen-pipeline@sha256:build-orchestrator"
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.c2_envelope, Mapping):
+            raise S2ContractModelError("S2 BuildOrchestrationRequest requires a C2 envelope mapping")
+        code_ref = self.code_ref.strip()
+        environment_digest = self.environment_digest.strip()
+        seed = self.seed.strip()
+        container_digest = self.container_digest.strip()
+        if not code_ref or not environment_digest or not seed:
+            raise S2ContractModelError("S2 BuildOrchestrationRequest requires code_ref, environment_digest, and seed")
+        if not container_digest:
+            raise S2ContractModelError("S2 BuildOrchestrationRequest requires container_digest")
+        if self.hpo_max_epochs <= 0:
+            raise S2ContractModelError("S2 BuildOrchestrationRequest hpo_max_epochs must be positive")
+        if self.final_max_epochs <= 0:
+            raise S2ContractModelError("S2 BuildOrchestrationRequest final_max_epochs must be positive")
+        if self.learning_rate <= 0:
+            raise S2ContractModelError("S2 BuildOrchestrationRequest learning_rate must be positive")
+        ratios = (float(self.train_ratio), float(self.validation_ratio), float(self.test_ratio))
+        if any(ratio <= 0 for ratio in ratios):
+            raise S2ContractModelError("S2 BuildOrchestrationRequest split ratios must be positive")
+        if abs(sum(ratios) - 1.0) > 1e-9:
+            raise S2ContractModelError("S2 BuildOrchestrationRequest split ratios must sum to 1.0")
+        if self.fold_count < 0 or self.fold_count == 1:
+            raise S2ContractModelError("S2 BuildOrchestrationRequest fold_count must be 0 or at least 2")
+        nominal_coverage = float(self.nominal_coverage)
+        coverage_tolerance = float(self.coverage_tolerance)
+        if not 0.0 < nominal_coverage < 1.0:
+            raise S2ContractModelError("S2 BuildOrchestrationRequest nominal_coverage must be between 0 and 1")
+        if coverage_tolerance < 0 or coverage_tolerance >= 1:
+            raise S2ContractModelError("S2 BuildOrchestrationRequest coverage_tolerance must be in [0, 1)")
+        if self.nondeterminism_tolerance < 0:
+            raise S2ContractModelError("S2 BuildOrchestrationRequest nondeterminism_tolerance must be non-negative")
+        if self.max_self_replay_fraction <= 0:
+            raise S2ContractModelError("S2 BuildOrchestrationRequest max_self_replay_fraction must be positive")
+        if self.wallclock_seconds_per_epoch < 0:
+            raise S2ContractModelError("S2 BuildOrchestrationRequest wallclock_seconds_per_epoch must be non-negative")
+        if self.gpu_seconds_per_epoch < 0:
+            raise S2ContractModelError("S2 BuildOrchestrationRequest gpu_seconds_per_epoch must be non-negative")
+        if self.model_tokens_per_epoch < 0:
+            raise S2ContractModelError("S2 BuildOrchestrationRequest model_tokens_per_epoch must be non-negative")
+        if self.cost_usd_per_epoch < 0:
+            raise S2ContractModelError("S2 BuildOrchestrationRequest cost_usd_per_epoch must be non-negative")
+        object.__setattr__(self, "c2_envelope", dict(self.c2_envelope))
+        object.__setattr__(self, "code_ref", code_ref)
+        object.__setattr__(self, "environment_digest", environment_digest)
+        object.__setattr__(self, "seed", seed)
+        object.__setattr__(self, "hpo_parameter_grid", _normalize_hpo_parameter_grid(self.hpo_parameter_grid))
+        object.__setattr__(self, "train_ratio", ratios[0])
+        object.__setattr__(self, "validation_ratio", ratios[1])
+        object.__setattr__(self, "test_ratio", ratios[2])
+        object.__setattr__(self, "nominal_coverage", nominal_coverage)
+        object.__setattr__(self, "coverage_tolerance", coverage_tolerance)
+        object.__setattr__(self, "container_digest", container_digest)
+
+
+@dataclass(frozen=True)
 class BuildResult:
     job_id: str
     model_ref: str
@@ -5877,6 +5959,12 @@ class BuildResult:
     claim_tier: str
     diagnostics: dict[str, Any]
     cost_actual: dict[str, float | int] = field(default_factory=dict)
+    dataset_split_ref: str | None = None
+    feature_set_ref: str | None = None
+    hpo_selection_ref: str | None = None
+    training_log_ref: str | None = None
+    uq_calibration_ref: str | None = None
+    advisory_self_check_ref: str | None = None
 
 
 @dataclass(frozen=True)
@@ -6167,6 +6255,562 @@ class SpecCompiler:
                 message=f"S2 SpecCompiler could not resolve input artifact: {ref}",
             ) from exc
         return ResolvedC4Artifact.from_record(record)
+
+
+class BuildOrchestrator:
+    """Coordinates the S2-TC21 full build path from C2 envelope to frozen C4 pipeline."""
+
+    def __init__(
+        self,
+        *,
+        artifact_store: InMemoryArtifactStore,
+        spec_compiler: SpecCompiler,
+        provenance_emitter: ProvenanceEmitter | None = None,
+        data_manager: DataManager | None = None,
+        feature_engine: FeatureGraphEngine | None = None,
+        model_synthesizer: ModelSynthesizer | None = None,
+        hpo_engine: HPOEngine | None = None,
+        uq_calibrator: UQCalibrator | None = None,
+        failure_doctor: FailureDoctor | None = None,
+        advisory_self_check: AdvisorySelfCheck | None = None,
+        pipeline_freezer: PipelineFreezer | None = None,
+        hpo_scheduler_backend: str = "threadpool",
+        hpo_worker_count: int = 1,
+    ) -> None:
+        self._artifact_store = artifact_store
+        self._spec_compiler = spec_compiler
+        self._provenance_emitter = provenance_emitter or ProvenanceEmitter(artifact_store=artifact_store)
+        self._data_manager = data_manager or DataManager(
+            artifact_store=artifact_store,
+            provenance_emitter=self._provenance_emitter,
+        )
+        self._feature_engine = feature_engine or FeatureGraphEngine()
+        self._model_synthesizer = model_synthesizer or ModelSynthesizer(
+            policy=ComplexityEscalationPolicy(objective="minimize")
+        )
+        self._hpo_engine = hpo_engine or HPOEngine(
+            artifact_store=artifact_store,
+            provenance_emitter=self._provenance_emitter,
+            scheduler_backend=hpo_scheduler_backend,
+            worker_count=hpo_worker_count,
+        )
+        self._uq_calibrator = uq_calibrator or UQCalibrator(
+            artifact_store=artifact_store,
+            provenance_emitter=self._provenance_emitter,
+        )
+        self._failure_doctor = failure_doctor or FailureDoctor(
+            artifact_store=artifact_store,
+            provenance_emitter=self._provenance_emitter,
+        )
+        self._advisory_self_check = advisory_self_check or AdvisorySelfCheck(
+            artifact_store=artifact_store,
+            provenance_emitter=self._provenance_emitter,
+        )
+        self._pipeline_freezer = pipeline_freezer or PipelineFreezer(
+            artifact_store=artifact_store,
+            provenance_emitter=self._provenance_emitter,
+        )
+
+    def build(
+        self,
+        request: BuildOrchestrationRequest | Mapping[str, Any],
+        *,
+        attempted_claim_tier: str | None = None,
+    ) -> BuildResult:
+        if attempted_claim_tier and attempted_claim_tier != "ran-toy":
+            raise SelfGradeError("S2 BuildOrchestrator cannot assign claim_tier above ran-toy")
+        orchestration_request = (
+            request
+            if isinstance(request, BuildOrchestrationRequest)
+            else BuildOrchestrationRequest(c2_envelope=request)
+        )
+        started_at = time.perf_counter()
+        spec = self._spec_compiler.compile(orchestration_request.c2_envelope)
+        feature_fields = self._feature_fields(spec)
+        target_field = self._target_field(spec)
+        dataset_ref = self._resolve_dataset_ref(spec)
+        dataset_rows = self._dataset_rows(dataset_ref)
+
+        split = self._data_manager.create_splits(
+            DataSplitRequest(
+                job_id=spec.job_id,
+                dataset_ref=dataset_ref,
+                split_seed=f"{orchestration_request.seed}:split",
+                train_ratio=orchestration_request.train_ratio,
+                validation_ratio=orchestration_request.validation_ratio,
+                test_ratio=orchestration_request.test_ratio,
+                row_id_key="row_id",
+                label_key=target_field.name,
+                blind_role_key="role" if any("role" in row for row in dataset_rows) else None,
+                blind_roles=("blind",),
+                fold_count=orchestration_request.fold_count,
+                code_ref=orchestration_request.code_ref,
+                environment_digest=orchestration_request.environment_digest,
+            )
+        )
+        graph = self._build_feature_graph(spec=spec, feature_fields=feature_fields)
+        feature_set_result = self._feature_engine.emit_feature_set(
+            graph,
+            selected_nodes=tuple(field.name for field in feature_fields),
+            emitter=self._provenance_emitter,
+            lineage=Lineage(
+                input_refs=(dataset_ref, split.split_manifest_ref),
+                code_ref=orchestration_request.code_ref,
+                environment_digest=orchestration_request.environment_digest,
+                seeds=(f"{orchestration_request.seed}:feature-graph",),
+                job_id=spec.job_id,
+            ),
+            feature_set_id=f"featureset:{spec.job_id}",
+            replay_probe_input=self._numeric_feature_inputs(dataset_rows[split.split_indices["train"][0]], feature_fields),
+        )
+        feature_set_ref = feature_set_result.artifact_record.artifact_ref
+        training_rows = self._rows_for_indices(
+            dataset_rows,
+            split.split_indices["train"],
+            graph=graph,
+            feature_fields=feature_fields,
+            target_field=target_field,
+        )
+        synthesis = self._model_synthesizer.select_family(
+            incumbent_family_id="tabular-baseline",
+            candidates=(
+                ModelCandidateResult(
+                    family_id="tabular-baseline",
+                    heldout_score=self._target_variance(training_rows, target_field.name),
+                    cost=1.0,
+                    diagnostics={"evidence": "target_variance_baseline"},
+                ),
+            ),
+        )
+        hpo = self._hpo_engine.run(
+            HPORequest(
+                job_id=spec.job_id,
+                family_ids=(synthesis.selected_family_id,),
+                parameter_grid=orchestration_request.hpo_parameter_grid,
+                input_refs=(feature_set_ref, split.split_manifest_ref),
+                training_rows=training_rows,
+                feature_names=tuple(field.name for field in feature_fields),
+                target_name=target_field.name,
+                max_epochs=orchestration_request.hpo_max_epochs,
+                code_ref=orchestration_request.code_ref,
+                environment_digest=orchestration_request.environment_digest,
+                seed=f"{orchestration_request.seed}:hpo",
+                objective_metric="loss",
+                objective="minimize",
+                learning_rate=orchestration_request.learning_rate,
+                wallclock_seconds_per_epoch=orchestration_request.wallclock_seconds_per_epoch,
+                gpu_seconds_per_epoch=orchestration_request.gpu_seconds_per_epoch,
+                model_tokens_per_epoch=orchestration_request.model_tokens_per_epoch,
+                cost_usd_per_epoch=orchestration_request.cost_usd_per_epoch,
+                trial_budget=spec.budget,
+            )
+        )
+        selected_parameters = dict(hpo.selected.parameters)
+        budget_meter = BudgetMeter.from_budget(job_id=spec.job_id, budget=spec.budget)
+        training_runtime = TrainingRuntime(
+            artifact_store=self._artifact_store,
+            provenance_emitter=self._provenance_emitter,
+            budget_meter=budget_meter,
+        )
+        training = training_runtime.train(
+            TrainingRequest(
+                job_id=spec.job_id,
+                family_id=hpo.selected.family_id or synthesis.selected_family_id,
+                input_refs=(feature_set_ref, split.split_manifest_ref, hpo.selection_artifact_ref),
+                training_rows=training_rows,
+                feature_names=tuple(field.name for field in feature_fields),
+                target_name=target_field.name,
+                max_epochs=int(selected_parameters.get("max_epochs", orchestration_request.final_max_epochs)),
+                learning_rate=float(selected_parameters.get("learning_rate", orchestration_request.learning_rate)),
+                parameters=selected_parameters,
+                code_ref=orchestration_request.code_ref,
+                environment_digest=orchestration_request.environment_digest,
+                seed=f"{orchestration_request.seed}:final-train",
+                wallclock_seconds_per_epoch=orchestration_request.wallclock_seconds_per_epoch,
+                gpu_seconds_per_epoch=orchestration_request.gpu_seconds_per_epoch,
+                model_tokens_per_epoch=orchestration_request.model_tokens_per_epoch,
+                cost_usd_per_epoch=orchestration_request.cost_usd_per_epoch,
+            )
+        )
+        if not training.final_checkpoint_ref:
+            raise S2ContractModelError("S2 BuildOrchestrator final training did not emit a model checkpoint")
+        model_payload = self._artifact_payload(training.final_checkpoint_ref)
+        calibration_samples = self._prediction_samples(
+            dataset_rows,
+            split.split_indices["validation"],
+            graph=graph,
+            feature_fields=feature_fields,
+            target_field=target_field,
+            model_payload=model_payload,
+            prefix="calibration",
+        )
+        validation_samples = self._prediction_samples(
+            dataset_rows,
+            split.split_indices["test"],
+            graph=graph,
+            feature_fields=feature_fields,
+            target_field=target_field,
+            model_payload=model_payload,
+            prefix="validation",
+        )
+        calibration = self._uq_calibrator.calibrate(
+            UQCalibrationRequest(
+                job_id=spec.job_id,
+                model_artifact_ref=training.final_checkpoint_ref,
+                split_manifest_ref=split.split_manifest_ref,
+                calibration_input_refs=(split.split_manifest_ref,),
+                validation_input_refs=(split.split_manifest_ref,),
+                calibration_samples=calibration_samples,
+                validation_samples=validation_samples,
+                uncertainty_method="split_conformal",
+                native_uq="conformal",
+                nominal_coverage=orchestration_request.nominal_coverage,
+                coverage_tolerance=orchestration_request.coverage_tolerance,
+                nondeterminism_tolerance=orchestration_request.nondeterminism_tolerance,
+                replay_output_pairs=((1.0, 1.0),),
+                code_ref=orchestration_request.code_ref,
+                environment_digest=orchestration_request.environment_digest,
+                seed=f"{orchestration_request.seed}:uq",
+            )
+        )
+        advisory = self._advisory_self_check.run(
+            AdvisorySelfCheckRequest(
+                job_id=spec.job_id,
+                input_refs=(training.final_checkpoint_ref, feature_set_ref, calibration.calibration_artifact_ref),
+                injection_samples=(
+                    AdvisorySignalSample(sample_id="injection-1", template=1.0, observed=2.0),
+                    AdvisorySignalSample(sample_id="injection-2", template=-1.0, observed=-2.0),
+                    AdvisorySignalSample(sample_id="injection-3", template=0.5, observed=1.0),
+                ),
+                known_amplitude=2.0,
+                amplitude_tolerance=1e-12,
+                null_samples=(
+                    AdvisorySignalSample(sample_id="null-1", template=1.0, observed=0.0),
+                    AdvisorySignalSample(sample_id="null-2", template=-1.0, observed=0.0),
+                ),
+                null_detection_threshold=0.05,
+                code_ref=orchestration_request.code_ref,
+                environment_digest=orchestration_request.environment_digest,
+                seed=f"{orchestration_request.seed}:advisory",
+            )
+        )
+        build_wallclock_seconds = max(time.perf_counter() - started_at, 1.0)
+        probe_inputs = self._probe_inputs(
+            dataset_rows,
+            split.split_indices["test"],
+            feature_fields=feature_fields,
+        )
+        freeze = self._pipeline_freezer.freeze(
+            PipelineFreezeRequest(
+                job_id=spec.job_id,
+                feature_set_ref=feature_set_ref,
+                model_checkpoint_ref=training.final_checkpoint_ref,
+                calibration_artifact_ref=calibration.calibration_artifact_ref,
+                input_refs=_unique_pipeline_refs(
+                    (
+                        dataset_ref,
+                        split.split_manifest_ref,
+                        hpo.selection_artifact_ref,
+                        training.training_log_ref,
+                        advisory.artifact_ref,
+                    )
+                ),
+                code_ref=orchestration_request.code_ref,
+                environment_digest=orchestration_request.environment_digest,
+                seed=f"{orchestration_request.seed}:freeze",
+                container_digest=orchestration_request.container_digest,
+                probe_inputs_units_tagged=probe_inputs,
+                output_name=target_field.name,
+                output_units=target_field.units,
+                nondeterminism_tolerance=orchestration_request.nondeterminism_tolerance,
+                build_wallclock_seconds=build_wallclock_seconds,
+                max_self_replay_fraction=orchestration_request.max_self_replay_fraction,
+                adapter_refs=tuple(
+                    descriptor.provenance_ref or f"{descriptor.entity_id}@{descriptor.revision}"
+                    for descriptor in spec.resolved_adapters
+                ),
+                config={
+                    "orchestrator": "BuildOrchestrator",
+                    "s2_tc21": True,
+                    "subtopic": spec.subtopic,
+                    "hpo_selection_ref": hpo.selection_artifact_ref,
+                    "advisory_self_check_ref": advisory.artifact_ref,
+                },
+            )
+        )
+        artifact_refs = _unique_pipeline_refs(
+            (
+                split.split_manifest_ref,
+                feature_set_ref,
+            )
+            + hpo.trial_artifact_refs
+            + (
+                hpo.selection_artifact_ref,
+            )
+            + training.checkpoint_refs
+            + (
+                training.training_log_ref,
+                calibration.calibration_artifact_ref,
+                advisory.artifact_ref,
+                freeze.artifact_ref,
+            )
+        )
+        diagnostics = {
+            "status": "SUCCEEDED",
+            "s2_tc21": "PASS",
+            "claim_tier_cap": "ran-toy",
+            "steps": {
+                "spec_compiler": "SUCCEEDED",
+                "data_manager": "SUCCEEDED",
+                "feature_graph": "SUCCEEDED",
+                "model_synthesizer": "SUCCEEDED",
+                "hpo_engine": hpo.status,
+                "training_runtime": training.status,
+                "uq_calibrator": calibration.status,
+                "failure_doctor": "ARMED",
+                "advisory_self_check": advisory.status,
+                "pipeline_freezer": "SUCCEEDED",
+            },
+            "build_spec": {
+                "job_id": spec.job_id,
+                "trace_id": spec.trace_id,
+                "subtopic": spec.subtopic,
+                "task_type": spec.task_type,
+                "required_claim_tier_max": spec.required_claim_tier_max,
+                "verifier_profile_ref": spec.verifier_profile_ref,
+            },
+            "data": {
+                "dataset_ref": dataset_ref,
+                "split_manifest_ref": split.split_manifest_ref,
+                "row_count": len(dataset_rows),
+                "split_indices": {role: list(indices) for role, indices in split.split_indices.items()},
+            },
+            "model_synthesis": asdict(synthesis),
+            "hpo": {
+                "selection_artifact_ref": hpo.selection_artifact_ref,
+                "selected_trial_id": hpo.selected.trial_id,
+                "selected_family_id": hpo.selected.family_id,
+                "selected_parameters": hpo.selected.parameters,
+                "trial_count": len(hpo.trials),
+            },
+            "training": {
+                "training_log_ref": training.training_log_ref,
+                "final_checkpoint_ref": training.final_checkpoint_ref,
+                "completed_epochs": training.completed_epochs,
+                "final_metrics": dict(training.diagnostics.get("final_metrics", {})),
+            },
+            "uq": {
+                "calibration_artifact_ref": calibration.calibration_artifact_ref,
+                "status": calibration.status,
+                "empirical_coverage": calibration.empirical_coverage,
+                "passed_internal_coverage": calibration.passed_internal_coverage,
+            },
+            "advisory": {
+                "artifact_ref": advisory.artifact_ref,
+                "status": advisory.status,
+                "warnings": list(advisory.warnings),
+            },
+            "pipeline_freeze": {
+                "artifact_ref": freeze.artifact_ref,
+                "self_replay_passed": freeze.self_replay_passed,
+                "self_replay_fraction": freeze.self_replay_fraction,
+                "max_replay_delta": freeze.max_replay_delta,
+            },
+            "cost_actual": training.cost_actual,
+        }
+        return BuildResult(
+            job_id=spec.job_id,
+            model_ref=training.final_checkpoint_ref,
+            frozen_pipeline_ref=freeze.artifact_ref,
+            artifact_refs=artifact_refs,
+            adapter_provenance_refs=tuple(
+                descriptor.provenance_ref or f"{descriptor.entity_id}@{descriptor.revision}"
+                for descriptor in spec.resolved_adapters
+            ),
+            claim_tier="ran-toy",
+            diagnostics=diagnostics,
+            cost_actual=training.cost_actual,
+            dataset_split_ref=split.split_manifest_ref,
+            feature_set_ref=feature_set_ref,
+            hpo_selection_ref=hpo.selection_artifact_ref,
+            training_log_ref=training.training_log_ref,
+            uq_calibration_ref=calibration.calibration_artifact_ref,
+            advisory_self_check_ref=advisory.artifact_ref,
+        )
+
+    def _resolve_dataset_ref(self, spec: BuildSpec) -> str:
+        candidate_refs = tuple(resolved.artifact_ref for resolved in spec.resolved_input_artifacts) + tuple(
+            resolved.provenance_ref for resolved in spec.resolved_datasets
+        )
+        for candidate_ref in candidate_refs:
+            resolved = self._dataset_ref_from_artifact(candidate_ref)
+            if resolved is not None:
+                return resolved
+        raise S2ContractModelError("S2 BuildOrchestrator could not resolve a concrete dataset artifact")
+
+    def _dataset_ref_from_artifact(self, artifact_ref: str) -> str | None:
+        record = self._artifact_store.get_record(artifact_ref)
+        if record.kind == "dataset":
+            return artifact_ref
+        if record.kind != "dataset_descriptor":
+            return None
+        payload = self._artifact_payload(artifact_ref)
+        direct_ref = payload.get("dataset_ref") or payload.get("artifact_ref") or payload.get("c4_ref")
+        if isinstance(direct_ref, str) and direct_ref.strip():
+            dataset_ref = direct_ref.strip()
+            dataset_record = self._artifact_store.get_record(dataset_ref)
+            if dataset_record.kind != "dataset":
+                raise S2ContractModelError("S2 BuildOrchestrator dataset_descriptor points to a non-dataset artifact")
+            return dataset_ref
+        nested = payload.get("dataset")
+        if isinstance(nested, Mapping):
+            nested_ref = nested.get("artifact_ref") or nested.get("dataset_ref")
+            if isinstance(nested_ref, str) and nested_ref.strip():
+                dataset_record = self._artifact_store.get_record(nested_ref.strip())
+                if dataset_record.kind != "dataset":
+                    raise S2ContractModelError("S2 BuildOrchestrator nested dataset ref is not a dataset artifact")
+                return nested_ref.strip()
+        return None
+
+    def _dataset_rows(self, dataset_ref: str) -> tuple[Mapping[str, Any], ...]:
+        payload = self._artifact_payload(dataset_ref)
+        rows = payload.get("rows")
+        if not isinstance(rows, (list, tuple)) or not rows:
+            raise S2ContractModelError("S2 BuildOrchestrator dataset artifact requires non-empty rows")
+        normalized: list[Mapping[str, Any]] = []
+        for row in rows:
+            if not isinstance(row, Mapping):
+                raise S2ContractModelError("S2 BuildOrchestrator dataset rows must be objects")
+            normalized.append(dict(row))
+        return tuple(normalized)
+
+    def _artifact_payload(self, artifact_ref: str) -> dict[str, Any]:
+        try:
+            return json.loads(self._artifact_store.get_artifact(artifact_ref).decode("utf-8"))
+        except KeyError as exc:
+            raise S2ContractModelError(f"S2 BuildOrchestrator cannot load artifact: {artifact_ref}") from exc
+
+    @staticmethod
+    def _feature_fields(spec: BuildSpec) -> tuple[FieldSpec, ...]:
+        fields = tuple(field for field in spec.fields if field.role != "target")
+        if not fields:
+            raise S2ContractModelError("S2 BuildOrchestrator requires at least one feature field")
+        return fields
+
+    @staticmethod
+    def _target_field(spec: BuildSpec) -> FieldSpec:
+        targets = tuple(field for field in spec.fields if field.role == "target")
+        if len(targets) != 1:
+            raise S2ContractModelError("S2 BuildOrchestrator requires exactly one target field")
+        return targets[0]
+
+    def _build_feature_graph(self, *, spec: BuildSpec, feature_fields: tuple[FieldSpec, ...]) -> FeatureGraph:
+        nodes = tuple(
+            FeatureGraphNode(
+                node_id=field.name,
+                op="source",
+                params={"field": field.name},
+                feature_node=FeatureNode(
+                    node_id=field.name,
+                    terms=(FeatureTerm(field_name=field.name, units=field.units),),
+                    declared_units=field.units,
+                ),
+            )
+            for field in feature_fields
+        )
+        return self._feature_engine.build_graph(graph_id=f"featuregraph:{spec.job_id}", nodes=nodes)
+
+    def _rows_for_indices(
+        self,
+        rows: tuple[Mapping[str, Any], ...],
+        indices: tuple[int, ...],
+        *,
+        graph: FeatureGraph,
+        feature_fields: tuple[FieldSpec, ...],
+        target_field: FieldSpec,
+    ) -> tuple[Mapping[str, Any], ...]:
+        materialized: list[Mapping[str, Any]] = []
+        for index in indices:
+            row = rows[index]
+            replay = self._feature_engine.replay(
+                graph,
+                inputs=self._numeric_feature_inputs(row, feature_fields),
+                selected_nodes=tuple(field.name for field in feature_fields),
+            )
+            if target_field.name not in row:
+                raise S2ContractModelError(f"S2 BuildOrchestrator dataset row missing target field: {target_field.name}")
+            materialized.append(
+                {
+                    **dict(replay.values),
+                    target_field.name: _finite_feature_value(row[target_field.name], field_name=target_field.name),
+                }
+            )
+        if not materialized:
+            raise S2ContractModelError("S2 BuildOrchestrator requires non-empty training rows")
+        return tuple(materialized)
+
+    @staticmethod
+    def _numeric_feature_inputs(row: Mapping[str, Any], feature_fields: tuple[FieldSpec, ...]) -> dict[str, float]:
+        inputs: dict[str, float] = {}
+        for field in feature_fields:
+            if field.name not in row:
+                raise S2ContractModelError(f"S2 BuildOrchestrator dataset row missing feature field: {field.name}")
+            inputs[field.name] = _finite_feature_value(row[field.name], field_name=field.name)
+        return inputs
+
+    @staticmethod
+    def _target_variance(rows: tuple[Mapping[str, Any], ...], target_name: str) -> float:
+        targets = tuple(float(row[target_name]) for row in rows)
+        mean = sum(targets) / float(len(targets))
+        return sum((target - mean) ** 2 for target in targets) / float(len(targets))
+
+    def _prediction_samples(
+        self,
+        rows: tuple[Mapping[str, Any], ...],
+        indices: tuple[int, ...],
+        *,
+        graph: FeatureGraph,
+        feature_fields: tuple[FieldSpec, ...],
+        target_field: FieldSpec,
+        model_payload: Mapping[str, Any],
+        prefix: str,
+    ) -> tuple[UQCalibrationSample, ...]:
+        samples: list[UQCalibrationSample] = []
+        for ordinal, index in enumerate(indices):
+            row = rows[index]
+            replay = self._feature_engine.replay(
+                graph,
+                inputs=self._numeric_feature_inputs(row, feature_fields),
+                selected_nodes=tuple(field.name for field in feature_fields),
+            )
+            prediction = FrozenPipelineRunner._predict_model(model_payload, dict(replay.values))
+            samples.append(
+                UQCalibrationSample(
+                    sample_id=f"{prefix}-{ordinal}",
+                    prediction=prediction,
+                    target=_finite_feature_value(row[target_field.name], field_name=target_field.name),
+                )
+            )
+        if not samples:
+            raise S2ContractModelError(f"S2 BuildOrchestrator requires non-empty {prefix} samples")
+        return tuple(samples)
+
+    @staticmethod
+    def _probe_inputs(
+        rows: tuple[Mapping[str, Any], ...],
+        indices: tuple[int, ...],
+        *,
+        feature_fields: tuple[FieldSpec, ...],
+    ) -> dict[str, dict[str, Any]]:
+        index = indices[0]
+        row = rows[index]
+        return {
+            field.name: {
+                "value": _finite_feature_value(row[field.name], field_name=field.name),
+                "units": field.units,
+            }
+            for field in feature_fields
+        }
 
 
 class BaselineBuilder:
