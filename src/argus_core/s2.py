@@ -7,7 +7,9 @@ from dataclasses import asdict, dataclass, field
 import hashlib
 from itertools import product
 import json
+import os
 from pathlib import Path
+import tempfile
 import time
 from typing import Any, Callable, Mapping
 
@@ -961,7 +963,7 @@ class HPORunResult:
 
 
 class HPOEngine:
-    """Executes deterministic S2 HPO trials through TrainingRuntime and C4 provenance."""
+    """Executes S2 HPO trials through Optuna search, Ray Tune scheduling, and C4 provenance."""
 
     def __init__(
         self,
@@ -971,14 +973,20 @@ class HPOEngine:
         registry: ModelFamilyRegistry | None = None,
         backends: Mapping[str, DeterministicLinearTrainingBackend] | None = None,
         worker_count: int = 1,
+        scheduler_backend: str = "optuna_ray",
+        ray_storage_path: str | None = None,
     ) -> None:
         if worker_count <= 0:
             raise S2ContractModelError("S2 HPOEngine worker_count must be positive")
+        if scheduler_backend not in {"optuna_ray", "threadpool"}:
+            raise S2ContractModelError(f"unsupported S2 HPOEngine scheduler_backend: {scheduler_backend}")
         self._artifact_store = artifact_store
         self._provenance_emitter = provenance_emitter or ProvenanceEmitter(artifact_store=artifact_store)
         self._registry = registry or _default_model_family_registry()
         self._backends = dict(backends or {})
         self._worker_count = int(worker_count)
+        self._scheduler_backend = scheduler_backend
+        self._ray_storage_path = ray_storage_path
 
     def run(self, request: HPORequest) -> HPORunResult:
         started_at = time.perf_counter()
@@ -989,11 +997,7 @@ class HPOEngine:
         eligible_trials = tuple(trial for trial in trials if trial.status in {"SUCCEEDED", "WARM_STARTED"})
         if not eligible_trials:
             raise S2Error("S2 HPOEngine produced no eligible trial")
-        selected = select_hpo_winner(
-            eligible_trials,
-            max_calibration_error=request.max_calibration_error if request.max_calibration_error is not None else float("inf"),
-            objective=request.objective,
-        )
+        selected = self._select_with_optuna_study(request=request, eligible_trials=eligible_trials)
         selection_record = self._emit_selection(request=request, trials=trials, selected=selected)
         selected_with_ref = HPOSelection(
             trial_id=selected.trial_id,
@@ -1020,6 +1024,10 @@ class HPOEngine:
                 "objective_metric": request.objective_metric,
                 "worker_count": self._worker_count,
                 "eligible_trial_count": len(eligible_trials),
+                "search_backend": "optuna",
+                "scheduler_backend": "ray_tune" if self._scheduler_backend == "optuna_ray" else "threadpool",
+                "ray_scheduler": "ASHAScheduler" if self._scheduler_backend == "optuna_ray" else None,
+                "optuna_sampler": "NSGAIISampler",
             },
             wallclock_seconds=elapsed,
         )
@@ -1055,6 +1063,8 @@ class HPOEngine:
     def _run_trial_specs(self, request: HPORequest, specs: tuple[dict[str, Any], ...]) -> tuple[HPOTrial, ...]:
         if not specs:
             return ()
+        if self._scheduler_backend == "optuna_ray":
+            return self._run_trial_specs_with_ray_tune(request, specs)
         if self._worker_count == 1 or len(specs) == 1:
             return tuple(self._run_training_trial(request, spec) for spec in specs)
         results: dict[int, HPOTrial] = {}
@@ -1063,6 +1073,158 @@ class HPOEngine:
             for future in as_completed(futures):
                 results[futures[future]] = future.result()
         return tuple(results[index] for index in sorted(results))
+
+    def _run_trial_specs_with_ray_tune(
+        self,
+        request: HPORequest,
+        specs: tuple[dict[str, Any], ...],
+    ) -> tuple[HPOTrial, ...]:
+        ray, tune, RunConfig, ASHAScheduler = _import_ray_tune()
+        _ensure_ray_initialized(ray, worker_count=self._worker_count)
+        os.environ.setdefault("RAY_AIR_NEW_OUTPUT", "0")
+        tune_metric = "argus_objective"
+        tune_mode = "max" if request.objective == "maximize" else "min"
+        trainable = tune.with_parameters(
+            _ray_tune_hpo_trainable,
+            request=request,
+            registry=self._registry,
+            backends=self._backends,
+        )
+        scheduler = ASHAScheduler(
+            metric=tune_metric,
+            mode=tune_mode,
+            max_t=max(1, request.max_epochs),
+            grace_period=1,
+            reduction_factor=2,
+        )
+        storage_context = tempfile.TemporaryDirectory(prefix="argus-hpo-ray-") if self._ray_storage_path is None else None
+        storage_path = self._ray_storage_path or storage_context.name
+        try:
+            tuner = tune.Tuner(
+                trainable,
+                param_space={"spec": tune.grid_search([dict(spec) for spec in specs])},
+                tune_config=tune.TuneConfig(
+                    max_concurrent_trials=self._worker_count,
+                    scheduler=scheduler,
+                ),
+                run_config=RunConfig(
+                    name=f"{request.job_id}-ray-tune",
+                    storage_path=storage_path,
+                    verbose=0,
+                ),
+            )
+            result_grid = tuner.fit()
+            packets: dict[int, dict[str, Any]] = {}
+            errors: list[str] = []
+            for result in result_grid:
+                if result.error is not None:
+                    errors.append(str(result.error))
+                    continue
+                packet_path = result.metrics.get("argus_trial_packet_path")
+                if not isinstance(packet_path, str) or not packet_path:
+                    errors.append(f"Ray Tune result missing argus_trial_packet_path for config {result.config}")
+                    continue
+                try:
+                    with open(packet_path, "r", encoding="utf-8") as packet_file:
+                        packet = json.load(packet_file)
+                except OSError as exc:
+                    errors.append(f"Ray Tune packet read failed for config {result.config}: {exc}")
+                    continue
+                packet = dict(packet)
+                diagnostics = dict(packet.get("diagnostics", {}))
+                diagnostics.update(
+                    {
+                        "scheduler_backend": "ray_tune",
+                        "ray_scheduler": "ASHAScheduler",
+                        "ray_tune_trial_path": str(getattr(result, "path", "")),
+                    }
+                )
+                packet["diagnostics"] = diagnostics
+                packets[int(packet["index"])] = packet
+            expected_indexes = {int(spec["index"]) for spec in specs}
+            if errors:
+                raise S2Error("S2 Ray Tune HPO trial execution failed: " + "; ".join(errors))
+            if set(packets) != expected_indexes:
+                raise S2Error("S2 Ray Tune HPO did not return every scheduled trial")
+            return tuple(self._materialize_trial_packet(request, packets[index]) for index in sorted(packets))
+        finally:
+            if storage_context is not None:
+                storage_context.cleanup()
+
+    def _materialize_trial_packet(self, request: HPORequest, packet: Mapping[str, Any]) -> HPOTrial:
+        for artifact_packet in packet.get("artifact_packets", ()):
+            _import_hpo_artifact_packet(self._artifact_store, artifact_packet)
+        status = str(packet["status"])
+        if status in {"SUCCEEDED", "CANCELLED", "INTERRUPTED"}:
+            return self._emit_completed_trial(
+                request=request,
+                trial_id=str(packet["trial_id"]),
+                family_id=str(packet["family_id"]),
+                parameters=dict(packet["parameters"]),
+                status=status,
+                score=float(packet["score"]),
+                calibration_error=float(packet["calibration_error"]),
+                cost=float(packet["cost"]),
+                checkpoint_ref=packet.get("checkpoint_ref"),
+                training_log_ref=packet.get("training_log_ref"),
+                completed_epochs=int(packet.get("completed_epochs", 0)),
+                diagnostics=dict(packet.get("diagnostics", {})),
+            )
+        partial_payload = packet.get("partial_checkpoint")
+        partial_checkpoint = None
+        if isinstance(partial_payload, Mapping):
+            partial_checkpoint = PartialModelCheckpoint(
+                artifact_ref=str(partial_payload["artifact_ref"]),
+                reason=str(partial_payload.get("reason", status)),
+                metrics=dict(partial_payload.get("metrics", {})),
+            )
+        return self._emit_failed_trial(
+            request=request,
+            trial_id=str(packet["trial_id"]),
+            family_id=str(packet["family_id"]),
+            parameters=dict(packet["parameters"]),
+            status=status,
+            error_code=str(packet["error_code"]),
+            error_message=str(packet["error_message"]),
+            cost_actual=dict(packet["cost_actual"]),
+            partial_checkpoint=partial_checkpoint,
+        )
+
+    def _select_with_optuna_study(
+        self,
+        *,
+        request: HPORequest,
+        eligible_trials: tuple[HPOTrial, ...],
+    ) -> HPOSelection:
+        max_calibration_error = request.max_calibration_error if request.max_calibration_error is not None else float("inf")
+        eligible = tuple(trial for trial in eligible_trials if trial.calibration_error <= max_calibration_error)
+        if not eligible:
+            raise S2Error("no HPO trial satisfies calibration constraint")
+        study = _build_optuna_hpo_study(request=request, trials=eligible)
+        pareto_trial_ids = tuple(sorted(str(trial.user_attrs["argus_trial_id"]) for trial in study.best_trials))
+        pareto_trials = tuple(trial for trial in eligible if trial.trial_id in set(pareto_trial_ids))
+        if not pareto_trials:
+            raise S2Error("Optuna HPO study produced an empty Pareto front")
+        selected = sorted(pareto_trials, key=lambda trial: _hpo_selection_key(trial, objective=request.objective))[0]
+        return HPOSelection(
+            trial_id=selected.trial_id,
+            parameters=selected.parameters,
+            score=selected.score,
+            calibration_error=selected.calibration_error,
+            cost=selected.cost,
+            family_id=selected.family_id,
+            trial_artifact_refs=tuple(trial.trial_artifact_ref for trial in eligible if trial.trial_artifact_ref),
+            pareto_front_trial_ids=pareto_trial_ids,
+            diagnostics={
+                "policy": "pareto_lexicographic",
+                "objective": request.objective,
+                "search_backend": "optuna",
+                "optuna_study_name": study.study_name,
+                "optuna_sampler": "NSGAIISampler",
+                "optuna_directions": tuple(direction.name for direction in study.directions),
+                "optuna_trial_count": len(study.trials),
+            },
+        )
 
     def _run_training_trial(self, request: HPORequest, spec: Mapping[str, Any]) -> HPOTrial:
         trial_id = str(spec["trial_id"])
@@ -1342,6 +1504,7 @@ class HPOEngine:
                 "objective": request.objective,
                 "objective_metric": request.objective_metric,
                 "policy": "pareto_lexicographic",
+                "diagnostics": dict(selected.diagnostics),
                 "pareto_front_trial_ids": list(selected.pareto_front_trial_ids),
                 "trial_artifact_refs": list(trial_refs),
             },
@@ -1362,6 +1525,287 @@ class HPOEngine:
             _stable_hpo_json({"family_id": family_id, "parameters": dict(parameters), "seed": request.seed}).encode("utf-8")
         ).hexdigest()[:12]
         return f"{request.job_id}-trial-{index:04d}-{digest}"
+
+
+def _ray_tune_hpo_trainable(
+    config: Mapping[str, Any],
+    *,
+    request: HPORequest,
+    registry: ModelFamilyRegistry,
+    backends: Mapping[str, DeterministicLinearTrainingBackend],
+) -> None:
+    from ray import tune as ray_tune
+
+    packet = _execute_hpo_training_trial_packet(
+        request=request,
+        spec=dict(config["spec"]),
+        registry=registry,
+        backends=backends,
+    )
+    if packet["status"] in {"SUCCEEDED", "WARM_STARTED"}:
+        tune_objective = float(packet["score"])
+    else:
+        tune_objective = float("-inf") if request.objective == "maximize" else float("inf")
+    trial_dir = ray_tune.get_context().get_trial_dir()
+    packet_path = os.path.join(trial_dir, "argus_trial_packet.json")
+    with open(packet_path, "w", encoding="utf-8") as packet_file:
+        json.dump(packet, packet_file, sort_keys=True, separators=(",", ":"))
+    ray_tune.report(
+        {
+            "argus_objective": tune_objective,
+            "argus_trial_index": int(packet["index"]),
+            "argus_trial_status": str(packet["status"]),
+            "argus_trial_packet_path": packet_path,
+        }
+    )
+
+
+def _execute_hpo_training_trial_packet(
+    *,
+    request: HPORequest,
+    spec: Mapping[str, Any],
+    registry: ModelFamilyRegistry,
+    backends: Mapping[str, DeterministicLinearTrainingBackend],
+) -> dict[str, Any]:
+    trial_id = str(spec["trial_id"])
+    family_id = str(spec["family_id"])
+    parameters = dict(spec["parameters"])
+    trial_job_id = f"{request.job_id}:{trial_id}"
+    artifact_store = InMemoryArtifactStore()
+    provenance_emitter = ProvenanceEmitter(artifact_store=artifact_store)
+    meter = BudgetMeter.from_budget(job_id=trial_job_id, budget=request.trial_budget) if request.trial_budget else None
+    runtime = TrainingRuntime(
+        artifact_store=artifact_store,
+        provenance_emitter=provenance_emitter,
+        registry=registry,
+        budget_meter=meter,
+        backends=backends,
+    )
+    try:
+        result = runtime.train(
+            TrainingRequest(
+                job_id=trial_job_id,
+                family_id=family_id,
+                input_refs=request.input_refs,
+                training_rows=request.training_rows,
+                feature_names=request.feature_names,
+                target_name=request.target_name,
+                max_epochs=int(parameters.get("max_epochs", request.max_epochs)),
+                learning_rate=float(parameters.get("learning_rate", request.learning_rate)),
+                code_ref=request.code_ref,
+                environment_digest=request.environment_digest,
+                seed=f"{request.seed}:{trial_id}",
+                parameters=parameters,
+                wallclock_seconds_per_epoch=float(
+                    parameters.get("wallclock_seconds_per_epoch", request.wallclock_seconds_per_epoch)
+                ),
+                gpu_seconds_per_epoch=float(parameters.get("gpu_seconds_per_epoch", request.gpu_seconds_per_epoch)),
+                model_tokens_per_epoch=int(parameters.get("model_tokens_per_epoch", request.model_tokens_per_epoch)),
+                cost_usd_per_epoch=float(parameters.get("cost_usd_per_epoch", request.cost_usd_per_epoch)),
+            )
+        )
+    except S2BudgetExceededError as exc:
+        artifact_refs = (exc.partial_checkpoint.artifact_ref,) if exc.partial_checkpoint else ()
+        partial_payload = None
+        if exc.partial_checkpoint:
+            partial_payload = {
+                "artifact_ref": exc.partial_checkpoint.artifact_ref,
+                "reason": exc.partial_checkpoint.reason,
+                "metrics": dict(exc.partial_checkpoint.metrics),
+            }
+        return _hpo_jsonable(
+            {
+                "index": int(spec["index"]),
+                "trial_id": trial_id,
+                "family_id": family_id,
+                "parameters": parameters,
+                "status": "BUDGET_HALTED",
+                "score": None,
+                "calibration_error": None,
+                "cost": float(exc.snapshot.cost_usd),
+                "checkpoint_ref": exc.partial_checkpoint.artifact_ref if exc.partial_checkpoint else None,
+                "training_log_ref": None,
+                "completed_epochs": 0,
+                "error_code": exc.code,
+                "error_message": exc.message,
+                "cost_actual": exc.snapshot.as_cost_actual(),
+                "partial_checkpoint": partial_payload,
+                "artifact_packets": [_export_hpo_artifact_packet(artifact_store, ref) for ref in artifact_refs],
+                "diagnostics": {
+                    "error_code": exc.code,
+                    "cost_actual": exc.snapshot.as_cost_actual(),
+                    "scheduler_backend": "ray_tune",
+                },
+            }
+        )
+    except S2Error as exc:
+        cost_actual = (
+            meter.snapshot().as_cost_actual()
+            if meter
+            else SpendSnapshot(
+                job_id=trial_job_id,
+                wallclock_seconds=0.0,
+                gpu_seconds=0.0,
+                model_tokens=0,
+                cost_usd=0.0,
+            ).as_cost_actual()
+        )
+        return _hpo_jsonable(
+            {
+                "index": int(spec["index"]),
+                "trial_id": trial_id,
+                "family_id": family_id,
+                "parameters": parameters,
+                "status": "FAILED",
+                "score": None,
+                "calibration_error": None,
+                "cost": float(cost_actual.get("cost_usd", 0.0)),
+                "checkpoint_ref": None,
+                "training_log_ref": None,
+                "completed_epochs": 0,
+                "error_code": exc.__class__.__name__,
+                "error_message": str(exc),
+                "cost_actual": cost_actual,
+                "partial_checkpoint": None,
+                "artifact_packets": [],
+                "diagnostics": {
+                    "error_code": exc.__class__.__name__,
+                    "cost_actual": cost_actual,
+                    "scheduler_backend": "ray_tune",
+                },
+            }
+        )
+    final_metrics = dict(result.diagnostics.get("final_metrics", {}))
+    if request.objective_metric not in final_metrics:
+        return _hpo_jsonable(
+            {
+                "index": int(spec["index"]),
+                "trial_id": trial_id,
+                "family_id": family_id,
+                "parameters": parameters,
+                "status": "FAILED",
+                "score": None,
+                "calibration_error": None,
+                "cost": float(result.cost_actual.get("cost_usd", 0.0)),
+                "checkpoint_ref": result.partial_checkpoint.artifact_ref if result.partial_checkpoint else None,
+                "training_log_ref": result.training_log_ref,
+                "completed_epochs": result.completed_epochs,
+                "error_code": "OBJECTIVE_METRIC_MISSING",
+                "error_message": f"S2 HPO trial missing objective metric: {request.objective_metric}",
+                "cost_actual": result.cost_actual,
+                "partial_checkpoint": None,
+                "artifact_packets": [
+                    _export_hpo_artifact_packet(artifact_store, ref)
+                    for ref in tuple(result.checkpoint_refs) + ((result.training_log_ref,) if result.training_log_ref else ())
+                ],
+                "diagnostics": {
+                    "final_metrics": final_metrics,
+                    "cost_actual": result.cost_actual,
+                    "scheduler_backend": "ray_tune",
+                },
+            }
+        )
+    artifact_refs = tuple(result.checkpoint_refs) + ((result.training_log_ref,) if result.training_log_ref else ())
+    return _hpo_jsonable(
+        {
+            "index": int(spec["index"]),
+            "trial_id": trial_id,
+            "family_id": family_id,
+            "parameters": parameters,
+            "status": result.status,
+            "score": float(final_metrics[request.objective_metric]),
+            "calibration_error": float(final_metrics.get("calibration_error", 0.0)),
+            "cost": float(result.cost_actual.get("cost_usd", 0.0)),
+            "checkpoint_ref": result.final_checkpoint_ref,
+            "training_log_ref": result.training_log_ref,
+            "completed_epochs": result.completed_epochs,
+            "error_code": None,
+            "error_message": None,
+            "cost_actual": result.cost_actual,
+            "partial_checkpoint": None,
+            "artifact_packets": [_export_hpo_artifact_packet(artifact_store, ref) for ref in artifact_refs],
+            "diagnostics": {
+                "final_metrics": final_metrics,
+                "cost_actual": result.cost_actual,
+                "scheduler_backend": "ray_tune",
+            },
+        }
+    )
+
+
+def _export_hpo_artifact_packet(artifact_store: InMemoryArtifactStore, artifact_ref: str) -> dict[str, Any]:
+    record = artifact_store.get_record(artifact_ref)
+    payload = json.loads(artifact_store.get_artifact(artifact_ref).decode("utf-8"))
+    return _hpo_jsonable(
+        {
+            "artifact_ref": record.artifact_ref,
+            "kind": record.kind,
+            "payload": payload,
+            "producer": asdict(record.producer),
+            "lineage": asdict(record.lineage),
+            "claim_tier": record.claim_tier,
+            "validation_report_ref": record.validation_report_ref,
+            "created_at": record.created_at,
+        }
+    )
+
+
+def _import_hpo_artifact_packet(artifact_store: InMemoryArtifactStore, packet: Mapping[str, Any]) -> ArtifactRecord:
+    producer_payload = dict(packet["producer"])
+    lineage_payload = dict(packet["lineage"])
+    producer = Producer(
+        subsystem=str(producer_payload["subsystem"]),
+        version=str(producer_payload["version"]),
+        actor_id=producer_payload.get("actor_id"),
+        job_id=producer_payload.get("job_id"),
+    )
+    lineage = Lineage(
+        input_refs=tuple(lineage_payload.get("input_refs", ())),
+        code_ref=str(lineage_payload["code_ref"]),
+        environment_digest=str(lineage_payload["environment_digest"]),
+        seeds=tuple(lineage_payload.get("seeds", ())),
+        actor_id=lineage_payload.get("actor_id"),
+        job_id=lineage_payload.get("job_id"),
+        contamination_index_version=lineage_payload.get("contamination_index_version"),
+    )
+    return artifact_store.create_artifact(
+        kind=str(packet["kind"]),
+        payload=packet["payload"],
+        producer=producer,
+        lineage=lineage,
+        artifact_ref=str(packet["artifact_ref"]),
+        claim_tier=str(packet.get("claim_tier") or "ran-toy"),
+        validation_report_ref=packet.get("validation_report_ref"),
+        created_at=packet.get("created_at"),
+    )
+
+
+def _hpo_jsonable(value: Any) -> Any:
+    return json.loads(json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False))
+
+
+def _import_ray_tune() -> tuple[Any, Any, Any, Any]:
+    try:
+        import ray
+        from ray import tune
+        try:
+            from ray.tune import RunConfig
+        except ImportError:
+            from ray.air import RunConfig
+        from ray.tune.schedulers import ASHAScheduler
+    except ImportError as exc:
+        raise S2ContractModelError("S2-T14 requires installed ray[tune] for HPOEngine") from exc
+    return ray, tune, RunConfig, ASHAScheduler
+
+
+def _ensure_ray_initialized(ray: Any, *, worker_count: int) -> None:
+    requested_cpus = max(worker_count, int(os.environ.get("ARGUS_HPO_RAY_MIN_CPUS", "4")))
+    if ray.is_initialized():
+        available_cpus = float(ray.cluster_resources().get("CPU", 0.0))
+        if available_cpus >= worker_count:
+            return
+        ray.shutdown()
+    ray.init(num_cpus=requested_cpus, include_dashboard=False, ignore_reinit_error=True, log_to_driver=False)
 
 
 @dataclass(frozen=True)
@@ -2026,10 +2470,13 @@ class DeterministicLinearTrainingBackend:
 
     backend_id = "deterministic-linear"
 
-    def __init__(self, *, learning_rate: float | None = None) -> None:
+    def __init__(self, *, learning_rate: float | None = None, delay_seconds: float = 0.0) -> None:
         if learning_rate is not None and learning_rate <= 0:
             raise S2ContractModelError("S2 deterministic linear backend learning_rate must be positive")
+        if delay_seconds < 0:
+            raise S2ContractModelError("S2 deterministic linear backend delay_seconds must be non-negative")
         self._learning_rate = learning_rate
+        self._delay_seconds = float(delay_seconds)
 
     def initial_state(self, request: TrainingRequest) -> dict[str, Any]:
         return {
@@ -2040,6 +2487,8 @@ class DeterministicLinearTrainingBackend:
         }
 
     def train_epoch(self, request: TrainingRequest, state: Mapping[str, Any], *, epoch: int) -> TrainingEpochResult:
+        if self._delay_seconds:
+            time.sleep(self._delay_seconds)
         feature_names = tuple(state.get("feature_names", request.feature_names))
         weights = {name: float(dict(state.get("weights", {})).get(name, 0.0)) for name in feature_names}
         bias = float(state.get("bias", 0.0))
@@ -2980,6 +3429,60 @@ def _default_model_family_descriptors() -> tuple[ModelFamilyDescriptor, ...]:
             provenance_ref="c4://model-family/differentiable-surrogate/v1",
         ),
     )
+
+
+def _build_optuna_hpo_study(*, request: HPORequest, trials: tuple[HPOTrial, ...]) -> Any:
+    optuna = _import_optuna()
+    directions = ("maximize" if request.objective == "maximize" else "minimize", "minimize", "minimize")
+    sampler = optuna.samplers.NSGAIISampler(seed=_stable_hpo_seed_int(request.seed))
+    study = optuna.create_study(
+        study_name=f"{request.job_id}-optuna-study",
+        directions=directions,
+        sampler=sampler,
+    )
+    distributions = _optuna_categorical_distributions(request=request, trials=trials, optuna=optuna)
+    for trial in trials:
+        params = {name: _stable_hpo_json(value) for name, value in sorted(trial.parameters.items())}
+        trial_distributions = {name: distributions[name] for name in params}
+        study.add_trial(
+            optuna.trial.create_trial(
+                params=params,
+                distributions=trial_distributions,
+                values=(trial.score, trial.calibration_error, trial.cost),
+                state=optuna.trial.TrialState.COMPLETE,
+                user_attrs={
+                    "argus_trial_id": trial.trial_id,
+                    "argus_family_id": trial.family_id,
+                    "argus_parameters": dict(trial.parameters),
+                },
+            )
+        )
+    return study
+
+
+def _optuna_categorical_distributions(*, request: HPORequest, trials: tuple[HPOTrial, ...], optuna: Any) -> dict[str, Any]:
+    choices_by_name: dict[str, set[str]] = {}
+    for name, values in request.parameter_grid.items():
+        choices_by_name.setdefault(name, set()).update(_stable_hpo_json(value) for value in values)
+    for trial in trials:
+        for name, value in trial.parameters.items():
+            choices_by_name.setdefault(str(name), set()).add(_stable_hpo_json(value))
+    return {
+        name: optuna.distributions.CategoricalDistribution(tuple(sorted(choices)))
+        for name, choices in choices_by_name.items()
+    }
+
+
+def _import_optuna() -> Any:
+    try:
+        import optuna
+    except ImportError as exc:
+        raise S2ContractModelError("S2-T14 requires installed optuna for HPOEngine") from exc
+    return optuna
+
+
+def _stable_hpo_seed_int(seed: str) -> int:
+    return int(hashlib.sha256(seed.encode("utf-8")).hexdigest()[:8], 16)
 
 
 def select_hpo_winner(

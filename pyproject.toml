@@ -11,8 +11,10 @@ dependencies = [
   "grpcio>=1.64,<2",
   "jsonschema>=4.25,<5",
   "minio>=7.2,<8",
+  "optuna>=4.0,<5",
   "psycopg[binary]>=3.2,<4",
-  "pydantic>=2.7,<3"
+  "pydantic>=2.7,<3",
+  "ray[tune]>=2.31,<3"
 ]
 
 [build-system]

@@ -36,6 +36,9 @@ class S2HPOEngineTests(unittest.TestCase):
         self.assertEqual({trial.status for trial in first.trials}, {"SUCCEEDED"})
         self.assertEqual(len(first.trials), 2)
         self.assertIsNotNone(first.selection_artifact_ref)
+        self.assertEqual(first.diagnostics["search_backend"], "optuna")
+        self.assertEqual(first.diagnostics["scheduler_backend"], "ray_tune")
+        self.assertEqual(first.diagnostics["ray_scheduler"], "ASHAScheduler")
 
         selection_record = self.store.get_record(first.selection_artifact_ref)
         selection_payload = self._payload(first.selection_artifact_ref)
@@ -45,8 +48,13 @@ class S2HPOEngineTests(unittest.TestCase):
         self.assertEqual(selection_payload["selected_trial_id"], first.selected.trial_id)
         self.assertEqual(selection_payload["objective"], "minimize")
         self.assertEqual(selection_payload["policy"], "pareto_lexicographic")
+        self.assertEqual(selection_payload["diagnostics"]["search_backend"], "optuna")
+        self.assertEqual(selection_payload["diagnostics"]["optuna_sampler"], "NSGAIISampler")
+        self.assertEqual(selection_payload["diagnostics"]["optuna_trial_count"], 2)
         self.assertEqual(selection_record.lineage.input_refs, trial_refs)
         for trial in first.trials:
+            self.assertEqual(trial.diagnostics["scheduler_backend"], "ray_tune")
+            self.assertEqual(trial.diagnostics["ray_scheduler"], "ASHAScheduler")
             self.assertEqual(self.store.get_record(trial.trial_artifact_ref).kind, "hpo_trial")
             trial_payload = self._payload(trial.trial_artifact_ref)
             self.assertEqual(trial_payload["status"], "SUCCEEDED")
@@ -126,20 +134,23 @@ class S2HPOEngineTests(unittest.TestCase):
 
     def test_worker_count_reduces_wallclock_for_parallel_trials(self) -> None:
         parameter_grid = {"learning_rate": (0.01, 0.02, 0.03, 0.04, 0.05, 0.06, 0.07, 0.08)}
-        slow_backend = {"tabular-baseline": SlowLinearBackend(delay_seconds=0.06)}
+        slow_backend = {"tabular-baseline": DeterministicLinearTrainingBackend(delay_seconds=2.0)}
 
         single_start = time.perf_counter()
-        HPOEngine(artifact_store=InMemoryArtifactStore(), backends=slow_backend, worker_count=1).run(
+        single = HPOEngine(artifact_store=InMemoryArtifactStore(), backends=slow_backend, worker_count=1).run(
             self._request(parameter_grid=parameter_grid, max_epochs=1)
         )
         single_elapsed = time.perf_counter() - single_start
 
         parallel_start = time.perf_counter()
-        HPOEngine(artifact_store=InMemoryArtifactStore(), backends=slow_backend, worker_count=4).run(
+        parallel = HPOEngine(artifact_store=InMemoryArtifactStore(), backends=slow_backend, worker_count=4).run(
             self._request(parameter_grid=parameter_grid, max_epochs=1)
         )
         parallel_elapsed = time.perf_counter() - parallel_start
 
+        self.assertEqual(single.diagnostics["scheduler_backend"], "ray_tune")
+        self.assertEqual(parallel.diagnostics["scheduler_backend"], "ray_tune")
+        self.assertEqual(parallel.diagnostics["ray_scheduler"], "ASHAScheduler")
         self.assertLessEqual(parallel_elapsed, single_elapsed / (0.7 * 4))
 
     def _request(
@@ -180,16 +191,6 @@ class S2HPOEngineTests(unittest.TestCase):
     def _payload(self, artifact_ref: str | None) -> dict:
         self.assertIsNotNone(artifact_ref)
         return json.loads(self.store.get_artifact(artifact_ref).decode("utf-8"))
-
-
-class SlowLinearBackend(DeterministicLinearTrainingBackend):
-    def __init__(self, *, delay_seconds: float) -> None:
-        super().__init__()
-        self._delay_seconds = delay_seconds
-
-    def train_epoch(self, request, state, *, epoch: int):
-        time.sleep(self._delay_seconds)
-        return super().train_epoch(request, state, epoch=epoch)
 
 
 if __name__ == "__main__":
