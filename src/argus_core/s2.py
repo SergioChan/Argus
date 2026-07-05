@@ -20,7 +20,7 @@ from .hashing import hash_bytes
 from .s5 import C2VersionPolicy, parse_c2_job_envelope
 from .s6 import CapabilityDescriptor, RegistryError
 from .s7 import AdapterBroker, EvalRequest, EvalResult
-from .s8 import ArtifactRecord, IllegalTierError, InMemoryArtifactStore, Lineage, Producer, assert_lineage_complete
+from .s8 import ArtifactRecord, InMemoryArtifactStore, Lineage, Producer, assert_lineage_complete
 
 
 class S2Error(Exception):
@@ -29,6 +29,37 @@ class S2Error(Exception):
 
 class SelfGradeError(S2Error):
     """Raised when S2 tries to assign a tier above ran-toy."""
+
+
+class S2ClaimTierPolicy:
+    """Central no-self-grade policy for S2-owned build artifacts."""
+
+    RAN_TOY = "ran-toy"
+    PRODUCER_SUBSYSTEM = "S2"
+
+    @classmethod
+    def assert_attempted_claim_tier(cls, attempted_claim_tier: str | None, *, actor: str) -> None:
+        if attempted_claim_tier and attempted_claim_tier != cls.RAN_TOY:
+            raise SelfGradeError(f"{actor} cannot assign claim_tier above {cls.RAN_TOY}")
+
+    @classmethod
+    def assert_s2_writer_producer(cls, producer: Producer) -> None:
+        if producer.subsystem != cls.PRODUCER_SUBSYSTEM:
+            raise SelfGradeError(f"S2 writer cannot emit as subsystem {producer.subsystem}")
+
+    @classmethod
+    def assert_s2_artifact_claim(
+        cls,
+        *,
+        claim_tier: str,
+        validation_report_ref: str | None,
+    ) -> None:
+        if claim_tier != cls.RAN_TOY:
+            raise SelfGradeError(
+                "S2 cannot emit promoted claim_tier; tier promotion must come from signed C3 validation"
+            )
+        if validation_report_ref is not None:
+            raise SelfGradeError("S2 writer cannot attach validation_report_ref; signed validation refs are framework-owned")
 
 
 class RewardSourceError(S2Error):
@@ -4228,8 +4259,10 @@ class AdvisorySelfCheck:
         *,
         attempted_claim_tier: str | None = None,
     ) -> AdvisorySelfCheckResult:
-        if attempted_claim_tier and attempted_claim_tier != "ran-toy":
-            raise SelfGradeError("S2 AdvisorySelfCheck cannot raise claim_tier")
+        S2ClaimTierPolicy.assert_attempted_claim_tier(
+            attempted_claim_tier,
+            actor="S2 AdvisorySelfCheck",
+        )
         for input_ref in request.input_refs:
             self._artifact_store.get_record(input_ref)
         checks: list[AdvisoryCheck] = []
@@ -5989,6 +6022,7 @@ class ProvenanceEmitter:
         self._artifact_store = artifact_store
         self._producer = producer or Producer(subsystem="S2", version="0.0.0")
         self._assert_valid_producer(self._producer)
+        S2ClaimTierPolicy.assert_s2_writer_producer(self._producer)
 
     @property
     def producer(self) -> Producer:
@@ -6005,10 +6039,13 @@ class ProvenanceEmitter:
         artifact_ref: str | None = None,
         producer: Producer | None = None,
     ) -> ArtifactRecord:
-        if claim_tier != "ran-toy" and not validation_report_ref:
-            raise IllegalTierError("tier above ran-toy requires validation_report_ref")
         artifact_producer = producer or self._producer
         self._assert_valid_producer(artifact_producer)
+        S2ClaimTierPolicy.assert_s2_writer_producer(artifact_producer)
+        S2ClaimTierPolicy.assert_s2_artifact_claim(
+            claim_tier=claim_tier,
+            validation_report_ref=validation_report_ref,
+        )
         assert_lineage_complete(
             lineage,
             kind=kind,
@@ -6317,8 +6354,10 @@ class BuildOrchestrator:
         *,
         attempted_claim_tier: str | None = None,
     ) -> BuildResult:
-        if attempted_claim_tier and attempted_claim_tier != "ran-toy":
-            raise SelfGradeError("S2 BuildOrchestrator cannot assign claim_tier above ran-toy")
+        S2ClaimTierPolicy.assert_attempted_claim_tier(
+            attempted_claim_tier,
+            actor="S2 BuildOrchestrator",
+        )
         orchestration_request = (
             request
             if isinstance(request, BuildOrchestrationRequest)
@@ -6830,8 +6869,10 @@ class BaselineBuilder:
         self._budget_meter = budget_meter
 
     def build(self, plan: BuildPlan, *, attempted_claim_tier: str | None = None) -> BuildResult:
-        if attempted_claim_tier and attempted_claim_tier != "ran-toy":
-            raise SelfGradeError("S2 cannot assign claim_tier above ran-toy")
+        S2ClaimTierPolicy.assert_attempted_claim_tier(
+            attempted_claim_tier,
+            actor="S2 BaselineBuilder",
+        )
         self._assert_budget_open(plan)
 
         adapter_result = self._adapter_broker.evaluate(plan.adapter_request)

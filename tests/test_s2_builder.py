@@ -11,7 +11,6 @@ from argus_core import (
     HPOTrial,
     InMemoryArtifactStore,
     IncompleteLineageError,
-    IllegalTierError,
     Lineage,
     MutationSpec,
     NormalizedQuantity,
@@ -83,10 +82,10 @@ class S2BaselineBuilderTests(unittest.TestCase):
         self.assertEqual(raised.exception.missing_fields, ("lineage.environment_digest",))
         self.assertEqual(len(self.store), 0)
 
-    def test_provenance_emitter_rejects_promoted_tier_without_report_without_record(self) -> None:
+    def test_provenance_emitter_rejects_promoted_tier_from_s2_writer_without_record(self) -> None:
         emitter = ProvenanceEmitter(artifact_store=self.store)
 
-        with self.assertRaises(IllegalTierError) as raised:
+        with self.assertRaises(SelfGradeError) as raised:
             emitter.emit_artifact(
                 kind="model",
                 payload={"weights": [1], "uncertainty_tag": {"kind": "interval", "radius": 0.1}},
@@ -94,8 +93,7 @@ class S2BaselineBuilderTests(unittest.TestCase):
                 claim_tier="recapitulated-known",
             )
 
-        self.assertEqual(raised.exception.category, "ILLEGAL_TIER")
-        self.assertEqual(raised.exception.reason, "tier above ran-toy requires validation_report_ref")
+        self.assertIn("S2 cannot emit promoted claim_tier", str(raised.exception))
         self.assertEqual(len(self.store), 0)
 
     def test_builder_writes_model_and_pipeline_through_provenance_emitter(self) -> None:
