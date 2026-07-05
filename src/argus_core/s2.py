@@ -5887,6 +5887,34 @@ class MutationSpec:
     variant_id: str
     model_family: str
     parameters: dict[str, Any]
+    feature_subset: tuple[str, ...] = ()
+    hpo: dict[str, Any] = field(default_factory=dict)
+    hyperparam_overrides: dict[str, Any] = field(default_factory=dict)
+    constraint_overrides: tuple[Mapping[str, Any], ...] = ()
+
+    def __post_init__(self) -> None:
+        variant_id = self.variant_id.strip()
+        model_family = self.model_family.strip()
+        if not variant_id:
+            raise S2ContractModelError("S2 MutationSpec requires variant_id")
+        if not model_family:
+            raise S2ContractModelError("S2 MutationSpec requires model_family")
+        feature_subset = tuple(str(node_id).strip() for node_id in self.feature_subset)
+        if any(not node_id for node_id in feature_subset):
+            raise S2ContractModelError("S2 MutationSpec feature_subset cannot contain empty node ids")
+        if len(set(feature_subset)) != len(feature_subset):
+            raise S2ContractModelError("S2 MutationSpec feature_subset cannot contain duplicates")
+        object.__setattr__(self, "variant_id", variant_id)
+        object.__setattr__(self, "model_family", model_family)
+        object.__setattr__(self, "parameters", _s2_jsonable(dict(self.parameters)))
+        object.__setattr__(self, "feature_subset", feature_subset)
+        object.__setattr__(self, "hpo", _s2_jsonable(dict(self.hpo)))
+        object.__setattr__(self, "hyperparam_overrides", _s2_jsonable(dict(self.hyperparam_overrides)))
+        object.__setattr__(
+            self,
+            "constraint_overrides",
+            tuple(_s2_jsonable(dict(item)) for item in self.constraint_overrides),
+        )
 
 
 @dataclass(frozen=True)
@@ -5926,6 +5954,14 @@ class BuildOrchestrationRequest:
     model_tokens_per_epoch: int = 0
     cost_usd_per_epoch: float = 0.01
     container_digest: str = "oci://argus-s2/frozen-pipeline@sha256:build-orchestrator"
+    cached_dataset_split_ref: str | None = None
+    cached_feature_set_ref: str | None = None
+    warm_start_ref: str | None = None
+    warm_start_trials: tuple[HPOTrial, ...] = ()
+    variant_id: str | None = None
+    variant_model_family: str | None = None
+    base_pipeline_ref: str | None = None
+    mutation_parameters: Mapping[str, Any] = field(default_factory=dict, hash=False)
 
     def __post_init__(self) -> None:
         if not isinstance(self.c2_envelope, Mapping):
@@ -5934,10 +5970,32 @@ class BuildOrchestrationRequest:
         environment_digest = self.environment_digest.strip()
         seed = self.seed.strip()
         container_digest = self.container_digest.strip()
+        cached_dataset_split_ref = (
+            self.cached_dataset_split_ref.strip() if isinstance(self.cached_dataset_split_ref, str) else None
+        )
+        cached_feature_set_ref = (
+            self.cached_feature_set_ref.strip() if isinstance(self.cached_feature_set_ref, str) else None
+        )
+        warm_start_ref = self.warm_start_ref.strip() if isinstance(self.warm_start_ref, str) else None
+        variant_id = self.variant_id.strip() if isinstance(self.variant_id, str) else None
+        variant_model_family = self.variant_model_family.strip() if isinstance(self.variant_model_family, str) else None
+        base_pipeline_ref = self.base_pipeline_ref.strip() if isinstance(self.base_pipeline_ref, str) else None
         if not code_ref or not environment_digest or not seed:
             raise S2ContractModelError("S2 BuildOrchestrationRequest requires code_ref, environment_digest, and seed")
         if not container_digest:
             raise S2ContractModelError("S2 BuildOrchestrationRequest requires container_digest")
+        for name, ref in (
+            ("cached_dataset_split_ref", cached_dataset_split_ref),
+            ("cached_feature_set_ref", cached_feature_set_ref),
+            ("warm_start_ref", warm_start_ref),
+            ("base_pipeline_ref", base_pipeline_ref),
+        ):
+            if ref == "":
+                raise S2ContractModelError(f"S2 BuildOrchestrationRequest {name} cannot be empty")
+        if variant_id == "":
+            raise S2ContractModelError("S2 BuildOrchestrationRequest variant_id cannot be empty")
+        if variant_model_family == "":
+            raise S2ContractModelError("S2 BuildOrchestrationRequest variant_model_family cannot be empty")
         if self.hpo_max_epochs <= 0:
             raise S2ContractModelError("S2 BuildOrchestrationRequest hpo_max_epochs must be positive")
         if self.final_max_epochs <= 0:
@@ -5980,6 +6038,14 @@ class BuildOrchestrationRequest:
         object.__setattr__(self, "nominal_coverage", nominal_coverage)
         object.__setattr__(self, "coverage_tolerance", coverage_tolerance)
         object.__setattr__(self, "container_digest", container_digest)
+        object.__setattr__(self, "cached_dataset_split_ref", cached_dataset_split_ref)
+        object.__setattr__(self, "cached_feature_set_ref", cached_feature_set_ref)
+        object.__setattr__(self, "warm_start_ref", warm_start_ref)
+        object.__setattr__(self, "warm_start_trials", tuple(self.warm_start_trials))
+        object.__setattr__(self, "variant_id", variant_id)
+        object.__setattr__(self, "variant_model_family", variant_model_family)
+        object.__setattr__(self, "base_pipeline_ref", base_pipeline_ref)
+        object.__setattr__(self, "mutation_parameters", _s2_jsonable(dict(self.mutation_parameters)))
 
 
 @dataclass(frozen=True)
@@ -6363,6 +6429,57 @@ class BuildOrchestrator:
             if isinstance(request, BuildOrchestrationRequest)
             else BuildOrchestrationRequest(c2_envelope=request)
         )
+        return self._build(orchestration_request)
+
+    def build_variant(
+        self,
+        *,
+        base_pipeline_ref: str,
+        request: BuildOrchestrationRequest | Mapping[str, Any],
+        mutation: MutationSpec,
+        warm_start_ref: str | None = None,
+        fabricated_score: float | None = None,
+        attempted_claim_tier: str | None = None,
+    ) -> BuildResult:
+        """Build an Evolver-facing variant while keeping S3 as the only authority for scores."""
+        if fabricated_score is not None:
+            raise RewardSourceError("S2 build_variant cannot accept non-C3 scores")
+        S2ClaimTierPolicy.assert_attempted_claim_tier(
+            attempted_claim_tier,
+            actor="S2 BuildOrchestrator.build_variant",
+        )
+        base_pipeline_ref = base_pipeline_ref.strip()
+        if not base_pipeline_ref:
+            raise S2ContractModelError("S2 build_variant requires base_pipeline_ref")
+        base_payload = self._assert_base_frozen_pipeline(base_pipeline_ref)
+        orchestration_request = (
+            request
+            if isinstance(request, BuildOrchestrationRequest)
+            else BuildOrchestrationRequest(c2_envelope=request)
+        )
+        selected_warm_start_ref = warm_start_ref or self._base_hpo_selection_ref(base_payload)
+        warm_start_trials = self._warm_start_trials_from_ref(selected_warm_start_ref)
+        variant_request = replace(
+            orchestration_request,
+            hpo_parameter_grid=self._mutated_hpo_grid(orchestration_request.hpo_parameter_grid, mutation),
+            cached_dataset_split_ref=self._base_dataset_split_ref(base_payload),
+            cached_feature_set_ref=self._base_feature_set_ref(base_payload),
+            warm_start_ref=selected_warm_start_ref,
+            warm_start_trials=warm_start_trials,
+            variant_id=mutation.variant_id,
+            variant_model_family=mutation.model_family,
+            base_pipeline_ref=base_pipeline_ref,
+            mutation_parameters={
+                "parameters": mutation.parameters,
+                "feature_subset": list(mutation.feature_subset),
+                "hpo": mutation.hpo,
+                "hyperparam_overrides": mutation.hyperparam_overrides,
+                "constraint_overrides": list(mutation.constraint_overrides),
+            },
+        )
+        return self._build(variant_request)
+
+    def _build(self, orchestration_request: BuildOrchestrationRequest) -> BuildResult:
         started_at = time.perf_counter()
         spec = self._spec_compiler.compile(orchestration_request.c2_envelope)
         feature_fields = self._feature_fields(spec)
@@ -6370,39 +6487,58 @@ class BuildOrchestrator:
         dataset_ref = self._resolve_dataset_ref(spec)
         dataset_rows = self._dataset_rows(dataset_ref)
 
-        split = self._data_manager.create_splits(
-            DataSplitRequest(
-                job_id=spec.job_id,
-                dataset_ref=dataset_ref,
-                split_seed=f"{orchestration_request.seed}:split",
-                train_ratio=orchestration_request.train_ratio,
-                validation_ratio=orchestration_request.validation_ratio,
-                test_ratio=orchestration_request.test_ratio,
-                row_id_key="row_id",
-                label_key=target_field.name,
-                blind_role_key="role" if any("role" in row for row in dataset_rows) else None,
-                blind_roles=("blind",),
-                fold_count=orchestration_request.fold_count,
-                code_ref=orchestration_request.code_ref,
-                environment_digest=orchestration_request.environment_digest,
-            )
+        split_request = DataSplitRequest(
+            job_id=spec.job_id,
+            dataset_ref=dataset_ref,
+            split_seed=f"{orchestration_request.seed}:split",
+            train_ratio=orchestration_request.train_ratio,
+            validation_ratio=orchestration_request.validation_ratio,
+            test_ratio=orchestration_request.test_ratio,
+            row_id_key="row_id",
+            label_key=target_field.name,
+            blind_role_key="role" if any("role" in row for row in dataset_rows) else None,
+            blind_roles=("blind",),
+            fold_count=orchestration_request.fold_count,
+            code_ref=orchestration_request.code_ref,
+            environment_digest=orchestration_request.environment_digest,
         )
+        split = (
+            self._cached_split(orchestration_request.cached_dataset_split_ref, split_request)
+            if orchestration_request.cached_dataset_split_ref
+            else None
+        )
+        if split is None:
+            split = self._data_manager.create_splits(split_request)
+        dataset_split_reused = split.diagnostics.get("cache_reused") is True
         graph = self._build_feature_graph(spec=spec, feature_fields=feature_fields)
-        feature_set_result = self._feature_engine.emit_feature_set(
-            graph,
-            selected_nodes=tuple(field.name for field in feature_fields),
-            emitter=self._provenance_emitter,
-            lineage=Lineage(
-                input_refs=(dataset_ref, split.split_manifest_ref),
-                code_ref=orchestration_request.code_ref,
-                environment_digest=orchestration_request.environment_digest,
-                seeds=(f"{orchestration_request.seed}:feature-graph",),
-                job_id=spec.job_id,
-            ),
-            feature_set_id=f"featureset:{spec.job_id}",
-            replay_probe_input=self._numeric_feature_inputs(dataset_rows[split.split_indices["train"][0]], feature_fields),
-        )
-        feature_set_ref = feature_set_result.artifact_record.artifact_ref
+        selected_feature_nodes = tuple(field.name for field in feature_fields)
+        feature_set_ref = None
+        if orchestration_request.cached_feature_set_ref:
+            feature_set_ref = self._cached_feature_set_ref(
+                orchestration_request.cached_feature_set_ref,
+                graph=graph,
+                selected_nodes=selected_feature_nodes,
+            )
+        feature_set_reused = feature_set_ref is not None
+        if feature_set_ref is None:
+            feature_set_result = self._feature_engine.emit_feature_set(
+                graph,
+                selected_nodes=selected_feature_nodes,
+                emitter=self._provenance_emitter,
+                lineage=Lineage(
+                    input_refs=(dataset_ref, split.split_manifest_ref),
+                    code_ref=orchestration_request.code_ref,
+                    environment_digest=orchestration_request.environment_digest,
+                    seeds=(f"{orchestration_request.seed}:feature-graph",),
+                    job_id=spec.job_id,
+                ),
+                feature_set_id=f"featureset:{spec.job_id}",
+                replay_probe_input=self._numeric_feature_inputs(
+                    dataset_rows[split.split_indices["train"][0]],
+                    feature_fields,
+                ),
+            )
+            feature_set_ref = feature_set_result.artifact_record.artifact_ref
         training_rows = self._rows_for_indices(
             dataset_rows,
             split.split_indices["train"],
@@ -6424,7 +6560,7 @@ class BuildOrchestrator:
         hpo = self._hpo_engine.run(
             HPORequest(
                 job_id=spec.job_id,
-                family_ids=(synthesis.selected_family_id,),
+                family_ids=(orchestration_request.variant_model_family or synthesis.selected_family_id,),
                 parameter_grid=orchestration_request.hpo_parameter_grid,
                 input_refs=(feature_set_ref, split.split_manifest_ref),
                 training_rows=training_rows,
@@ -6442,6 +6578,8 @@ class BuildOrchestrator:
                 model_tokens_per_epoch=orchestration_request.model_tokens_per_epoch,
                 cost_usd_per_epoch=orchestration_request.cost_usd_per_epoch,
                 trial_budget=spec.budget,
+                warm_start_trials=orchestration_request.warm_start_trials,
+                warm_start_ref=orchestration_request.warm_start_ref,
             )
         )
         selected_parameters = dict(hpo.selected.parameters)
@@ -6539,6 +6677,28 @@ class BuildOrchestrator:
             split.split_indices["test"],
             feature_fields=feature_fields,
         )
+        freeze_config = {
+            "orchestrator": "BuildOrchestrator",
+            "s2_tc21": True,
+            "subtopic": spec.subtopic,
+            "hpo_selection_ref": hpo.selection_artifact_ref,
+            "advisory_self_check_ref": advisory.artifact_ref,
+        }
+        if orchestration_request.variant_id:
+            freeze_config.update(
+                {
+                    "s2_tc22": True,
+                    "variant_id": orchestration_request.variant_id,
+                    "base_pipeline_ref": orchestration_request.base_pipeline_ref,
+                    "reward_source": "c3-only",
+                    "cache_reuse": {
+                        "dataset_split_reused": dataset_split_reused,
+                        "feature_set_reused": feature_set_reused,
+                        "warm_start_ref": orchestration_request.warm_start_ref,
+                    },
+                    "mutation_parameters": dict(orchestration_request.mutation_parameters),
+                }
+            )
         freeze = self._pipeline_freezer.freeze(
             PipelineFreezeRequest(
                 job_id=spec.job_id,
@@ -6568,13 +6728,7 @@ class BuildOrchestrator:
                     descriptor.provenance_ref or f"{descriptor.entity_id}@{descriptor.revision}"
                     for descriptor in spec.resolved_adapters
                 ),
-                config={
-                    "orchestrator": "BuildOrchestrator",
-                    "s2_tc21": True,
-                    "subtopic": spec.subtopic,
-                    "hpo_selection_ref": hpo.selection_artifact_ref,
-                    "advisory_self_check_ref": advisory.artifact_ref,
-                },
+                config=freeze_config,
             )
         )
         artifact_refs = _unique_pipeline_refs(
@@ -6657,6 +6811,27 @@ class BuildOrchestrator:
             },
             "cost_actual": training.cost_actual,
         }
+        if orchestration_request.variant_id:
+            diagnostics.update(
+                {
+                    "s2_tc22": "PASS",
+                    "reward_source": "c3-only",
+                    "variant": {
+                        "variant_id": orchestration_request.variant_id,
+                        "base_pipeline_ref": orchestration_request.base_pipeline_ref,
+                        "model_family": orchestration_request.variant_model_family,
+                        "mutation_parameters": dict(orchestration_request.mutation_parameters),
+                    },
+                    "cache_reuse": {
+                        "dataset_split_reused": dataset_split_reused,
+                        "feature_set_reused": feature_set_reused,
+                        "cached_dataset_split_ref": orchestration_request.cached_dataset_split_ref,
+                        "cached_feature_set_ref": orchestration_request.cached_feature_set_ref,
+                        "warm_start_ref": orchestration_request.warm_start_ref,
+                        "warm_started_trial_count": len(orchestration_request.warm_start_trials),
+                    },
+                }
+            )
         return BuildResult(
             job_id=spec.job_id,
             model_ref=training.final_checkpoint_ref,
@@ -6676,6 +6851,227 @@ class BuildOrchestrator:
             uq_calibration_ref=calibration.calibration_artifact_ref,
             advisory_self_check_ref=advisory.artifact_ref,
         )
+
+    def _assert_base_frozen_pipeline(self, artifact_ref: str) -> dict[str, Any]:
+        try:
+            record = self._artifact_store.get_record(artifact_ref)
+        except KeyError as exc:
+            raise S2ContractModelError(f"S2 build_variant cannot resolve base_pipeline_ref: {artifact_ref}") from exc
+        if record.kind != "frozen_pipeline":
+            raise S2ContractModelError("S2 build_variant requires a frozen_pipeline base artifact")
+        payload = self._artifact_payload(artifact_ref)
+        if payload.get("entrypoint") != "predict" or payload.get("claim_tier") != "ran-toy":
+            raise S2ContractModelError("S2 build_variant base pipeline is not an S2 ran-toy predict artifact")
+        component_refs = payload.get("component_refs")
+        if not isinstance(component_refs, Mapping):
+            raise S2ContractModelError("S2 build_variant base pipeline is missing component_refs")
+        return payload
+
+    def _base_feature_set_ref(self, base_payload: Mapping[str, Any]) -> str | None:
+        component_refs = base_payload.get("component_refs")
+        if not isinstance(component_refs, Mapping):
+            return None
+        ref = component_refs.get("feature_set_ref")
+        if not isinstance(ref, str) or not ref.strip():
+            return None
+        record = self._artifact_store.get_record(ref.strip())
+        if record.kind != "feature_set":
+            raise S2ContractModelError("S2 build_variant base feature_set_ref does not point to a feature_set")
+        return ref.strip()
+
+    def _base_dataset_split_ref(self, base_payload: Mapping[str, Any]) -> str | None:
+        return self._base_component_input_ref(base_payload, kind="dataset_split")
+
+    def _base_hpo_selection_ref(self, base_payload: Mapping[str, Any]) -> str | None:
+        config = base_payload.get("config")
+        if isinstance(config, Mapping):
+            ref = config.get("hpo_selection_ref")
+            if isinstance(ref, str) and ref.strip():
+                record = self._artifact_store.get_record(ref.strip())
+                if record.kind != "hpo_selection":
+                    raise S2ContractModelError("S2 build_variant base hpo_selection_ref does not point to hpo_selection")
+                return ref.strip()
+        return self._base_component_input_ref(base_payload, kind="hpo_selection")
+
+    def _base_component_input_ref(self, base_payload: Mapping[str, Any], *, kind: str) -> str | None:
+        component_refs = base_payload.get("component_refs")
+        if not isinstance(component_refs, Mapping):
+            return None
+        input_refs = component_refs.get("input_refs")
+        if not isinstance(input_refs, list):
+            return None
+        for ref in input_refs:
+            if not isinstance(ref, str) or not ref.strip():
+                continue
+            try:
+                record = self._artifact_store.get_record(ref.strip())
+            except KeyError:
+                continue
+            if record.kind == kind:
+                return ref.strip()
+        return None
+
+    def _warm_start_trials_from_ref(self, warm_start_ref: str | None) -> tuple[HPOTrial, ...]:
+        if warm_start_ref is None:
+            return ()
+        warm_start_ref = warm_start_ref.strip()
+        if not warm_start_ref:
+            return ()
+        record = self._artifact_store.get_record(warm_start_ref)
+        if record.kind != "hpo_selection":
+            raise S2ContractModelError("S2 build_variant warm_start_ref must point to an hpo_selection artifact")
+        selection_payload = self._artifact_payload(warm_start_ref)
+        trial_refs = selection_payload.get("trial_artifact_refs")
+        if not isinstance(trial_refs, list):
+            raise S2ContractModelError("S2 build_variant warm_start hpo_selection is missing trial_artifact_refs")
+        trials: list[HPOTrial] = []
+        for trial_ref in trial_refs:
+            if not isinstance(trial_ref, str) or not trial_ref.strip():
+                continue
+            trial_record = self._artifact_store.get_record(trial_ref.strip())
+            if trial_record.kind != "hpo_trial":
+                continue
+            payload = self._artifact_payload(trial_ref.strip())
+            if payload.get("status") != "SUCCEEDED":
+                continue
+            trials.append(
+                HPOTrial(
+                    trial_id=str(payload["trial_id"]),
+                    score=float(payload["score"]),
+                    calibration_error=float(payload["calibration_error"]),
+                    cost=float(payload["cost"]),
+                    parameters=dict(payload.get("parameters", {})),
+                    family_id=str(payload.get("family_id") or ""),
+                    status="SUCCEEDED",
+                    checkpoint_ref=payload.get("final_checkpoint_ref"),
+                    training_log_ref=payload.get("training_log_ref"),
+                    trial_artifact_ref=trial_ref.strip(),
+                    diagnostics={
+                        "source_hpo_selection_ref": warm_start_ref,
+                        "source_trial_artifact_ref": trial_ref.strip(),
+                    },
+                )
+            )
+        if not trials:
+            raise S2ContractModelError("S2 build_variant warm_start_ref contains no completed HPO trials")
+        return tuple(trials)
+
+    @staticmethod
+    def _mutated_hpo_grid(
+        base_grid: Mapping[str, tuple[Any, ...]],
+        mutation: MutationSpec,
+    ) -> Mapping[str, tuple[Any, ...]]:
+        grid = {str(key): tuple(values) for key, values in base_grid.items()}
+        overrides = {**mutation.parameters, **mutation.hyperparam_overrides}
+        for key, value in overrides.items():
+            if key in {"variant_id", "model_family"}:
+                continue
+            grid[str(key)] = (value,)
+        budget_trials = mutation.hpo.get("budget_trials")
+        if isinstance(budget_trials, int) and budget_trials <= 0:
+            raise S2ContractModelError("S2 MutationSpec hpo.budget_trials must be positive when provided")
+        return grid
+
+    def _cached_split(self, artifact_ref: str | None, request: DataSplitRequest) -> DataSplitResult | None:
+        if artifact_ref is None:
+            return None
+        try:
+            record = self._artifact_store.get_record(artifact_ref)
+        except KeyError as exc:
+            raise S2ContractModelError(f"S2 build_variant cached split is missing: {artifact_ref}") from exc
+        if record.kind != "dataset_split":
+            raise S2ContractModelError("S2 build_variant cached split ref must point to dataset_split")
+        payload = self._artifact_payload(artifact_ref)
+        if not self._split_payload_matches_request(payload, request):
+            return None
+        split_indices = {
+            role: tuple(int(index) for index in payload["splits"][role]["indices"])
+            for role in ("train", "validation", "test")
+        }
+        split_group_ids = {
+            role: tuple(str(group_id) for group_id in payload["splits"][role].get("group_ids", ()))
+            for role in ("train", "validation", "test")
+        }
+        folds = tuple(
+            FoldAssignment(
+                fold_id=str(fold["fold_id"]),
+                train_indices=tuple(int(index) for index in fold["train_indices"]),
+                validation_indices=tuple(int(index) for index in fold["validation_indices"]),
+            )
+            for fold in payload.get("folds", ())
+        )
+        blind_inputs = payload.get("blind_inputs", {})
+        blind_input_indices = tuple(int(index) for index in blind_inputs.get("indices", ()))
+        return DataSplitResult(
+            job_id=request.job_id,
+            dataset_ref=request.dataset_ref,
+            split_manifest_ref=artifact_ref,
+            split_indices=split_indices,
+            split_group_ids=split_group_ids,
+            folds=folds,
+            blind_input_indices=blind_input_indices,
+            diagnostics={
+                "cache_reused": True,
+                "source_job_id": payload.get("job_id"),
+                "row_count": payload.get("row_count"),
+                "fold_count": len(folds),
+                "label_materialized": False,
+            },
+        )
+
+    @staticmethod
+    def _split_payload_matches_request(payload: Mapping[str, Any], request: DataSplitRequest) -> bool:
+        if payload.get("dataset_ref") != request.dataset_ref:
+            return False
+        ratios = payload.get("split_ratios")
+        if not isinstance(ratios, Mapping):
+            return False
+        expected = {
+            "train": request.train_ratio,
+            "validation": request.validation_ratio,
+            "test": request.test_ratio,
+        }
+        for role, value in expected.items():
+            if abs(float(ratios.get(role, -1.0)) - float(value)) > 1e-12:
+                return False
+        if payload.get("row_id_key") != request.row_id_key:
+            return False
+        label_policy = payload.get("label_policy")
+        if not isinstance(label_policy, Mapping) or label_policy.get("label_key") != request.label_key:
+            return False
+        blind_inputs = payload.get("blind_inputs")
+        if not isinstance(blind_inputs, Mapping):
+            return False
+        if blind_inputs.get("role_key") != request.blind_role_key:
+            return False
+        if tuple(blind_inputs.get("roles", ())) != tuple(request.blind_roles):
+            return False
+        return len(payload.get("folds", ())) == request.fold_count
+
+    def _cached_feature_set_ref(
+        self,
+        artifact_ref: str,
+        *,
+        graph: FeatureGraph,
+        selected_nodes: tuple[str, ...],
+    ) -> str | None:
+        record = self._artifact_store.get_record(artifact_ref)
+        if record.kind != "feature_set":
+            raise S2ContractModelError("S2 build_variant cached feature ref must point to feature_set")
+        payload = self._artifact_payload(artifact_ref)
+        feature_set = payload.get("feature_set")
+        base_graph = payload.get("graph")
+        if not isinstance(feature_set, Mapping) or not isinstance(base_graph, Mapping):
+            raise S2ContractModelError("S2 build_variant cached feature_set artifact is malformed")
+        if tuple(feature_set.get("selected_nodes", ())) != selected_nodes:
+            return None
+        if base_graph.get("nodes") != self._feature_graph_nodes_payload(graph):
+            return None
+        return artifact_ref
+
+    @staticmethod
+    def _feature_graph_nodes_payload(graph: FeatureGraph) -> list[dict[str, Any]]:
+        return [_feature_graph_node_payload(node) for node in graph.nodes]
 
     def _resolve_dataset_ref(self, spec: BuildSpec) -> str:
         candidate_refs = tuple(resolved.artifact_ref for resolved in spec.resolved_input_artifacts) + tuple(

@@ -14,8 +14,10 @@ from argus_core import (
     InMemoryArtifactStore,
     InMemoryRegistry,
     Lineage,
+    MutationSpec,
     Producer,
     ProvenanceEmitter,
+    RewardSourceError,
     S2SpecCompilerError,
     SelfGradeError,
     SpecCompiler,
@@ -118,6 +120,69 @@ class S2BuildOrchestratorTests(unittest.TestCase):
         self.assertEqual(raised.exception.code, "VERIFIER_PROFILE_UNAVAILABLE")
         self.assertEqual(self.store.record_count, before_count)
 
+    def test_build_variant_reuses_base_caches_and_returns_no_score(self) -> None:
+        orchestrator = self._orchestrator()
+        base = orchestrator.build(self._request(job_id="33333333-3333-4333-8333-333333333333", seed="base-seed"))
+
+        variant = orchestrator.build_variant(
+            base_pipeline_ref=base.frozen_pipeline_ref,
+            request=self._request(job_id="44444444-4444-4444-8444-444444444444", seed="variant-seed"),
+            mutation=MutationSpec(
+                variant_id="variant-cache-reuse",
+                model_family="tabular-baseline",
+                parameters={"learning_rate": 0.02},
+            ),
+            warm_start_ref=base.hpo_selection_ref,
+        )
+
+        self.assertEqual(variant.claim_tier, "ran-toy")
+        self.assertEqual(variant.diagnostics["s2_tc22"], "PASS")
+        self.assertEqual(variant.diagnostics["variant"]["variant_id"], "variant-cache-reuse")
+        self.assertEqual(variant.diagnostics["variant"]["base_pipeline_ref"], base.frozen_pipeline_ref)
+        self.assertEqual(variant.dataset_split_ref, base.dataset_split_ref)
+        self.assertEqual(variant.feature_set_ref, base.feature_set_ref)
+        self.assertNotEqual(variant.frozen_pipeline_ref, base.frozen_pipeline_ref)
+        self.assertTrue(variant.diagnostics["cache_reuse"]["dataset_split_reused"])
+        self.assertTrue(variant.diagnostics["cache_reuse"]["feature_set_reused"])
+        self.assertEqual(variant.diagnostics["reward_source"], "c3-only")
+        self.assertFalse(hasattr(variant, "score"))
+        self.assertNotIn("score", variant.diagnostics)
+
+        hpo_payload = self._payload(variant.hpo_selection_ref)
+        warm_started = [
+            self._payload(trial_ref)
+            for trial_ref in hpo_payload["trial_artifact_refs"]
+            if self._payload(trial_ref)["status"] == "WARM_STARTED"
+        ]
+        self.assertGreaterEqual(len(warm_started), 1)
+        self.assertEqual(warm_started[0]["diagnostics"]["warm_start_ref"], base.hpo_selection_ref)
+        self.assertIn(base.hpo_selection_ref, self.store.get_record(warm_started[0]["diagnostics"]["warm_start_ref"]).artifact_ref)
+
+        frozen_payload = self._payload(variant.frozen_pipeline_ref)
+        self.assertEqual(frozen_payload["component_refs"]["feature_set_ref"], base.feature_set_ref)
+        self.assertIn(base.dataset_split_ref, frozen_payload["component_refs"]["input_refs"])
+        self.assertEqual(frozen_payload["config"]["s2_tc22"], True)
+        self.assertEqual(frozen_payload["config"]["reward_source"], "c3-only")
+
+    def test_build_variant_rejects_fabricated_score_before_writes(self) -> None:
+        orchestrator = self._orchestrator()
+        base = orchestrator.build(self._request(job_id="33333333-3333-4333-8333-333333333333", seed="base-seed"))
+        before_count = self.store.record_count
+
+        with self.assertRaises(RewardSourceError):
+            orchestrator.build_variant(
+                base_pipeline_ref=base.frozen_pipeline_ref,
+                request=self._request(job_id="44444444-4444-4444-8444-444444444444", seed="variant-seed"),
+                mutation=MutationSpec(
+                    variant_id="variant-forged-score",
+                    model_family="tabular-baseline",
+                    parameters={},
+                ),
+                fabricated_score=0.99,
+            )
+
+        self.assertEqual(self.store.record_count, before_count)
+
     def _orchestrator(self) -> BuildOrchestrator:
         compiler = SpecCompiler(
             verifier_profiles=self.profile_catalog,
@@ -131,12 +196,17 @@ class S2BuildOrchestratorTests(unittest.TestCase):
             hpo_scheduler_backend="threadpool",
         )
 
-    def _request(self) -> BuildOrchestrationRequest:
+    def _request(
+        self,
+        *,
+        job_id: str = "33333333-3333-4333-8333-333333333333",
+        seed: str = "s2-tc21-seed",
+    ) -> BuildOrchestrationRequest:
         return BuildOrchestrationRequest(
-            c2_envelope=self._c2_payload(),
+            c2_envelope=self._c2_payload(job_id=job_id),
             code_ref="git:s2-build-orchestrator-test",
             environment_digest="oci:s2-build-orchestrator-test@sha256:fixture",
-            seed="s2-tc21-seed",
+            seed=seed,
             hpo_parameter_grid={"learning_rate": (0.02, 0.05)},
             hpo_max_epochs=2,
             final_max_epochs=5,
@@ -149,12 +219,12 @@ class S2BuildOrchestratorTests(unittest.TestCase):
             cost_usd_per_epoch=0.01,
         )
 
-    def _c2_payload(self) -> dict[str, object]:
+    def _c2_payload(self, *, job_id: str = "33333333-3333-4333-8333-333333333333") -> dict[str, object]:
         return {
             "contract_version": "1.0.0",
-            "job_id": "33333333-3333-4333-8333-333333333333",
+            "job_id": job_id,
             "root_request_id": "33333333-3333-4333-8333-333333333334",
-            "trace_id": "trace-s2-tc21",
+            "trace_id": f"trace-s2-tc21-{job_id[:8]}",
             "subtopic": "s2-tc21-classical-baseline",
             "problem_spec": {
                 "task_type": "regression",
