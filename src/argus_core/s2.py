@@ -88,6 +88,7 @@ class FieldSpec:
 
 S2_DIMENSION_BASES = ("energy", "length", "time", "mass", "temperature", "charge")
 S2_UNIT_REGISTRY_VERSION = "argus-s2-units@1"
+S2_MODEL_REGISTRY_VERSION = "argus-s2-model-family-registry@1"
 
 
 class DimensionalError(S2Error):
@@ -475,6 +476,98 @@ class ModelFamilyDescriptor:
     differentiable: bool
     physics_informed: bool
     native_uq: str
+    name: str = ""
+    task_types: tuple[str, ...] = ("regression",)
+    cost_class: str = "standard"
+    deterministic_training: bool = True
+    supported_constraints: tuple[str, ...] = ()
+    training_entrypoint: str = ""
+    prediction_entrypoint: str = ""
+    provenance_ref: str = ""
+
+    def __post_init__(self) -> None:
+        family_id = self.family_id.strip()
+        if not family_id:
+            raise S2ContractModelError("model family descriptors require family_id")
+        family_kind = self.family_kind.strip()
+        if not family_kind:
+            raise S2ContractModelError(f"model family {family_id!r} requires family_kind")
+        native_uq = self.native_uq.strip()
+        if not native_uq:
+            raise S2ContractModelError(f"model family {family_id!r} requires native_uq")
+        cost_class = self.cost_class.strip()
+        if not cost_class:
+            raise S2ContractModelError(f"model family {family_id!r} requires cost_class")
+        task_types = tuple(str(task_type).strip() for task_type in self.task_types)
+        if not task_types or any(not task_type for task_type in task_types):
+            raise S2ContractModelError(f"model family {family_id!r} requires task_types")
+        supported_constraints = tuple(str(constraint).strip() for constraint in self.supported_constraints)
+        if any(not constraint for constraint in supported_constraints):
+            raise S2ContractModelError(f"model family {family_id!r} has an empty supported constraint")
+        safe_entrypoint_id = family_id.replace("-", "_")
+        training_entrypoint = self.training_entrypoint or f"argus_core.s2.model_families.{safe_entrypoint_id}.train"
+        prediction_entrypoint = self.prediction_entrypoint or f"argus_core.s2.model_families.{safe_entrypoint_id}.predict"
+        provenance_ref = self.provenance_ref or f"c4://model-family/{family_id}/{S2_MODEL_REGISTRY_VERSION}"
+        if not provenance_ref.startswith("c4://"):
+            raise S2ContractModelError(f"model family {family_id!r} requires a C4 provenance_ref")
+        object.__setattr__(self, "family_id", family_id)
+        object.__setattr__(self, "family_kind", family_kind)
+        object.__setattr__(self, "native_uq", native_uq)
+        object.__setattr__(self, "name", self.name.strip() or family_id.replace("-", " ").title())
+        object.__setattr__(self, "task_types", task_types)
+        object.__setattr__(self, "cost_class", cost_class)
+        object.__setattr__(self, "supported_constraints", supported_constraints)
+        object.__setattr__(self, "training_entrypoint", training_entrypoint)
+        object.__setattr__(self, "prediction_entrypoint", prediction_entrypoint)
+        object.__setattr__(self, "provenance_ref", provenance_ref)
+
+    def as_c4_payload(self) -> dict[str, Any]:
+        return {
+            "family_id": self.family_id,
+            "name": self.name,
+            "family_kind": self.family_kind,
+            "task_types": list(self.task_types),
+            "cost_class": self.cost_class,
+            "differentiable": self.differentiable,
+            "physics_informed": self.physics_informed,
+            "native_uq": self.native_uq,
+            "deterministic_training": self.deterministic_training,
+            "supported_constraints": list(self.supported_constraints),
+            "training_entrypoint": self.training_entrypoint,
+            "prediction_entrypoint": self.prediction_entrypoint,
+            "provenance_ref": self.provenance_ref,
+            "registry_version": S2_MODEL_REGISTRY_VERSION,
+        }
+
+
+class ModelFamilyRegistry:
+    """Descriptor registry for S2 model-family metadata, not a training runtime."""
+
+    def __init__(self, descriptors: tuple[ModelFamilyDescriptor, ...] = ()) -> None:
+        self._descriptors: dict[str, ModelFamilyDescriptor] = {}
+        for descriptor in descriptors:
+            self.register(descriptor)
+
+    @classmethod
+    def default(cls) -> "ModelFamilyRegistry":
+        return cls(_default_model_family_descriptors())
+
+    def register(self, descriptor: ModelFamilyDescriptor) -> ModelFamilyDescriptor:
+        if not isinstance(descriptor, ModelFamilyDescriptor):
+            raise S2ContractModelError("model family registry accepts only ModelFamilyDescriptor values")
+        if descriptor.family_id in self._descriptors:
+            raise S2ContractModelError(f"duplicate S2 model family descriptor: {descriptor.family_id}")
+        self._descriptors[descriptor.family_id] = descriptor
+        return descriptor
+
+    def get(self, family_id: str) -> ModelFamilyDescriptor:
+        try:
+            return self._descriptors[family_id]
+        except KeyError as exc:
+            raise S2ContractModelError(f"unknown S2 model family: {family_id}") from exc
+
+    def list(self) -> tuple[ModelFamilyDescriptor, ...]:
+        return tuple(self._descriptors.values())
 
 
 @dataclass(frozen=True)
@@ -867,28 +960,74 @@ class BaselineBuilder:
         )
 
 
-def list_model_families() -> tuple[ModelFamilyDescriptor, ...]:
+_MODEL_FAMILY_REGISTRY: ModelFamilyRegistry | None = None
+
+
+def _default_model_family_registry() -> ModelFamilyRegistry:
+    global _MODEL_FAMILY_REGISTRY
+    if _MODEL_FAMILY_REGISTRY is None:
+        _MODEL_FAMILY_REGISTRY = ModelFamilyRegistry.default()
+    return _MODEL_FAMILY_REGISTRY
+
+
+def list_model_families(*, registry: ModelFamilyRegistry | None = None) -> tuple[ModelFamilyDescriptor, ...]:
+    return (registry or _default_model_family_registry()).list()
+
+
+def register_model_family(
+    descriptor: ModelFamilyDescriptor,
+    *,
+    registry: ModelFamilyRegistry | None = None,
+) -> ModelFamilyDescriptor:
+    return (registry or _default_model_family_registry()).register(descriptor)
+
+
+def _default_model_family_descriptors() -> tuple[ModelFamilyDescriptor, ...]:
     return (
         ModelFamilyDescriptor(
             family_id="tabular-baseline",
+            name="Tabular Baseline",
             family_kind="classical",
+            task_types=("regression", "surrogate_emulation"),
+            cost_class="low",
             differentiable=False,
             physics_informed=False,
             native_uq="conformal",
+            deterministic_training=True,
+            supported_constraints=("standardization", "conformal_uq"),
+            training_entrypoint="argus_core.s2.model_families.tabular_baseline.train",
+            prediction_entrypoint="argus_core.s2.model_families.tabular_baseline.predict",
+            provenance_ref="c4://model-family/tabular-baseline/v1",
         ),
         ModelFamilyDescriptor(
             family_id="physics-informed-mlp",
+            name="Physics-Informed MLP",
             family_kind="deep",
+            task_types=("regression", "surrogate_emulation"),
+            cost_class="high",
             differentiable=True,
             physics_informed=True,
             native_uq="ensemble",
+            deterministic_training=True,
+            supported_constraints=("positivity", "asymptotic_limit", "symmetry"),
+            training_entrypoint="argus_core.s2.model_families.physics_informed_mlp.train",
+            prediction_entrypoint="argus_core.s2.model_families.physics_informed_mlp.predict",
+            provenance_ref="c4://model-family/physics-informed-mlp/v1",
         ),
         ModelFamilyDescriptor(
             family_id="differentiable-surrogate",
+            name="Differentiable Surrogate",
             family_kind="deep",
+            task_types=("surrogate_emulation",),
+            cost_class="medium",
             differentiable=True,
             physics_informed=True,
             native_uq="interval",
+            deterministic_training=True,
+            supported_constraints=("forward_model_loss", "gradient_based"),
+            training_entrypoint="argus_core.s2.model_families.differentiable_surrogate.train",
+            prediction_entrypoint="argus_core.s2.model_families.differentiable_surrogate.predict",
+            provenance_ref="c4://model-family/differentiable-surrogate/v1",
         ),
     )
 
