@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, field
 import hashlib
+from itertools import product
 import json
 from pathlib import Path
+import time
 from typing import Any, Callable, Mapping
 
 from .s5 import C2VersionPolicy, parse_c2_job_envelope
@@ -788,6 +791,30 @@ class HPOTrial:
     calibration_error: float
     cost: float
     parameters: dict[str, Any]
+    family_id: str = ""
+    status: str = "SUCCEEDED"
+    checkpoint_ref: str | None = None
+    training_log_ref: str | None = None
+    trial_artifact_ref: str | None = None
+    diagnostics: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        trial_id = self.trial_id.strip()
+        family_id = self.family_id.strip()
+        status = self.status.strip()
+        if not trial_id:
+            raise S2ContractModelError("S2 HPO trials require trial_id")
+        if status not in {"SUCCEEDED", "WARM_STARTED", "BUDGET_HALTED", "CANCELLED", "INTERRUPTED", "FAILED"}:
+            raise S2ContractModelError(f"unsupported S2 HPO trial status: {status}")
+        if self.calibration_error < 0:
+            raise S2ContractModelError("S2 HPO trial calibration_error must be non-negative")
+        if self.cost < 0:
+            raise S2ContractModelError("S2 HPO trial cost must be non-negative")
+        object.__setattr__(self, "trial_id", trial_id)
+        object.__setattr__(self, "family_id", family_id)
+        object.__setattr__(self, "status", status)
+        object.__setattr__(self, "parameters", dict(self.parameters))
+        object.__setattr__(self, "diagnostics", dict(self.diagnostics))
 
 
 @dataclass(frozen=True)
@@ -797,6 +824,544 @@ class HPOSelection:
     score: float
     calibration_error: float
     cost: float
+    family_id: str = ""
+    selection_artifact_ref: str | None = None
+    trial_artifact_refs: tuple[str, ...] = ()
+    pareto_front_trial_ids: tuple[str, ...] = ()
+    diagnostics: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if not self.trial_id:
+            raise S2ContractModelError("S2 HPO selection requires trial_id")
+        if self.calibration_error < 0:
+            raise S2ContractModelError("S2 HPO selection calibration_error must be non-negative")
+        if self.cost < 0:
+            raise S2ContractModelError("S2 HPO selection cost must be non-negative")
+        object.__setattr__(self, "parameters", dict(self.parameters))
+        object.__setattr__(self, "trial_artifact_refs", tuple(self.trial_artifact_refs))
+        object.__setattr__(self, "pareto_front_trial_ids", tuple(self.pareto_front_trial_ids))
+        object.__setattr__(self, "diagnostics", dict(self.diagnostics))
+
+
+@dataclass(frozen=True)
+class HPORequest:
+    job_id: str
+    family_ids: tuple[str, ...]
+    parameter_grid: Mapping[str, tuple[Any, ...]]
+    input_refs: tuple[str, ...]
+    training_rows: tuple[Mapping[str, Any], ...]
+    feature_names: tuple[str, ...]
+    target_name: str
+    max_epochs: int
+    code_ref: str
+    environment_digest: str
+    seed: str
+    objective_metric: str = "loss"
+    objective: str = "minimize"
+    learning_rate: float = 0.01
+    wallclock_seconds_per_epoch: float = 0.0
+    gpu_seconds_per_epoch: float = 0.0
+    model_tokens_per_epoch: int = 0
+    cost_usd_per_epoch: float = 0.0
+    max_trials: int | None = None
+    max_calibration_error: float | None = None
+    trial_budget: BuildBudget | None = None
+    warm_start_trials: tuple[HPOTrial, ...] = ()
+    warm_start_ref: str | None = None
+
+    def __post_init__(self) -> None:
+        job_id = self.job_id.strip()
+        family_ids = tuple(str(family_id).strip() for family_id in self.family_ids)
+        input_refs = tuple(str(ref).strip() for ref in self.input_refs)
+        feature_names = tuple(str(name).strip() for name in self.feature_names)
+        target_name = self.target_name.strip()
+        objective_metric = self.objective_metric.strip()
+        code_ref = self.code_ref.strip()
+        environment_digest = self.environment_digest.strip()
+        seed = self.seed.strip()
+        if not job_id:
+            raise S2ContractModelError("S2 HPORequest requires job_id")
+        if not family_ids or any(not family_id for family_id in family_ids):
+            raise S2ContractModelError("S2 HPORequest requires family_ids")
+        if len(set(family_ids)) != len(family_ids):
+            raise S2ContractModelError("S2 HPORequest family_ids must be unique")
+        if not input_refs or any(not ref for ref in input_refs):
+            raise S2ContractModelError("S2 HPORequest requires input_refs")
+        if not self.training_rows:
+            raise S2ContractModelError("S2 HPORequest requires training_rows")
+        if not feature_names or any(not name for name in feature_names):
+            raise S2ContractModelError("S2 HPORequest requires feature_names")
+        if not target_name:
+            raise S2ContractModelError("S2 HPORequest requires target_name")
+        if self.max_epochs <= 0:
+            raise S2ContractModelError("S2 HPORequest max_epochs must be positive")
+        if self.learning_rate <= 0:
+            raise S2ContractModelError("S2 HPORequest learning_rate must be positive")
+        if self.objective not in {"maximize", "minimize"}:
+            raise S2ContractModelError(f"unsupported S2 HPO objective: {self.objective}")
+        if not objective_metric:
+            raise S2ContractModelError("S2 HPORequest requires objective_metric")
+        if not code_ref:
+            raise S2ContractModelError("S2 HPORequest requires code_ref")
+        if not environment_digest:
+            raise S2ContractModelError("S2 HPORequest requires environment_digest")
+        if not seed:
+            raise S2ContractModelError("S2 HPORequest requires seed")
+        if self.wallclock_seconds_per_epoch < 0:
+            raise S2ContractModelError("S2 HPORequest wallclock_seconds_per_epoch must be non-negative")
+        if self.gpu_seconds_per_epoch < 0:
+            raise S2ContractModelError("S2 HPORequest gpu_seconds_per_epoch must be non-negative")
+        if self.model_tokens_per_epoch < 0:
+            raise S2ContractModelError("S2 HPORequest model_tokens_per_epoch must be non-negative")
+        if self.cost_usd_per_epoch < 0:
+            raise S2ContractModelError("S2 HPORequest cost_usd_per_epoch must be non-negative")
+        if self.max_trials is not None and self.max_trials < 0:
+            raise S2ContractModelError("S2 HPORequest max_trials must be non-negative")
+        if self.max_calibration_error is not None and self.max_calibration_error < 0:
+            raise S2ContractModelError("S2 HPORequest max_calibration_error must be non-negative")
+        normalized_rows: list[dict[str, Any]] = []
+        for row in self.training_rows:
+            normalized = dict(row)
+            for name in feature_names + (target_name,):
+                if name not in normalized:
+                    raise S2ContractModelError(f"S2 HPORequest row missing field: {name}")
+            normalized_rows.append(normalized)
+        normalized_grid = _normalize_hpo_parameter_grid(self.parameter_grid)
+        warm_start_ids: set[str] = set()
+        for trial in self.warm_start_trials:
+            if trial.status != "SUCCEEDED":
+                raise S2ContractModelError("S2 HPO warm-start trials must be completed SUCCEEDED trials")
+            if trial.trial_id in warm_start_ids:
+                raise S2ContractModelError(f"duplicate S2 HPO warm-start trial: {trial.trial_id}")
+            warm_start_ids.add(trial.trial_id)
+        object.__setattr__(self, "job_id", job_id)
+        object.__setattr__(self, "family_ids", family_ids)
+        object.__setattr__(self, "parameter_grid", normalized_grid)
+        object.__setattr__(self, "input_refs", input_refs)
+        object.__setattr__(self, "training_rows", tuple(normalized_rows))
+        object.__setattr__(self, "feature_names", feature_names)
+        object.__setattr__(self, "target_name", target_name)
+        object.__setattr__(self, "objective_metric", objective_metric)
+        object.__setattr__(self, "code_ref", code_ref)
+        object.__setattr__(self, "environment_digest", environment_digest)
+        object.__setattr__(self, "seed", seed)
+        object.__setattr__(self, "warm_start_trials", tuple(self.warm_start_trials))
+
+
+@dataclass(frozen=True)
+class HPORunResult:
+    job_id: str
+    status: str
+    trials: tuple[HPOTrial, ...]
+    selected: HPOSelection
+    trial_artifact_refs: tuple[str, ...]
+    selection_artifact_ref: str
+    diagnostics: dict[str, Any]
+    wallclock_seconds: float
+
+
+class HPOEngine:
+    """Executes deterministic S2 HPO trials through TrainingRuntime and C4 provenance."""
+
+    def __init__(
+        self,
+        *,
+        artifact_store: InMemoryArtifactStore,
+        provenance_emitter: ProvenanceEmitter | None = None,
+        registry: ModelFamilyRegistry | None = None,
+        backends: Mapping[str, DeterministicLinearTrainingBackend] | None = None,
+        worker_count: int = 1,
+    ) -> None:
+        if worker_count <= 0:
+            raise S2ContractModelError("S2 HPOEngine worker_count must be positive")
+        self._artifact_store = artifact_store
+        self._provenance_emitter = provenance_emitter or ProvenanceEmitter(artifact_store=artifact_store)
+        self._registry = registry or _default_model_family_registry()
+        self._backends = dict(backends or {})
+        self._worker_count = int(worker_count)
+
+    def run(self, request: HPORequest) -> HPORunResult:
+        started_at = time.perf_counter()
+        trial_specs = self._trial_specs(request)
+        warm_trials = tuple(self._emit_warm_started_trial(request, trial) for trial in request.warm_start_trials)
+        new_trials = self._run_trial_specs(request, trial_specs)
+        trials = warm_trials + new_trials
+        eligible_trials = tuple(trial for trial in trials if trial.status in {"SUCCEEDED", "WARM_STARTED"})
+        if not eligible_trials:
+            raise S2Error("S2 HPOEngine produced no eligible trial")
+        selected = select_hpo_winner(
+            eligible_trials,
+            max_calibration_error=request.max_calibration_error if request.max_calibration_error is not None else float("inf"),
+            objective=request.objective,
+        )
+        selection_record = self._emit_selection(request=request, trials=trials, selected=selected)
+        selected_with_ref = HPOSelection(
+            trial_id=selected.trial_id,
+            parameters=selected.parameters,
+            score=selected.score,
+            calibration_error=selected.calibration_error,
+            cost=selected.cost,
+            family_id=selected.family_id,
+            selection_artifact_ref=selection_record.artifact_ref,
+            trial_artifact_refs=tuple(trial.trial_artifact_ref for trial in trials if trial.trial_artifact_ref),
+            pareto_front_trial_ids=selected.pareto_front_trial_ids,
+            diagnostics=selected.diagnostics,
+        )
+        elapsed = time.perf_counter() - started_at
+        return HPORunResult(
+            job_id=request.job_id,
+            status="SUCCEEDED",
+            trials=trials,
+            selected=selected_with_ref,
+            trial_artifact_refs=tuple(trial.trial_artifact_ref for trial in trials if trial.trial_artifact_ref),
+            selection_artifact_ref=selection_record.artifact_ref,
+            diagnostics={
+                "objective": request.objective,
+                "objective_metric": request.objective_metric,
+                "worker_count": self._worker_count,
+                "eligible_trial_count": len(eligible_trials),
+            },
+            wallclock_seconds=elapsed,
+        )
+
+    def _trial_specs(self, request: HPORequest) -> tuple[dict[str, Any], ...]:
+        parameter_names = tuple(sorted(request.parameter_grid))
+        parameter_value_sets = tuple(tuple(request.parameter_grid[name]) for name in parameter_names)
+        specs: list[dict[str, Any]] = []
+        seen_trial_ids: set[str] = set()
+        for family_id in request.family_ids:
+            self._registry.get(family_id)
+            for values in product(*parameter_value_sets):
+                parameters = dict(zip(parameter_names, values))
+                index = len(specs) + 1
+                trial_id = self._trial_id(request=request, family_id=family_id, parameters=parameters, index=index)
+                if trial_id in seen_trial_ids:
+                    raise S2ContractModelError(f"duplicate S2 HPO trial id: {trial_id}")
+                seen_trial_ids.add(trial_id)
+                specs.append(
+                    {
+                        "index": index,
+                        "trial_id": trial_id,
+                        "family_id": family_id,
+                        "parameters": parameters,
+                    }
+                )
+        if request.max_trials is not None:
+            specs = specs[: request.max_trials]
+        if not specs and not request.warm_start_trials:
+            raise S2ContractModelError("S2 HPOEngine requires at least one scheduled or warm-start trial")
+        return tuple(specs)
+
+    def _run_trial_specs(self, request: HPORequest, specs: tuple[dict[str, Any], ...]) -> tuple[HPOTrial, ...]:
+        if not specs:
+            return ()
+        if self._worker_count == 1 or len(specs) == 1:
+            return tuple(self._run_training_trial(request, spec) for spec in specs)
+        results: dict[int, HPOTrial] = {}
+        with ThreadPoolExecutor(max_workers=self._worker_count) as executor:
+            futures = {executor.submit(self._run_training_trial, request, spec): int(spec["index"]) for spec in specs}
+            for future in as_completed(futures):
+                results[futures[future]] = future.result()
+        return tuple(results[index] for index in sorted(results))
+
+    def _run_training_trial(self, request: HPORequest, spec: Mapping[str, Any]) -> HPOTrial:
+        trial_id = str(spec["trial_id"])
+        family_id = str(spec["family_id"])
+        parameters = dict(spec["parameters"])
+        trial_job_id = f"{request.job_id}:{trial_id}"
+        meter = BudgetMeter.from_budget(job_id=trial_job_id, budget=request.trial_budget) if request.trial_budget else None
+        runtime = TrainingRuntime(
+            artifact_store=self._artifact_store,
+            provenance_emitter=self._provenance_emitter,
+            registry=self._registry,
+            budget_meter=meter,
+            backends=self._backends,
+        )
+        try:
+            result = runtime.train(
+                TrainingRequest(
+                    job_id=trial_job_id,
+                    family_id=family_id,
+                    input_refs=request.input_refs,
+                    training_rows=request.training_rows,
+                    feature_names=request.feature_names,
+                    target_name=request.target_name,
+                    max_epochs=int(parameters.get("max_epochs", request.max_epochs)),
+                    learning_rate=float(parameters.get("learning_rate", request.learning_rate)),
+                    code_ref=request.code_ref,
+                    environment_digest=request.environment_digest,
+                    seed=f"{request.seed}:{trial_id}",
+                    parameters=parameters,
+                    wallclock_seconds_per_epoch=float(
+                        parameters.get("wallclock_seconds_per_epoch", request.wallclock_seconds_per_epoch)
+                    ),
+                    gpu_seconds_per_epoch=float(parameters.get("gpu_seconds_per_epoch", request.gpu_seconds_per_epoch)),
+                    model_tokens_per_epoch=int(parameters.get("model_tokens_per_epoch", request.model_tokens_per_epoch)),
+                    cost_usd_per_epoch=float(parameters.get("cost_usd_per_epoch", request.cost_usd_per_epoch)),
+                )
+            )
+        except S2BudgetExceededError as exc:
+            return self._emit_failed_trial(
+                request=request,
+                trial_id=trial_id,
+                family_id=family_id,
+                parameters=parameters,
+                status="BUDGET_HALTED",
+                error_code=exc.code,
+                error_message=exc.message,
+                cost_actual=exc.snapshot.as_cost_actual(),
+                partial_checkpoint=exc.partial_checkpoint,
+            )
+        except S2Error as exc:
+            return self._emit_failed_trial(
+                request=request,
+                trial_id=trial_id,
+                family_id=family_id,
+                parameters=parameters,
+                status="FAILED",
+                error_code=exc.__class__.__name__,
+                error_message=str(exc),
+                cost_actual=meter.snapshot().as_cost_actual() if meter else SpendSnapshot(
+                    job_id=trial_job_id,
+                    wallclock_seconds=0.0,
+                    gpu_seconds=0.0,
+                    model_tokens=0,
+                    cost_usd=0.0,
+                ).as_cost_actual(),
+                partial_checkpoint=None,
+            )
+        final_metrics = dict(result.diagnostics.get("final_metrics", {}))
+        if request.objective_metric not in final_metrics:
+            return self._emit_failed_trial(
+                request=request,
+                trial_id=trial_id,
+                family_id=family_id,
+                parameters=parameters,
+                status="FAILED",
+                error_code="OBJECTIVE_METRIC_MISSING",
+                error_message=f"S2 HPO trial missing objective metric: {request.objective_metric}",
+                cost_actual=result.cost_actual,
+                partial_checkpoint=result.partial_checkpoint,
+            )
+        score = float(final_metrics[request.objective_metric])
+        calibration_error = float(final_metrics.get("calibration_error", 0.0))
+        return self._emit_completed_trial(
+            request=request,
+            trial_id=trial_id,
+            family_id=family_id,
+            parameters=parameters,
+            status=result.status,
+            score=score,
+            calibration_error=calibration_error,
+            cost=float(result.cost_actual.get("cost_usd", 0.0)),
+            checkpoint_ref=result.final_checkpoint_ref,
+            training_log_ref=result.training_log_ref,
+            completed_epochs=result.completed_epochs,
+            diagnostics={"final_metrics": final_metrics, "cost_actual": result.cost_actual},
+        )
+
+    def _emit_warm_started_trial(self, request: HPORequest, trial: HPOTrial) -> HPOTrial:
+        lineage_inputs = (request.warm_start_ref,) if request.warm_start_ref else request.input_refs
+        record = self._provenance_emitter.emit_artifact(
+            kind="hpo_trial",
+            payload={
+                "job_id": request.job_id,
+                "trial_id": trial.trial_id,
+                "family_id": trial.family_id,
+                "status": "WARM_STARTED",
+                "parameters": dict(trial.parameters),
+                "objective": request.objective,
+                "objective_metric": request.objective_metric,
+                "score": trial.score,
+                "calibration_error": trial.calibration_error,
+                "cost": trial.cost,
+                "final_checkpoint_ref": trial.checkpoint_ref,
+                "training_log_ref": trial.training_log_ref,
+                "partial_checkpoint_ref": None,
+                "diagnostics": {"warm_start_ref": request.warm_start_ref, **trial.diagnostics},
+            },
+            producer=Producer(subsystem="S2", version="0.0.0", job_id=request.job_id),
+            lineage=Lineage(
+                input_refs=lineage_inputs,
+                code_ref=request.code_ref,
+                environment_digest=request.environment_digest,
+                seeds=(request.seed, f"warm-start:{trial.trial_id}"),
+                job_id=request.job_id,
+            ),
+            claim_tier="ran-toy",
+        )
+        return HPOTrial(
+            trial_id=trial.trial_id,
+            score=trial.score,
+            calibration_error=trial.calibration_error,
+            cost=trial.cost,
+            parameters=trial.parameters,
+            family_id=trial.family_id,
+            status="WARM_STARTED",
+            checkpoint_ref=trial.checkpoint_ref,
+            training_log_ref=trial.training_log_ref,
+            trial_artifact_ref=record.artifact_ref,
+            diagnostics={"warm_start_ref": request.warm_start_ref, **trial.diagnostics},
+        )
+
+    def _emit_completed_trial(
+        self,
+        *,
+        request: HPORequest,
+        trial_id: str,
+        family_id: str,
+        parameters: Mapping[str, Any],
+        status: str,
+        score: float,
+        calibration_error: float,
+        cost: float,
+        checkpoint_ref: str | None,
+        training_log_ref: str | None,
+        completed_epochs: int,
+        diagnostics: Mapping[str, Any],
+    ) -> HPOTrial:
+        input_refs = tuple(ref for ref in request.input_refs + (checkpoint_ref, training_log_ref) if ref)
+        record = self._provenance_emitter.emit_artifact(
+            kind="hpo_trial",
+            payload={
+                "job_id": request.job_id,
+                "trial_id": trial_id,
+                "family_id": family_id,
+                "status": status,
+                "parameters": dict(parameters),
+                "objective": request.objective,
+                "objective_metric": request.objective_metric,
+                "score": score,
+                "calibration_error": calibration_error,
+                "cost": cost,
+                "final_checkpoint_ref": checkpoint_ref,
+                "training_log_ref": training_log_ref,
+                "completed_epochs": completed_epochs,
+                "partial_checkpoint_ref": None,
+                "diagnostics": dict(diagnostics),
+            },
+            producer=Producer(subsystem="S2", version="0.0.0", job_id=request.job_id),
+            lineage=Lineage(
+                input_refs=input_refs,
+                code_ref=request.code_ref,
+                environment_digest=request.environment_digest,
+                seeds=(request.seed, f"trial:{trial_id}"),
+                job_id=request.job_id,
+            ),
+            claim_tier="ran-toy",
+        )
+        return HPOTrial(
+            trial_id=trial_id,
+            score=score,
+            calibration_error=calibration_error,
+            cost=cost,
+            parameters=dict(parameters),
+            family_id=family_id,
+            status=status,
+            checkpoint_ref=checkpoint_ref,
+            training_log_ref=training_log_ref,
+            trial_artifact_ref=record.artifact_ref,
+            diagnostics=dict(diagnostics),
+        )
+
+    def _emit_failed_trial(
+        self,
+        *,
+        request: HPORequest,
+        trial_id: str,
+        family_id: str,
+        parameters: Mapping[str, Any],
+        status: str,
+        error_code: str,
+        error_message: str,
+        cost_actual: Mapping[str, float | int],
+        partial_checkpoint: PartialModelCheckpoint | None,
+    ) -> HPOTrial:
+        checkpoint_ref = partial_checkpoint.artifact_ref if partial_checkpoint else None
+        input_refs = tuple(ref for ref in request.input_refs + (checkpoint_ref,) if ref)
+        cost = float(cost_actual.get("cost_usd", 0.0))
+        diagnostics = {
+            "error_code": error_code,
+            "error_message": error_message,
+            "cost_actual": dict(cost_actual),
+        }
+        record = self._provenance_emitter.emit_artifact(
+            kind="hpo_trial",
+            payload={
+                "job_id": request.job_id,
+                "trial_id": trial_id,
+                "family_id": family_id,
+                "status": status,
+                "parameters": dict(parameters),
+                "objective": request.objective,
+                "objective_metric": request.objective_metric,
+                "score": None,
+                "calibration_error": None,
+                "cost": cost,
+                "final_checkpoint_ref": None,
+                "training_log_ref": None,
+                "partial_checkpoint_ref": checkpoint_ref,
+                "diagnostics": diagnostics,
+            },
+            producer=Producer(subsystem="S2", version="0.0.0", job_id=request.job_id),
+            lineage=Lineage(
+                input_refs=input_refs,
+                code_ref=request.code_ref,
+                environment_digest=request.environment_digest,
+                seeds=(request.seed, f"trial:{trial_id}"),
+                job_id=request.job_id,
+            ),
+            claim_tier="ran-toy",
+        )
+        return HPOTrial(
+            trial_id=trial_id,
+            score=0.0,
+            calibration_error=request.max_calibration_error + 1.0 if request.max_calibration_error is not None else 1.0,
+            cost=cost,
+            parameters=dict(parameters),
+            family_id=family_id,
+            status=status,
+            checkpoint_ref=checkpoint_ref,
+            training_log_ref=None,
+            trial_artifact_ref=record.artifact_ref,
+            diagnostics=diagnostics,
+        )
+
+    def _emit_selection(self, *, request: HPORequest, trials: tuple[HPOTrial, ...], selected: HPOSelection) -> ArtifactRecord:
+        trial_refs = tuple(trial.trial_artifact_ref for trial in trials if trial.trial_artifact_ref)
+        return self._provenance_emitter.emit_artifact(
+            kind="hpo_selection",
+            payload={
+                "job_id": request.job_id,
+                "selected_trial_id": selected.trial_id,
+                "selected_family_id": selected.family_id,
+                "selected_parameters": dict(selected.parameters),
+                "score": selected.score,
+                "calibration_error": selected.calibration_error,
+                "cost": selected.cost,
+                "objective": request.objective,
+                "objective_metric": request.objective_metric,
+                "policy": "pareto_lexicographic",
+                "pareto_front_trial_ids": list(selected.pareto_front_trial_ids),
+                "trial_artifact_refs": list(trial_refs),
+            },
+            producer=Producer(subsystem="S2", version="0.0.0", job_id=request.job_id),
+            lineage=Lineage(
+                input_refs=trial_refs,
+                code_ref=request.code_ref,
+                environment_digest=request.environment_digest,
+                seeds=(request.seed, "hpo-selection"),
+                job_id=request.job_id,
+            ),
+            claim_tier="ran-toy",
+        )
+
+    @staticmethod
+    def _trial_id(*, request: HPORequest, family_id: str, parameters: Mapping[str, Any], index: int) -> str:
+        digest = hashlib.sha256(
+            _stable_hpo_json({"family_id": family_id, "parameters": dict(parameters), "seed": request.seed}).encode("utf-8")
+        ).hexdigest()[:12]
+        return f"{request.job_id}-trial-{index:04d}-{digest}"
 
 
 @dataclass(frozen=True)
@@ -2417,18 +2982,105 @@ def _default_model_family_descriptors() -> tuple[ModelFamilyDescriptor, ...]:
     )
 
 
-def select_hpo_winner(trials: tuple[HPOTrial, ...], *, max_calibration_error: float) -> HPOSelection:
-    eligible = tuple(trial for trial in trials if trial.calibration_error <= max_calibration_error)
+def select_hpo_winner(
+    trials: tuple[HPOTrial, ...],
+    *,
+    max_calibration_error: float,
+    objective: str = "maximize",
+) -> HPOSelection:
+    if objective not in {"maximize", "minimize"}:
+        raise S2ContractModelError(f"unsupported S2 HPO objective: {objective}")
+    eligible = tuple(
+        trial
+        for trial in trials
+        if trial.status in {"SUCCEEDED", "WARM_STARTED"} and trial.calibration_error <= max_calibration_error
+    )
     if not eligible:
         raise S2Error("no HPO trial satisfies calibration constraint")
-    selected = max(eligible, key=lambda trial: (trial.score, -trial.cost, trial.trial_id))
+    pareto_front = _hpo_pareto_front(eligible, objective=objective)
+    selected = sorted(pareto_front, key=lambda trial: _hpo_selection_key(trial, objective=objective))[0]
     return HPOSelection(
         trial_id=selected.trial_id,
         parameters=selected.parameters,
         score=selected.score,
         calibration_error=selected.calibration_error,
         cost=selected.cost,
+        family_id=selected.family_id,
+        trial_artifact_refs=tuple(trial.trial_artifact_ref for trial in eligible if trial.trial_artifact_ref),
+        pareto_front_trial_ids=tuple(sorted(trial.trial_id for trial in pareto_front)),
+        diagnostics={"policy": "pareto_lexicographic", "objective": objective},
     )
+
+
+def _normalize_hpo_parameter_grid(parameter_grid: Mapping[str, tuple[Any, ...]]) -> dict[str, tuple[Any, ...]]:
+    if not parameter_grid:
+        raise S2ContractModelError("S2 HPO parameter_grid must be non-empty")
+    normalized: dict[str, tuple[Any, ...]] = {}
+    for raw_name, raw_values in parameter_grid.items():
+        name = str(raw_name).strip()
+        if not name:
+            raise S2ContractModelError("S2 HPO parameter names must be non-empty")
+        values = tuple(raw_values)
+        if not values:
+            raise S2ContractModelError(f"S2 HPO parameter {name!r} requires at least one value")
+        seen_value_keys: set[str] = set()
+        for value in values:
+            value_key = _stable_hpo_json(value)
+            if value_key in seen_value_keys:
+                raise S2ContractModelError(f"duplicate S2 HPO value for parameter {name!r}")
+            seen_value_keys.add(value_key)
+            if name == "learning_rate" and float(value) <= 0:
+                raise S2ContractModelError("S2 HPO learning_rate values must be positive")
+            if name == "max_epochs" and int(value) <= 0:
+                raise S2ContractModelError("S2 HPO max_epochs values must be positive")
+            if name in {
+                "wallclock_seconds_per_epoch",
+                "gpu_seconds_per_epoch",
+                "cost_usd_per_epoch",
+            } and float(value) < 0:
+                raise S2ContractModelError(f"S2 HPO {name} values must be non-negative")
+            if name == "model_tokens_per_epoch" and int(value) < 0:
+                raise S2ContractModelError("S2 HPO model_tokens_per_epoch values must be non-negative")
+        normalized[name] = values
+    return normalized
+
+
+def _stable_hpo_json(value: Any) -> str:
+    try:
+        return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    except (TypeError, ValueError) as exc:
+        raise S2ContractModelError("S2 HPO parameter values must be canonical JSON serializable") from exc
+
+
+def _hpo_pareto_front(trials: tuple[HPOTrial, ...], *, objective: str) -> tuple[HPOTrial, ...]:
+    front = []
+    for trial in trials:
+        if any(_hpo_dominates(other, trial, objective=objective) for other in trials if other.trial_id != trial.trial_id):
+            continue
+        front.append(trial)
+    return tuple(front)
+
+
+def _hpo_dominates(left: HPOTrial, right: HPOTrial, *, objective: str) -> bool:
+    if objective == "maximize":
+        score_no_worse = left.score >= right.score
+        score_better = left.score > right.score
+    else:
+        score_no_worse = left.score <= right.score
+        score_better = left.score < right.score
+    calibration_no_worse = left.calibration_error <= right.calibration_error
+    cost_no_worse = left.cost <= right.cost
+    return (
+        score_no_worse
+        and calibration_no_worse
+        and cost_no_worse
+        and (score_better or left.calibration_error < right.calibration_error or left.cost < right.cost)
+    )
+
+
+def _hpo_selection_key(trial: HPOTrial, *, objective: str) -> tuple[float, float, float, str]:
+    score_key = -trial.score if objective == "maximize" else trial.score
+    return (score_key, trial.calibration_error, trial.cost, trial.trial_id)
 
 
 def _build_budget(value: Mapping[str, Any]) -> BuildBudget:
