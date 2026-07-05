@@ -1934,7 +1934,7 @@ class HPOEngine:
         artifact_store: InMemoryArtifactStore,
         provenance_emitter: ProvenanceEmitter | None = None,
         registry: ModelFamilyRegistry | None = None,
-        backends: Mapping[str, DeterministicLinearTrainingBackend] | None = None,
+        backends: Mapping[str, Any] | None = None,
         worker_count: int = 1,
         scheduler_backend: str = "optuna_ray",
         ray_storage_path: str | None = None,
@@ -4293,6 +4293,225 @@ class DeterministicLinearTrainingBackend:
         return total / float(len(request.training_rows))
 
 
+class PhysicsInformedTrainingBackend:
+    """Deterministic differentiable backend for S2 physics-informed fixtures."""
+
+    backend_id = "physics-informed-analytic"
+
+    def initial_state(self, request: TrainingRequest) -> dict[str, Any]:
+        feature_name = self._single_feature(request)
+        scale_raw = _finite_training_parameter(
+            request.parameters.get("initial_scale_raw", 0.0),
+            name="initial_scale_raw",
+        )
+        return {
+            "feature_names": [feature_name],
+            "target_name": request.target_name,
+            "scale_raw": scale_raw,
+            "architecture": "positive_quadratic",
+            "differentiable": True,
+            "gradient_entrypoint": "PhysicsInformedTrainingBackend.grad",
+            "framework": "analytic-python",
+        }
+
+    def train_epoch(self, request: TrainingRequest, state: Mapping[str, Any], *, epoch: int) -> TrainingEpochResult:
+        feature_name = self._single_feature(request)
+        scale_raw = _finite_training_parameter(state.get("scale_raw", 0.0), name="scale_raw")
+        grad_scale_raw = self._scale_raw_gradient(request, feature_name=feature_name, scale_raw=scale_raw)
+        learning_rate = float(request.learning_rate)
+        next_scale_raw = max(-40.0, min(40.0, scale_raw - learning_rate * grad_scale_raw))
+        metrics = self._metrics(request, feature_name=feature_name, scale_raw=next_scale_raw)
+        next_state = {
+            "feature_names": [feature_name],
+            "target_name": request.target_name,
+            "scale_raw": next_scale_raw,
+            "scale": self._positive_scale(next_scale_raw),
+            "architecture": "positive_quadratic",
+            "differentiable": True,
+            "gradient_entrypoint": "PhysicsInformedTrainingBackend.grad",
+            "framework": "analytic-python",
+            "last_scale_raw_gradient": grad_scale_raw,
+            "constraints": {
+                "positivity": True,
+                "asymptotic_limit": {
+                    "feature_value": _finite_training_parameter(
+                        request.parameters.get("asymptotic_feature_value", 0.0),
+                        name="asymptotic_feature_value",
+                    ),
+                    "known_output": _finite_training_parameter(
+                        request.parameters.get("asymptotic_known_output", 0.0),
+                        name="asymptotic_known_output",
+                    ),
+                },
+                "unitarity_bound": self._unitarity_bound(request),
+                "unitarity_penalty_weight": self._unitarity_penalty_weight(request),
+            },
+        }
+        return TrainingEpochResult(epoch=epoch, model_state=next_state, metrics=metrics)
+
+    def predict(self, state: Mapping[str, Any], row: Mapping[str, Any]) -> float:
+        feature_name = self._feature_name_from_state(state)
+        x_value = _finite_training_parameter(row[feature_name], name=feature_name)
+        return self._positive_scale(_finite_training_parameter(state.get("scale_raw", 0.0), name="scale_raw")) * (
+            x_value * x_value
+        )
+
+    def grad(self, state: Mapping[str, Any], row: Mapping[str, Any]) -> dict[str, float]:
+        feature_name = self._feature_name_from_state(state)
+        x_value = _finite_training_parameter(row[feature_name], name=feature_name)
+        scale = self._positive_scale(_finite_training_parameter(state.get("scale_raw", 0.0), name="scale_raw"))
+        return {feature_name: 2.0 * scale * x_value}
+
+    def _scale_raw_gradient(self, request: TrainingRequest, *, feature_name: str, scale_raw: float) -> float:
+        count = float(len(request.training_rows))
+        scale_derivative = self._scale_derivative(scale_raw)
+        scale = self._positive_scale(scale_raw)
+        unitarity_bound = self._unitarity_bound(request)
+        unitarity_weight = self._unitarity_penalty_weight(request)
+        asymptotic_weight = self._asymptotic_penalty_weight(request)
+        gradient = 0.0
+        for row in request.training_rows:
+            x_value = _finite_training_parameter(row[feature_name], name=feature_name)
+            basis = x_value * x_value
+            prediction = scale * basis
+            error = prediction - _finite_training_parameter(row[request.target_name], name=request.target_name)
+            prediction_gradient = scale_derivative * basis
+            gradient += 2.0 * error * prediction_gradient / count
+            if unitarity_bound is not None and prediction > unitarity_bound:
+                gradient += 2.0 * unitarity_weight * (prediction - unitarity_bound) * prediction_gradient / count
+        if asymptotic_weight:
+            anchor_x = _finite_training_parameter(
+                request.parameters.get("asymptotic_feature_value", 0.0),
+                name="asymptotic_feature_value",
+            )
+            known = _finite_training_parameter(
+                request.parameters.get("asymptotic_known_output", 0.0),
+                name="asymptotic_known_output",
+            )
+            anchor_basis = anchor_x * anchor_x
+            gradient += 2.0 * asymptotic_weight * (scale * anchor_basis - known) * scale_derivative * anchor_basis
+        return gradient
+
+    def _metrics(self, request: TrainingRequest, *, feature_name: str, scale_raw: float) -> dict[str, Any]:
+        scale = self._positive_scale(scale_raw)
+        unitarity_bound = self._unitarity_bound(request)
+        unitarity_penalty_sum = 0.0
+        violation_count = 0
+        squared_error_sum = 0.0
+        predictions: list[float] = []
+        for row in request.training_rows:
+            x_value = _finite_training_parameter(row[feature_name], name=feature_name)
+            prediction = scale * x_value * x_value
+            predictions.append(prediction)
+            error = prediction - _finite_training_parameter(row[request.target_name], name=request.target_name)
+            squared_error_sum += error * error
+            if unitarity_bound is not None and prediction > unitarity_bound:
+                violation_count += 1
+                unitarity_penalty_sum += (prediction - unitarity_bound) ** 2
+        count = float(len(request.training_rows))
+        mse = squared_error_sum / count
+        unitarity_penalty = unitarity_penalty_sum / count
+        unitarity_loss = self._unitarity_penalty_weight(request) * unitarity_penalty
+        anchor_x = _finite_training_parameter(
+            request.parameters.get("asymptotic_feature_value", 0.0),
+            name="asymptotic_feature_value",
+        )
+        known = _finite_training_parameter(
+            request.parameters.get("asymptotic_known_output", 0.0),
+            name="asymptotic_known_output",
+        )
+        asymptotic_error = abs(scale * anchor_x * anchor_x - known)
+        positivity_min = min(predictions + self._stress_predictions(request, feature_name=feature_name, scale=scale))
+        return {
+            "loss": mse + unitarity_loss + self._asymptotic_penalty_weight(request) * asymptotic_error * asymptotic_error,
+            "mse_loss": mse,
+            "unitarity_penalty": unitarity_penalty,
+            "unitarity_loss": unitarity_loss,
+            "unitarity_violation_count": violation_count,
+            "positivity_min_prediction": positivity_min,
+            "asymptotic_limit_abs_error": asymptotic_error,
+            "scale": scale,
+            "scale_raw": scale_raw,
+        }
+
+    def _stress_predictions(self, request: TrainingRequest, *, feature_name: str, scale: float) -> list[float]:
+        raw_values = request.parameters.get("positivity_stress_inputs", (-2.0, -1.0, 0.0, 0.5, 1.0, 2.0))
+        if not isinstance(raw_values, (list, tuple)):
+            raise S2ContractModelError("S2 physics-informed positivity_stress_inputs must be a list or tuple")
+        predictions: list[float] = []
+        for raw_value in raw_values:
+            x_value = _finite_training_parameter(raw_value, name=feature_name)
+            predictions.append(scale * x_value * x_value)
+        return predictions
+
+    @staticmethod
+    def _single_feature(request: TrainingRequest) -> str:
+        if len(request.feature_names) != 1:
+            raise S2ContractModelError("S2 physics-informed backend fixture requires exactly one feature")
+        return request.feature_names[0]
+
+    @staticmethod
+    def _feature_name_from_state(state: Mapping[str, Any]) -> str:
+        feature_names = tuple(state.get("feature_names", ()))
+        if len(feature_names) != 1:
+            raise S2ContractModelError("S2 physics-informed model state requires exactly one feature")
+        return str(feature_names[0])
+
+    @staticmethod
+    def _positive_scale(scale_raw: float) -> float:
+        if scale_raw > 30.0:
+            return scale_raw
+        return math.log1p(math.exp(scale_raw))
+
+    @staticmethod
+    def _scale_derivative(scale_raw: float) -> float:
+        if scale_raw >= 0:
+            z = math.exp(-scale_raw)
+            return 1.0 / (1.0 + z)
+        z = math.exp(scale_raw)
+        return z / (1.0 + z)
+
+    @staticmethod
+    def _unitarity_bound(request: TrainingRequest) -> float | None:
+        raw_bound = request.parameters.get("unitarity_bound")
+        if raw_bound is None:
+            return None
+        bound = _finite_training_parameter(raw_bound, name="unitarity_bound")
+        if bound <= 0:
+            raise S2ContractModelError("S2 physics-informed unitarity_bound must be positive")
+        return bound
+
+    @staticmethod
+    def _unitarity_penalty_weight(request: TrainingRequest) -> float:
+        weight = _finite_training_parameter(
+            request.parameters.get("unitarity_penalty_weight", 0.0),
+            name="unitarity_penalty_weight",
+        )
+        if weight < 0:
+            raise S2ContractModelError("S2 physics-informed unitarity_penalty_weight must be non-negative")
+        return weight
+
+    @staticmethod
+    def _asymptotic_penalty_weight(request: TrainingRequest) -> float:
+        weight = _finite_training_parameter(
+            request.parameters.get("asymptotic_penalty_weight", 0.0),
+            name="asymptotic_penalty_weight",
+        )
+        if weight < 0:
+            raise S2ContractModelError("S2 physics-informed asymptotic_penalty_weight must be non-negative")
+        return weight
+
+
+def _finite_training_parameter(value: Any, *, name: str) -> float:
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError) as exc:
+        raise S2ContractModelError(f"S2 physics-informed parameter {name!r} must be numeric") from exc
+    if not math.isfinite(numeric):
+        raise S2ContractModelError(f"S2 physics-informed parameter {name!r} must be finite")
+    return numeric
+
+
 class TrainingRuntime:
     """S2 training runtime with checkpoint/restart, budget, and cancel semantics."""
 
@@ -4309,7 +4528,7 @@ class TrainingRuntime:
         self._provenance_emitter = provenance_emitter or ProvenanceEmitter(artifact_store=artifact_store)
         self._registry = registry or _default_model_family_registry()
         self._budget_meter = budget_meter
-        self._backends: dict[str, DeterministicLinearTrainingBackend] = {
+        self._backends: dict[str, Any] = {
             "tabular-baseline": DeterministicLinearTrainingBackend(),
         }
         if backends:
@@ -4318,7 +4537,7 @@ class TrainingRuntime:
         self._cancel_reasons: dict[str, str] = {}
         self._interrupt_reasons: dict[str, str] = {}
 
-    def register_backend(self, family_id: str, backend: DeterministicLinearTrainingBackend) -> None:
+    def register_backend(self, family_id: str, backend: Any) -> None:
         family_id = family_id.strip()
         if not family_id:
             raise S2ContractModelError("S2 TrainingRuntime backend registration requires family_id")
@@ -4495,7 +4714,7 @@ class TrainingRuntime:
             cost_actual=self._budget_snapshot(request).as_cost_actual(),
         )
 
-    def _backend_for(self, family_id: str) -> DeterministicLinearTrainingBackend:
+    def _backend_for(self, family_id: str) -> Any:
         try:
             return self._backends[family_id]
         except KeyError as exc:
@@ -5166,7 +5385,7 @@ def _default_model_family_descriptors() -> tuple[ModelFamilyDescriptor, ...]:
             physics_informed=True,
             native_uq="ensemble",
             deterministic_training=True,
-            supported_constraints=("positivity", "asymptotic_limit", "symmetry"),
+            supported_constraints=("positivity", "asymptotic_limit", "symmetry", "unitarity_penalty"),
             training_entrypoint="argus_core.s2.model_families.physics_informed_mlp.train",
             prediction_entrypoint="argus_core.s2.model_families.physics_informed_mlp.predict",
             provenance_ref="c4://model-family/physics-informed-mlp/v1",
@@ -5181,7 +5400,7 @@ def _default_model_family_descriptors() -> tuple[ModelFamilyDescriptor, ...]:
             physics_informed=True,
             native_uq="interval",
             deterministic_training=True,
-            supported_constraints=("forward_model_loss", "gradient_based"),
+            supported_constraints=("forward_model_loss", "gradient_based", "unitarity_penalty"),
             training_entrypoint="argus_core.s2.model_families.differentiable_surrogate.train",
             prediction_entrypoint="argus_core.s2.model_families.differentiable_surrogate.predict",
             provenance_ref="c4://model-family/differentiable-surrogate/v1",
