@@ -21,6 +21,7 @@ from .s5 import C2VersionPolicy, parse_c2_job_envelope
 from .s6 import CapabilityDescriptor, RegistryError
 from .s7 import AdapterBroker, EvalRequest, EvalResult
 from .s8 import ArtifactRecord, InMemoryArtifactStore, Lineage, Producer, assert_lineage_complete
+from .s12 import ConformanceRecord, ConformanceService, SubmissionBundle, sign_submission_bundle
 
 
 class S2Error(Exception):
@@ -68,6 +69,10 @@ class RewardSourceError(S2Error):
 
 class ExplainabilityReportError(S2Error):
     """Raised when S2 cannot generate a build explainability report."""
+
+
+class S2ConformanceError(S2Error):
+    """Raised when S2 cannot assemble an S12 conformance hook from real C4 evidence."""
 
 
 class S2ContractModelError(S2Error):
@@ -6079,6 +6084,313 @@ class VariantBuildResult:
     artifact_refs: tuple[str, ...]
     base_pipeline_ref: str
     diagnostics: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class S2ConformanceRequest:
+    build_result: BuildResult
+    level: str
+    entity_id: str
+    claimed_level: str | None = None
+    maintainer_id: str = "s2-conformance"
+    key_id: str = "s2-conformance-key"
+    maintainer_secret: bytes = b"s2-conformance-maintainer-secret"
+    code_ref: str | None = None
+    container_digest: str | None = None
+    sbom_hash: str = "c4://sbom/s2-conformance"
+    base_pipeline_ref: str | None = None
+    independence_tags: tuple[str, ...] = ("s2-conformance-independent",)
+    reward_path_write_attempt: bool = False
+    egress_attempt: bool = False
+    trust_path_write_attempt: bool = False
+    signing_key_visible_in_sandbox: bool = False
+
+
+@dataclass(frozen=True)
+class S2ConformanceResult:
+    record: ConformanceRecord
+    record_ref: str
+    bundle: SubmissionBundle
+    status: str
+    level_requested: str
+    evidence_refs: tuple[str, ...]
+    recursion_safety: dict[str, Any]
+
+
+class S2ConformanceHarness:
+    """S12 conformance hook that derives bundle predicates from real S2 C4 build artifacts."""
+
+    def __init__(self, *, artifact_store: InMemoryArtifactStore, conformance_service: ConformanceService) -> None:
+        self._artifact_store = artifact_store
+        self._conformance_service = conformance_service
+
+    def run(self, request: S2ConformanceRequest) -> S2ConformanceResult:
+        level = _s2_conformance_level(request.level)
+        build = request.build_result
+        frozen_payload = _s2_conformance_payload(
+            self._artifact_store,
+            build.frozen_pipeline_ref,
+            expected_kind="frozen_pipeline",
+            role="frozen pipeline",
+        )
+        evidence_refs = _s2_conformance_evidence_refs(build, request.base_pipeline_ref)
+        provenance_complete = _s2_conformance_provenance_complete(self._artifact_store, evidence_refs)
+        recursion_safety = _s2_recursion_safety_evidence(build, frozen_payload, base_pipeline_ref=request.base_pipeline_ref)
+        descriptor = _s2_conformance_descriptor(request, build, frozen_payload)
+        bundle = SubmissionBundle(
+            submission_id=f"s2-conformance:{build.job_id}:{level}",
+            entity_id=request.entity_id,
+            maintainer_id=request.maintainer_id,
+            key_id=request.key_id,
+            descriptor_draft=descriptor,
+            claimed_level=request.claimed_level or level,
+            code_ref=request.code_ref or str(frozen_payload.get("config_hash") or build.frozen_pipeline_ref),
+            container_digest=request.container_digest or _s2_conformance_container_digest(frozen_payload),
+            sbom_hash=request.sbom_hash,
+            lifecycle_valid=bool(build.diagnostics.get("status") == "SUCCEEDED" and build.frozen_pipeline_ref),
+            provenance_complete=provenance_complete,
+            attempted_claim_tier=str(build.claim_tier),
+            uncertainty_tagged=_s2_uncertainty_tagged(self._artifact_store, build.uq_calibration_ref),
+            refuses_without_verifier=_s2_verifier_profile_declared(build),
+            typed_error_envelope=_s2_typed_error_surface_declared(build),
+            reward_path_write_attempt=bool(request.reward_path_write_attempt or not recursion_safety["recursion_safe"]),
+            c6_units_present=_s2_io_units_present(frozen_payload),
+            differentiable=_s2_differentiable_model(self._artifact_store, build.model_ref),
+            grad_implemented=_s2_grad_implemented(self._artifact_store, build.model_ref),
+            reproducibility_manifest_complete=_s2_repro_manifest_complete(frozen_payload, provenance_complete),
+            egress_attempt=bool(request.egress_attempt),
+            trust_path_write_attempt=bool(request.trust_path_write_attempt),
+            signing_key_visible_in_sandbox=bool(request.signing_key_visible_in_sandbox),
+        )
+        signed_bundle = sign_submission_bundle(bundle, secret=request.maintainer_secret)
+        record = self._conformance_service.run(signed_bundle, level=level)
+        record_artifact = self._conformance_service.write_record(
+            store=self._artifact_store,
+            record=record,
+            evidence_refs=evidence_refs,
+        )
+        return S2ConformanceResult(
+            record=record,
+            record_ref=record_artifact.artifact_ref,
+            bundle=signed_bundle,
+            status=record.status,
+            level_requested=level,
+            evidence_refs=evidence_refs,
+            recursion_safety=recursion_safety,
+        )
+
+
+def _s2_conformance_level(level: str) -> str:
+    normalized = str(level).strip().lower()
+    if normalized not in {"bronze", "silver", "gold"}:
+        raise S2ConformanceError("S2 conformance level must be one of: bronze, silver, gold")
+    return normalized
+
+
+def _s2_conformance_payload(
+    store: InMemoryArtifactStore,
+    artifact_ref: str | None,
+    *,
+    expected_kind: str,
+    role: str,
+) -> dict[str, Any]:
+    if not artifact_ref:
+        raise S2ConformanceError(f"S2 conformance requires {role} artifact ref")
+    try:
+        record = store.get_record(artifact_ref)
+    except KeyError as exc:
+        raise S2ConformanceError(f"S2 conformance cannot load {role} artifact: {artifact_ref}") from exc
+    if record.kind != expected_kind:
+        raise S2ConformanceError(f"S2 conformance expected {role} kind {expected_kind}, got {record.kind}")
+    payload = json.loads(store.get_artifact(artifact_ref).decode("utf-8"))
+    if not isinstance(payload, dict):
+        raise S2ConformanceError(f"S2 conformance {role} artifact payload must be an object")
+    return payload
+
+
+def _s2_conformance_evidence_refs(build: BuildResult, base_pipeline_ref: str | None) -> tuple[str, ...]:
+    refs = list(build.artifact_refs)
+    refs.extend(
+        ref
+        for ref in (
+            build.frozen_pipeline_ref,
+            build.model_ref,
+            build.dataset_split_ref,
+            build.feature_set_ref,
+            build.hpo_selection_ref,
+            build.training_log_ref,
+            build.uq_calibration_ref,
+            build.advisory_self_check_ref,
+            base_pipeline_ref,
+        )
+        if ref
+    )
+    return tuple(dict.fromkeys(refs))
+
+
+def _s2_conformance_provenance_complete(store: InMemoryArtifactStore, artifact_refs: tuple[str, ...]) -> bool:
+    if not artifact_refs:
+        return False
+    for artifact_ref in artifact_refs:
+        try:
+            record = store.get_record(artifact_ref)
+            raw_payload = json.loads(store.get_artifact(artifact_ref).decode("utf-8"))
+            payload = raw_payload if isinstance(raw_payload, Mapping) else None
+            assert_lineage_complete(
+                record.lineage,
+                kind=record.kind,
+                payload=payload,
+                claim_tier=record.claim_tier,
+                validation_report_ref=record.validation_report_ref,
+            )
+        except Exception:
+            return False
+    return True
+
+
+def _s2_conformance_descriptor(
+    request: S2ConformanceRequest,
+    build: BuildResult,
+    frozen_payload: Mapping[str, Any],
+) -> CapabilityDescriptor:
+    diagnostics = build.diagnostics
+    build_spec = diagnostics.get("build_spec")
+    subtopic = "s2-conformance"
+    if isinstance(build_spec, Mapping) and build_spec.get("subtopic"):
+        subtopic = str(build_spec["subtopic"])
+    return CapabilityDescriptor(
+        entity_id=request.entity_id,
+        revision=1,
+        kind="subagent",
+        owner_subsystem="S2",
+        contract_versions={"C1": "1.0.0", "C5": "1.0.0"},
+        trust_class="internal",
+        capability_scopes=("c1.accept", "c1.plan", "c1.build", "c1.validate", "c1.report"),
+        provenance_ref=build.frozen_pipeline_ref,
+        subtopics=(subtopic,),
+        independence_tags=tuple(request.independence_tags),
+        conformance_level=None,
+    )
+
+
+def _s2_conformance_container_digest(frozen_payload: Mapping[str, Any]) -> str:
+    raw = str(frozen_payload.get("container_digest") or "")
+    marker = "sha256:"
+    if marker in raw:
+        return marker + raw.split(marker, 1)[1]
+    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    return f"{marker}{digest}"
+
+
+def _s2_recursion_safety_evidence(
+    build: BuildResult,
+    frozen_payload: Mapping[str, Any],
+    *,
+    base_pipeline_ref: str | None,
+) -> dict[str, Any]:
+    diagnostics = build.diagnostics
+    config = frozen_payload.get("config")
+    config = config if isinstance(config, Mapping) else {}
+    replay = frozen_payload.get("self_replay")
+    replay = replay if isinstance(replay, Mapping) else {}
+    resolved_base_ref = base_pipeline_ref or config.get("base_pipeline_ref")
+    reward_source = str(diagnostics.get("reward_source") or config.get("reward_source") or "").lower()
+    score_returned = bool(
+        hasattr(build, "score")
+        or "score" in diagnostics
+        or "score" in frozen_payload
+        or "fitness" in diagnostics
+        or "reward" in diagnostics
+    )
+    recursion_safe = bool(
+        resolved_base_ref
+        and reward_source == "c3-only"
+        and not score_returned
+        and replay.get("status") == "PASS"
+        and frozen_payload.get("claim_tier") == "ran-toy"
+    )
+    return {
+        "base_pipeline_ref": resolved_base_ref,
+        "reward_source": reward_source,
+        "s2_score_returned": score_returned,
+        "self_replay_status": replay.get("status"),
+        "claim_tier": frozen_payload.get("claim_tier"),
+        "recursion_safe": recursion_safe,
+    }
+
+
+def _s2_uncertainty_tagged(store: InMemoryArtifactStore, uq_calibration_ref: str | None) -> bool:
+    if uq_calibration_ref is None:
+        return False
+    payload = _s2_conformance_payload(
+        store,
+        uq_calibration_ref,
+        expected_kind="uq_calibration",
+        role="UQ calibration",
+    )
+    uncertainty_tag = payload.get("uncertainty_tag")
+    return (
+        isinstance(uncertainty_tag, Mapping)
+        and bool(uncertainty_tag.get("kind"))
+        and str(payload.get("uncertainty_method") or "none") != "none"
+        and payload.get("self_replay", {}).get("status") == "PASS"
+    )
+
+
+def _s2_verifier_profile_declared(build: BuildResult) -> bool:
+    build_spec = build.diagnostics.get("build_spec")
+    return isinstance(build_spec, Mapping) and bool(build_spec.get("verifier_profile_ref"))
+
+
+def _s2_typed_error_surface_declared(build: BuildResult) -> bool:
+    build_spec = build.diagnostics.get("build_spec")
+    return build.diagnostics.get("status") == "SUCCEEDED" and isinstance(build_spec, Mapping)
+
+
+def _s2_io_units_present(frozen_payload: Mapping[str, Any]) -> bool:
+    io_signature = frozen_payload.get("io_signature")
+    if not isinstance(io_signature, Mapping):
+        return False
+    for section_name in ("inputs", "outputs"):
+        section = io_signature.get(section_name)
+        if not isinstance(section, Mapping) or not section:
+            return False
+        for spec in section.values():
+            if not isinstance(spec, Mapping) or not isinstance(spec.get("units"), str) or not spec.get("units"):
+                return False
+    return True
+
+
+def _s2_differentiable_model(store: InMemoryArtifactStore, model_ref: str) -> bool:
+    payload = _s2_conformance_payload(store, model_ref, expected_kind="model_checkpoint", role="model checkpoint")
+    backend = str(payload.get("backend") or payload.get("family_id") or "")
+    return bool(payload.get("differentiable") is True or backend in {"physics-informed", "physics_informed"})
+
+
+def _s2_grad_implemented(store: InMemoryArtifactStore, model_ref: str) -> bool:
+    payload = _s2_conformance_payload(store, model_ref, expected_kind="model_checkpoint", role="model checkpoint")
+    if not _s2_differentiable_model(store, model_ref):
+        return False
+    return bool(payload.get("grad_implemented") or payload.get("supports_grad") or payload.get("gradient_ref"))
+
+
+def _s2_repro_manifest_complete(frozen_payload: Mapping[str, Any], provenance_complete: bool) -> bool:
+    component_refs = frozen_payload.get("component_refs")
+    replay = frozen_payload.get("self_replay")
+    if not isinstance(component_refs, Mapping) or not isinstance(replay, Mapping):
+        return False
+    required_component_refs = ("feature_set_ref", "model_checkpoint_ref", "calibration_artifact_ref")
+    return bool(
+        provenance_complete
+        and all(isinstance(component_refs.get(ref_name), str) and component_refs.get(ref_name) for ref_name in required_component_refs)
+        and isinstance(component_refs.get("input_refs"), list)
+        and component_refs.get("input_refs")
+        and frozen_payload.get("config_hash")
+        and frozen_payload.get("params_hash")
+        and frozen_payload.get("seeds")
+        and frozen_payload.get("container_digest")
+        and replay.get("status") == "PASS"
+    )
 
 
 class ProvenanceEmitter:

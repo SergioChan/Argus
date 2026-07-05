@@ -77,6 +77,7 @@ class ConformanceRecord:
     aggregate_passed: bool
     determinism_hash: str
     signer_key_id: str
+    status: str = "PASSED"
     signature: str = ""
 
 
@@ -236,6 +237,7 @@ class ConformanceService:
         checks = _conformance_checks(bundle, level)
         aggregate = all(check.status == "PASS" for check in checks)
         level_awarded = level if aggregate else _previous_level(level)
+        status = _conformance_status(checks, aggregate)
         body = ConformanceRecord(
             record_id="",
             submission_id=bundle.submission_id,
@@ -254,17 +256,24 @@ class ConformanceService:
                 }
             ),
             signer_key_id=self._signer_key_id,
+            status=status,
         )
         body = replace(body, record_id=hash_json(_record_unsigned_payload(body)))
         return sign_conformance_record(body, secret=self._signer_secret)
 
-    def write_record(self, *, store: InMemoryArtifactStore, record: ConformanceRecord) -> ArtifactRecord:
+    def write_record(
+        self,
+        *,
+        store: InMemoryArtifactStore,
+        record: ConformanceRecord,
+        evidence_refs: tuple[str, ...] = (),
+    ) -> ArtifactRecord:
         return store.create_artifact(
             kind="conformance_record",
             payload=asdict(record),
             producer=Producer(subsystem="S12", version="0.0.0"),
             lineage=Lineage(
-                input_refs=(record.standard_release_ref,),
+                input_refs=tuple(dict.fromkeys((record.standard_release_ref,) + tuple(evidence_refs))),
                 code_ref="git:s12-conformance",
                 environment_digest="oci:s12-conformance",
             ),
@@ -597,6 +606,20 @@ def _conformance_checks(bundle: SubmissionBundle, level: str) -> list[Conformanc
             ]
         )
     return checks
+
+
+def _conformance_status(checks: list[ConformanceCheck], aggregate_passed: bool) -> str:
+    if aggregate_passed:
+        return "PASSED"
+    quarantine_checks = {
+        "GLD-RECURSION-NO-REWARD-WRITE",
+        "GLD-SANDBOX-EGRESS",
+        "GLD-NO-TRUST-PATH-WRITE",
+        "GLD-NO-SIGNING-KEY",
+    }
+    if any(check.check_id in quarantine_checks and check.status == "FAIL" for check in checks):
+        return "QUARANTINED"
+    return "FAILED"
 
 
 def _check(check_id: str, passed: bool, oracle_spec: str) -> ConformanceCheck:
