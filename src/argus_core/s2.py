@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 import hashlib
 from itertools import product
 import json
@@ -2483,6 +2483,435 @@ class TrainingRunResult:
     partial_checkpoint: PartialModelCheckpoint | None
     diagnostics: dict[str, Any]
     cost_actual: dict[str, float | int]
+
+
+@dataclass(frozen=True)
+class FailureSymptom:
+    code: str
+    message: str
+    metrics: dict[str, Any] = field(default_factory=dict)
+    evidence_refs: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        code = self.code.strip()
+        message = self.message.strip()
+        evidence_refs = tuple(str(ref).strip() for ref in self.evidence_refs)
+        if not code:
+            raise S2ContractModelError("S2 FailureSymptom requires code")
+        if not message:
+            raise S2ContractModelError("S2 FailureSymptom requires message")
+        if any(not ref for ref in evidence_refs):
+            raise S2ContractModelError("S2 FailureSymptom evidence_refs cannot contain empty refs")
+        object.__setattr__(self, "code", code)
+        object.__setattr__(self, "message", message)
+        object.__setattr__(self, "metrics", dict(self.metrics))
+        object.__setattr__(self, "evidence_refs", evidence_refs)
+
+
+@dataclass(frozen=True)
+class FailureRepairProposal:
+    code: str
+    reason: str
+    learning_rate: float
+    parameters: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        code = self.code.strip()
+        reason = self.reason.strip()
+        learning_rate = float(self.learning_rate)
+        if not code:
+            raise S2ContractModelError("S2 FailureRepairProposal requires code")
+        if not reason:
+            raise S2ContractModelError("S2 FailureRepairProposal requires reason")
+        if learning_rate <= 0 or not math.isfinite(learning_rate):
+            raise S2ContractModelError("S2 FailureRepairProposal learning_rate must be finite and positive")
+        object.__setattr__(self, "code", code)
+        object.__setattr__(self, "reason", reason)
+        object.__setattr__(self, "learning_rate", learning_rate)
+        object.__setattr__(self, "parameters", dict(self.parameters))
+
+
+@dataclass(frozen=True)
+class FailureProbeResult:
+    status: str
+    metrics: dict[str, Any] = field(default_factory=dict)
+    symptom: FailureSymptom | None = None
+    training_artifact_ref: str | None = None
+
+    def __post_init__(self) -> None:
+        status = self.status.strip()
+        if status not in {"RESOLVED", "FAILED"}:
+            raise S2ContractModelError(f"unsupported S2 FailureProbeResult status: {status}")
+        training_artifact_ref = None if self.training_artifact_ref is None else self.training_artifact_ref.strip()
+        if training_artifact_ref == "":
+            raise S2ContractModelError("S2 FailureProbeResult training_artifact_ref cannot be empty")
+        object.__setattr__(self, "status", status)
+        object.__setattr__(self, "metrics", dict(self.metrics))
+        object.__setattr__(self, "training_artifact_ref", training_artifact_ref)
+
+    @property
+    def resolved(self) -> bool:
+        return self.status == "RESOLVED"
+
+
+@dataclass(frozen=True)
+class FailureRepairAction:
+    code: str
+    reason: str
+    attempt: int
+    learning_rate: float
+    parameters: dict[str, Any]
+    probe_result: str
+    resolved: bool
+    metrics: dict[str, Any] = field(default_factory=dict)
+    training_artifact_ref: str | None = None
+
+    def __post_init__(self) -> None:
+        code = self.code.strip()
+        reason = self.reason.strip()
+        probe_result = self.probe_result.strip()
+        if not code:
+            raise S2ContractModelError("S2 FailureRepairAction requires code")
+        if not reason:
+            raise S2ContractModelError("S2 FailureRepairAction requires reason")
+        if self.attempt <= 0:
+            raise S2ContractModelError("S2 FailureRepairAction attempt must be positive")
+        if not probe_result:
+            raise S2ContractModelError("S2 FailureRepairAction requires probe_result")
+        training_artifact_ref = None if self.training_artifact_ref is None else self.training_artifact_ref.strip()
+        if training_artifact_ref == "":
+            raise S2ContractModelError("S2 FailureRepairAction training_artifact_ref cannot be empty")
+        object.__setattr__(self, "code", code)
+        object.__setattr__(self, "reason", reason)
+        object.__setattr__(self, "learning_rate", float(self.learning_rate))
+        object.__setattr__(self, "parameters", dict(self.parameters))
+        object.__setattr__(self, "probe_result", probe_result)
+        object.__setattr__(self, "metrics", dict(self.metrics))
+        object.__setattr__(self, "training_artifact_ref", training_artifact_ref)
+
+
+RepairPlanner = Callable[[FailureSymptom, TrainingRequest, int], FailureRepairProposal]
+FailureProbe = Callable[[TrainingRequest], FailureProbeResult]
+
+
+@dataclass(frozen=True)
+class FailureDiagnosisRequest:
+    job_id: str
+    training_request: TrainingRequest
+    observed_symptom: FailureSymptom
+    max_repair_attempts: int
+    code_ref: str
+    environment_digest: str
+    seed: str
+    repair_planner: RepairPlanner | None = field(default=None, compare=False, repr=False)
+    probe: FailureProbe | None = field(default=None, compare=False, repr=False)
+
+    def __post_init__(self) -> None:
+        job_id = self.job_id.strip()
+        code_ref = self.code_ref.strip()
+        environment_digest = self.environment_digest.strip()
+        seed = self.seed.strip()
+        if not job_id:
+            raise S2ContractModelError("S2 FailureDiagnosisRequest requires job_id")
+        if self.max_repair_attempts <= 0:
+            raise S2ContractModelError("S2 FailureDiagnosisRequest max_repair_attempts must be positive")
+        if not code_ref:
+            raise S2ContractModelError("S2 FailureDiagnosisRequest requires code_ref")
+        if not environment_digest:
+            raise S2ContractModelError("S2 FailureDiagnosisRequest requires environment_digest")
+        if not seed:
+            raise S2ContractModelError("S2 FailureDiagnosisRequest requires seed")
+        object.__setattr__(self, "job_id", job_id)
+        object.__setattr__(self, "code_ref", code_ref)
+        object.__setattr__(self, "environment_digest", environment_digest)
+        object.__setattr__(self, "seed", seed)
+
+
+@dataclass(frozen=True)
+class FailureDiagnosisResult:
+    job_id: str
+    status: str
+    repair_actions: tuple[FailureRepairAction, ...]
+    repair_log_ref: str
+    final_training_request: TrainingRequest
+    final_symptom: FailureSymptom | None
+    final_metrics: dict[str, Any]
+    diagnostics: dict[str, Any] = field(default_factory=dict)
+
+
+class FailureDoctor:
+    """Diagnoses bounded S2 training failures and logs repair attempts to C4."""
+
+    def __init__(
+        self,
+        *,
+        artifact_store: InMemoryArtifactStore,
+        provenance_emitter: "ProvenanceEmitter" | None = None,
+    ) -> None:
+        self._artifact_store = artifact_store
+        self._provenance_emitter = provenance_emitter or ProvenanceEmitter(artifact_store=artifact_store)
+
+    def diagnose_and_repair(self, request: FailureDiagnosisRequest) -> FailureDiagnosisResult:
+        current_request = request.training_request
+        current_symptom = request.observed_symptom
+        seen_repair_states = {self._repair_state_key(current_request)}
+        actions: list[FailureRepairAction] = []
+        final_metrics: dict[str, Any] = {}
+
+        for attempt in range(1, request.max_repair_attempts + 1):
+            proposal = self._plan_repair(request, current_symptom, current_request, attempt)
+            candidate = self._apply_repair(current_request, proposal)
+            candidate_key = self._repair_state_key(candidate)
+            if candidate_key in seen_repair_states:
+                actions.append(
+                    FailureRepairAction(
+                        code="repair_loop_detected",
+                        reason="repair proposal repeats a previous training configuration",
+                        attempt=attempt,
+                        learning_rate=candidate.learning_rate,
+                        parameters=dict(candidate.parameters),
+                        probe_result="loop_detected",
+                        resolved=False,
+                        metrics={},
+                    )
+                )
+                return self._emit_result(
+                    request=request,
+                    status="QUARANTINED",
+                    actions=tuple(actions),
+                    final_training_request=current_request,
+                    final_symptom=current_symptom,
+                    final_metrics=final_metrics,
+                )
+            seen_repair_states.add(candidate_key)
+
+            probe_result = self._run_probe(request, candidate)
+            final_metrics = dict(probe_result.metrics)
+            actions.append(
+                FailureRepairAction(
+                    code=proposal.code,
+                    reason=proposal.reason,
+                    attempt=attempt,
+                    learning_rate=candidate.learning_rate,
+                    parameters=dict(candidate.parameters),
+                    probe_result="resolved" if probe_result.resolved else "failed",
+                    resolved=probe_result.resolved,
+                    metrics=probe_result.metrics,
+                    training_artifact_ref=probe_result.training_artifact_ref,
+                )
+            )
+            if probe_result.resolved:
+                return self._emit_result(
+                    request=request,
+                    status="RESOLVED",
+                    actions=tuple(actions),
+                    final_training_request=candidate,
+                    final_symptom=None,
+                    final_metrics=final_metrics,
+                )
+            current_request = candidate
+            current_symptom = probe_result.symptom or current_symptom
+
+        return self._emit_result(
+            request=request,
+            status="QUARANTINED",
+            actions=tuple(actions),
+            final_training_request=current_request,
+            final_symptom=current_symptom,
+            final_metrics=final_metrics,
+        )
+
+    def _plan_repair(
+        self,
+        request: FailureDiagnosisRequest,
+        symptom: FailureSymptom,
+        current_request: TrainingRequest,
+        attempt: int,
+    ) -> FailureRepairProposal:
+        if request.repair_planner is not None:
+            return request.repair_planner(symptom, current_request, attempt)
+        if symptom.code in {"nan_loss", "loss_nan", "divergent_loss"}:
+            parameters = dict(current_request.parameters)
+            parameters.setdefault("gradient_clip_norm", 1.0)
+            repaired_lr = max(min(current_request.learning_rate * 0.1, 0.05), 1e-6)
+            return FailureRepairProposal(
+                code="nan_loss",
+                reason="lower learning rate and add gradient clipping after NaN/divergent loss",
+                learning_rate=repaired_lr,
+                parameters=parameters,
+            )
+        return FailureRepairProposal(
+            code="no_repair_policy",
+            reason=f"no bounded S2 repair policy for symptom {symptom.code!r}",
+            learning_rate=current_request.learning_rate,
+            parameters=dict(current_request.parameters),
+        )
+
+    @staticmethod
+    def _apply_repair(training_request: TrainingRequest, proposal: FailureRepairProposal) -> TrainingRequest:
+        return replace(
+            training_request,
+            learning_rate=proposal.learning_rate,
+            parameters=dict(proposal.parameters),
+        )
+
+    def _run_probe(self, request: FailureDiagnosisRequest, candidate: TrainingRequest) -> FailureProbeResult:
+        if request.probe is not None:
+            return request.probe(candidate)
+        runtime = TrainingRuntime(artifact_store=self._artifact_store, provenance_emitter=self._provenance_emitter)
+        try:
+            result = runtime.train(candidate)
+        except S2BudgetExceededError as exc:
+            return FailureProbeResult(
+                status="FAILED",
+                metrics=exc.snapshot.as_cost_actual(),
+                symptom=FailureSymptom(code=exc.code, message=exc.message, metrics=exc.snapshot.as_cost_actual()),
+                training_artifact_ref=exc.partial_checkpoint.artifact_ref if exc.partial_checkpoint else None,
+            )
+        metrics = dict(result.diagnostics.get("final_metrics", {}))
+        loss = metrics.get("loss")
+        if isinstance(loss, (int, float)) and math.isfinite(float(loss)):
+            return FailureProbeResult(
+                status="RESOLVED",
+                metrics=metrics,
+                training_artifact_ref=result.final_checkpoint_ref,
+            )
+        return FailureProbeResult(
+            status="FAILED",
+            metrics=metrics,
+            symptom=FailureSymptom(code="nan_loss", message="probe training did not produce finite loss", metrics=metrics),
+            training_artifact_ref=result.final_checkpoint_ref,
+        )
+
+    def _emit_result(
+        self,
+        *,
+        request: FailureDiagnosisRequest,
+        status: str,
+        actions: tuple[FailureRepairAction, ...],
+        final_training_request: TrainingRequest,
+        final_symptom: FailureSymptom | None,
+        final_metrics: Mapping[str, Any],
+    ) -> FailureDiagnosisResult:
+        input_refs = self._lineage_input_refs(request, actions)
+        payload = {
+            "job_id": request.job_id,
+            "status": status,
+            "observed_symptom": self._symptom_payload(request.observed_symptom),
+            "final_symptom": self._symptom_payload(final_symptom) if final_symptom is not None else None,
+            "max_repair_attempts": request.max_repair_attempts,
+            "repair_actions": [self._repair_action_payload(action) for action in actions],
+            "final_metrics": self._safe_json_value(dict(final_metrics)),
+            "final_training_request": self._training_request_summary(final_training_request),
+            "diagnostics": {
+                "attempt_count": len(actions),
+                "bounded": True,
+                "claim_tier": "ran-toy",
+            },
+        }
+        record = self._provenance_emitter.emit_artifact(
+            kind="failure_repair_log",
+            payload=payload,
+            producer=Producer(subsystem="S2", version="0.0.0", job_id=request.job_id),
+            lineage=Lineage(
+                input_refs=input_refs,
+                code_ref=request.code_ref,
+                environment_digest=request.environment_digest,
+                seeds=(request.seed,),
+                job_id=request.job_id,
+            ),
+            claim_tier="ran-toy",
+        )
+        return FailureDiagnosisResult(
+            job_id=request.job_id,
+            status=status,
+            repair_actions=actions,
+            repair_log_ref=record.artifact_ref,
+            final_training_request=final_training_request,
+            final_symptom=final_symptom,
+            final_metrics=dict(final_metrics),
+            diagnostics=dict(payload["diagnostics"]),
+        )
+
+    @staticmethod
+    def _lineage_input_refs(
+        request: FailureDiagnosisRequest,
+        actions: tuple[FailureRepairAction, ...],
+    ) -> tuple[str, ...]:
+        refs: list[str] = []
+        for ref in tuple(request.training_request.input_refs) + tuple(request.observed_symptom.evidence_refs):
+            if ref not in refs:
+                refs.append(ref)
+        for action in actions:
+            if action.training_artifact_ref and action.training_artifact_ref not in refs:
+                refs.append(action.training_artifact_ref)
+        return tuple(refs)
+
+    @staticmethod
+    def _repair_state_key(training_request: TrainingRequest) -> str:
+        return json.dumps(
+            {
+                "family_id": training_request.family_id,
+                "learning_rate": training_request.learning_rate,
+                "parameters": training_request.parameters,
+                "max_epochs": training_request.max_epochs,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+
+    @classmethod
+    def _repair_action_payload(cls, action: FailureRepairAction) -> dict[str, Any]:
+        return {
+            "code": action.code,
+            "reason": action.reason,
+            "attempt": action.attempt,
+            "learning_rate": action.learning_rate,
+            "parameters": cls._safe_json_value(action.parameters),
+            "probe_result": action.probe_result,
+            "resolved": action.resolved,
+            "metrics": cls._safe_json_value(action.metrics),
+            "training_artifact_ref": action.training_artifact_ref,
+        }
+
+    @classmethod
+    def _symptom_payload(cls, symptom: FailureSymptom) -> dict[str, Any]:
+        return {
+            "code": symptom.code,
+            "message": symptom.message,
+            "metrics": cls._safe_json_value(symptom.metrics),
+            "evidence_refs": list(symptom.evidence_refs),
+        }
+
+    @staticmethod
+    def _training_request_summary(training_request: TrainingRequest) -> dict[str, Any]:
+        return {
+            "job_id": training_request.job_id,
+            "family_id": training_request.family_id,
+            "input_refs": list(training_request.input_refs),
+            "feature_names": list(training_request.feature_names),
+            "target_name": training_request.target_name,
+            "max_epochs": training_request.max_epochs,
+            "learning_rate": training_request.learning_rate,
+            "parameters": dict(training_request.parameters),
+        }
+
+    @classmethod
+    def _safe_json_value(cls, value: Any) -> Any:
+        if isinstance(value, float):
+            if math.isnan(value):
+                return "NaN"
+            if math.isinf(value):
+                return "Infinity" if value > 0 else "-Infinity"
+            return value
+        if isinstance(value, Mapping):
+            return {str(key): cls._safe_json_value(item) for key, item in value.items()}
+        if isinstance(value, tuple):
+            return [cls._safe_json_value(item) for item in value]
+        if isinstance(value, list):
+            return [cls._safe_json_value(item) for item in value]
+        return value
 
 
 @dataclass(frozen=True)
