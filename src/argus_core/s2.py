@@ -447,6 +447,217 @@ class BuildBudget:
     max_gpu_seconds: float | None = None
     max_model_tokens: int | None = None
 
+    def __post_init__(self) -> None:
+        if self.max_usd < 0:
+            raise S2ContractModelError("S2 build budget max_usd must be non-negative")
+        if self.max_wallclock_seconds < 0:
+            raise S2ContractModelError("S2 build budget max_wallclock_seconds must be non-negative")
+        if self.max_gpu_seconds is not None and self.max_gpu_seconds < 0:
+            raise S2ContractModelError("S2 build budget max_gpu_seconds must be non-negative")
+        if self.max_model_tokens is not None and self.max_model_tokens < 0:
+            raise S2ContractModelError("S2 build budget max_model_tokens must be non-negative")
+
+
+@dataclass(frozen=True)
+class PartialModelCheckpoint:
+    artifact_ref: str
+    reason: str
+    metrics: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if not self.artifact_ref:
+            raise S2ContractModelError("S2 partial checkpoints require artifact_ref")
+        if not self.reason:
+            raise S2ContractModelError("S2 partial checkpoints require reason")
+
+
+@dataclass(frozen=True)
+class SpendSnapshot:
+    job_id: str
+    wallclock_seconds: float
+    gpu_seconds: float
+    model_tokens: int
+    cost_usd: float
+    halted_reason: str | None = None
+    partial_checkpoint: PartialModelCheckpoint | None = None
+
+    def as_cost_actual(self) -> dict[str, float | int]:
+        return {
+            "wallclock_seconds": self.wallclock_seconds,
+            "gpu_seconds": self.gpu_seconds,
+            "model_tokens": self.model_tokens,
+            "cost_usd": self.cost_usd,
+        }
+
+
+class S2BudgetExceededError(S2Error):
+    """Raised when S2 metered spend exceeds a hard C2-derived budget cap."""
+
+    def __init__(
+        self,
+        *,
+        code: str,
+        message: str,
+        snapshot: SpendSnapshot,
+        limit: float | int,
+        observed: float | int,
+        grace_limit: float | int,
+        partial_checkpoint: PartialModelCheckpoint | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.category = "BUDGET"
+        self.code = code
+        self.message = message
+        self.retryable = False
+        self.snapshot = snapshot
+        self.limit = limit
+        self.observed = observed
+        self.grace_limit = grace_limit
+        self.partial_checkpoint = partial_checkpoint
+
+    def as_c1_payload(self) -> dict[str, Any]:
+        return {
+            "category": self.category,
+            "code": self.code,
+            "message": self.message,
+            "retryable": self.retryable,
+            "cost_actual": self.snapshot.as_cost_actual(),
+            "partial_checkpoint_ref": self.partial_checkpoint.artifact_ref if self.partial_checkpoint else None,
+        }
+
+
+class BudgetMeter:
+    """S2 spend meter that fails closed on hard budget breaches."""
+
+    def __init__(
+        self,
+        *,
+        job_id: str,
+        budget: BuildBudget,
+        grace_fraction: float = 0.0,
+    ) -> None:
+        if not job_id:
+            raise S2ContractModelError("S2 BudgetMeter requires job_id")
+        if grace_fraction < 0:
+            raise S2ContractModelError("S2 BudgetMeter grace_fraction must be non-negative")
+        self._job_id = job_id
+        self._budget = budget
+        self._grace_fraction = float(grace_fraction)
+        self._snapshot = SpendSnapshot(
+            job_id=job_id,
+            wallclock_seconds=0.0,
+            gpu_seconds=0.0,
+            model_tokens=0,
+            cost_usd=0.0,
+        )
+        self._halt_error: S2BudgetExceededError | None = None
+
+    @classmethod
+    def from_budget(
+        cls,
+        *,
+        job_id: str,
+        budget: BuildBudget,
+        grace_fraction: float = 0.0,
+    ) -> "BudgetMeter":
+        return cls(job_id=job_id, budget=budget, grace_fraction=grace_fraction)
+
+    @property
+    def job_id(self) -> str:
+        return self._job_id
+
+    @property
+    def budget(self) -> BuildBudget:
+        return self._budget
+
+    def record(
+        self,
+        *,
+        wallclock_seconds: float = 0.0,
+        gpu_seconds: float = 0.0,
+        model_tokens: int = 0,
+        cost_usd: float = 0.0,
+        partial_checkpoint: PartialModelCheckpoint | None = None,
+    ) -> SpendSnapshot:
+        if self._halt_error is not None:
+            raise self._halt_error
+        self._assert_non_negative(
+            wallclock_seconds=wallclock_seconds,
+            gpu_seconds=gpu_seconds,
+            model_tokens=model_tokens,
+            cost_usd=cost_usd,
+        )
+        next_snapshot = SpendSnapshot(
+            job_id=self._job_id,
+            wallclock_seconds=self._snapshot.wallclock_seconds + float(wallclock_seconds),
+            gpu_seconds=self._snapshot.gpu_seconds + float(gpu_seconds),
+            model_tokens=self._snapshot.model_tokens + int(model_tokens),
+            cost_usd=self._snapshot.cost_usd + float(cost_usd),
+        )
+        breach = self._breach(next_snapshot)
+        if breach is not None:
+            code, limit, observed = breach
+            halted = SpendSnapshot(
+                job_id=next_snapshot.job_id,
+                wallclock_seconds=next_snapshot.wallclock_seconds,
+                gpu_seconds=next_snapshot.gpu_seconds,
+                model_tokens=next_snapshot.model_tokens,
+                cost_usd=next_snapshot.cost_usd,
+                halted_reason=code,
+                partial_checkpoint=partial_checkpoint,
+            )
+            self._snapshot = halted
+            self._halt_error = S2BudgetExceededError(
+                code=code,
+                message=f"S2 budget exceeded: {code}",
+                snapshot=halted,
+                limit=limit,
+                observed=observed,
+                grace_limit=self._grace_limit(limit),
+                partial_checkpoint=partial_checkpoint,
+            )
+            raise self._halt_error
+        self._snapshot = next_snapshot
+        return self._snapshot
+
+    def snapshot(self) -> SpendSnapshot:
+        return self._snapshot
+
+    def assert_open(self) -> None:
+        if self._halt_error is not None:
+            raise self._halt_error
+
+    def _breach(self, snapshot: SpendSnapshot) -> tuple[str, float | int, float | int] | None:
+        if snapshot.wallclock_seconds > self._budget.max_wallclock_seconds:
+            return ("WALLCLOCK_SECONDS_EXCEEDED", self._budget.max_wallclock_seconds, snapshot.wallclock_seconds)
+        if self._budget.max_gpu_seconds is not None and snapshot.gpu_seconds > self._budget.max_gpu_seconds:
+            return ("GPU_SECONDS_EXCEEDED", self._budget.max_gpu_seconds, snapshot.gpu_seconds)
+        if self._budget.max_model_tokens is not None and snapshot.model_tokens > self._budget.max_model_tokens:
+            return ("MODEL_TOKENS_EXCEEDED", self._budget.max_model_tokens, snapshot.model_tokens)
+        if snapshot.cost_usd > self._budget.max_usd:
+            return ("COST_USD_EXCEEDED", self._budget.max_usd, snapshot.cost_usd)
+        return None
+
+    def _grace_limit(self, limit: float | int) -> float:
+        return float(limit) * (1.0 + self._grace_fraction)
+
+    @staticmethod
+    def _assert_non_negative(
+        *,
+        wallclock_seconds: float,
+        gpu_seconds: float,
+        model_tokens: int,
+        cost_usd: float,
+    ) -> None:
+        if wallclock_seconds < 0:
+            raise S2ContractModelError("S2 BudgetMeter wallclock_seconds increments must be non-negative")
+        if gpu_seconds < 0:
+            raise S2ContractModelError("S2 BudgetMeter gpu_seconds increments must be non-negative")
+        if model_tokens < 0:
+            raise S2ContractModelError("S2 BudgetMeter model_tokens increments must be non-negative")
+        if cost_usd < 0:
+            raise S2ContractModelError("S2 BudgetMeter cost_usd increments must be non-negative")
+
 
 @dataclass(frozen=True)
 class BuildSpec:
@@ -829,6 +1040,7 @@ class BuildResult:
     adapter_provenance_refs: tuple[str, ...]
     claim_tier: str
     diagnostics: dict[str, Any]
+    cost_actual: dict[str, float | int] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -1130,18 +1342,22 @@ class BaselineBuilder:
         artifact_store: InMemoryArtifactStore,
         adapter_broker: AdapterBroker,
         provenance_emitter: ProvenanceEmitter | None = None,
+        budget_meter: BudgetMeter | None = None,
     ) -> None:
         self._artifact_store = artifact_store
         self._adapter_broker = adapter_broker
         self._provenance_emitter = provenance_emitter or ProvenanceEmitter(artifact_store=artifact_store)
+        self._budget_meter = budget_meter
 
     def build(self, plan: BuildPlan, *, attempted_claim_tier: str | None = None) -> BuildResult:
         if attempted_claim_tier and attempted_claim_tier != "ran-toy":
             raise SelfGradeError("S2 cannot assign claim_tier above ran-toy")
+        self._assert_budget_open(plan)
 
         adapter_result = self._adapter_broker.evaluate(plan.adapter_request)
         model_record = self._write_model(plan, adapter_result)
         pipeline_record = self._write_frozen_pipeline(plan, model_record, adapter_result)
+        budget_snapshot = self._budget_snapshot(plan)
         return BuildResult(
             job_id=plan.job_id,
             model_ref=model_record.artifact_ref,
@@ -1153,7 +1369,10 @@ class BaselineBuilder:
                 "model_family": plan.model_family,
                 "adapter_id": adapter_result.adapter_id,
                 "extrapolation_flag": adapter_result.extrapolation_flag,
+                "budget_halted": budget_snapshot.halted_reason is not None,
+                "budget_halted_reason": budget_snapshot.halted_reason,
             },
+            cost_actual=budget_snapshot.as_cost_actual(),
         )
 
     def build_variant(
@@ -1238,6 +1457,24 @@ class BaselineBuilder:
             ),
             claim_tier="ran-toy",
         )
+
+    def _assert_budget_open(self, plan: BuildPlan) -> None:
+        if self._budget_meter is None:
+            return
+        if self._budget_meter.job_id != plan.job_id:
+            raise S2ContractModelError("S2 BudgetMeter job_id must match BuildPlan job_id")
+        self._budget_meter.assert_open()
+
+    def _budget_snapshot(self, plan: BuildPlan) -> SpendSnapshot:
+        if self._budget_meter is None:
+            return SpendSnapshot(
+                job_id=plan.job_id,
+                wallclock_seconds=0.0,
+                gpu_seconds=0.0,
+                model_tokens=0,
+                cost_usd=0.0,
+            )
+        return self._budget_meter.snapshot()
 
 
 _MODEL_FAMILY_REGISTRY: ModelFamilyRegistry | None = None
