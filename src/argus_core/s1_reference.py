@@ -21,6 +21,7 @@ from .s1 import (
 )
 from .s3 import (
     CheckResult,
+    PerturbationPairOutcome,
     S3Verifier,
     attest_challenger_independence,
     run_calibration_check,
@@ -43,6 +44,8 @@ S1_REFERENCE_PHYSICS_PROPONENT_ID = "s1-reference-physics"
 S1_REFERENCE_S3_VERIFIER_ID = "s3-reference-verifier"
 S1_REFERENCE_S3_REFEREE_KEY_ID = "s3-reference-referee-key"
 S1_REFERENCE_S3_REFEREE_SECRET = b"s3-reference-referee-secret"
+S1_REFERENCE_SHOULD_REACT_ALPHA_SCALE = 0.2
+S1_REFERENCE_MUST_NOT_REACT_VW_DELTA = 0.02
 
 
 @dataclass(frozen=True)
@@ -437,10 +440,18 @@ class S1ReferencePhysicsSubagent(Subagent):
             {"inputs": self.adapter_inputs, "seed": 7},
         )
         result = dict(adapter_call["result"])
+        perturbation_observations = _reference_adapter_perturbation_observations(
+            ctx=ctx,
+            adapter_inputs=self.adapter_inputs,
+        )
         diagnostics = {
             "dataset_ref": dataset["dataset_ref"],
             "adapter_id": result["adapter_id"],
             "adapter_provenance_ref": adapter_call["provenance_ref"],
+            "perturbation_provenance_refs": [
+                perturbation_observations["must_react"]["provenance_ref"],
+                perturbation_observations["must_not_react"]["provenance_ref"],
+            ],
             "in_validity_domain": result["in_validity_domain"],
             "extrapolation_flag": result["extrapolation_flag"],
             "risk_notes": [],
@@ -458,10 +469,16 @@ class S1ReferencePhysicsSubagent(Subagent):
             "model_family": "ewpt-tabular-reference",
             "dataset_ref": self.dataset_ref,
             "adapter_outputs": result["outputs"],
+            "perturbation_observations": perturbation_observations,
             "diagnostics": diagnostics,
             "uncertainty_tag": {"kind": "interval", "source": "gw_spectrum_surrogate"},
         }
-        lineage_inputs = (self.dataset_ref, str(adapter_call["provenance_ref"]))
+        lineage_inputs = (
+            self.dataset_ref,
+            str(adapter_call["provenance_ref"]),
+            str(perturbation_observations["must_react"]["provenance_ref"]),
+            str(perturbation_observations["must_not_react"]["provenance_ref"]),
+        )
         if self.variant_base_ref is not None:
             model_payload["variant"] = {
                 "derived_from": self.variant_base_ref,
@@ -541,13 +558,10 @@ class _ReferenceS3ValidationClient:
             contamination_snapshot=self.contamination_snapshot,
             extrapolated=extrapolated or self.mode == "extrapolated",
         )
-        outcome = run_perturbation_pair(
+        outcome = _reference_perturbation_outcome(
+            model_payload=model_payload,
+            dataset_payload=dataset_payload,
             perturbation_id=f"pair-{request['job_id']}",
-            must_react_expected=1.0,
-            must_react_observed=1.0,
-            must_not_react_observed=0.0,
-            unperturbed_headline=1.0,
-            perturbed_headline=0.2,
         )
         challengers = _reference_challengers()
         independence = attest_challenger_independence(challengers=challengers, min_independent=2)
@@ -596,6 +610,81 @@ def _reference_adapter_inputs() -> dict[str, dict[str, object]]:
         "alpha": {"value": 0.2, "units": "dimensionless", "uncertainty": {"kind": "interval", "radius": 0.01}},
         "v_w": {"value": 0.7, "units": "dimensionless", "uncertainty": {"kind": "interval", "radius": 0.02}},
     }
+
+
+def _reference_adapter_perturbation_observations(
+    *,
+    ctx: ExecContext,
+    adapter_inputs: Mapping[str, Any],
+) -> dict[str, Any]:
+    should_react_inputs = _reference_inputs_with_value(
+        adapter_inputs,
+        field="alpha",
+        value=_reference_input_value(adapter_inputs, "alpha") * S1_REFERENCE_SHOULD_REACT_ALPHA_SCALE,
+    )
+    must_react_call = ctx.call_adapter(
+        S1_REFERENCE_PHYSICS_ADAPTER_ID,
+        {"inputs": should_react_inputs, "seed": 8},
+    )
+    must_react_result = dict(must_react_call["result"])
+
+    must_not_react_inputs = _reference_inputs_with_value(
+        adapter_inputs,
+        field="v_w",
+        value=_reference_null_vw_value(_reference_input_value(adapter_inputs, "v_w")),
+    )
+    must_not_react_call = ctx.call_adapter(
+        S1_REFERENCE_PHYSICS_ADAPTER_ID,
+        {"inputs": must_not_react_inputs, "seed": 9},
+    )
+    must_not_react_result = dict(must_not_react_call["result"])
+
+    return {
+        "schema": "argus.s1.reference_physics_perturbation_observations.v1",
+        "must_react": {
+            "perturbation": {
+                "field": "alpha",
+                "scale": S1_REFERENCE_SHOULD_REACT_ALPHA_SCALE,
+            },
+            "omega": dict(must_react_result["outputs"]["omega"]),
+            "provenance_ref": str(must_react_call["provenance_ref"]),
+            "in_validity_domain": bool(must_react_result["in_validity_domain"]),
+        },
+        "must_not_react": {
+            "perturbation": {
+                "field": "v_w",
+                "delta": S1_REFERENCE_MUST_NOT_REACT_VW_DELTA,
+            },
+            "omega": dict(must_not_react_result["outputs"]["omega"]),
+            "provenance_ref": str(must_not_react_call["provenance_ref"]),
+            "in_validity_domain": bool(must_not_react_result["in_validity_domain"]),
+        },
+    }
+
+
+def _reference_inputs_with_value(
+    adapter_inputs: Mapping[str, Any],
+    *,
+    field: str,
+    value: float,
+) -> dict[str, Any]:
+    updated = {key: dict(quantity) for key, quantity in adapter_inputs.items()}
+    updated[field] = {**updated[field], "value": value}
+    return updated
+
+
+def _reference_input_value(adapter_inputs: Mapping[str, Any], field: str) -> float:
+    quantity = adapter_inputs[field]
+    if not isinstance(quantity, Mapping):
+        raise ValueError(f"reference adapter input {field} must be a mapping")
+    return float(quantity["value"])
+
+
+def _reference_null_vw_value(value: float) -> float:
+    candidate = value + S1_REFERENCE_MUST_NOT_REACT_VW_DELTA
+    if candidate <= 0.95:
+        return candidate
+    return value - S1_REFERENCE_MUST_NOT_REACT_VW_DELTA
 
 
 def _reference_physics_adapter() -> SimpleAdapter:
@@ -696,6 +785,61 @@ def _reference_checks(
         leakage,
         calibration,
     )
+
+
+def _reference_perturbation_outcome(
+    *,
+    model_payload: Mapping[str, Any],
+    dataset_payload: Mapping[str, Any],
+    perturbation_id: str,
+) -> PerturbationPairOutcome:
+    row = _reference_dataset_row(dataset_payload)
+    t_n = float(row["T_n"])
+    alpha = float(row["alpha"])
+    expected_omega = float(row["known_omega"])
+    observed_omega = _reference_observed_omega(model_payload)
+    perturbed_alpha = alpha * S1_REFERENCE_SHOULD_REACT_ALPHA_SCALE
+    expected_perturbed_omega = _reference_predict_omega(model_payload, t_n=t_n, alpha=perturbed_alpha)
+    expected_delta = expected_omega - expected_perturbed_omega
+
+    observed_perturbed_omega = _reference_observed_perturbation_omega(model_payload, "must_react")
+    if observed_perturbed_omega is None:
+        observed_perturbed_omega = expected_perturbed_omega * _reference_ratio(observed_omega, expected_omega)
+    observed_null_omega = _reference_observed_perturbation_omega(model_payload, "must_not_react")
+    if observed_null_omega is None:
+        observed_null_omega = observed_omega
+
+    return run_perturbation_pair(
+        perturbation_id=perturbation_id,
+        must_react_expected=_reference_ratio(expected_delta, expected_delta),
+        must_react_observed=_reference_ratio(observed_omega - observed_perturbed_omega, expected_delta),
+        must_not_react_observed=_reference_ratio(observed_null_omega - observed_omega, expected_delta),
+        unperturbed_headline=_reference_ratio(observed_omega, expected_omega),
+        perturbed_headline=_reference_ratio(observed_perturbed_omega, expected_omega),
+    )
+
+
+def _reference_observed_perturbation_omega(model_payload: Mapping[str, Any], kind: str) -> float | None:
+    observations = model_payload.get("perturbation_observations")
+    if not isinstance(observations, Mapping):
+        return None
+    observation = observations.get(kind)
+    if not isinstance(observation, Mapping):
+        return None
+    omega = observation.get("omega")
+    if not isinstance(omega, Mapping):
+        outputs = observation.get("outputs")
+        if isinstance(outputs, Mapping):
+            omega = outputs.get("omega")
+    if not isinstance(omega, Mapping):
+        return None
+    return float(omega["value"])
+
+
+def _reference_ratio(numerator: float, denominator: float) -> float:
+    if denominator == 0.0:
+        return 0.0
+    return numerator / denominator
 
 
 def _reference_model_payload(store: InMemoryArtifactStore, frozen_payload: Mapping[str, Any]) -> dict[str, Any]:

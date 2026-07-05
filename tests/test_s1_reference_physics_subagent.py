@@ -5,10 +5,14 @@ import unittest
 
 from argus_core import (
     CheckResult,
+    Lineage,
     LifecycleState,
+    Producer,
+    S1_REFERENCE_PHYSICS_PROFILE_REF,
     S1ReferencePhysicsHarness,
     tier_from_checks,
 )
+from argus_core.s1_reference import _ReferenceS3ValidationClient
 
 
 class S1ReferencePhysicsSubagentTests(unittest.TestCase):
@@ -61,6 +65,142 @@ class S1ReferencePhysicsSubagentTests(unittest.TestCase):
         self.assertEqual(checks["PHYSICAL_CONSISTENCY"]["metrics"]["model_family"], "ewpt-tabular-reference")
         self.assertTrue(checks["LEAKAGE"]["metrics"]["snapshot_ref"].startswith("c4://"))
         self.assertEqual(checks["CALIBRATION"]["metrics"]["nominal_coverage"], 1.0)
+
+    def test_reference_perturbation_uses_c4_model_response_not_canned_literals(self) -> None:
+        harness = S1ReferencePhysicsHarness()
+        dataset_ref = "c4://dataset/ewpt-reference/r44-m2-underresponsive"
+        must_react_ref = "c4://log/ewpt-reference/r44-m2-underresponsive-alpha"
+        must_not_react_ref = "c4://log/ewpt-reference/r44-m2-underresponsive-vw"
+        model_ref = "c4://model/ewpt-reference/r44-m2-underresponsive"
+        pipeline_ref = "c4://pipeline/ewpt-reference/r44-m2-underresponsive"
+        harness.artifact_store.create_artifact(
+            kind="dataset",
+            artifact_ref=dataset_ref,
+            payload={"rows": [{"T_n": 100.0, "alpha": 0.2, "v_w": 0.7, "known_omega": 0.02}]},
+            producer=Producer(subsystem="S6", version="0.0.0", actor_id="s6.reference-dataset"),
+            lineage=Lineage(input_refs=(), code_ref="git:s6-r44-m2-dataset", environment_digest="oci:s6-reference"),
+        )
+        harness.artifact_store.create_artifact(
+            kind="log",
+            artifact_ref=must_react_ref,
+            payload={
+                "adapter_id": "gw_spectrum_surrogate",
+                "perturbation": {"field": "alpha", "scale": 0.2},
+                "omega": {"value": 0.003, "units": "dimensionless"},
+            },
+            producer=Producer(subsystem="S7", version="1.0.0", actor_id="s7.adapter-broker"),
+            lineage=Lineage(
+                input_refs=(dataset_ref,),
+                code_ref="adapter:gw_spectrum_surrogate@1.0.0",
+                environment_digest="oci:s7-reference",
+            ),
+        )
+        harness.artifact_store.create_artifact(
+            kind="log",
+            artifact_ref=must_not_react_ref,
+            payload={
+                "adapter_id": "gw_spectrum_surrogate",
+                "perturbation": {"field": "v_w", "delta": 0.02},
+                "omega": {"value": 0.015, "units": "dimensionless"},
+            },
+            producer=Producer(subsystem="S7", version="1.0.0", actor_id="s7.adapter-broker"),
+            lineage=Lineage(
+                input_refs=(dataset_ref,),
+                code_ref="adapter:gw_spectrum_surrogate@1.0.0",
+                environment_digest="oci:s7-reference",
+            ),
+        )
+        harness.artifact_store.create_artifact(
+            kind="model",
+            artifact_ref=model_ref,
+            payload={
+                "schema": "argus.s1.reference_physics_model.v1",
+                "model_family": "ewpt-tabular-reference",
+                "dataset_ref": dataset_ref,
+                "adapter_outputs": {
+                    "omega": {
+                        "value": 0.015,
+                        "units": "dimensionless",
+                        "uncertainty": {"kind": "interval", "radius": 0.01},
+                    }
+                },
+                "perturbation_observations": {
+                    "schema": "argus.s1.reference_physics_perturbation_observations.v1",
+                    "must_react": {
+                        "perturbation": {"field": "alpha", "scale": 0.2},
+                        "omega": {
+                            "value": 0.003,
+                            "units": "dimensionless",
+                            "uncertainty": {"kind": "interval", "radius": 0.01},
+                        },
+                        "provenance_ref": must_react_ref,
+                    },
+                    "must_not_react": {
+                        "perturbation": {"field": "v_w", "delta": 0.02},
+                        "omega": {
+                            "value": 0.015,
+                            "units": "dimensionless",
+                            "uncertainty": {"kind": "interval", "radius": 0.01},
+                        },
+                        "provenance_ref": must_not_react_ref,
+                    },
+                },
+                "diagnostics": {"dataset_ref": dataset_ref, "adapter_id": "gw_spectrum_surrogate"},
+                "uncertainty_tag": {"kind": "interval", "source": "gw_spectrum_surrogate"},
+            },
+            producer=Producer(subsystem="S1", version="0.0.0", actor_id="s1.reference-physics"),
+            lineage=Lineage(
+                input_refs=(dataset_ref, must_react_ref, must_not_react_ref),
+                code_ref="argus-core:s1.reference-physics.r44-m2",
+                environment_digest="python:s1-reference-physics:v1",
+                seeds=("7",),
+            ),
+        )
+        harness.artifact_store.create_artifact(
+            kind="container",
+            artifact_ref=pipeline_ref,
+            payload={
+                "schema": "argus.s1.reference_physics_pipeline.v1",
+                "entrypoint": "predict",
+                "model_ref": model_ref,
+                "artifact_refs": [model_ref],
+                "uncertainty_tag": {"kind": "interval", "source": "gw_spectrum_surrogate"},
+            },
+            producer=Producer(subsystem="S1", version="0.0.0", actor_id="s1.reference-physics"),
+            lineage=Lineage(
+                input_refs=(model_ref,),
+                code_ref="argus-core:s1.reference-physics.freeze",
+                environment_digest="python:s1-reference-physics:v1",
+                seeds=("7",),
+            ),
+        )
+        validation_client = _ReferenceS3ValidationClient(
+            artifact_store=harness.artifact_store,
+            verifier=harness.s3_verifier,
+            contamination_index=harness.contamination_index,
+            contamination_snapshot=harness.contamination_snapshot,
+            mode="happy",
+        )
+
+        report = validation_client.validate(
+            {
+                "job_id": "job-r44-m2-underresponsive",
+                "profile_ref": S1_REFERENCE_PHYSICS_PROFILE_REF,
+                "frozen_pipeline_ref": pipeline_ref,
+            }
+        )
+        checks = {check["check"]: check for check in report["checks"]}
+        must_react = next(pair for pair in report["perturbation_pairs"] if pair["kind"] == "must_react")
+        must_not_react = next(pair for pair in report["perturbation_pairs"] if pair["kind"] == "must_not_react")
+
+        self.assertTrue(all(check["status"] == "PASS" for check in checks.values()))
+        self.assertEqual(must_react["verdict"], "fail")
+        self.assertAlmostEqual(must_react["amplitude_linearity"]["observed"], 0.75)
+        self.assertNotEqual(must_react["amplitude_linearity"]["observed"], 1.0)
+        self.assertEqual(must_not_react["verdict"], "pass")
+        self.assertAlmostEqual(must_not_react["observed_degradation"]["observed_signal"], 0.0)
+        self.assertFalse(report["aggregate"]["passed"])
+        self.assertEqual(report["claim_tier"], "ran-toy")
 
     def test_refusal_reroute_records_first_refused_and_second_reported(self) -> None:
         harness = S1ReferencePhysicsHarness()
