@@ -3,12 +3,17 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+from functools import lru_cache
 import json
+import math
+from pathlib import Path
 from typing import Any, Mapping
 from uuid import NAMESPACE_URL, uuid4, uuid5
 
-from argusverify import C3ReportSigner
-from .hashing import hash_json
+from jsonschema import Draft202012Validator
+
+from argusverify import C3ReportSigner, canonical_c3_json_bytes
+from .hashing import hash_bytes, hash_json
 from .s6 import (
     CapabilityDescriptor,
     ContaminationIndex,
@@ -27,6 +32,16 @@ class RefereePolicyError(S3Error):
 
 class SignerIdentityError(S3Error):
     """Raised when referee metadata does not match the real signer key."""
+
+
+class ReportCanonicalizationError(S3Error):
+    """Raised when a C3 report cannot be canonically serialized for hashing."""
+
+    def __init__(self, *, code: str, message: str, digest: str | None = None) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+        self.digest = digest
 
 
 class FrozenPipelineEntrypointContractError(S3Error):
@@ -49,6 +64,8 @@ class FrozenPipelineEntrypointContractError(S3Error):
 
 
 S3_FROZEN_PIPELINE_ENTRYPOINT_REQUEST_SCHEMA = "argus.s3.frozen_pipeline_entrypoint_request.v1"
+S3_REPORT_CANONICALIZATION_SPEC_VERSION = "argus.s3.validation_report.canonical.v1"
+S3_REPORT_DIGEST_ALGORITHM = "BLAKE3"
 S3_FROZEN_PIPELINE_ALLOWED_KINDS = frozenset({"frozen_pipeline", "container", "pipeline"})
 S3_VERIFICATION_REQUEST_ALLOWED_FIELDS = frozenset(
     {
@@ -101,9 +118,66 @@ class InsensitivityFlag:
 
 
 @dataclass(frozen=True)
+class CanonicalValidationReport:
+    spec_version: str
+    hash_algorithm: str
+    report: dict[str, Any]
+    canonical_bytes: bytes
+    digest: str
+    signing_payload: dict[str, Any]
+    signing_payload_bytes: bytes
+    signing_payload_digest: str
+
+
+@dataclass(frozen=True)
 class PerturbationPairOutcome:
     perturbation_pairs: tuple[PerturbationResult, ...]
     insensitivity_flags: tuple[InsensitivityFlag, ...]
+
+
+def canonicalize_validation_report(report: Mapping[str, Any]) -> CanonicalValidationReport:
+    """Validate and canonicalize a C3 ValidationReport for stable BLAKE3 hashing."""
+    payload = _validation_report_payload(report)
+    _assert_c3_validation_report_schema(payload)
+    canonical_bytes = canonical_c3_json_bytes(payload)
+    signing_payload = validation_report_signing_payload(payload)
+    signing_payload_bytes = canonical_c3_json_bytes(signing_payload)
+    return CanonicalValidationReport(
+        spec_version=S3_REPORT_CANONICALIZATION_SPEC_VERSION,
+        hash_algorithm=S3_REPORT_DIGEST_ALGORITHM,
+        report=payload,
+        canonical_bytes=canonical_bytes,
+        digest=hash_bytes(canonical_bytes),
+        signing_payload=signing_payload,
+        signing_payload_bytes=signing_payload_bytes,
+        signing_payload_digest=hash_bytes(signing_payload_bytes),
+    )
+
+
+def canonical_validation_report_bytes(report: Mapping[str, Any]) -> bytes:
+    return canonicalize_validation_report(report).canonical_bytes
+
+
+def validation_report_digest(report: Mapping[str, Any]) -> str:
+    return canonicalize_validation_report(report).digest
+
+
+def validation_report_signing_payload(report: Mapping[str, Any]) -> dict[str, Any]:
+    payload = _validation_report_payload(report)
+    _assert_c3_validation_report_schema(payload)
+    signature = payload.get("signature")
+    if not isinstance(signature, Mapping):
+        _report_error(
+            code="S3_REPORT_SCHEMA_INVALID",
+            message="ValidationReport signature must be an object",
+        )
+    signing_payload = _validation_report_payload(payload)
+    signing_payload["signature"] = {
+        "algorithm": signature.get("algorithm"),
+        "key_id": signature.get("key_id"),
+        "value": "",
+    }
+    return signing_payload
 
 
 def build_frozen_pipeline_entrypoint_request(
@@ -284,6 +358,85 @@ def build_referee_block(*, referee_id: str, signer_key_id: str, proponent_id: st
         "signed_by": signer_key_id,
         "distinct_from_proponent": True,
     }
+
+
+def _validation_report_payload(value: Mapping[str, Any] | Any) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        _report_error(
+            code="S3_REPORT_JSON_INVALID",
+            message="ValidationReport must be a JSON object",
+        )
+    payload = _strict_report_json_value(value, path="ValidationReport")
+    if not isinstance(payload, dict):
+        _report_error(
+            code="S3_REPORT_JSON_INVALID",
+            message="ValidationReport must be a JSON object",
+        )
+    return payload
+
+
+def _strict_report_json_value(value: Any, *, path: str) -> Any:
+    if isinstance(value, Mapping):
+        payload: dict[str, Any] = {}
+        for key, item in value.items():
+            if not isinstance(key, str):
+                _report_error(
+                    code="S3_REPORT_JSON_INVALID",
+                    message=f"{path} contains a non-string key",
+                )
+            payload[key] = _strict_report_json_value(item, path=f"{path}.{key}")
+        return payload
+    if isinstance(value, list):
+        return [_strict_report_json_value(item, path=f"{path}[]") for item in value]
+    if isinstance(value, tuple):
+        _report_error(
+            code="S3_REPORT_JSON_INVALID",
+            message=f"{path} contains a tuple; ValidationReport arrays must be JSON lists",
+        )
+    if isinstance(value, bool) or value is None or isinstance(value, str):
+        return value
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            _report_error(
+                code="S3_REPORT_JSON_INVALID",
+                message=f"{path} contains a non-finite number",
+            )
+        return value
+    _report_error(
+        code="S3_REPORT_JSON_INVALID",
+        message=f"{path} contains non-JSON value of type {type(value).__name__}",
+    )
+
+
+def _assert_c3_validation_report_schema(report: Mapping[str, Any]) -> None:
+    errors = sorted(
+        _c3_validation_report_validator().iter_errors(report),
+        key=lambda error: (list(error.absolute_path), error.message),
+    )
+    if errors:
+        first = errors[0]
+        path = ".".join(str(part) for part in first.absolute_path) or "$"
+        _report_error(
+            code="S3_REPORT_SCHEMA_INVALID",
+            message=f"ValidationReport schema violation at {path}: {first.message}",
+        )
+
+
+@lru_cache(maxsize=1)
+def _c3_validation_report_validator() -> Draft202012Validator:
+    schema_path = Path(__file__).resolve().parents[2] / "schemas" / "contracts" / "c3.validation-report.schema.json"
+    schema = json.loads(schema_path.read_text(encoding="utf-8"))
+    validation_report = dict(schema["$defs"]["ValidationReport"])
+    validation_report["$schema"] = schema["$schema"]
+    validation_report["$defs"] = schema["$defs"]
+    Draft202012Validator.check_schema(validation_report)
+    return Draft202012Validator(validation_report)
+
+
+def _report_error(*, code: str, message: str) -> None:
+    raise ReportCanonicalizationError(code=code, message=message)
 
 
 def _mapping_payload(name: str, value: Mapping[str, Any] | Any) -> dict[str, Any]:

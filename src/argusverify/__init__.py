@@ -125,6 +125,16 @@ def sign_report(report: dict[str, Any], *, key_id: str, secret: bytes) -> dict[s
     return signed
 
 
+def canonical_c3_json_bytes(value: Any) -> bytes:
+    """Return the canonical JSON bytes used by C3 report signatures."""
+    return _canonical_json_bytes(value)
+
+
+def canonical_c3_json_text(value: Any) -> str:
+    """Return the canonical JSON text used by C3 report signatures."""
+    return _canonical_json_text(value)
+
+
 def verify_report(report: dict[str, Any], trust_store: VerifierTrustStore) -> C3SignatureVerification:
     signature = report.get("signature")
     if not isinstance(signature, dict):
