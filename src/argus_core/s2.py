@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, field, replace
+from datetime import datetime, timezone
 from fractions import Fraction
 import hashlib
 from itertools import product
@@ -14,6 +15,7 @@ from pathlib import Path
 import tempfile
 import time
 from typing import Any, Callable, Mapping
+from uuid import NAMESPACE_URL, uuid5
 
 from .canonical import canonical_json_bytes
 from .hashing import hash_bytes
@@ -210,6 +212,105 @@ S2_FEATURE_GRAPH_OPS = (
     "adapter_eval",
     "aggregate",
 )
+
+
+@dataclass(frozen=True)
+class S2BuildBusEvent:
+    subject: str
+    event_id: str
+    trace_id: str
+    root_request_id: str
+    payload: dict[str, Any]
+    occurred_at: str
+
+
+@dataclass(frozen=True)
+class S2TelemetrySpan:
+    trace_id: str
+    span_id: str
+    name: str
+    subsystem: str
+    attributes: dict[str, Any]
+
+
+class InMemoryS2EventBus:
+    """Deterministic NATS-style event bus for S2 local tests and S11 mock consumers."""
+
+    def __init__(self) -> None:
+        self._events: list[S2BuildBusEvent] = []
+
+    def publish(
+        self,
+        subject: str,
+        payload: Mapping[str, Any],
+        *,
+        event_id: str | None = None,
+        trace_id: str | None = None,
+        root_request_id: str | None = None,
+    ) -> S2BuildBusEvent:
+        normalized_payload = dict(_s2_jsonable(payload))
+        resolved_trace_id = _s2_event_trace_id(normalized_payload, trace_id)
+        resolved_root_request_id = _s2_event_root_request_id(normalized_payload, root_request_id)
+        resolved_event_id = event_id or _derive_s2_bus_event_id(
+            subject=subject,
+            payload=normalized_payload,
+            index=len(self._events) + 1,
+        )
+        event = S2BuildBusEvent(
+            subject=subject,
+            event_id=resolved_event_id,
+            trace_id=resolved_trace_id,
+            root_request_id=resolved_root_request_id,
+            payload=normalized_payload,
+            occurred_at=_utc_now_s2(),
+        )
+        self._events.append(event)
+        return event
+
+    def subscribe(self, subject: str) -> tuple[S2BuildBusEvent, ...]:
+        return tuple(event for event in self._events if event.subject == subject)
+
+    def events(self, subject: str | None = None) -> tuple[S2BuildBusEvent, ...]:
+        if subject is None:
+            return tuple(self._events)
+        return self.subscribe(subject)
+
+
+class InMemoryS2TelemetrySink:
+    """S11-compatible in-memory span sink for S2 build phase spans."""
+
+    def __init__(self) -> None:
+        self._spans: list[S2TelemetrySpan] = []
+
+    def record_span(
+        self,
+        name: str,
+        *,
+        trace_id: str,
+        attributes: Mapping[str, Any] | None = None,
+        span_id: str | None = None,
+    ) -> S2TelemetrySpan:
+        normalized_attributes = dict(_s2_jsonable(attributes or {}))
+        resolved_span_id = span_id or _derive_s2_span_id(
+            trace_id=trace_id,
+            name=name,
+            attributes=normalized_attributes,
+            index=len(self._spans) + 1,
+        )
+        span = S2TelemetrySpan(
+            trace_id=trace_id,
+            span_id=resolved_span_id,
+            name=name,
+            subsystem="S2",
+            attributes=normalized_attributes,
+        )
+        self._spans.append(span)
+        return span
+
+    def spans(self, trace_id: str | None = None) -> tuple[S2TelemetrySpan, ...]:
+        if trace_id is None:
+            return tuple(self._spans)
+        return tuple(span for span in self._spans if span.trace_id == trace_id)
 
 
 @dataclass(frozen=True)
@@ -901,6 +1002,42 @@ def _s2_jsonable(value: Any) -> Any:
         return json.loads(json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False))
     except (TypeError, ValueError) as exc:
         raise S2ContractModelError("S2 FeatureGraph payload must be canonical JSON serializable") from exc
+
+
+def _utc_now_s2() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _s2_event_trace_id(payload: Mapping[str, Any], trace_id: str | None) -> str:
+    if trace_id:
+        return trace_id
+    payload_trace_id = payload.get("trace_id")
+    if isinstance(payload_trace_id, str) and payload_trace_id:
+        return payload_trace_id
+    job_id = payload.get("job_id")
+    if isinstance(job_id, str) and job_id:
+        return f"trace:{job_id}"
+    return "trace:s2"
+
+
+def _s2_event_root_request_id(payload: Mapping[str, Any], root_request_id: str | None) -> str:
+    if root_request_id:
+        return root_request_id
+    payload_root_request_id = payload.get("root_request_id")
+    if isinstance(payload_root_request_id, str) and payload_root_request_id:
+        return payload_root_request_id
+    job_id = payload.get("job_id")
+    if isinstance(job_id, str) and job_id:
+        return job_id
+    return "s2"
+
+
+def _derive_s2_bus_event_id(*, subject: str, payload: Mapping[str, Any], index: int) -> str:
+    return str(uuid5(NAMESPACE_URL, f"argus:s2:event-bus:{subject}:{index}:{hashlib.sha256(canonical_json_bytes(payload)).hexdigest()}"))
+
+
+def _derive_s2_span_id(*, trace_id: str, name: str, attributes: Mapping[str, Any], index: int) -> str:
+    return str(uuid5(NAMESPACE_URL, f"argus:s2:span:{trace_id}:{name}:{index}:{hashlib.sha256(canonical_json_bytes(attributes)).hexdigest()}"))
 
 
 @dataclass(frozen=True)
@@ -7485,6 +7622,8 @@ class BuildOrchestrator:
         advisory_self_check: AdvisorySelfCheck | None = None,
         pipeline_freezer: PipelineFreezer | None = None,
         sandbox_guard: S2SandboxGuard | None = None,
+        event_bus: InMemoryS2EventBus | None = None,
+        telemetry_sink: InMemoryS2TelemetrySink | None = None,
         hpo_scheduler_backend: str = "threadpool",
         hpo_worker_count: int = 1,
     ) -> None:
@@ -7522,6 +7661,8 @@ class BuildOrchestrator:
             provenance_emitter=self._provenance_emitter,
         )
         self._sandbox_guard = sandbox_guard or S2SandboxGuard(artifact_store=artifact_store)
+        self._event_bus = event_bus or InMemoryS2EventBus()
+        self._telemetry_sink = telemetry_sink or InMemoryS2TelemetrySink()
 
     def build(
         self,
@@ -7538,7 +7679,7 @@ class BuildOrchestrator:
             if isinstance(request, BuildOrchestrationRequest)
             else BuildOrchestrationRequest(c2_envelope=request)
         )
-        return self._build(orchestration_request)
+        return self._build_with_observability(orchestration_request)
 
     def build_variant(
         self,
@@ -7586,12 +7727,111 @@ class BuildOrchestrator:
                 "constraint_overrides": list(mutation.constraint_overrides),
             },
         )
-        return self._build(variant_request)
+        return self._build_with_observability(variant_request)
+
+    def _build_with_observability(self, orchestration_request: BuildOrchestrationRequest) -> BuildResult:
+        started_at = time.perf_counter()
+        self._publish_build_event(
+            orchestration_request,
+            "s2.build.started",
+            {"status": "STARTED", "variant": orchestration_request.variant_id is not None},
+        )
+        try:
+            result = self._build(orchestration_request)
+        except S2SandboxViolation as exc:
+            self._publish_build_event(
+                orchestration_request,
+                "s2.build.quarantined",
+                {
+                    "status": exc.status,
+                    "category": exc.category,
+                    "code": exc.code,
+                    "evidence_ref": exc.evidence_ref,
+                },
+            )
+            self._record_build_span(
+                orchestration_request,
+                status=exc.status,
+                started_at=started_at,
+                attributes={"category": exc.category, "code": exc.code, "evidence_ref": exc.evidence_ref},
+            )
+            raise
+        except S2Error as exc:
+            category = str(getattr(exc, "category", "S2"))
+            code = str(getattr(exc, "code", exc.__class__.__name__))
+            self._publish_build_event(
+                orchestration_request,
+                "s2.build.failed",
+                {"status": "FAILED", "category": category, "code": code},
+            )
+            self._record_build_span(
+                orchestration_request,
+                status="FAILED",
+                started_at=started_at,
+                attributes={"category": category, "code": code},
+            )
+            raise
+        except Exception as exc:
+            self._publish_build_event(
+                orchestration_request,
+                "s2.build.failed",
+                {"status": "FAILED", "category": "UNEXPECTED", "code": exc.__class__.__name__},
+            )
+            self._record_build_span(
+                orchestration_request,
+                status="FAILED",
+                started_at=started_at,
+                attributes={"category": "UNEXPECTED", "code": exc.__class__.__name__},
+            )
+            raise
+        self._publish_build_event(
+            orchestration_request,
+            "s2.build.completed",
+            {
+                "status": "SUCCEEDED",
+                "frozen_pipeline_ref": result.frozen_pipeline_ref,
+                "model_ref": result.model_ref,
+                "artifact_count": len(result.artifact_refs),
+                "cost_actual": dict(result.cost_actual),
+            },
+        )
+        self._record_build_span(
+            orchestration_request,
+            status="SUCCEEDED",
+            started_at=started_at,
+            attributes={
+                "frozen_pipeline_ref": result.frozen_pipeline_ref,
+                "artifact_count": len(result.artifact_refs),
+            },
+        )
+        self._attach_observability_diagnostics(result, orchestration_request)
+        return result
 
     def _build(self, orchestration_request: BuildOrchestrationRequest) -> BuildResult:
         started_at = time.perf_counter()
         spec = self._spec_compiler.compile(orchestration_request.c2_envelope)
-        sandbox_evidence_ref = self._sandbox_guard.prepare(spec=spec, request=orchestration_request)
+        self._emit_build_phase(
+            orchestration_request,
+            "spec_compiler",
+            "SUCCEEDED",
+            {"task_type": spec.task_type, "verifier_profile_ref": spec.verifier_profile_ref},
+        )
+        try:
+            sandbox_evidence_ref = self._sandbox_guard.prepare(spec=spec, request=orchestration_request)
+        except S2SandboxViolation as exc:
+            self._emit_build_phase(
+                orchestration_request,
+                "sandbox_guard",
+                exc.status,
+                {"category": exc.category, "code": exc.code, "evidence_ref": exc.evidence_ref},
+            )
+            raise
+        self._emit_build_phase(
+            orchestration_request,
+            "sandbox_guard",
+            "SUCCEEDED",
+            {"evidence_ref": sandbox_evidence_ref},
+        )
         sandbox_evidence_payload = self._artifact_payload(sandbox_evidence_ref)
         feature_fields = self._feature_fields(spec)
         target_field = self._target_field(spec)
@@ -7621,6 +7861,12 @@ class BuildOrchestrator:
         if split is None:
             split = self._data_manager.create_splits(split_request)
         dataset_split_reused = split.diagnostics.get("cache_reused") is True
+        self._emit_build_phase(
+            orchestration_request,
+            "data_manager",
+            "SUCCEEDED",
+            {"dataset_ref": dataset_ref, "split_manifest_ref": split.split_manifest_ref},
+        )
         graph = self._build_feature_graph(spec=spec, feature_fields=feature_fields)
         selected_feature_nodes = tuple(field.name for field in feature_fields)
         feature_set_ref = None
@@ -7650,6 +7896,12 @@ class BuildOrchestrator:
                 ),
             )
             feature_set_ref = feature_set_result.artifact_record.artifact_ref
+        self._emit_build_phase(
+            orchestration_request,
+            "feature_graph",
+            "SUCCEEDED",
+            {"feature_set_ref": feature_set_ref, "feature_count": len(selected_feature_nodes)},
+        )
         training_rows = self._rows_for_indices(
             dataset_rows,
             split.split_indices["train"],
@@ -7667,6 +7919,12 @@ class BuildOrchestrator:
                     diagnostics={"evidence": "target_variance_baseline"},
                 ),
             ),
+        )
+        self._emit_build_phase(
+            orchestration_request,
+            "model_synthesizer",
+            "SUCCEEDED",
+            {"selected_family_id": synthesis.selected_family_id},
         )
         hpo = self._hpo_engine.run(
             HPORequest(
@@ -7692,6 +7950,12 @@ class BuildOrchestrator:
                 warm_start_trials=orchestration_request.warm_start_trials,
                 warm_start_ref=orchestration_request.warm_start_ref,
             )
+        )
+        self._emit_build_phase(
+            orchestration_request,
+            "hpo_engine",
+            hpo.status,
+            {"selection_artifact_ref": hpo.selection_artifact_ref, "trial_count": len(hpo.trials)},
         )
         selected_parameters = dict(hpo.selected.parameters)
         budget_meter = BudgetMeter.from_budget(job_id=spec.job_id, budget=spec.budget)
@@ -7719,6 +7983,16 @@ class BuildOrchestrator:
                 model_tokens_per_epoch=orchestration_request.model_tokens_per_epoch,
                 cost_usd_per_epoch=orchestration_request.cost_usd_per_epoch,
             )
+        )
+        self._emit_build_phase(
+            orchestration_request,
+            "training_runtime",
+            training.status,
+            {
+                "training_log_ref": training.training_log_ref,
+                "final_checkpoint_ref": training.final_checkpoint_ref,
+                "completed_epochs": training.completed_epochs,
+            },
         )
         if not training.final_checkpoint_ref:
             raise S2ContractModelError("S2 BuildOrchestrator final training did not emit a model checkpoint")
@@ -7761,6 +8035,15 @@ class BuildOrchestrator:
                 seed=f"{orchestration_request.seed}:uq",
             )
         )
+        self._emit_build_phase(
+            orchestration_request,
+            "uq_calibrator",
+            calibration.status,
+            {
+                "calibration_artifact_ref": calibration.calibration_artifact_ref,
+                "empirical_coverage": calibration.empirical_coverage,
+            },
+        )
         advisory = self._advisory_self_check.run(
             AdvisorySelfCheckRequest(
                 job_id=spec.job_id,
@@ -7781,6 +8064,12 @@ class BuildOrchestrator:
                 environment_digest=orchestration_request.environment_digest,
                 seed=f"{orchestration_request.seed}:advisory",
             )
+        )
+        self._emit_build_phase(
+            orchestration_request,
+            "advisory_self_check",
+            advisory.status,
+            {"artifact_ref": advisory.artifact_ref, "warning_count": len(advisory.warnings)},
         )
         build_wallclock_seconds = max(time.perf_counter() - started_at, 1.0)
         probe_inputs = self._probe_inputs(
@@ -7846,6 +8135,16 @@ class BuildOrchestrator:
                 ),
                 config=freeze_config,
             )
+        )
+        self._emit_build_phase(
+            orchestration_request,
+            "pipeline_freezer",
+            "SUCCEEDED",
+            {
+                "artifact_ref": freeze.artifact_ref,
+                "self_replay_passed": freeze.self_replay_passed,
+                "self_replay_fraction": freeze.self_replay_fraction,
+            },
         )
         artifact_refs = _unique_pipeline_refs(
             (
@@ -7980,6 +8279,117 @@ class BuildOrchestrator:
             advisory_self_check_ref=advisory.artifact_ref,
             sandbox_evidence_ref=sandbox_evidence_ref,
         )
+
+    def _observability_context(self, request: BuildOrchestrationRequest) -> dict[str, str]:
+        envelope = dict(request.c2_envelope)
+        job_id = str(envelope.get("job_id") or "s2-build")
+        return {
+            "job_id": job_id,
+            "root_request_id": str(envelope.get("root_request_id") or job_id),
+            "trace_id": str(envelope.get("trace_id") or f"trace:{job_id}"),
+            "subtopic": str(envelope.get("subtopic") or "s2-build"),
+        }
+
+    def _publish_build_event(
+        self,
+        request: BuildOrchestrationRequest,
+        subject: str,
+        payload: Mapping[str, Any],
+    ) -> S2BuildBusEvent:
+        context = self._observability_context(request)
+        event_payload = {
+            **context,
+            **dict(payload),
+        }
+        return self._event_bus.publish(
+            subject,
+            event_payload,
+            trace_id=context["trace_id"],
+            root_request_id=context["root_request_id"],
+        )
+
+    def _emit_build_phase(
+        self,
+        request: BuildOrchestrationRequest,
+        phase: str,
+        status: str,
+        payload: Mapping[str, Any] | None = None,
+    ) -> None:
+        phase_payload = {
+            "phase": phase,
+            "status": status,
+            **dict(payload or {}),
+        }
+        self._publish_build_event(request, "s2.build.phase", phase_payload)
+        self._record_phase_span(request, phase=phase, status=status, attributes=dict(payload or {}))
+
+    def _record_phase_span(
+        self,
+        request: BuildOrchestrationRequest,
+        *,
+        phase: str,
+        status: str,
+        attributes: Mapping[str, Any] | None = None,
+    ) -> S2TelemetrySpan:
+        context = self._observability_context(request)
+        span_attributes = {
+            **context,
+            "phase": phase,
+            "status": status,
+            **dict(attributes or {}),
+        }
+        return self._telemetry_sink.record_span(
+            f"S2.{phase}",
+            trace_id=context["trace_id"],
+            attributes=span_attributes,
+        )
+
+    def _record_build_span(
+        self,
+        request: BuildOrchestrationRequest,
+        *,
+        status: str,
+        started_at: float,
+        attributes: Mapping[str, Any] | None = None,
+    ) -> S2TelemetrySpan:
+        context = self._observability_context(request)
+        span_attributes = {
+            **context,
+            "status": status,
+            "elapsed_seconds": max(time.perf_counter() - started_at, 0.0),
+            **dict(attributes or {}),
+        }
+        return self._telemetry_sink.record_span(
+            "S2.build",
+            trace_id=context["trace_id"],
+            attributes=span_attributes,
+        )
+
+    def _attach_observability_diagnostics(
+        self,
+        result: BuildResult,
+        request: BuildOrchestrationRequest,
+    ) -> None:
+        context = self._observability_context(request)
+        events = tuple(
+            event
+            for event in self._event_bus.events()
+            if event.trace_id == context["trace_id"] and event.payload.get("job_id") == context["job_id"]
+        )
+        spans = tuple(
+            span
+            for span in self._telemetry_sink.spans(context["trace_id"])
+            if span.attributes.get("job_id") == context["job_id"]
+        )
+        result.diagnostics["s2_tc23"] = "PASS"
+        result.diagnostics["observability"] = {
+            "trace_id": context["trace_id"],
+            "root_request_id": context["root_request_id"],
+            "event_subjects": [event.subject for event in events],
+            "event_count": len(events),
+            "span_names": [span.name for span in spans],
+            "span_count": len(spans),
+        }
 
     def _assert_base_frozen_pipeline(self, artifact_ref: str) -> dict[str, Any]:
         try:
