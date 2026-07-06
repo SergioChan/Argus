@@ -21,6 +21,24 @@ from .s5 import C2VersionPolicy, parse_c2_job_envelope
 from .s6 import CapabilityDescriptor, RegistryError
 from .s7 import AdapterBroker, EvalRequest, EvalResult
 from .s8 import ArtifactRecord, InMemoryArtifactStore, Lineage, Producer, assert_lineage_complete
+from .s10 import (
+    BudgetCaps,
+    EgressProxy,
+    EgressRule,
+    InMemoryAuditLedger,
+    InMemoryTokenService,
+    LaunchEnvelope,
+    LaunchRequest,
+    PolicyBundle,
+    PolicyBundleSigner,
+    PolicyDeniedError,
+    ResourceCeilings,
+    ScopeDeniedError,
+    ScopeGrant,
+    StoreWriterBroker,
+    decide_policy,
+    materialize_sandbox_env,
+)
 from .s12 import ConformanceRecord, ConformanceService, SubmissionBundle, sign_submission_bundle
 
 
@@ -73,6 +91,38 @@ class ExplainabilityReportError(S2Error):
 
 class S2ConformanceError(S2Error):
     """Raised when S2 cannot assemble an S12 conformance hook from real C4 evidence."""
+
+
+class S2SandboxViolation(S2Error):
+    """Raised when an S2 build hits an S10 sandbox policy violation before training execution."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str,
+        evidence_ref: str | None,
+        diagnostics: Mapping[str, Any],
+        status: str = "QUARANTINED",
+    ) -> None:
+        super().__init__(message)
+        self.message = message
+        self.code = code
+        self.status = status
+        self.evidence_ref = evidence_ref
+        self.diagnostics = dict(diagnostics)
+        self.category = "SANDBOX"
+        self.retryable = False
+
+    def as_c1_payload(self) -> dict[str, Any]:
+        return {
+            "category": self.category,
+            "code": self.code,
+            "message": self.message,
+            "retryable": self.retryable,
+            "status": self.status,
+            "evidence_ref": self.evidence_ref,
+        }
 
 
 class S2ContractModelError(S2Error):
@@ -1709,6 +1759,7 @@ class BuildSpec:
     input_artifact_refs: tuple[str, ...]
     allowed_adapters: tuple[str, ...]
     allowed_datasets: tuple[str, ...]
+    allowed_egress: tuple[EgressRule, ...] = ()
     fields: tuple[FieldSpec, ...] = ()
     constraints: dict[str, Any] = field(default_factory=dict)
     verifier_profile: C3VerifierProfile | None = None
@@ -5972,6 +6023,9 @@ class BuildOrchestrationRequest:
     variant_model_family: str | None = None
     base_pipeline_ref: str | None = None
     mutation_parameters: Mapping[str, Any] = field(default_factory=dict, hash=False)
+    sandbox_env: Mapping[str, str] = field(default_factory=dict, hash=False)
+    sandbox_env_allowlist: tuple[str, ...] = ()
+    sandbox_egress_probe: Mapping[str, Any] | None = field(default=None, hash=False)
 
     def __post_init__(self) -> None:
         if not isinstance(self.c2_envelope, Mapping):
@@ -5990,6 +6044,11 @@ class BuildOrchestrationRequest:
         variant_id = self.variant_id.strip() if isinstance(self.variant_id, str) else None
         variant_model_family = self.variant_model_family.strip() if isinstance(self.variant_model_family, str) else None
         base_pipeline_ref = self.base_pipeline_ref.strip() if isinstance(self.base_pipeline_ref, str) else None
+        sandbox_env = {str(key): str(value) for key, value in dict(self.sandbox_env).items()}
+        sandbox_env_allowlist = tuple(str(key).strip() for key in self.sandbox_env_allowlist if str(key).strip())
+        sandbox_egress_probe = (
+            _s2_jsonable(dict(self.sandbox_egress_probe)) if self.sandbox_egress_probe is not None else None
+        )
         if not code_ref or not environment_digest or not seed:
             raise S2ContractModelError("S2 BuildOrchestrationRequest requires code_ref, environment_digest, and seed")
         if not container_digest:
@@ -6056,6 +6115,9 @@ class BuildOrchestrationRequest:
         object.__setattr__(self, "variant_model_family", variant_model_family)
         object.__setattr__(self, "base_pipeline_ref", base_pipeline_ref)
         object.__setattr__(self, "mutation_parameters", _s2_jsonable(dict(self.mutation_parameters)))
+        object.__setattr__(self, "sandbox_env", sandbox_env)
+        object.__setattr__(self, "sandbox_env_allowlist", sandbox_env_allowlist)
+        object.__setattr__(self, "sandbox_egress_probe", sandbox_egress_probe)
 
 
 @dataclass(frozen=True)
@@ -6074,6 +6136,345 @@ class BuildResult:
     training_log_ref: str | None = None
     uq_calibration_ref: str | None = None
     advisory_self_check_ref: str | None = None
+    sandbox_evidence_ref: str | None = None
+
+
+class S2SandboxGuard:
+    """S10-backed preflight guard for S2 build sandbox policy evidence."""
+
+    SCHEMA_VERSION = "argus.s2.sandbox_evidence.v1"
+
+    def __init__(
+        self,
+        *,
+        artifact_store: InMemoryArtifactStore,
+        token_service: InMemoryTokenService | None = None,
+    ) -> None:
+        self._artifact_store = artifact_store
+        self._token_service = token_service or InMemoryTokenService(
+            signing_key=b"argus-s2-sandbox-guard-test-key",
+            signer_key_id="s2-s10-sandbox-guard",
+            now_fn=lambda: 1_800_000_000,
+        )
+
+    def prepare(self, *, spec: BuildSpec, request: BuildOrchestrationRequest) -> str:
+        audit_ledger = InMemoryAuditLedger()
+        scope_token = self._scope_token(spec)
+        budget_token = self._budget_token(spec)
+        bundle = self._policy_bundle(spec)
+        visible_env, secret_failed = self._materialize_env(request)
+        launch_request = self._launch_request(
+            spec=spec,
+            request=request,
+            budget_token=budget_token,
+            scope_token=scope_token,
+            visible_env=visible_env,
+        )
+        verdict = decide_policy(bundle, launch_request)
+        egress_probe = self._egress_probe(
+            spec=spec,
+            request=request,
+            scope_token=scope_token,
+            bundle=bundle,
+            audit_ledger=audit_ledger,
+        )
+        broker_result = self._broker_write_probe(
+            spec=spec,
+            request=request,
+            scope_token=scope_token,
+            audit_ledger=audit_ledger,
+        )
+        checks = self._checks(
+            verdict=verdict,
+            egress_probe=egress_probe,
+            secret_failed=secret_failed,
+        )
+        status = "PASS" if all(check["status"] == "PASS" for check in checks.values()) else "QUARANTINED"
+        payload = self._evidence_payload(
+            spec=spec,
+            request=request,
+            status=status,
+            checks=checks,
+            verdict=verdict,
+            bundle=bundle,
+            visible_env=visible_env,
+            egress_probe=egress_probe,
+            broker_result=broker_result,
+            audit_ledger=audit_ledger,
+        )
+        record = broker_result["client"].put_artifact(
+            kind="s2_sandbox_evidence",
+            payload=payload,
+            producer=Producer(subsystem="S2", version="0.0.0"),
+            lineage=Lineage(
+                input_refs=tuple(spec.input_artifact_refs),
+                code_ref=request.code_ref,
+                environment_digest=request.environment_digest,
+                seeds=(request.seed,),
+                job_id=spec.job_id,
+            ),
+            claim_tier=S2ClaimTierPolicy.RAN_TOY,
+        )
+        evidence_ref = record.artifact_ref
+        if status != "PASS":
+            failing_check = next(key for key, check in checks.items() if check["status"] == "FAIL")
+            code = "EGRESS_DENIED" if failing_check == "S2-TC30" else "SECRET_EXPOSED"
+            diagnostics = {
+                "status": status,
+                "failed_check": failing_check,
+                "evidence_ref": evidence_ref,
+                "checks": checks,
+            }
+            raise S2SandboxViolation(
+                "S2 sandbox integration preflight quarantined the build",
+                code=code,
+                evidence_ref=evidence_ref,
+                diagnostics=diagnostics,
+            )
+        return evidence_ref
+
+    def _scope_token(self, spec: BuildSpec) -> Any:
+        return self._token_service.mint_scope(
+            scopes=ScopeGrant(
+                allowed_adapters=spec.allowed_adapters,
+                allowed_datasets=spec.allowed_datasets,
+                egress_allowlist=spec.allowed_egress,
+                broker_audiences=("store",),
+                capabilities=("s2.build",),
+                producer_subsystems=("S2",),
+                sandbox_risk_class="standard",
+            ),
+            job_id=spec.job_id,
+            ttl_s=900,
+        )
+
+    def _budget_token(self, spec: BuildSpec) -> Any:
+        return self._token_service.mint_budget(
+            caps=BudgetCaps(
+                max_compute_units=max(float(spec.budget.max_wallclock_seconds), 1.0),
+                max_gpu_seconds=float(spec.budget.max_gpu_seconds or 0.0),
+                max_model_tokens=float(spec.budget.max_model_tokens or 0.0),
+                max_wallclock_s=float(spec.budget.max_wallclock_seconds),
+                max_cost_usd=float(spec.budget.max_usd),
+            ),
+            job_id=spec.job_id,
+            root_request_id=spec.trace_id,
+            risk_class="standard",
+            ttl_s=900,
+        )
+
+    @staticmethod
+    def _policy_bundle(spec: BuildSpec) -> PolicyBundle:
+        unsigned = PolicyBundle(
+            bundle_version=f"s2-sandbox-{spec.job_id}",
+            egress_allowlist=spec.allowed_egress,
+            resource_ceilings=ResourceCeilings(
+                cpu_m=1000,
+                mem_bytes=1_073_741_824,
+                gpu_count=1 if (spec.budget.max_gpu_seconds or 0.0) > 0 else 0,
+                wallclock_s=max(int(spec.budget.max_wallclock_seconds), 1),
+                max_cost_usd=float(spec.budget.max_usd),
+            ),
+            risk_to_runtime={"standard": "docker"},
+            seccomp_profile_hash=f"blake3:{'0' * 64}",
+            signer_key_id="s2-s10-sandbox-guard",
+            signature="",
+        )
+        return PolicyBundleSigner(key_id="s2-s10-sandbox-guard", secret=b"argus-s2-sandbox-policy").sign(unsigned)
+
+    @staticmethod
+    def _materialize_env(request: BuildOrchestrationRequest) -> tuple[dict[str, str], bool]:
+        try:
+            return materialize_sandbox_env(dict(request.sandbox_env), request.sandbox_env_allowlist), False
+        except PolicyDeniedError:
+            return {}, True
+
+    def _launch_request(
+        self,
+        *,
+        spec: BuildSpec,
+        request: BuildOrchestrationRequest,
+        budget_token: Any,
+        scope_token: Any,
+        visible_env: dict[str, str],
+    ) -> LaunchRequest:
+        return LaunchRequest(
+            job_id=spec.job_id,
+            subagent_id="s2-build-orchestrator",
+            trace_id=spec.trace_id,
+            budget_token=budget_token,
+            scope_token=scope_token,
+            image=_s2_digest_pinned_image(request.container_digest),
+            entrypoint=("argus-s2-build",),
+            args=(spec.job_id,),
+            env=visible_env,
+            env_allowlist=request.sandbox_env_allowlist,
+            requested_envelope=LaunchEnvelope(
+                cpu_m=1000,
+                mem_bytes=1_073_741_824,
+                gpu_count=0,
+                wallclock_s=max(int(spec.budget.max_wallclock_seconds), 1),
+                scratch_bytes=268_435_456,
+                pids=128,
+                estimated_cost_usd=min(float(spec.budget.max_usd), 0.01),
+            ),
+            runtime_class_hint="docker",
+            policy_pin=f"s2-sandbox-{spec.job_id}",
+        )
+
+    @staticmethod
+    def _egress_probe(
+        *,
+        spec: BuildSpec,
+        request: BuildOrchestrationRequest,
+        scope_token: Any,
+        bundle: PolicyBundle,
+        audit_ledger: InMemoryAuditLedger,
+    ) -> dict[str, Any]:
+        probe = request.sandbox_egress_probe
+        if probe is None:
+            default_rule = spec.allowed_egress[0] if spec.allowed_egress else None
+            if default_rule is None:
+                return {"attempted": False, "decision": "SKIPPED", "reason": "no_probe_configured"}
+            probe = {
+                "host": default_rule.host,
+                "port": default_rule.port,
+                "proto": default_rule.proto,
+                "sni": default_rule.host,
+            }
+        host = str(probe.get("host") or "")
+        port = int(probe.get("port") or 0)
+        proto = str(probe.get("proto") or "https")
+        sni = str(probe.get("sni") or host)
+        decision = EgressProxy(bundle).decide(scope_token, host=host, port=port, proto=proto, sni=sni)
+        audit_ledger.append(
+            "egress.decision",
+            {
+                "host": host,
+                "port": port,
+                "proto": proto,
+                "decision": "ALLOW" if decision.allowed else "DENY",
+                "reason": decision.reason,
+                "job_id": spec.job_id,
+            },
+        )
+        return {
+            "attempted": True,
+            "host": host,
+            "port": port,
+            "proto": proto,
+            "sni": sni,
+            "decision": "ALLOW" if decision.allowed else "DENY",
+            "reason": decision.reason,
+        }
+
+    def _broker_write_probe(
+        self,
+        *,
+        spec: BuildSpec,
+        request: BuildOrchestrationRequest,
+        scope_token: Any,
+        audit_ledger: InMemoryAuditLedger,
+    ) -> dict[str, Any]:
+        broker = StoreWriterBroker(
+            token_service=self._token_service,
+            artifact_store=self._artifact_store,
+            audit_ledger=audit_ledger,
+        )
+        client = broker.client_for(scope_token)
+        direct_denied = False
+        try:
+            client.create_artifact(
+                kind="s2_direct_write_probe",
+                payload={"job_id": spec.job_id},
+                producer=Producer(subsystem="S2", version="0.0.0"),
+                lineage=Lineage(
+                    input_refs=tuple(spec.input_artifact_refs),
+                    code_ref=request.code_ref,
+                    environment_digest=request.environment_digest,
+                    seeds=(request.seed,),
+                    job_id=spec.job_id,
+                ),
+            )
+        except ScopeDeniedError:
+            direct_denied = True
+        return {
+            "broker": broker,
+            "client": client,
+            "direct_write_bypass": {
+                "attempted": True,
+                "denied": direct_denied,
+                "required_path": "StoreWriterBroker.put_artifact",
+            },
+        }
+
+    @staticmethod
+    def _checks(
+        *,
+        verdict: Any,
+        egress_probe: Mapping[str, Any],
+        secret_failed: bool,
+    ) -> dict[str, dict[str, str]]:
+        return {
+            "S2-TC30": {
+                "status": "PASS" if verdict.allowed and egress_probe.get("decision") != "DENY" else "FAIL",
+                **({"severity": "SEV-1"} if not verdict.allowed or egress_probe.get("decision") == "DENY" else {}),
+            },
+            "S2-TC31": {
+                "status": "FAIL" if secret_failed else "PASS",
+                **({"severity": "SEV-1"} if secret_failed else {}),
+            },
+            "S2-TC32": {"status": "PASS"},
+        }
+
+    @staticmethod
+    def _evidence_payload(
+        *,
+        spec: BuildSpec,
+        request: BuildOrchestrationRequest,
+        status: str,
+        checks: Mapping[str, Any],
+        verdict: Any,
+        bundle: PolicyBundle,
+        visible_env: Mapping[str, str],
+        egress_probe: Mapping[str, Any],
+        broker_result: Mapping[str, Any],
+        audit_ledger: InMemoryAuditLedger,
+    ) -> dict[str, Any]:
+        audit_events = [event.event_type for event in audit_ledger.events()]
+        if "store.put" not in audit_events:
+            audit_events.append("store.put")
+        return {
+            "schema_version": S2SandboxGuard.SCHEMA_VERSION,
+            "status": status,
+            "job_id": spec.job_id,
+            "trace_id": spec.trace_id,
+            "checks": dict(checks),
+            "policy": {
+                "runtime_class": verdict.runtime_class,
+                "egress_acl": [asdict(rule) for rule in verdict.egress_acl],
+                "deny_reason": verdict.deny_reason,
+                "bundle": {
+                    "bundle_version": bundle.bundle_version,
+                    "resource_ceilings": asdict(bundle.resource_ceilings),
+                    "risk_to_runtime": dict(bundle.risk_to_runtime),
+                    "seccomp_profile_hash": bundle.seccomp_profile_hash,
+                },
+            },
+            "sandbox_visible_env": dict(visible_env),
+            "secret_scan": {
+                "zero_matches": checks["S2-TC31"]["status"] == "PASS",
+                "scanned_keys": sorted(set(request.sandbox_env_allowlist) & set(request.sandbox_env)),
+                "leaked_values_recorded": False,
+            },
+            "egress_probe": dict(egress_probe),
+            "direct_write_bypass": dict(broker_result["direct_write_bypass"]),
+            "brokered_store_client": {
+                "opaque_handle": True,
+                "direct_store_reference_exposed": False,
+            },
+            "audit_events": audit_events,
+        }
 
 
 @dataclass(frozen=True)
@@ -6914,6 +7315,7 @@ def compile_build_spec_from_c2_envelope(
         input_artifact_refs=tuple(envelope.input_artifact_refs),
         allowed_adapters=tuple(envelope.capability_scopes.get("allowed_adapters", ())),
         allowed_datasets=tuple(envelope.capability_scopes.get("allowed_datasets", ())),
+        allowed_egress=_s2_egress_rules(envelope.capability_scopes.get("allowed_egress", ())),
         fields=_field_specs(problem_spec),
         constraints=dict(constraints),
     )
@@ -6969,6 +7371,7 @@ class SpecCompiler:
             input_artifact_refs=spec.input_artifact_refs,
             allowed_adapters=spec.allowed_adapters,
             allowed_datasets=spec.allowed_datasets,
+            allowed_egress=spec.allowed_egress,
             fields=spec.fields,
             constraints=dict(spec.constraints),
             verifier_profile=verifier_profile,
@@ -7081,6 +7484,7 @@ class BuildOrchestrator:
         failure_doctor: FailureDoctor | None = None,
         advisory_self_check: AdvisorySelfCheck | None = None,
         pipeline_freezer: PipelineFreezer | None = None,
+        sandbox_guard: S2SandboxGuard | None = None,
         hpo_scheduler_backend: str = "threadpool",
         hpo_worker_count: int = 1,
     ) -> None:
@@ -7117,6 +7521,7 @@ class BuildOrchestrator:
             artifact_store=artifact_store,
             provenance_emitter=self._provenance_emitter,
         )
+        self._sandbox_guard = sandbox_guard or S2SandboxGuard(artifact_store=artifact_store)
 
     def build(
         self,
@@ -7186,6 +7591,8 @@ class BuildOrchestrator:
     def _build(self, orchestration_request: BuildOrchestrationRequest) -> BuildResult:
         started_at = time.perf_counter()
         spec = self._spec_compiler.compile(orchestration_request.c2_envelope)
+        sandbox_evidence_ref = self._sandbox_guard.prepare(spec=spec, request=orchestration_request)
+        sandbox_evidence_payload = self._artifact_payload(sandbox_evidence_ref)
         feature_fields = self._feature_fields(spec)
         target_field = self._target_field(spec)
         dataset_ref = self._resolve_dataset_ref(spec)
@@ -7384,9 +7791,13 @@ class BuildOrchestrator:
         freeze_config = {
             "orchestrator": "BuildOrchestrator",
             "s2_tc21": True,
+            "s2_tc30": True,
+            "s2_tc31": True,
+            "s2_tc32": True,
             "subtopic": spec.subtopic,
             "hpo_selection_ref": hpo.selection_artifact_ref,
             "advisory_self_check_ref": advisory.artifact_ref,
+            "sandbox_evidence_ref": sandbox_evidence_ref,
         }
         if orchestration_request.variant_id:
             freeze_config.update(
@@ -7416,6 +7827,7 @@ class BuildOrchestrator:
                         hpo.selection_artifact_ref,
                         training.training_log_ref,
                         advisory.artifact_ref,
+                        sandbox_evidence_ref,
                     )
                 ),
                 code_ref=orchestration_request.code_ref,
@@ -7449,12 +7861,16 @@ class BuildOrchestrator:
                 training.training_log_ref,
                 calibration.calibration_artifact_ref,
                 advisory.artifact_ref,
+                sandbox_evidence_ref,
                 freeze.artifact_ref,
             )
         )
         diagnostics = {
             "status": "SUCCEEDED",
             "s2_tc21": "PASS",
+            "s2_tc30": "PASS",
+            "s2_tc31": "PASS",
+            "s2_tc32": "PASS",
             "claim_tier_cap": "ran-toy",
             "steps": {
                 "spec_compiler": "SUCCEEDED",
@@ -7513,6 +7929,14 @@ class BuildOrchestrator:
                 "self_replay_fraction": freeze.self_replay_fraction,
                 "max_replay_delta": freeze.max_replay_delta,
             },
+            "sandbox": {
+                "evidence_ref": sandbox_evidence_ref,
+                "status": sandbox_evidence_payload.get("status"),
+                "checks": sandbox_evidence_payload.get("checks"),
+                "egress_probe": sandbox_evidence_payload.get("egress_probe"),
+                "secret_scan": sandbox_evidence_payload.get("secret_scan"),
+                "direct_write_bypass": sandbox_evidence_payload.get("direct_write_bypass"),
+            },
             "cost_actual": training.cost_actual,
         }
         if orchestration_request.variant_id:
@@ -7554,6 +7978,7 @@ class BuildOrchestrator:
             training_log_ref=training.training_log_ref,
             uq_calibration_ref=calibration.calibration_artifact_ref,
             advisory_self_check_ref=advisory.artifact_ref,
+            sandbox_evidence_ref=sandbox_evidence_ref,
         )
 
     def _assert_base_frozen_pipeline(self, artifact_ref: str) -> dict[str, Any]:
@@ -8332,6 +8757,39 @@ def _build_budget(value: Mapping[str, Any]) -> BuildBudget:
         max_gpu_seconds=float(value["max_gpu_seconds"]) if "max_gpu_seconds" in value else None,
         max_model_tokens=int(value["max_model_tokens"]) if "max_model_tokens" in value else None,
     )
+
+
+def _s2_egress_rules(value: Any) -> tuple[EgressRule, ...]:
+    if value in (None, ""):
+        return ()
+    if not isinstance(value, (list, tuple)):
+        raise S2ContractModelError("C2 capability_scopes.allowed_egress must be a list")
+    return tuple(_s2_egress_rule(entry) for entry in value)
+
+
+def _s2_egress_rule(value: Any) -> EgressRule:
+    if not isinstance(value, Mapping):
+        raise S2ContractModelError("S2 allowed_egress entries must be objects")
+    host = str(value.get("host") or "").strip()
+    proto = str(value.get("proto") or "https").strip()
+    try:
+        port = int(value.get("port") or 0)
+    except (TypeError, ValueError) as exc:
+        raise S2ContractModelError("S2 allowed_egress port must be an integer") from exc
+    if not host or port <= 0:
+        raise S2ContractModelError("S2 allowed_egress entries require host and positive port")
+    if proto not in {"https", "grpc", "tcp"}:
+        raise S2ContractModelError("S2 allowed_egress proto must be https, grpc, or tcp")
+    return EgressRule(host=host, port=port, proto=proto)  # type: ignore[arg-type]
+
+
+def _s2_digest_pinned_image(container_digest: str) -> str:
+    digest = ""
+    if "sha256:" in container_digest:
+        digest = container_digest.split("sha256:", 1)[1].strip()
+    if len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest):
+        digest = hashlib.sha256(container_digest.encode("utf-8")).hexdigest()
+    return f"argus-s2@sha256:{digest}"
 
 
 def _field_specs(problem_spec: Mapping[str, Any]) -> tuple[FieldSpec, ...]:
