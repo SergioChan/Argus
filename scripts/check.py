@@ -37,10 +37,13 @@ CHECKS = (
             "scripts/validate_docs.py",
             "scripts/validate_schemas.py",
             "src/argus_core/s3.py",
+            "src/argus_core/s10.py",
+            "src/argus_runtime/s3_report_signer_service.py",
             "src/argus_runtime/s3_verifier_service.py",
             "src/argus_runtime/s3_verify_orchestrator.py",
             "src/argusverify/__init__.py",
             "tests/test_s3_report_canonicalizer.py",
+            "tests/test_s3_report_signer.py",
         ),
     ),
 )

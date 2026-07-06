@@ -22,6 +22,7 @@ from weakref import ref
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
+from argusverify import canonical_c3_json_bytes
 
 from .canonical import canonical_json_bytes
 from .c3 import C3_SIGNATURE_PREFIX, SIGNATURE_VERIFICATION_ACCEPTED, VerifierKey
@@ -580,7 +581,7 @@ class InMemoryS10KmsVerifierKeyProvider:
             return "unknown_key"
         if key.revoked:
             return "revoked_key"
-        digest = hmac.new(key.secret, canonical_json_bytes(report_with_empty_signature), sha256).hexdigest()
+        digest = hmac.new(key.secret, canonical_c3_json_bytes(report_with_empty_signature), sha256).hexdigest()
         expected = f"{C3_SIGNATURE_PREFIX}{digest}"
         if not hmac.compare_digest(signature_value, expected):
             return "signature_invalid"

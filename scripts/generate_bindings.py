@@ -2920,6 +2920,10 @@ def render_rust_manifest() -> str:
             'name = "argus-s8-ledger-writer"',
             'path = "src/bin/s8_ledger_writer.rs"',
             "",
+            "[[bin]]",
+            'name = "argus-s3-report-signer"',
+            'path = "src/bin/s3_report_signer.rs"',
+            "",
         ]
     )
 
