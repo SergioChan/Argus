@@ -36,6 +36,8 @@ CHECKS = (
             "scripts/schema_compatibility.py",
             "scripts/validate_docs.py",
             "scripts/validate_schemas.py",
+            "src/argus_runtime/s3_verifier_service.py",
+            "src/argus_runtime/s3_verify_orchestrator.py",
         ),
     ),
 )

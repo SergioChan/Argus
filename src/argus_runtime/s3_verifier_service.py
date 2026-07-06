@@ -115,11 +115,13 @@ class S3VerifierApiApp:
         artifact_store: Any,
         health_token: str | None = None,
         telemetry: InMemoryS3TelemetrySink | None = None,
+        orchestrator: Any | None = None,
     ) -> None:
         self.auth = auth
         self.artifact_store = artifact_store
         self._health_token = health_token
         self.telemetry = telemetry or InMemoryS3TelemetrySink()
+        self._orchestrator = orchestrator
         self._dispatches: list[S3VerificationDispatch] = []
         self.http = JsonHttpApp()
         self._register_routes()
@@ -163,6 +165,7 @@ class S3VerifierApiApp:
                 entrypoint_request=entrypoint_request,
             )
             self._dispatches.append(dispatch)
+            workflow_state = self._orchestrator.start(dispatch) if self._orchestrator is not None else None
             self._record_trace(
                 trace_id=trace_id,
                 status="OK",
@@ -174,15 +177,32 @@ class S3VerifierApiApp:
                     "job_id": dispatch.job_id,
                     "profile_ref": dispatch.profile_ref,
                     "frozen_pipeline_ref": dispatch.frozen_pipeline_ref,
+                    **(
+                        {
+                            "workflow_id": workflow_state.workflow_id,
+                            "workflow_type": workflow_state.workflow_type,
+                        }
+                        if workflow_state is not None
+                        else {}
+                    ),
                 },
             )
-            return 202, {
+            response = {
                 "status": "DISPATCHED",
                 "transport": transport,
                 "trace_id": trace_id,
                 "request_id": dispatch.request_id,
                 "entrypoint_request": entrypoint_request,
             }
+            if workflow_state is not None:
+                response.update(
+                    {
+                        "workflow_id": workflow_state.workflow_id,
+                        "workflow_type": workflow_state.workflow_type,
+                        "workflow_status": workflow_state.status,
+                    }
+                )
+            return 202, response
         except UnauthorizedError as exc:
             self._record_trace(trace_id=trace_id, status="UNAUTHORIZED", transport=transport, attributes={})
             return 401, {"error": "Unauthorized", "message": str(exc)}
