@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from functools import lru_cache
 import json
 import math
@@ -13,6 +13,7 @@ from uuid import NAMESPACE_URL, uuid4, uuid5
 from jsonschema import Draft202012Validator
 
 from argusverify import C3ReportSigner, canonical_c3_json_bytes
+from .canonical import canonical_json_bytes
 from .hashing import hash_bytes, hash_json
 from .s6 import (
     CapabilityDescriptor,
@@ -92,6 +93,193 @@ S3_FORBIDDEN_LABEL_MATERIAL_FIELDS = frozenset(
         "truth",
     }
 )
+S3_VERIFIER_PROFILE_SPEC_VERSION = "argus.s3.verifier_profile.v1"
+S3_VERIFIER_PROFILE_STATUSES = frozenset({"active", "deprecated", "revoked"})
+S3_VERIFIER_PROFILE_CHECKS = frozenset(
+    {
+        "INJECTION",
+        "NULL_CONTROL",
+        "CROSS_CODE",
+        "PHYSICAL_CONSISTENCY",
+        "LEAKAGE",
+        "CALIBRATION",
+        "PERTURBATION_PAIR",
+        "INSENSITIVITY",
+    }
+)
+S3_PROFILE_REF_PREFIX = "c4://profile"
+_S3_PROFILE_ID_CHARS = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-")
+
+
+class VerifierProfileRegistryError(S3Error):
+    """Raised when an S3 VerifierProfile registry operation fails closed."""
+
+    def __init__(self, *, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
+@dataclass(frozen=True)
+class VerifierProfileStatusEvent:
+    profile_id: str
+    revision: int
+    status: str
+    reason: str
+    actor: str = "s3-profile-registry"
+
+
+@dataclass(frozen=True)
+class VerifierProfileRevision:
+    profile_id: str
+    revision: int
+    profile_ref: str
+    subtopic: str
+    checks: tuple[str, ...]
+    cost_estimate: dict[str, Any]
+    spec_json: dict[str, Any]
+    spec_hash: str
+    status: str = "active"
+
+    @property
+    def spec_json_bytes(self) -> bytes:
+        return canonical_json_bytes(self.spec_json)
+
+    def to_c3_profile(self) -> dict[str, Any]:
+        return {
+            "profile_id": self.profile_id,
+            "revision": self.revision,
+            "subtopic": self.subtopic,
+            "checks": list(self.checks),
+            "cost_estimate": _profile_json_value(self.cost_estimate, path="cost_estimate"),
+        }
+
+
+class InMemoryVerifierProfileRegistry:
+    """Append-only VerifierProfile registry used by S3-T07 tests and local flows."""
+
+    def __init__(self) -> None:
+        self._revisions: dict[tuple[str, int], VerifierProfileRevision] = {}
+        self._status_events: list[VerifierProfileStatusEvent] = []
+
+    def publish(self, spec: Mapping[str, Any]) -> VerifierProfileRevision:
+        draft = _profile_mapping_payload(spec)
+        profile_id = _profile_id(draft.get("profile_id"))
+        revision = self._next_revision(profile_id)
+        revision_payload = _build_verifier_profile_revision(draft, revision=revision, status="active")
+        key = (revision_payload.profile_id, revision_payload.revision)
+        self._revisions[key] = revision_payload
+        self._status_events.append(
+            VerifierProfileStatusEvent(
+                profile_id=revision_payload.profile_id,
+                revision=revision_payload.revision,
+                status="active",
+                reason="published",
+            )
+        )
+        return revision_payload
+
+    def get(self, *, profile_id: str, revision: int) -> VerifierProfileRevision:
+        normalized_id = _profile_id(profile_id)
+        if not isinstance(revision, int) or revision < 1:
+            _profile_error(code="S3_PROFILE_REVISION_INVALID", message="profile revision must be a positive integer")
+        try:
+            profile = self._revisions[(normalized_id, revision)]
+        except KeyError as exc:
+            raise VerifierProfileRegistryError(
+                code="S3_PROFILE_NOT_FOUND",
+                message=f"VerifierProfile {normalized_id} revision {revision} was not found",
+            ) from exc
+        return replace(profile, status=self._latest_status(profile_id=normalized_id, revision=revision))
+
+    def get_by_ref(self, profile_ref: str) -> VerifierProfileRevision:
+        for profile in self._revisions.values():
+            if profile.profile_ref == profile_ref:
+                return self.get(profile_id=profile.profile_id, revision=profile.revision)
+        raise VerifierProfileRegistryError(
+            code="S3_PROFILE_NOT_FOUND",
+            message=f"VerifierProfile ref {profile_ref} was not found",
+        )
+
+    def latest(self, profile_id: str) -> VerifierProfileRevision:
+        normalized_id = _profile_id(profile_id)
+        revisions = [revision for pid, revision in self._revisions if pid == normalized_id]
+        if not revisions:
+            raise VerifierProfileRegistryError(
+                code="S3_PROFILE_NOT_FOUND",
+                message=f"VerifierProfile {normalized_id} was not found",
+            )
+        return self.get(profile_id=normalized_id, revision=max(revisions))
+
+    def list_profiles(self, *, subtopic: str | None = None, include_revoked: bool = False) -> tuple[VerifierProfileRevision, ...]:
+        profiles = [self.get(profile_id=profile.profile_id, revision=profile.revision) for profile in self._revisions.values()]
+        if subtopic is not None:
+            profiles = [profile for profile in profiles if profile.subtopic == subtopic]
+        if not include_revoked:
+            profiles = [profile for profile in profiles if profile.status != "revoked"]
+        return tuple(sorted(profiles, key=lambda item: (item.profile_id, item.revision)))
+
+    def deprecate(self, *, profile_id: str, revision: int, reason: str, actor: str = "s3-profile-registry") -> VerifierProfileRevision:
+        return self._append_status(profile_id=profile_id, revision=revision, status="deprecated", reason=reason, actor=actor)
+
+    def revoke(self, *, profile_id: str, revision: int, reason: str, actor: str = "s3-profile-registry") -> VerifierProfileRevision:
+        return self._append_status(profile_id=profile_id, revision=revision, status="revoked", reason=reason, actor=actor)
+
+    def status_events(self, *, profile_id: str | None = None, revision: int | None = None) -> tuple[VerifierProfileStatusEvent, ...]:
+        events = self._status_events
+        if profile_id is not None:
+            normalized_id = _profile_id(profile_id)
+            events = [event for event in events if event.profile_id == normalized_id]
+        if revision is not None:
+            events = [event for event in events if event.revision == revision]
+        return tuple(events)
+
+    def _next_revision(self, profile_id: str) -> int:
+        revisions = [revision for pid, revision in self._revisions if pid == profile_id]
+        return max(revisions, default=0) + 1
+
+    def _append_status(
+        self,
+        *,
+        profile_id: str,
+        revision: int,
+        status: str,
+        reason: str,
+        actor: str,
+    ) -> VerifierProfileRevision:
+        profile = self.get(profile_id=profile_id, revision=revision)
+        if status not in S3_VERIFIER_PROFILE_STATUSES:
+            _profile_error(code="S3_PROFILE_STATUS_INVALID", message=f"unsupported profile status: {status}")
+        if not isinstance(reason, str) or not reason:
+            _profile_error(code="S3_PROFILE_STATUS_REASON_REQUIRED", message="profile status event requires a reason")
+        if not isinstance(actor, str) or not actor:
+            _profile_error(code="S3_PROFILE_STATUS_ACTOR_REQUIRED", message="profile status event requires an actor")
+        self._status_events.append(
+            VerifierProfileStatusEvent(
+                profile_id=profile.profile_id,
+                revision=profile.revision,
+                status=status,
+                reason=reason,
+                actor=actor,
+            )
+        )
+        return self.get(profile_id=profile.profile_id, revision=profile.revision)
+
+    def _latest_status(self, *, profile_id: str, revision: int) -> str:
+        for event in reversed(self._status_events):
+            if event.profile_id == profile_id and event.revision == revision:
+                return event.status
+        return "active"
+
+
+def build_verifier_profile_revision(
+    spec: Mapping[str, Any],
+    *,
+    revision: int,
+    status: str = "active",
+) -> VerifierProfileRevision:
+    """Build a normalized VerifierProfile revision after a registry assigns the revision."""
+    return _build_verifier_profile_revision(spec, revision=revision, status=status)
 
 
 @dataclass(frozen=True)
@@ -358,6 +546,178 @@ def build_referee_block(*, referee_id: str, signer_key_id: str, proponent_id: st
         "signed_by": signer_key_id,
         "distinct_from_proponent": True,
     }
+
+
+def _build_verifier_profile_revision(
+    spec: Mapping[str, Any],
+    *,
+    revision: int,
+    status: str,
+) -> VerifierProfileRevision:
+    normalized = _normalized_verifier_profile_spec(spec, revision=revision)
+    profile = VerifierProfileRevision(
+        profile_id=str(normalized["profile_id"]),
+        revision=int(normalized["revision"]),
+        profile_ref=str(normalized["profile_ref"]),
+        subtopic=str(normalized["subtopic"]),
+        checks=tuple(str(check) for check in normalized["checks"]),
+        cost_estimate=dict(normalized["cost_estimate"]),
+        spec_json=normalized,
+        spec_hash=hash_bytes(canonical_json_bytes(normalized)),
+        status=status,
+    )
+    _assert_c3_verifier_profile_schema(profile.to_c3_profile())
+    return profile
+
+
+def _normalized_verifier_profile_spec(spec: Mapping[str, Any], *, revision: int) -> dict[str, Any]:
+    if not isinstance(revision, int) or revision < 1:
+        _profile_error(code="S3_PROFILE_REVISION_INVALID", message="profile revision must be a positive integer")
+    payload = _profile_mapping_payload(spec)
+    profile_id = _profile_id(payload.get("profile_id"))
+    subtopic = _profile_non_empty_string(payload.get("subtopic"), field_name="subtopic")
+    checks = _profile_checks(payload.get("checks"))
+    cost_estimate = _profile_mapping_payload(payload.get("cost_estimate"), field_name="cost_estimate")
+    review_signatures = _review_signatures(payload.get("review_signatures"))
+
+    if "revision" in payload and payload["revision"] != revision:
+        _profile_error(
+            code="S3_PROFILE_REVISION_MISMATCH",
+            message="profile revision is assigned by the append-only registry",
+        )
+    profile_ref = f"{S3_PROFILE_REF_PREFIX}/{profile_id}/r{revision}"
+    if "profile_ref" in payload and payload["profile_ref"] != profile_ref:
+        _profile_error(
+            code="S3_PROFILE_REF_MISMATCH",
+            message="profile_ref must match the registry-assigned revision",
+        )
+    if "status" in payload:
+        _profile_error(
+            code="S3_PROFILE_STATUS_FIELD_FORBIDDEN",
+            message="profile status is append-only registry metadata, not mutable spec_json",
+        )
+
+    normalized = dict(payload)
+    normalized["schema"] = str(normalized.get("schema") or S3_VERIFIER_PROFILE_SPEC_VERSION)
+    normalized["profile_id"] = profile_id
+    normalized["revision"] = revision
+    normalized["profile_ref"] = profile_ref
+    normalized["subtopic"] = subtopic
+    normalized["checks"] = list(checks)
+    normalized["cost_estimate"] = cost_estimate
+    normalized["review_signatures"] = review_signatures
+    canonical_json_bytes(normalized)
+    return normalized
+
+
+def _profile_mapping_payload(value: Mapping[str, Any] | Any, *, field_name: str = "VerifierProfile") -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        _profile_error(code="S3_PROFILE_JSON_INVALID", message=f"{field_name} must be a JSON object")
+    payload = _profile_json_value(value, path=field_name)
+    if not isinstance(payload, dict):
+        _profile_error(code="S3_PROFILE_JSON_INVALID", message=f"{field_name} must be a JSON object")
+    return payload
+
+
+def _profile_json_value(value: Any, *, path: str) -> Any:
+    if isinstance(value, Mapping):
+        payload: dict[str, Any] = {}
+        for key, item in value.items():
+            if not isinstance(key, str):
+                _profile_error(code="S3_PROFILE_JSON_INVALID", message=f"{path} contains a non-string key")
+            payload[key] = _profile_json_value(item, path=f"{path}.{key}")
+        return payload
+    if isinstance(value, list):
+        return [_profile_json_value(item, path=f"{path}[]") for item in value]
+    if isinstance(value, tuple):
+        _profile_error(code="S3_PROFILE_JSON_INVALID", message=f"{path} contains a tuple; use JSON arrays")
+    if isinstance(value, bool) or value is None or isinstance(value, str):
+        return value
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            _profile_error(code="S3_PROFILE_JSON_INVALID", message=f"{path} contains a non-finite number")
+        return value
+    _profile_error(
+        code="S3_PROFILE_JSON_INVALID",
+        message=f"{path} contains non-JSON value of type {type(value).__name__}",
+    )
+
+
+def _profile_id(value: Any) -> str:
+    profile_id = _profile_non_empty_string(value, field_name="profile_id")
+    if any(char not in _S3_PROFILE_ID_CHARS for char in profile_id):
+        _profile_error(
+            code="S3_PROFILE_ID_INVALID",
+            message="profile_id may contain only letters, digits, dot, underscore, and hyphen",
+        )
+    return profile_id
+
+
+def _profile_non_empty_string(value: Any, *, field_name: str) -> str:
+    if not isinstance(value, str) or not value:
+        _profile_error(code="S3_PROFILE_FIELD_REQUIRED", message=f"{field_name} must be a non-empty string")
+    return value
+
+
+def _profile_checks(value: Any) -> tuple[str, ...]:
+    if not isinstance(value, list) or not value:
+        _profile_error(code="S3_PROFILE_CHECKS_INVALID", message="checks must be a non-empty JSON array")
+    checks: list[str] = []
+    for item in value:
+        if not isinstance(item, str) or not item:
+            _profile_error(code="S3_PROFILE_CHECKS_INVALID", message="checks must contain non-empty strings")
+        if item not in S3_VERIFIER_PROFILE_CHECKS:
+            _profile_error(code="S3_PROFILE_CHECK_UNSUPPORTED", message=f"unsupported S3 check: {item}")
+        if item in checks:
+            _profile_error(code="S3_PROFILE_CHECKS_INVALID", message=f"duplicate S3 check: {item}")
+        checks.append(item)
+    return tuple(checks)
+
+
+def _review_signatures(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list) or not value:
+        _profile_error(
+            code="S3_PROFILE_REVIEW_SIGNATURE_REQUIRED",
+            message="profile publication requires at least one review signature envelope",
+        )
+    signatures: list[dict[str, Any]] = []
+    for index, item in enumerate(value):
+        payload = _profile_mapping_payload(item, field_name=f"review_signatures[{index}]")
+        _profile_non_empty_string(payload.get("reviewer_id"), field_name=f"review_signatures[{index}].reviewer_id")
+        _profile_non_empty_string(payload.get("signature"), field_name=f"review_signatures[{index}].signature")
+        signatures.append(payload)
+    return signatures
+
+
+def _assert_c3_verifier_profile_schema(profile: Mapping[str, Any]) -> None:
+    errors = sorted(
+        _c3_verifier_profile_validator().iter_errors(profile),
+        key=lambda error: (list(error.absolute_path), error.message),
+    )
+    if errors:
+        first = errors[0]
+        path = ".".join(str(part) for part in first.absolute_path) or "$"
+        _profile_error(
+            code="S3_PROFILE_SCHEMA_INVALID",
+            message=f"VerifierProfile schema violation at {path}: {first.message}",
+        )
+
+
+@lru_cache(maxsize=1)
+def _c3_verifier_profile_validator() -> Draft202012Validator:
+    schema_path = Path(__file__).resolve().parents[2] / "schemas" / "contracts" / "c3.validation-report.schema.json"
+    schema = json.loads(schema_path.read_text(encoding="utf-8"))
+    verifier_profile = dict(schema["$defs"]["VerifierProfile"])
+    verifier_profile["$schema"] = schema["$schema"]
+    verifier_profile["$defs"] = schema["$defs"]
+    Draft202012Validator.check_schema(verifier_profile)
+    return Draft202012Validator(verifier_profile)
+
+
+def _profile_error(*, code: str, message: str) -> None:
+    raise VerifierProfileRegistryError(code=code, message=message)
 
 
 def _validation_report_payload(value: Mapping[str, Any] | Any) -> dict[str, Any]:
