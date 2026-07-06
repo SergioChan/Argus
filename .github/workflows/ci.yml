@@ -39,6 +39,15 @@ jobs:
           name: s1-perf-scale-evidence
           path: ${{ runner.temp }}/s1-perf-scale-evidence.json
 
+      - name: Run S2 perf latency battery
+        run: python3 scripts/run_s2_perf_latency_battery.py --evidence-file "$RUNNER_TEMP/s2-perf-latency-evidence.json"
+
+      - name: Upload S2 perf latency evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: s2-perf-latency-evidence
+          path: ${{ runner.temp }}/s2-perf-latency-evidence.json
+
       - name: Run S8 lineage scale battery
         run: python3 scripts/run_s8_lineage_scale_battery.py --evidence-file "$RUNNER_TEMP/s8-lineage-scale-evidence.json"
 

@@ -28,6 +28,7 @@ CHECKS = (
             "scripts/check.py",
             "scripts/generate_bindings.py",
             "scripts/run_s1_perf_scale_battery.py",
+            "scripts/run_s2_perf_latency_battery.py",
             "scripts/run_s8_read_query_scale_battery.py",
             "scripts/run_s8_lineage_scale_battery.py",
             "scripts/run_m0_spine_battery.py",
