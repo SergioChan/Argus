@@ -1623,11 +1623,27 @@ class S3InjectionCheckError(S3Error):
         self.message = message
 
 
+class S3NullControlCheckError(S3Error):
+    """Raised when the S3 NULL_CONTROL check cannot be evaluated safely."""
+
+    def __init__(self, *, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
 @dataclass(frozen=True)
 class S3InjectionSample:
     sample_id: str
     injected_value: float
     recovered_value: float
+
+
+@dataclass(frozen=True)
+class S3NullControlSample:
+    sample_id: str
+    variant: str
+    detected: bool
 
 
 class S3InjectionCheckPlugin:
@@ -1743,6 +1759,88 @@ class S3InjectionCheckPlugin:
                 "intercept_tolerance_abs": intercept_tolerance_abs,
                 "amplitude_linearity_pass": amplitude_linearity_pass,
                 "linearity_failure_reason": failure_reason,
+            },
+        )
+
+
+class S3NullControlCheckPlugin:
+    """Concrete NULL_CONTROL check plugin for S3-TC06/07/08."""
+
+    def __init__(
+        self,
+        *,
+        samples: tuple[S3NullControlSample, ...],
+        plugin_version: str = "1.0.0",
+    ) -> None:
+        self._samples = tuple(samples)
+        self._plugin_version = plugin_version
+
+    def describe(self) -> CheckPluginDescriptor:
+        return CheckPluginDescriptor(
+            check="NULL_CONTROL",
+            plugin_ref="argus.s3.plugins.null_control",
+            plugin_version=self._plugin_version,
+            determinism="deterministic",
+            declared_inputs=(
+                "s3.blind_data_stage",
+                "s3.frozen_pipeline_observations",
+            ),
+        )
+
+    def run(self, ctx: CheckPluginContext) -> CheckResult:
+        if ctx.check_spec.check != "NULL_CONTROL":
+            _s3_null_control_error(
+                "S3_NULL_CONTROL_CHECK_SPEC_MISMATCH",
+                f"null-control plugin cannot run {ctx.check_spec.check}",
+            )
+        samples = _s3_null_control_samples(self._samples)
+        alpha = _s3_null_control_probability(
+            ctx.check_spec.thresholds.get("alpha"),
+            field="alpha",
+        )
+        confidence_level = _s3_null_control_probability(
+            ctx.check_spec.thresholds.get("confidence_level", 0.95),
+            field="confidence_level",
+        )
+        false_positives = sum(1 for _sample_id, _variant, detected in samples if detected)
+        aggregate_bound = S3StatisticsLibrary.false_positive_rate_bound(
+            false_positives=false_positives,
+            trials=len(samples),
+            confidence_level=confidence_level,
+            max_rate=alpha,
+        )
+        variant_results = _s3_null_control_variant_results(
+            samples=samples,
+            alpha=alpha,
+            confidence_level=confidence_level,
+        )
+        all_variants_pass = all(result["passed"] for result in variant_results)
+        null_control_pass = aggregate_bound.passed and all_variants_pass
+        status = "PASS" if null_control_pass else "FAIL"
+        variants = tuple(dict.fromkeys(variant for _sample_id, variant, _detected in samples))
+        test_cases = _s3_null_control_test_cases(status=status, variants=variants)
+        failure_reason = _s3_null_control_failure_reason(
+            aggregate_pass=aggregate_bound.passed,
+            all_variants_pass=all_variants_pass,
+        )
+
+        return CheckResult(
+            check="NULL_CONTROL",
+            status=status,
+            metrics={
+                "test_cases": test_cases,
+                "trial_count": len(samples),
+                "sample_digest": _s3_null_control_samples_digest(samples),
+                "false_positives": false_positives,
+                "false_positive_rate": aggregate_bound.observed_rate,
+                "false_positive_rate_upper": aggregate_bound.upper_bound,
+                "alpha": alpha,
+                "confidence_level": confidence_level,
+                "binomial_method": aggregate_bound.method,
+                "null_control_pass": null_control_pass,
+                "variant_counts": _s3_null_control_variant_counts(samples),
+                "variant_results": variant_results,
+                "failure_reason": failure_reason,
             },
         )
 
@@ -3254,6 +3352,140 @@ def _s3_injection_optional_non_negative(value: Any, *, field: str) -> float | No
 
 def _s3_injection_error(code: str, message: str) -> None:
     raise S3InjectionCheckError(code=code, message=message)
+
+
+def _s3_null_control_samples(samples: tuple[S3NullControlSample, ...]) -> tuple[tuple[str, str, bool], ...]:
+    if not samples:
+        _s3_null_control_error("S3_NULL_CONTROL_SAMPLES_REQUIRED", "NULL_CONTROL requires at least one null sample")
+    normalized: list[tuple[str, str, bool]] = []
+    seen: set[str] = set()
+    for index, sample in enumerate(samples):
+        if not isinstance(sample, S3NullControlSample):
+            _s3_null_control_error(
+                "S3_NULL_CONTROL_SAMPLE_INVALID",
+                f"sample at index {index} must be S3NullControlSample",
+            )
+        sample_id = sample.sample_id
+        if not isinstance(sample_id, str) or not sample_id:
+            _s3_null_control_error("S3_NULL_CONTROL_SAMPLE_ID_INVALID", "sample_id must be a non-empty string")
+        if sample_id in seen:
+            _s3_null_control_error("S3_NULL_CONTROL_SAMPLE_DUPLICATE", f"duplicate sample_id {sample_id}")
+        seen.add(sample_id)
+        variant = _s3_null_control_variant(sample.variant, field=f"{sample_id}.variant")
+        detected = _s3_null_control_bool(sample.detected, field=f"{sample_id}.detected")
+        normalized.append((sample_id, variant, detected))
+    return tuple(normalized)
+
+
+def _s3_null_control_samples_digest(samples: tuple[tuple[str, str, bool], ...]) -> str:
+    return hash_json(
+        [
+            {
+                "sample_id": sample_id,
+                "variant": variant,
+                "detected": detected,
+            }
+            for sample_id, variant, detected in samples
+        ]
+    )
+
+
+def _s3_null_control_variant_counts(samples: tuple[tuple[str, str, bool], ...]) -> list[dict[str, Any]]:
+    counts: dict[str, dict[str, Any]] = {}
+    for _sample_id, variant, detected in samples:
+        entry = counts.setdefault(variant, {"variant": variant, "false_positives": 0, "trials": 0})
+        entry["trials"] += 1
+        if detected:
+            entry["false_positives"] += 1
+    return list(counts.values())
+
+
+def _s3_null_control_variant_results(
+    *,
+    samples: tuple[tuple[str, str, bool], ...],
+    alpha: float,
+    confidence_level: float,
+) -> list[dict[str, Any]]:
+    results: list[dict[str, Any]] = []
+    for count in _s3_null_control_variant_counts(samples):
+        bound = S3StatisticsLibrary.false_positive_rate_bound(
+            false_positives=count["false_positives"],
+            trials=count["trials"],
+            confidence_level=confidence_level,
+            max_rate=alpha,
+        )
+        results.append(
+            {
+                "variant": count["variant"],
+                "false_positives": count["false_positives"],
+                "trials": count["trials"],
+                "false_positive_rate": bound.observed_rate,
+                "false_positive_rate_upper": bound.upper_bound,
+                "passed": bound.passed,
+            }
+        )
+    return results
+
+
+def _s3_null_control_test_cases(*, status: str, variants: tuple[str, ...]) -> list[str]:
+    test_cases: list[str] = []
+    signal_free_variants = {"signal_free", "pure_noise", "fake_contamination", "data_contamination"}
+    if status == "FAIL" and any(variant in signal_free_variants for variant in variants):
+        test_cases.append("S3-TC06")
+    elif status == "PASS" and any(variant in signal_free_variants for variant in variants):
+        test_cases.append("S3-TC07")
+    if "label_shuffle" in variants:
+        test_cases.append("S3-TC08")
+    if not test_cases:
+        test_cases.append("S3-TC06" if status == "FAIL" else "S3-TC07")
+    return test_cases
+
+
+def _s3_null_control_failure_reason(*, aggregate_pass: bool, all_variants_pass: bool) -> str | None:
+    if aggregate_pass and all_variants_pass:
+        return None
+    if not aggregate_pass:
+        return "FPR_UPPER_EXCEEDS_ALPHA"
+    return "VARIANT_FPR_UPPER_EXCEEDS_ALPHA"
+
+
+def _s3_null_control_variant(value: Any, *, field: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        _s3_null_control_error("S3_NULL_CONTROL_VARIANT_INVALID", f"{field} must be a non-empty string")
+    normalized = value.strip().lower().replace("-", "_")
+    allowed = {"signal_free", "pure_noise", "label_shuffle", "fake_contamination", "data_contamination"}
+    if normalized not in allowed:
+        _s3_null_control_error(
+            "S3_NULL_CONTROL_VARIANT_INVALID",
+            f"{field} must be one of {', '.join(sorted(allowed))}",
+        )
+    return normalized
+
+
+def _s3_null_control_bool(value: Any, *, field: str) -> bool:
+    if not isinstance(value, bool):
+        _s3_null_control_error("S3_NULL_CONTROL_DETECTION_INVALID", f"{field} must be boolean")
+    return value
+
+
+def _s3_null_control_float(value: Any, *, field: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        _s3_null_control_error("S3_NULL_CONTROL_VALUE_INVALID", f"{field} must be numeric")
+    numeric = float(value)
+    if not math.isfinite(numeric):
+        _s3_null_control_error("S3_NULL_CONTROL_VALUE_NONFINITE", f"{field} must be finite")
+    return numeric
+
+
+def _s3_null_control_probability(value: Any, *, field: str) -> float:
+    numeric = _s3_null_control_float(value, field=field)
+    if numeric <= 0 or numeric >= 1:
+        _s3_null_control_error("S3_NULL_CONTROL_PROBABILITY_INVALID", f"{field} must be in (0, 1)")
+    return numeric
+
+
+def _s3_null_control_error(code: str, message: str) -> None:
+    raise S3NullControlCheckError(code=code, message=message)
 
 
 @dataclass(frozen=True)
