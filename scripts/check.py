@@ -46,6 +46,7 @@ CHECKS = (
             "src/argusverify/__init__.py",
             "tests/test_s3_blind_data_manager.py",
             "tests/test_s3_check_plugin_host.py",
+            "tests/test_s3_cross_code_check_plugin.py",
             "tests/test_s3_frozen_pipeline_runner.py",
             "tests/test_s3_independence_resolver.py",
             "tests/test_s3_injection_check_plugin.py",

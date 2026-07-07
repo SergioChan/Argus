@@ -1632,6 +1632,15 @@ class S3NullControlCheckError(S3Error):
         self.message = message
 
 
+class S3CrossCodeCheckError(S3Error):
+    """Raised when the S3 CROSS_CODE check cannot be evaluated safely."""
+
+    def __init__(self, *, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
 @dataclass(frozen=True)
 class S3InjectionSample:
     sample_id: str
@@ -1644,6 +1653,18 @@ class S3NullControlSample:
     sample_id: str
     variant: str
     detected: bool
+
+
+@dataclass(frozen=True)
+class S3CrossCodeSample:
+    sample_id: str
+    pipeline_value: float
+    reference_value: float
+    pipeline_uncertainty: float
+    reference_uncertainty: float
+    pipeline_units: str
+    reference_units: str
+    extrapolation_flag: bool = False
 
 
 class S3InjectionCheckPlugin:
@@ -1841,6 +1862,178 @@ class S3NullControlCheckPlugin:
                 "variant_counts": _s3_null_control_variant_counts(samples),
                 "variant_results": variant_results,
                 "failure_reason": failure_reason,
+            },
+        )
+
+
+class S3CrossCodeCheckPlugin:
+    """Concrete CROSS_CODE check plugin for S3-TC09/10/11/47."""
+
+    def __init__(
+        self,
+        *,
+        samples: tuple[S3CrossCodeSample, ...],
+        independence_resolution: S3IndependenceResolution | None,
+        plugin_version: str = "1.0.0",
+    ) -> None:
+        self._samples = tuple(samples)
+        self._independence_resolution = independence_resolution
+        self._plugin_version = plugin_version
+
+    def describe(self) -> CheckPluginDescriptor:
+        return CheckPluginDescriptor(
+            check="CROSS_CODE",
+            plugin_ref="argus.s3.plugins.cross_code",
+            plugin_version=self._plugin_version,
+            determinism="deterministic",
+            declared_inputs=(
+                "s3.frozen_pipeline_observations",
+                "c5.independence_resolution",
+                "c6.independent_adapter_observations",
+            ),
+        )
+
+    def run(self, ctx: CheckPluginContext) -> CheckResult:
+        if ctx.check_spec.check != "CROSS_CODE":
+            _s3_cross_code_error(
+                "S3_CROSS_CODE_CHECK_SPEC_MISMATCH",
+                f"cross-code plugin cannot run {ctx.check_spec.check}",
+            )
+        independence = _s3_cross_code_independence_resolution(self._independence_resolution)
+        if independence.verdict != "INDEPENDENT":
+            return CheckResult(
+                check="CROSS_CODE",
+                status="INCONCLUSIVE",
+                metrics={
+                    "test_cases": ["S3-TC11"],
+                    "independence_verdict": independence.verdict,
+                    "cross_codes": list(independence.cross_codes),
+                    "degradations": list(independence.degradations or ("INDEPENDENCE_UNAVAILABLE",)),
+                    "min_independent": independence.min_independent,
+                    "failure_reason": "INDEPENDENCE_UNAVAILABLE",
+                    "numeric_coercion_performed": False,
+                },
+            )
+
+        samples = _s3_cross_code_samples(self._samples)
+        reduced_min = _s3_cross_code_non_negative(
+            ctx.check_spec.thresholds.get("reduced_chi_square_min"),
+            field="reduced_chi_square_min",
+        )
+        reduced_max = _s3_cross_code_positive(
+            ctx.check_spec.thresholds.get("reduced_chi_square_max"),
+            field="reduced_chi_square_max",
+        )
+        if reduced_max < reduced_min:
+            _s3_cross_code_error(
+                "S3_CROSS_CODE_THRESHOLD_INVALID",
+                "reduced_chi_square_max must be >= reduced_chi_square_min",
+            )
+        z_max = _s3_cross_code_positive(ctx.check_spec.thresholds.get("z_max"), field="z_max")
+        max_excluded_fraction = _s3_cross_code_fraction(
+            ctx.check_spec.thresholds.get("max_excluded_fraction", 0.0),
+            field="max_excluded_fraction",
+        )
+        min_valid_points = _s3_cross_code_positive_int(
+            ctx.check_spec.thresholds.get("min_valid_points", 2),
+            field="min_valid_points",
+        )
+        alpha = _s3_cross_code_probability(
+            ctx.check_spec.thresholds.get("alpha", 0.05),
+            field="alpha",
+        )
+
+        units_mismatch_count = sum(
+            1 for sample in samples if sample["pipeline_units"] != sample["reference_units"]
+        )
+        base_metrics = _s3_cross_code_base_metrics(
+            samples=samples,
+            independence=independence,
+            reduced_min=reduced_min,
+            reduced_max=reduced_max,
+            z_max=z_max,
+            max_excluded_fraction=max_excluded_fraction,
+            min_valid_points=min_valid_points,
+        )
+        if units_mismatch_count:
+            return CheckResult(
+                check="CROSS_CODE",
+                status="FAIL",
+                metrics={
+                    **base_metrics,
+                    "test_cases": ["S3-TC47"],
+                    "units_mismatch_count": units_mismatch_count,
+                    "cross_code_pass": False,
+                    "numeric_coercion_performed": False,
+                    "failure_reason": "UNITS_MISMATCH",
+                },
+            )
+
+        valid_samples = tuple(sample for sample in samples if not sample["extrapolation_flag"])
+        points_excluded = len(samples) - len(valid_samples)
+        excluded_fraction = points_excluded / len(samples)
+        if excluded_fraction > max_excluded_fraction:
+            return CheckResult(
+                check="CROSS_CODE",
+                status="INCONCLUSIVE",
+                metrics={
+                    **base_metrics,
+                    "test_cases": ["S3-TC11"],
+                    "valid_point_count": len(valid_samples),
+                    "points_excluded": points_excluded,
+                    "excluded_fraction": excluded_fraction,
+                    "cross_code_pass": False,
+                    "numeric_coercion_performed": False,
+                    "failure_reason": "EXCLUDED_FRACTION_EXCEEDS_MAX",
+                },
+            )
+        if len(valid_samples) < min_valid_points:
+            return CheckResult(
+                check="CROSS_CODE",
+                status="INCONCLUSIVE",
+                metrics={
+                    **base_metrics,
+                    "test_cases": ["S3-TC11"],
+                    "valid_point_count": len(valid_samples),
+                    "points_excluded": points_excluded,
+                    "excluded_fraction": excluded_fraction,
+                    "cross_code_pass": False,
+                    "numeric_coercion_performed": False,
+                    "failure_reason": "INSUFFICIENT_VALID_POINTS",
+                },
+            )
+
+        agreement = S3StatisticsLibrary.chi_square_z_agreement(
+            observed=tuple(sample["pipeline_value"] for sample in valid_samples),
+            expected=tuple(sample["reference_value"] for sample in valid_samples),
+            observed_uncertainty=tuple(sample["pipeline_uncertainty"] for sample in valid_samples),
+            expected_uncertainty=tuple(sample["reference_uncertainty"] for sample in valid_samples),
+            max_abs_z=z_max,
+            max_reduced_chi_square=reduced_max,
+            alpha=alpha,
+        )
+        cross_code_pass = (
+            reduced_min <= agreement.reduced_chi_square <= reduced_max
+            and agreement.max_observed_abs_z <= z_max
+        )
+        return CheckResult(
+            check="CROSS_CODE",
+            status="PASS" if cross_code_pass else "FAIL",
+            metrics={
+                **base_metrics,
+                "test_cases": ["S3-TC09"] if cross_code_pass else ["S3-TC10"],
+                "valid_point_count": len(valid_samples),
+                "points_excluded": points_excluded,
+                "excluded_fraction": excluded_fraction,
+                "chi_square": agreement.chi_square,
+                "dof": agreement.dof,
+                "reduced_chi_square": agreement.reduced_chi_square,
+                "max_abs_z": agreement.max_observed_abs_z,
+                "p_value": agreement.p_value,
+                "agreement_method": agreement.method,
+                "cross_code_pass": cross_code_pass,
+                "numeric_coercion_performed": False,
+                "failure_reason": None if cross_code_pass else "AGREEMENT_OUT_OF_BOUNDS",
             },
         )
 
@@ -3486,6 +3679,197 @@ def _s3_null_control_probability(value: Any, *, field: str) -> float:
 
 def _s3_null_control_error(code: str, message: str) -> None:
     raise S3NullControlCheckError(code=code, message=message)
+
+
+def _s3_cross_code_independence_resolution(
+    value: S3IndependenceResolution | None,
+) -> S3IndependenceResolution:
+    if not isinstance(value, S3IndependenceResolution):
+        _s3_cross_code_error(
+            "S3_CROSS_CODE_INDEPENDENCE_REQUIRED",
+            "CROSS_CODE requires an S3IndependenceResolution from S3-T14",
+        )
+    if value.verdict == "INDEPENDENT" and not value.cross_codes:
+        _s3_cross_code_error(
+            "S3_CROSS_CODE_INDEPENDENCE_INVALID",
+            "independent CROSS_CODE resolution must include at least one cross-code id",
+        )
+    return value
+
+
+def _s3_cross_code_samples(samples: tuple[S3CrossCodeSample, ...]) -> tuple[dict[str, Any], ...]:
+    if not samples:
+        _s3_cross_code_error("S3_CROSS_CODE_SAMPLES_REQUIRED", "CROSS_CODE requires comparison samples")
+    normalized: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for index, sample in enumerate(samples):
+        if not isinstance(sample, S3CrossCodeSample):
+            _s3_cross_code_error(
+                "S3_CROSS_CODE_SAMPLE_INVALID",
+                f"sample at index {index} must be S3CrossCodeSample",
+            )
+        sample_id = sample.sample_id
+        if not isinstance(sample_id, str) or not sample_id:
+            _s3_cross_code_error("S3_CROSS_CODE_SAMPLE_ID_INVALID", "sample_id must be a non-empty string")
+        if sample_id in seen:
+            _s3_cross_code_error("S3_CROSS_CODE_SAMPLE_DUPLICATE", f"duplicate sample_id {sample_id}")
+        seen.add(sample_id)
+        pipeline_uncertainty = _s3_cross_code_non_negative(
+            sample.pipeline_uncertainty,
+            field=f"{sample_id}.pipeline_uncertainty",
+        )
+        reference_uncertainty = _s3_cross_code_non_negative(
+            sample.reference_uncertainty,
+            field=f"{sample_id}.reference_uncertainty",
+        )
+        pipeline_units = _s3_cross_code_units(sample.pipeline_units, field=f"{sample_id}.pipeline_units")
+        reference_units = _s3_cross_code_units(sample.reference_units, field=f"{sample_id}.reference_units")
+        extrapolation_flag = _s3_cross_code_bool(
+            sample.extrapolation_flag,
+            field=f"{sample_id}.extrapolation_flag",
+        )
+        if pipeline_units == reference_units and not extrapolation_flag:
+            _s3_cross_code_combined_uncertainty(
+                pipeline_uncertainty=pipeline_uncertainty,
+                reference_uncertainty=reference_uncertainty,
+                field=sample_id,
+            )
+        normalized.append(
+            {
+                "sample_id": sample_id,
+                "pipeline_value": _s3_cross_code_float(sample.pipeline_value, field=f"{sample_id}.pipeline_value"),
+                "reference_value": _s3_cross_code_float(sample.reference_value, field=f"{sample_id}.reference_value"),
+                "pipeline_uncertainty": pipeline_uncertainty,
+                "reference_uncertainty": reference_uncertainty,
+                "pipeline_units": pipeline_units,
+                "reference_units": reference_units,
+                "extrapolation_flag": extrapolation_flag,
+            }
+        )
+    return tuple(normalized)
+
+
+def _s3_cross_code_base_metrics(
+    *,
+    samples: tuple[dict[str, Any], ...],
+    independence: S3IndependenceResolution,
+    reduced_min: float,
+    reduced_max: float,
+    z_max: float,
+    max_excluded_fraction: float,
+    min_valid_points: int,
+) -> dict[str, Any]:
+    return {
+        "sample_count": len(samples),
+        "sample_digest": _s3_cross_code_samples_digest(samples),
+        "independence_verdict": independence.verdict,
+        "cross_codes": list(independence.cross_codes),
+        "rejected_candidate_ids": list(independence.rejected_candidate_ids),
+        "degradations": list(independence.degradations),
+        "min_independent": independence.min_independent,
+        "c5_pinned_revisions": dict(independence.c5_pinned_revisions or {}),
+        "reduced_chi_square_min": reduced_min,
+        "reduced_chi_square_max": reduced_max,
+        "z_max": z_max,
+        "max_excluded_fraction": max_excluded_fraction,
+        "min_valid_points": min_valid_points,
+        "units": sorted({sample["pipeline_units"] for sample in samples} | {sample["reference_units"] for sample in samples}),
+    }
+
+
+def _s3_cross_code_samples_digest(samples: tuple[dict[str, Any], ...]) -> str:
+    return hash_json(
+        [
+            {
+                "sample_id": sample["sample_id"],
+                "pipeline_value": sample["pipeline_value"],
+                "reference_value": sample["reference_value"],
+                "pipeline_uncertainty": sample["pipeline_uncertainty"],
+                "reference_uncertainty": sample["reference_uncertainty"],
+                "pipeline_units": sample["pipeline_units"],
+                "reference_units": sample["reference_units"],
+                "extrapolation_flag": sample["extrapolation_flag"],
+            }
+            for sample in samples
+        ]
+    )
+
+
+def _s3_cross_code_units(value: Any, *, field: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        _s3_cross_code_error("S3_CROSS_CODE_UNITS_INVALID", f"{field} must be a non-empty string")
+    return value.strip()
+
+
+def _s3_cross_code_bool(value: Any, *, field: str) -> bool:
+    if not isinstance(value, bool):
+        _s3_cross_code_error("S3_CROSS_CODE_FLAG_INVALID", f"{field} must be boolean")
+    return value
+
+
+def _s3_cross_code_float(value: Any, *, field: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        _s3_cross_code_error("S3_CROSS_CODE_VALUE_INVALID", f"{field} must be numeric")
+    numeric = float(value)
+    if not math.isfinite(numeric):
+        _s3_cross_code_error("S3_CROSS_CODE_VALUE_NONFINITE", f"{field} must be finite")
+    return numeric
+
+
+def _s3_cross_code_positive(value: Any, *, field: str) -> float:
+    numeric = _s3_cross_code_float(value, field=field)
+    if numeric <= 0:
+        _s3_cross_code_error("S3_CROSS_CODE_VALUE_INVALID", f"{field} must be positive")
+    return numeric
+
+
+def _s3_cross_code_non_negative(value: Any, *, field: str) -> float:
+    numeric = _s3_cross_code_float(value, field=field)
+    if numeric < 0:
+        _s3_cross_code_error("S3_CROSS_CODE_VALUE_INVALID", f"{field} must be non-negative")
+    return numeric
+
+
+def _s3_cross_code_fraction(value: Any, *, field: str) -> float:
+    numeric = _s3_cross_code_float(value, field=field)
+    if numeric < 0 or numeric > 1:
+        _s3_cross_code_error("S3_CROSS_CODE_FRACTION_INVALID", f"{field} must be in [0, 1]")
+    return numeric
+
+
+def _s3_cross_code_probability(value: Any, *, field: str) -> float:
+    numeric = _s3_cross_code_float(value, field=field)
+    if numeric <= 0 or numeric >= 1:
+        _s3_cross_code_error("S3_CROSS_CODE_PROBABILITY_INVALID", f"{field} must be in (0, 1)")
+    return numeric
+
+
+def _s3_cross_code_combined_uncertainty(
+    *,
+    pipeline_uncertainty: float,
+    reference_uncertainty: float,
+    field: str,
+) -> float:
+    combined = math.sqrt(
+        pipeline_uncertainty * pipeline_uncertainty
+        + reference_uncertainty * reference_uncertainty
+    )
+    if combined <= 0:
+        _s3_cross_code_error(
+            "S3_CROSS_CODE_ZERO_UNCERTAINTY",
+            f"{field} combined uncertainty must be positive",
+        )
+    return combined
+
+
+def _s3_cross_code_positive_int(value: Any, *, field: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        _s3_cross_code_error("S3_CROSS_CODE_INTEGER_INVALID", f"{field} must be a positive integer")
+    return value
+
+
+def _s3_cross_code_error(code: str, message: str) -> None:
+    raise S3CrossCodeCheckError(code=code, message=message)
 
 
 @dataclass(frozen=True)
