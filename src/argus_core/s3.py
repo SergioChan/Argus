@@ -1633,6 +1633,15 @@ class S3NullControlCheckError(S3Error):
         self.message = message
 
 
+class S3CalibrationCheckError(S3Error):
+    """Raised when the S3 CALIBRATION check cannot be evaluated safely."""
+
+    def __init__(self, *, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
 class S3CrossCodeCheckError(S3Error):
     """Raised when the S3 CROSS_CODE check cannot be evaluated safely."""
 
@@ -1672,6 +1681,16 @@ class S3NullControlSample:
     sample_id: str
     variant: str
     detected: bool
+
+
+@dataclass(frozen=True)
+class S3CalibrationSample:
+    sample_id: str
+    prediction: float
+    interval_lower: float
+    interval_upper: float
+    truth: float
+    pit_value: float
 
 
 @dataclass(frozen=True)
@@ -1920,6 +1939,106 @@ class S3NullControlCheckPlugin:
                 "variant_counts": _s3_null_control_variant_counts(samples),
                 "variant_results": variant_results,
                 "failure_reason": failure_reason,
+            },
+        )
+
+
+class S3CalibrationCheckPlugin:
+    """Concrete CALIBRATION check plugin for S3-TC19/20."""
+
+    def __init__(
+        self,
+        *,
+        samples: tuple[S3CalibrationSample, ...],
+        plugin_version: str = "1.0.0",
+    ) -> None:
+        self._samples = tuple(samples)
+        self._plugin_version = plugin_version
+
+    def describe(self) -> CheckPluginDescriptor:
+        return CheckPluginDescriptor(
+            check="CALIBRATION",
+            plugin_ref="argus.s3.plugins.calibration",
+            plugin_version=self._plugin_version,
+            determinism="deterministic",
+            declared_inputs=(
+                "s3.injection_truth",
+                "s3.held_out_calibration_points",
+                "s3.frozen_pipeline_uncertainty",
+            ),
+        )
+
+    def run(self, ctx: CheckPluginContext) -> CheckResult:
+        if ctx.check_spec.check != "CALIBRATION":
+            _s3_calibration_error(
+                "S3_CALIBRATION_CHECK_SPEC_MISMATCH",
+                f"calibration plugin cannot run {ctx.check_spec.check}",
+            )
+        nominal_coverage = _s3_calibration_probability(
+            ctx.check_spec.thresholds.get("nominal_coverage"),
+            field="nominal_coverage",
+            allow_zero=False,
+            allow_one=False,
+        )
+        alpha = _s3_calibration_probability(
+            ctx.check_spec.thresholds.get("alpha"),
+            field="alpha",
+            allow_zero=False,
+            allow_one=False,
+        )
+        min_samples = _s3_calibration_positive_int(
+            ctx.check_spec.thresholds.get("min_samples", 10),
+            field="min_samples",
+        )
+        coverage_tolerance = _s3_calibration_coverage_tolerance(
+            thresholds=ctx.check_spec.thresholds,
+            tolerance=ctx.check_spec.tolerance,
+        )
+        samples = _s3_calibration_samples(self._samples, min_samples=min_samples)
+
+        coverage = S3StatisticsLibrary.coverage(
+            truth=tuple(sample["truth"] for sample in samples),
+            lower=tuple(sample["interval_lower"] for sample in samples),
+            upper=tuple(sample["interval_upper"] for sample in samples),
+            nominal_coverage=nominal_coverage,
+            tolerance=coverage_tolerance,
+        )
+        pit = S3StatisticsLibrary.pit_uniformity(
+            tuple(sample["pit_value"] for sample in samples),
+            alpha=alpha,
+        )
+        calibration_pass = coverage.passed and pit.passed
+        failure_reasons = _s3_calibration_failure_reasons(
+            coverage_pass=coverage.passed,
+            pit_pass=pit.passed,
+        )
+
+        return CheckResult(
+            check="CALIBRATION",
+            status="PASS" if calibration_pass else "FAIL",
+            metrics={
+                "test_cases": ["S3-TC20"] if calibration_pass else ["S3-TC19"],
+                "calibration_pass": calibration_pass,
+                "sample_count": len(samples),
+                "sample_digest": _s3_calibration_samples_digest(samples),
+                "nominal_coverage": coverage.nominal_coverage,
+                "empirical_coverage": coverage.empirical_coverage,
+                "coverage_tolerance": coverage.tolerance,
+                "coverage_absolute_error": coverage.absolute_error,
+                "covered_count": coverage.covered_count,
+                "total_count": coverage.total_count,
+                "coverage_pass": coverage.passed,
+                "coverage_method": coverage.method,
+                "pit_ks_statistic": pit.ks_statistic,
+                "pit_p_value": pit.p_value,
+                "pit_sample_count": pit.sample_count,
+                "pit_pass": pit.passed,
+                "pit_method": pit.method,
+                "alpha": pit.alpha,
+                "min_samples": min_samples,
+                "failure_reasons": failure_reasons,
+                "point_estimates_exposed": False,
+                "heldout_answers_exposed": False,
             },
         )
 
@@ -3975,6 +4094,137 @@ def _s3_null_control_probability(value: Any, *, field: str) -> float:
 
 def _s3_null_control_error(code: str, message: str) -> None:
     raise S3NullControlCheckError(code=code, message=message)
+
+
+def _s3_calibration_samples(
+    samples: tuple[S3CalibrationSample, ...],
+    *,
+    min_samples: int,
+) -> tuple[dict[str, float | str], ...]:
+    if not samples:
+        _s3_calibration_error("S3_CALIBRATION_SAMPLES_REQUIRED", "CALIBRATION requires held-out samples")
+    normalized: list[dict[str, float | str]] = []
+    seen: set[str] = set()
+    for index, sample in enumerate(samples):
+        if not isinstance(sample, S3CalibrationSample):
+            _s3_calibration_error(
+                "S3_CALIBRATION_SAMPLE_INVALID",
+                f"sample at index {index} must be S3CalibrationSample",
+            )
+        sample_id = sample.sample_id
+        if not isinstance(sample_id, str) or not sample_id:
+            _s3_calibration_error("S3_CALIBRATION_SAMPLE_ID_INVALID", "sample_id must be a non-empty string")
+        if sample_id in seen:
+            _s3_calibration_error("S3_CALIBRATION_SAMPLE_DUPLICATE", f"duplicate sample_id {sample_id}")
+        seen.add(sample_id)
+        prediction = _s3_calibration_float(sample.prediction, field=f"{sample_id}.prediction")
+        lower = _s3_calibration_float(sample.interval_lower, field=f"{sample_id}.interval_lower")
+        upper = _s3_calibration_float(sample.interval_upper, field=f"{sample_id}.interval_upper")
+        truth = _s3_calibration_float(sample.truth, field=f"{sample_id}.truth")
+        pit_value = _s3_calibration_probability(sample.pit_value, field=f"{sample_id}.pit_value")
+        if lower > upper:
+            _s3_calibration_error(
+                "S3_CALIBRATION_INTERVAL_INVALID",
+                f"{sample_id}.interval_lower must be <= interval_upper",
+            )
+        normalized.append(
+            {
+                "sample_id": sample_id,
+                "prediction": prediction,
+                "interval_lower": lower,
+                "interval_upper": upper,
+                "truth": truth,
+                "pit_value": pit_value,
+            }
+        )
+    if len(normalized) < min_samples:
+        _s3_calibration_error(
+            "S3_CALIBRATION_UNDERPOWERED",
+            f"CALIBRATION requires at least {min_samples} samples",
+        )
+    return tuple(normalized)
+
+
+def _s3_calibration_samples_digest(samples: tuple[dict[str, float | str], ...]) -> str:
+    return hash_json(
+        [
+            {
+                "sample_id": sample["sample_id"],
+                "prediction": sample["prediction"],
+                "interval_lower": sample["interval_lower"],
+                "interval_upper": sample["interval_upper"],
+                "truth": sample["truth"],
+                "pit_value": sample["pit_value"],
+            }
+            for sample in samples
+        ]
+    )
+
+
+def _s3_calibration_coverage_tolerance(
+    *,
+    thresholds: Mapping[str, Any],
+    tolerance: Mapping[str, Any],
+) -> float:
+    value = tolerance.get("coverage_abs")
+    if value is None:
+        value = thresholds.get("tolerance")
+    if value is None:
+        _s3_calibration_error(
+            "S3_CALIBRATION_TOLERANCE_REQUIRED",
+            "CALIBRATION requires tolerance.coverage_abs or thresholds.tolerance",
+        )
+    return _s3_calibration_non_negative(value, field="coverage_tolerance")
+
+
+def _s3_calibration_failure_reasons(*, coverage_pass: bool, pit_pass: bool) -> list[str]:
+    reasons: list[str] = []
+    if not coverage_pass:
+        reasons.append("COVERAGE_OUT_OF_TOLERANCE")
+    if not pit_pass:
+        reasons.append("PIT_KS_REJECTED")
+    return reasons
+
+
+def _s3_calibration_float(value: Any, *, field: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        _s3_calibration_error("S3_CALIBRATION_VALUE_INVALID", f"{field} must be numeric")
+    numeric = float(value)
+    if not math.isfinite(numeric):
+        _s3_calibration_error("S3_CALIBRATION_VALUE_NONFINITE", f"{field} must be finite")
+    return numeric
+
+
+def _s3_calibration_probability(
+    value: Any,
+    *,
+    field: str,
+    allow_zero: bool = True,
+    allow_one: bool = True,
+) -> float:
+    numeric = _s3_calibration_float(value, field=field)
+    lower_ok = numeric >= 0 if allow_zero else numeric > 0
+    upper_ok = numeric <= 1 if allow_one else numeric < 1
+    if not lower_ok or not upper_ok:
+        _s3_calibration_error("S3_CALIBRATION_PROBABILITY_INVALID", f"{field} must be in [0, 1]")
+    return numeric
+
+
+def _s3_calibration_non_negative(value: Any, *, field: str) -> float:
+    numeric = _s3_calibration_float(value, field=field)
+    if numeric < 0:
+        _s3_calibration_error("S3_CALIBRATION_VALUE_INVALID", f"{field} must be non-negative")
+    return numeric
+
+
+def _s3_calibration_positive_int(value: Any, *, field: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        _s3_calibration_error("S3_CALIBRATION_INTEGER_INVALID", f"{field} must be a positive integer")
+    return value
+
+
+def _s3_calibration_error(code: str, message: str) -> None:
+    raise S3CalibrationCheckError(code=code, message=message)
 
 
 def _s3_cross_code_independence_resolution(
