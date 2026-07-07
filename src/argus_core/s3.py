@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from copy import deepcopy
 from dataclasses import asdict, dataclass, replace
 from functools import lru_cache
+from hashlib import sha256
+import hmac
 import json
 import math
 from pathlib import Path
@@ -14,7 +17,16 @@ from uuid import NAMESPACE_URL, uuid4, uuid5
 
 from jsonschema import Draft202012Validator
 
-from argusverify import C3ReportSigner, canonical_c3_json_bytes
+from argusverify import (
+    C3ReportSigner,
+    C3ReportVerifier,
+    C3SignatureVerification,
+    C3_SIGNATURE_ALGORITHM,
+    C3_SIGNATURE_PREFIX,
+    SIGNATURE_VERIFICATION_ACCEPTED,
+    VerifierKey,
+    canonical_c3_json_bytes,
+)
 from .canonical import canonical_json_bytes
 from .hashing import hash_bytes, hash_json
 from .s8 import InMemoryArtifactStore, Lineage, Producer
@@ -260,6 +272,24 @@ class S3StatisticsError(S3Error):
         self.message = message
 
 
+class S3KeyManagementError(S3Error):
+    """Raised when S3 signing/trust-store key management fails closed."""
+
+    def __init__(self, *, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
+class S3ReportSignerProtocol(Protocol):
+    @property
+    def key_id(self) -> str:
+        ...
+
+    def sign(self, report: dict[str, Any]) -> dict[str, Any]:
+        ...
+
+
 @dataclass(frozen=True)
 class VerifierProfileStatusEvent:
     profile_id: str
@@ -436,6 +466,274 @@ class S3MultipleComparisonResult:
 
     def as_payload(self) -> dict[str, Any]:
         return asdict(self)
+
+
+@dataclass(frozen=True)
+class S3SigningKeyMetadata:
+    key_id: str
+    epoch: int
+    status: str
+    active: bool
+    algorithm: str = C3_SIGNATURE_ALGORITHM
+    provider: str = "s3-trust-store-key-manager"
+    key_material_exposed: bool = False
+
+    def as_payload(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class S3KeyUseAuditEvent:
+    sequence: int
+    event_type: str
+    key_id: str
+    epoch: int
+    actor_id: str
+    outcome: str
+    report_digest: str = ""
+    reason: str = ""
+    key_material_exposed: bool = False
+
+    def as_payload(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class _S3SigningKeyMaterial:
+    key_id: str
+    key_bytes: bytes
+    epoch: int
+    revoked: bool = False
+    active: bool = False
+
+
+class S3TrustStoreKeyManager:
+    """S3-owned report signing key manager and secretless verifier trust store."""
+
+    def __init__(self, *, actor_id: str = "s3-trust-store-key-manager") -> None:
+        if not actor_id:
+            raise ValueError("actor_id is required")
+        self.actor_id = actor_id
+        self._keys: dict[str, _S3SigningKeyMaterial] = {}
+        self._active_key_id: str | None = None
+        self._epoch = 0
+        self._audit: list[S3KeyUseAuditEvent] = []
+
+    @property
+    def key_id(self) -> str:
+        return self._active_key().key_id
+
+    @property
+    def epoch(self) -> int:
+        return self._epoch
+
+    def register_signing_key(self, key_id: str, key_material: bytes, *, make_active: bool = True) -> S3SigningKeyMetadata:
+        normalized_key_id = _s3_key_id(key_id)
+        self._ensure_unused_key_id(normalized_key_id)
+        material = _s3_key_material(key_material)
+        self._epoch += 1
+        if make_active:
+            self._retire_active_key()
+        key = _S3SigningKeyMaterial(
+            key_id=normalized_key_id,
+            key_bytes=material,
+            epoch=self._epoch,
+            active=make_active,
+        )
+        self._keys[normalized_key_id] = key
+        if make_active:
+            self._active_key_id = normalized_key_id
+        self._record_key_event(
+            event_type="s3.key.register",
+            key_id=normalized_key_id,
+            epoch=key.epoch,
+            outcome="accepted",
+        )
+        return self._metadata_for(key)
+
+    def rotate_signing_key(self, key_id: str, key_material: bytes) -> S3SigningKeyMetadata:
+        normalized_key_id = _s3_key_id(key_id)
+        self._ensure_unused_key_id(normalized_key_id)
+        material = _s3_key_material(key_material)
+        self._epoch += 1
+        self._retire_active_key()
+        key = _S3SigningKeyMaterial(
+            key_id=normalized_key_id,
+            key_bytes=material,
+            epoch=self._epoch,
+            active=True,
+        )
+        self._keys[normalized_key_id] = key
+        self._active_key_id = normalized_key_id
+        self._record_key_event(
+            event_type="s3.key.rotate",
+            key_id=normalized_key_id,
+            epoch=key.epoch,
+            outcome="accepted",
+        )
+        return self._metadata_for(key)
+
+    def revoke_signing_key(self, key_id: str, *, reason: str = "") -> S3SigningKeyMetadata:
+        key = self._known_key(key_id)
+        self._epoch += 1
+        revoked = replace(key, revoked=True, active=False, epoch=self._epoch)
+        self._keys[revoked.key_id] = revoked
+        self._record_key_event(
+            event_type="s3.key.revoke",
+            key_id=revoked.key_id,
+            epoch=revoked.epoch,
+            outcome="accepted",
+            reason=reason,
+        )
+        return self._metadata_for(revoked)
+
+    def sign(self, report: dict[str, Any]) -> dict[str, Any]:
+        key = self._active_key()
+        unsigned = deepcopy(report)
+        unsigned["signature"] = {
+            "algorithm": C3_SIGNATURE_ALGORITHM,
+            "key_id": key.key_id,
+            "value": "",
+        }
+        signed = deepcopy(unsigned)
+        signed["signature"]["value"] = _s3_c3_signature_value(unsigned, key.key_bytes)
+        self._record_key_event(
+            event_type="s3.key.sign",
+            key_id=key.key_id,
+            epoch=key.epoch,
+            outcome="accepted",
+            report_digest=_s3_report_payload_digest(unsigned),
+        )
+        return signed
+
+    def verify_report(self, report: dict[str, Any]) -> C3SignatureVerification:
+        audit_count = len(self._audit)
+        verification = C3ReportVerifier(self).verify(report)
+        if len(self._audit) == audit_count:
+            key_id = _s3_report_key_id(report)
+            key = self._keys.get(key_id)
+            self._record_key_event(
+                event_type="s3.key.verify",
+                key_id=key_id or "<missing>",
+                epoch=key.epoch if key is not None else self._epoch,
+                outcome="accepted" if verification.valid else (verification.reason or "rejected"),
+                report_digest=_s3_report_payload_digest(_s3_report_with_empty_signature(report)),
+            )
+        return verification
+
+    def get_key(self, key_id: str) -> VerifierKey | None:
+        key = self._keys.get(key_id)
+        if key is None:
+            return None
+        return VerifierKey(key_id=key.key_id, secret=b"", revoked=key.revoked)
+
+    def verify_signature_value(
+        self,
+        *,
+        key_id: str,
+        report_with_empty_signature: dict[str, Any],
+        signature_value: str,
+    ) -> str | None:
+        key = self._keys.get(key_id)
+        if key is None:
+            outcome = "unknown_key"
+            epoch = self._epoch
+        elif key.revoked:
+            outcome = "revoked_key"
+            epoch = key.epoch
+        else:
+            expected = _s3_c3_signature_value(report_with_empty_signature, key.key_bytes)
+            outcome = (
+                SIGNATURE_VERIFICATION_ACCEPTED
+                if hmac.compare_digest(signature_value, expected)
+                else "signature_invalid"
+            )
+            epoch = key.epoch
+        self._record_key_event(
+            event_type="s3.key.verify",
+            key_id=key_id,
+            epoch=epoch,
+            outcome="accepted" if outcome == SIGNATURE_VERIFICATION_ACCEPTED else outcome,
+            report_digest=_s3_report_payload_digest(report_with_empty_signature),
+        )
+        return outcome
+
+    def key_metadata(self) -> tuple[S3SigningKeyMetadata, ...]:
+        return tuple(self._metadata_for(key) for key in sorted(self._keys.values(), key=lambda item: item.key_id))
+
+    def audit_events(self) -> tuple[S3KeyUseAuditEvent, ...]:
+        return tuple(self._audit)
+
+    def _active_key(self) -> _S3SigningKeyMaterial:
+        if self._active_key_id is None:
+            raise S3KeyManagementError(
+                code="S3_SIGNING_KEY_UNAVAILABLE",
+                message="no active S3 signing key is available",
+            )
+        key = self._keys[self._active_key_id]
+        if key.revoked:
+            raise S3KeyManagementError(
+                code="S3_SIGNING_KEY_REVOKED",
+                message=f"active S3 signing key is revoked: {key.key_id}",
+            )
+        if not key.active:
+            raise S3KeyManagementError(
+                code="S3_SIGNING_KEY_INACTIVE",
+                message=f"S3 signing key is not active: {key.key_id}",
+            )
+        return key
+
+    def _known_key(self, key_id: str) -> _S3SigningKeyMaterial:
+        normalized = _s3_key_id(key_id)
+        key = self._keys.get(normalized)
+        if key is None:
+            raise S3KeyManagementError(code="S3_SIGNING_KEY_UNKNOWN", message=f"unknown S3 signing key: {normalized}")
+        return key
+
+    def _ensure_unused_key_id(self, key_id: str) -> None:
+        if key_id in self._keys:
+            raise S3KeyManagementError(
+                code="S3_SIGNING_KEY_ALREADY_EXISTS",
+                message=f"S3 signing key already exists: {key_id}",
+            )
+
+    def _retire_active_key(self) -> None:
+        if self._active_key_id is None:
+            return
+        current = self._keys[self._active_key_id]
+        self._keys[current.key_id] = replace(current, active=False)
+
+    def _metadata_for(self, key: _S3SigningKeyMaterial) -> S3SigningKeyMetadata:
+        status = "revoked" if key.revoked else ("active" if key.active else "retired")
+        return S3SigningKeyMetadata(
+            key_id=key.key_id,
+            epoch=key.epoch,
+            status=status,
+            active=key.active,
+        )
+
+    def _record_key_event(
+        self,
+        *,
+        event_type: str,
+        key_id: str,
+        epoch: int,
+        outcome: str,
+        report_digest: str = "",
+        reason: str = "",
+    ) -> None:
+        self._audit.append(
+            S3KeyUseAuditEvent(
+                sequence=len(self._audit) + 1,
+                event_type=event_type,
+                key_id=key_id,
+                epoch=epoch,
+                actor_id=self.actor_id,
+                outcome=outcome,
+                report_digest=report_digest,
+                reason=reason,
+            )
+        )
 
 
 class S3StatisticsLibrary:
@@ -2855,7 +3153,7 @@ def build_frozen_pipeline_entrypoint_request(
 class S3Verifier:
     """Minimal non-gameable S3 referee that emits signed C3 reports."""
 
-    def __init__(self, *, verifier_id: str, signer_key_id: str, signer: C3ReportSigner) -> None:
+    def __init__(self, *, verifier_id: str, signer_key_id: str, signer: S3ReportSignerProtocol) -> None:
         if signer_key_id != signer.key_id:
             raise SignerIdentityError("referee signed_by must match the C3 signer key_id")
         self.verifier_id = verifier_id
@@ -3509,6 +3807,56 @@ def _artifact_refs(value: Any) -> tuple[str, ...]:
 
 def _merge_artifact_refs(left: tuple[str, ...], right: tuple[str, ...]) -> tuple[str, ...]:
     return tuple(dict.fromkeys(left + right))
+
+
+def _s3_key_id(value: Any) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise S3KeyManagementError(code="S3_SIGNING_KEY_ID_INVALID", message="S3 signing key_id is required")
+    return value.strip()
+
+
+def _s3_key_material(value: Any) -> bytes:
+    if not isinstance(value, (bytes, bytearray)) or not bytes(value):
+        raise S3KeyManagementError(
+            code="S3_SIGNING_KEY_MATERIAL_UNAVAILABLE",
+            message="S3 signing key material is unavailable",
+        )
+    return bytes(value)
+
+
+def _s3_c3_signature_value(report_with_empty_signature: dict[str, Any], key_material: bytes) -> str:
+    digest = hmac.new(key_material, canonical_c3_json_bytes(report_with_empty_signature), sha256).hexdigest()
+    return f"{C3_SIGNATURE_PREFIX}{digest}"
+
+
+def _s3_report_key_id(report: Mapping[str, Any]) -> str:
+    signature = report.get("signature")
+    if isinstance(signature, Mapping) and isinstance(signature.get("key_id"), str):
+        return str(signature["key_id"])
+    return ""
+
+
+def _s3_report_with_empty_signature(report: Mapping[str, Any]) -> dict[str, Any]:
+    payload = deepcopy(dict(report))
+    signature = payload.get("signature")
+    algorithm = C3_SIGNATURE_ALGORITHM
+    key_id = ""
+    if isinstance(signature, Mapping):
+        algorithm = str(signature.get("algorithm") or C3_SIGNATURE_ALGORITHM)
+        key_id = str(signature.get("key_id") or "")
+    payload["signature"] = {
+        "algorithm": algorithm,
+        "key_id": key_id,
+        "value": "",
+    }
+    return payload
+
+
+def _s3_report_payload_digest(report_payload: Mapping[str, Any]) -> str:
+    try:
+        return hash_bytes(canonical_c3_json_bytes(report_payload))
+    except (TypeError, ValueError):
+        return ""
 
 
 def _frozen_pipeline_record(artifact_store: Any, frozen_pipeline_ref: str) -> Any:

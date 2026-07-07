@@ -53,6 +53,7 @@ CHECKS = (
             "tests/test_s3_report_signer.py",
             "tests/test_s3_profile_registry.py",
             "tests/test_s3_statistics_library.py",
+            "tests/test_s3_trust_store_key_management.py",
         ),
     ),
 )
