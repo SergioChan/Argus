@@ -4,9 +4,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
-from typing import Any, Mapping
+import secrets
+from typing import Any, Callable, Mapping
 
-from .c3 import C3ReportSigner, C3ReportVerifier, InMemoryVerifierTrustStore
+from .c3 import C3ReportVerifier
 from .s1 import (
     Acceptance,
     ExecContext,
@@ -21,12 +22,30 @@ from .s1 import (
 )
 from .s3 import (
     CheckResult,
+    CheckPluginHost,
+    CompiledCheckSpec,
+    CompiledProfile,
+    InMemoryBlindDataVault,
     PerturbationPairOutcome,
+    S3BlindDataManager,
+    S3CalibrationCheckPlugin,
+    S3CalibrationSample,
+    S3CrossCodeCheckPlugin,
+    S3CrossCodeSample,
+    S3InjectionCheckPlugin,
+    S3InjectionSample,
+    S3IndependenceResolution,
+    S3LeakageCheckPlugin,
+    S3NullControlCheckPlugin,
+    S3NullControlSample,
+    S3PhysicalConsistencyCheckPlugin,
+    S3PhysicalConsistencySample,
+    S3RecapBenchmarkCheckPlugin,
+    S3RecapBenchmarkPrediction,
+    S3ReportSignerProtocol,
+    S3TrustStoreKeyManager,
     S3Verifier,
     attest_challenger_independence,
-    run_calibration_check,
-    run_cross_code_check,
-    run_leakage_check,
     run_perturbation_pair,
 )
 from .s6 import CapabilityDescriptor, ContaminationIndex, FrozenContaminationSnapshot, SourceDocument
@@ -43,9 +62,10 @@ S1_REFERENCE_PHYSICS_DATASET_REF = "c4://dataset/ewpt-reference/v1"
 S1_REFERENCE_PHYSICS_PROPONENT_ID = "s1-reference-physics"
 S1_REFERENCE_S3_VERIFIER_ID = "s3-reference-verifier"
 S1_REFERENCE_S3_REFEREE_KEY_ID = "s3-reference-referee-key"
-S1_REFERENCE_S3_REFEREE_SECRET = b"s3-reference-referee-secret"
 S1_REFERENCE_SHOULD_REACT_ALPHA_SCALE = 0.2
 S1_REFERENCE_MUST_NOT_REACT_VW_DELTA = 0.02
+
+S3ReferenceSignerFactory = Callable[[str, bytes], S3ReportSignerProtocol]
 
 
 @dataclass(frozen=True)
@@ -81,14 +101,40 @@ class S1ReferencePhysicsRerouteResult:
     second: S1ReferencePhysicsRunResult
 
 
+class _ReferenceS3KeyManagerSigner:
+    def __init__(self, key_manager: S3TrustStoreKeyManager) -> None:
+        self._key_manager = key_manager
+
+    @property
+    def key_id(self) -> str:
+        return self._key_manager.key_id
+
+    def sign(self, report: dict[str, Any]) -> dict[str, Any]:
+        return self._key_manager.sign(report)
+
+
 class S1ReferencePhysicsHarness:
     """Runs the reference EWPT physics subagent through real S1/C3/C4/C6 surfaces."""
 
-    def __init__(self, *, artifact_store: InMemoryArtifactStore | None = None) -> None:
-        self.trust_store = InMemoryVerifierTrustStore()
-        self.trust_store.register_key(S1_REFERENCE_S3_REFEREE_KEY_ID, S1_REFERENCE_S3_REFEREE_SECRET)
+    def __init__(
+        self,
+        *,
+        artifact_store: InMemoryArtifactStore | None = None,
+        s3_signer_factory: S3ReferenceSignerFactory | None = None,
+    ) -> None:
+        self.s3_key_manager = S3TrustStoreKeyManager(actor_id="s1-reference-s3-key-manager")
+        s3_referee_key_material = secrets.token_urlsafe(32).encode("utf-8")
+        self.s3_key_manager.register_signing_key(
+            S1_REFERENCE_S3_REFEREE_KEY_ID,
+            s3_referee_key_material,
+        )
+        self.trust_store = self.s3_key_manager
         self.report_verifier = C3ReportVerifier(self.trust_store)
-        self.signer = C3ReportSigner(key_id=S1_REFERENCE_S3_REFEREE_KEY_ID, secret=S1_REFERENCE_S3_REFEREE_SECRET)
+        self.signer = (
+            s3_signer_factory(S1_REFERENCE_S3_REFEREE_KEY_ID, s3_referee_key_material)
+            if s3_signer_factory is not None
+            else _ReferenceS3KeyManagerSigner(self.s3_key_manager)
+        )
         self.s3_verifier = S3Verifier(
             verifier_id=S1_REFERENCE_S3_VERIFIER_ID,
             signer_key_id=self.signer.key_id,
@@ -551,17 +597,23 @@ class _ReferenceS3ValidationClient:
         model_payload = _reference_model_payload(self.artifact_store, frozen_payload)
         dataset_payload = _artifact_payload(self.artifact_store, str(model_payload["dataset_ref"]))
         extrapolated = self._request_has_extrapolated_artifact(request)
-        checks = _reference_checks(
+        job_id = str(request["job_id"])
+        trace_id = str(request["trace_id"]) if request.get("trace_id") is not None else None
+        checks = _reference_plugin_checks(
+            artifact_store=self.artifact_store,
             model_payload=model_payload,
             dataset_payload=dataset_payload,
             contamination_index=self.contamination_index,
             contamination_snapshot=self.contamination_snapshot,
             extrapolated=extrapolated or self.mode == "extrapolated",
+            profile_ref=str(request["profile_ref"]),
+            job_id=job_id,
+            trace_id=trace_id,
         )
         outcome = _reference_perturbation_outcome(
             model_payload=model_payload,
             dataset_payload=dataset_payload,
-            perturbation_id=f"pair-{request['job_id']}",
+            perturbation_id=f"pair-{job_id}",
         )
         challengers = _reference_challengers()
         independence = attest_challenger_independence(challengers=challengers, min_independent=2)
@@ -573,7 +625,7 @@ class _ReferenceS3ValidationClient:
             perturbation_outcome=outcome,
             challenger_ids=tuple(challenger.entity_id for challenger in challengers),
             independence_attestation=independence,
-            debate_ref=f"c4://debate/s1-reference/{request['job_id']}",
+            debate_ref=f"c4://debate/s1-reference/{job_id}",
         )
 
     def _request_has_extrapolated_artifact(self, request: Mapping[str, object]) -> bool:
@@ -715,97 +767,335 @@ def _evaluate_reference_physics(inputs: dict[str, NormalizedQuantity], _seed: in
     }
 
 
-def _reference_checks(
+def _reference_plugin_checks(
     *,
+    artifact_store: InMemoryArtifactStore,
     model_payload: Mapping[str, Any],
     dataset_payload: Mapping[str, Any],
     contamination_index: ContaminationIndex,
     contamination_snapshot: FrozenContaminationSnapshot,
     extrapolated: bool,
+    profile_ref: str,
+    job_id: str,
+    trace_id: str | None,
 ) -> tuple[CheckResult, ...]:
+    profile = _reference_compiled_profile(profile_ref=profile_ref)
+    plugins = _reference_check_plugins(
+        artifact_store=artifact_store,
+        model_payload=model_payload,
+        dataset_payload=dataset_payload,
+        contamination_index=contamination_index,
+        contamination_snapshot=contamination_snapshot,
+        extrapolated=extrapolated,
+        job_id=job_id,
+        trace_id=trace_id,
+    )
+    return CheckPluginHost(
+        plugins=plugins,
+        artifact_store=artifact_store,
+        actor_id=S1_REFERENCE_S3_VERIFIER_ID,
+        job_id=job_id,
+        trace_id=trace_id,
+    ).run(profile)
+
+
+def _reference_check_plugins(
+    *,
+    artifact_store: InMemoryArtifactStore,
+    model_payload: Mapping[str, Any],
+    dataset_payload: Mapping[str, Any],
+    contamination_index: ContaminationIndex,
+    contamination_snapshot: FrozenContaminationSnapshot,
+    extrapolated: bool,
+    job_id: str,
+    trace_id: str | None,
+) -> tuple[Any, ...]:
     row = _reference_dataset_row(dataset_payload)
     observed_omega = _reference_observed_omega(model_payload)
     expected_omega = float(row["known_omega"])
-    omega_tolerance = _reference_omega_tolerance(model_payload)
-    injection_error = abs(observed_omega - expected_omega)
-    injection = CheckResult(
-        "INJECTION",
-        "PASS" if injection_error <= omega_tolerance else "FAIL",
-        {
-            "observed_omega": observed_omega,
-            "expected_omega": expected_omega,
-            "absolute_error": injection_error,
-            "tolerance": omega_tolerance,
-            "recovery_rate": observed_omega / expected_omega if expected_omega else 0.0,
-        },
+    omega_tolerance = max(_reference_omega_tolerance(model_payload), 0.01)
+    expected_from_equation = _reference_predict_omega(
+        model_payload,
+        t_n=float(row["T_n"]),
+        alpha=float(row["alpha"]),
     )
-    null_alpha = 0.0
-    null_omega = _reference_predict_omega(model_payload, t_n=float(row["T_n"]), alpha=null_alpha)
-    null_tolerance = 0.001
-    null_control = CheckResult(
-        "NULL_CONTROL",
-        "PASS" if abs(null_omega) <= null_tolerance else "FAIL",
-        {"null_alpha": null_alpha, "null_omega": null_omega, "absolute_tolerance": null_tolerance},
-    )
-    cross_code = run_cross_code_check(
-        observed=(observed_omega,),
-        independent=(expected_omega + 0.0005,),
-        combined_uncertainty=(omega_tolerance,),
-        extrapolation_flags=(extrapolated,),
-    )
-    expected_from_equation = _reference_predict_omega(model_payload, t_n=float(row["T_n"]), alpha=float(row["alpha"]))
-    physical_error = abs(observed_omega - expected_from_equation)
-    physical_consistency = CheckResult(
-        "PHYSICAL_CONSISTENCY",
-        "PASS" if physical_error <= omega_tolerance else "FAIL",
-        {
-            "model_family": str(model_payload.get("model_family", "")),
-            "observed_omega": observed_omega,
-            "expected_from_reference_equation": expected_from_equation,
-            "absolute_error": physical_error,
-            "units": _reference_omega_units(model_payload),
-        },
-    )
-    leakage = run_leakage_check(
-        contamination_index=contamination_index,
-        snapshot=contamination_snapshot,
-        candidate_text=_reference_candidate_text(model_payload=model_payload, observed_omega=observed_omega),
-        threshold=0.8,
-    )
-    calibration = run_calibration_check(
-        nominal_coverage=1.0,
-        empirical_coverage=1.0 if injection_error <= omega_tolerance else 0.0,
-        tolerance=0.0,
-    )
-    recap_pass = injection_error <= omega_tolerance
-    recap_benchmark = CheckResult(
-        "RECAP_BENCHMARK",
-        "PASS" if recap_pass else "FAIL",
-        {
-            "test_cases": ["S3-T24", "S3-TC32"],
-            "recap_benchmark_pass": recap_pass,
-            "sample_count": 1,
-            "recovered_count": 1 if recap_pass else 0,
-            "recovered_fraction": 1.0 if recap_pass else 0.0,
-            "min_recovered_fraction": 1.0,
-            "absolute_tolerance": omega_tolerance,
-            "recap_benchmark_ref": S1_REFERENCE_PHYSICS_DATASET_REF,
-            "truth_retained_server_side": True,
-            "truth_bytes_delivered_to_sandbox": False,
-            "truth_hash_delivered_to_sandbox": False,
-            "raw_truth_exposed": False,
-            "max_claim_tier": "novel-needs-human" if recap_pass else "ran-toy",
-        },
+    recap_vault, recap_stage = _reference_recap_stage(
+        artifact_store=artifact_store,
+        row=row,
+        expected_omega=expected_omega,
+        job_id=job_id,
+        trace_id=trace_id,
     )
     return (
-        injection,
-        null_control,
-        cross_code,
-        physical_consistency,
-        leakage,
-        calibration,
-        recap_benchmark,
+        S3InjectionCheckPlugin(
+            samples=_reference_injection_samples(expected_omega=expected_omega, observed_omega=observed_omega),
+        ),
+        S3NullControlCheckPlugin(samples=_reference_null_control_samples()),
+        S3CrossCodeCheckPlugin(
+            samples=(
+                S3CrossCodeSample(
+                    sample_id="ewpt-reference-omega",
+                    pipeline_value=observed_omega,
+                    reference_value=expected_omega,
+                    pipeline_uncertainty=omega_tolerance,
+                    reference_uncertainty=omega_tolerance,
+                    pipeline_units=_reference_omega_units(model_payload),
+                    reference_units="dimensionless",
+                    extrapolation_flag=extrapolated,
+                ),
+            ),
+            independence_resolution=_reference_independence_resolution(),
+        ),
+        S3PhysicalConsistencyCheckPlugin(
+            samples=(
+                S3PhysicalConsistencySample(
+                    sample_id="ewpt-reference-omega",
+                    observable="omega",
+                    value=observed_omega,
+                    units=_reference_omega_units(model_payload),
+                    expected_units="dimensionless",
+                    non_negative=True,
+                    asymptotic_expected=expected_from_equation,
+                ),
+            ),
+        ),
+        S3LeakageCheckPlugin(
+            candidate_text=_reference_candidate_text(
+                model_payload=model_payload,
+                observed_omega=observed_omega,
+            ),
+            contamination_index=contamination_index,
+            contamination_snapshot=contamination_snapshot,
+        ),
+        S3CalibrationCheckPlugin(
+            samples=_reference_calibration_samples(
+                prediction=observed_omega,
+                truth=expected_omega,
+                tolerance=omega_tolerance,
+            ),
+        ),
+        S3RecapBenchmarkCheckPlugin(
+            blind_data_vault=recap_vault,
+            blind_data_stage=recap_stage,
+            predictions=(
+                S3RecapBenchmarkPrediction(
+                    sample_id="ewpt-reference-omega",
+                    prediction=observed_omega,
+                ),
+            ),
+        ),
     )
+
+
+def _reference_compiled_profile(*, profile_ref: str) -> CompiledProfile:
+    checks = (
+        _reference_compiled_check(
+            "INJECTION",
+            thresholds={"recovery_rate_min": 1.0},
+            tolerance={
+                "relative_tolerance": 0.35,
+                "absolute_tolerance": 0.01,
+                "slope_tolerance": 0.3,
+                "intercept_tolerance_abs": 0.01,
+            },
+            seed=17,
+        ),
+        _reference_compiled_check(
+            "NULL_CONTROL",
+            thresholds={"alpha": 0.5, "confidence_level": 0.95},
+            seed=18,
+        ),
+        _reference_compiled_check(
+            "CROSS_CODE",
+            thresholds={
+                "reduced_chi_square_min": 0.0,
+                "reduced_chi_square_max": 1.5,
+                "z_max": 3.0,
+                "max_excluded_fraction": 0.0,
+                "min_valid_points": 1,
+            },
+            requires_independence=True,
+            seed=19,
+        ),
+        _reference_compiled_check(
+            "PHYSICAL_CONSISTENCY",
+            thresholds={
+                "mandatory_gates": ["dimensional", "positivity", "asymptotic"],
+                "normalization_epsilon": 0.01,
+            },
+            tolerance={"absolute_tolerance": 0.01},
+            seed=20,
+        ),
+        _reference_compiled_check(
+            "LEAKAGE",
+            thresholds={
+                "mandatory_gates": ["frozen_index_overlap"],
+                "overlap_threshold": 0.8,
+                "frozen_index_threshold": 0.8,
+                "target_leakage_purity_threshold": 0.95,
+                "target_leakage_min_support": 2,
+                "shingle_size": 5,
+                "min_reward_score_delta": 0.0,
+            },
+            seed=21,
+        ),
+        _reference_compiled_check(
+            "CALIBRATION",
+            thresholds={"nominal_coverage": 0.68, "alpha": 0.05, "min_samples": 10},
+            tolerance={"coverage_abs": 0.5},
+            seed=22,
+        ),
+        _reference_compiled_check(
+            "RECAP_BENCHMARK",
+            thresholds={"absolute_tolerance": 0.01, "relative_tolerance": 0.0, "min_recovered_fraction": 1.0},
+            seed=23,
+        ),
+    )
+    return CompiledProfile(
+        profile_id="s1-reference-ewpt",
+        revision=1,
+        profile_ref=profile_ref,
+        subtopic=S1_REFERENCE_PHYSICS_SUBTOPIC,
+        spec_hash="hash-s1-reference-ewpt",
+        public_profile={
+            "profile_id": "s1-reference-ewpt",
+            "revision": 1,
+            "checks": [check.check for check in checks],
+        },
+        cost_estimate={"max_wallclock_s": 3.0},
+        checks=checks,
+        independence_policy={"requires_cross_code": True, "min_independent": 2},
+        determinism_profile={
+            "seeded_checks": [{"check": check.check, "seed": check.seed} for check in checks],
+        },
+    )
+
+
+def _reference_compiled_check(
+    check: str,
+    *,
+    thresholds: dict[str, Any],
+    tolerance: dict[str, Any] | None = None,
+    requires_independence: bool = False,
+    seed: int,
+) -> CompiledCheckSpec:
+    return CompiledCheckSpec(
+        check=check,
+        plugin_ref=f"argus.s3.plugins.{check.lower()}",
+        plugin_version="1.0.0",
+        mandatory=True,
+        thresholds=thresholds,
+        determinism="deterministic",
+        seed=seed,
+        tolerance=tolerance or {},
+        requires_independence=requires_independence,
+        budget={"max_wallclock_s": 3.0},
+        adapter=None,
+    )
+
+
+def _reference_injection_samples(*, expected_omega: float, observed_omega: float) -> tuple[S3InjectionSample, ...]:
+    return tuple(
+        S3InjectionSample(
+            sample_id=f"ewpt-injection-{index}",
+            injected_value=expected_omega * scale,
+            recovered_value=observed_omega * scale,
+        )
+        for index, scale in enumerate((0.5, 1.0, 1.5), start=1)
+    )
+
+
+def _reference_null_control_samples() -> tuple[S3NullControlSample, ...]:
+    return tuple(
+        S3NullControlSample(
+            sample_id=f"ewpt-null-alpha-{index}",
+            variant="label_shuffle",
+            detected=False,
+        )
+        for index in range(1, 11)
+    )
+
+
+def _reference_calibration_samples(
+    *,
+    prediction: float,
+    truth: float,
+    tolerance: float,
+) -> tuple[S3CalibrationSample, ...]:
+    pit_values = (0.05, 0.15, 0.25, 0.35, 0.45, 0.55, 0.65, 0.75, 0.85, 0.95)
+    return tuple(
+        S3CalibrationSample(
+            sample_id=f"ewpt-calibration-{index}",
+            prediction=prediction,
+            interval_lower=prediction - tolerance,
+            interval_upper=prediction + tolerance,
+            truth=truth,
+            pit_value=pit,
+        )
+        for index, pit in enumerate(pit_values, start=1)
+    )
+
+
+def _reference_independence_resolution() -> S3IndependenceResolution:
+    challengers = _reference_challengers()
+    return S3IndependenceResolution(
+        test_case="S3-TC09",
+        verdict="INDEPENDENT",
+        candidate_ids=tuple(challenger.entity_id for challenger in challengers),
+        cross_codes=tuple(challenger.entity_id for challenger in challengers),
+        rejected_candidate_ids=(),
+        excluded_tags=("reference-physics",),
+        degradations=(),
+        min_independent=2,
+        max_claim_tier="novel-needs-human",
+        c5_pinned_revisions={challenger.entity_id: challenger.revision for challenger in challengers},
+    )
+
+
+def _reference_recap_stage(
+    *,
+    artifact_store: InMemoryArtifactStore,
+    row: Mapping[str, Any],
+    expected_omega: float,
+    job_id: str,
+    trace_id: str | None,
+):
+    vault = InMemoryBlindDataVault(artifact_store=artifact_store, actor_id=S1_REFERENCE_S3_VERIFIER_ID)
+    record = vault.register_dataset(
+        dataset_id=f"s1-reference-recap-{job_id}",
+        version="1.0.0",
+        split="recap",
+        dataset_kind="recap_benchmark",
+        opaque_input={
+            "schema": "argus.s3.reference_recap_opaque_input.v1",
+            "samples": [
+                {
+                    "sample_id": "ewpt-reference-omega",
+                    "T_n": float(row["T_n"]),
+                    "alpha": float(row["alpha"]),
+                    "v_w": float(row["v_w"]),
+                }
+            ],
+        },
+        truth={
+            "samples": [
+                {
+                    "sample_id": "ewpt-reference-omega",
+                    "expected": expected_omega,
+                }
+            ],
+        },
+    )
+    stage = S3BlindDataManager(
+        artifact_store=artifact_store,
+        vault=vault,
+        actor_id=S1_REFERENCE_S3_VERIFIER_ID,
+    ).stage_for_pipeline(
+        blind_data_handle=record.handle,
+        job_id=job_id,
+        trace_id=trace_id,
+    )
+    return vault, stage
 
 
 def _reference_perturbation_outcome(
@@ -866,6 +1156,11 @@ def _reference_ratio(numerator: float, denominator: float) -> float:
 def _reference_model_payload(store: InMemoryArtifactStore, frozen_payload: Mapping[str, Any]) -> dict[str, Any]:
     if frozen_payload.get("schema") == "argus.s1.reference_physics_model.v1":
         return dict(frozen_payload)
+    model_ref = frozen_payload.get("model_ref")
+    if isinstance(model_ref, str):
+        model_payload = _artifact_payload(store, model_ref)
+        if model_payload.get("schema") == "argus.s1.reference_physics_model.v1":
+            return model_payload
     artifact_refs = frozen_payload.get("artifact_refs", ())
     if not isinstance(artifact_refs, list | tuple):
         raise ValueError("reference frozen pipeline payload has no artifact_refs")

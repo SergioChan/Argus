@@ -7,7 +7,11 @@ from argus_core import (
     BudgetCaps,
     C3ReportSigner,
     C3ReportVerifier,
+    CheckPluginContext,
+    CheckPluginDescriptor,
     CheckResult,
+    CompiledCheckSpec,
+    CompiledProfile,
     InMemoryArtifactStore,
     InMemoryVerifierTrustStore,
     Lineage,
@@ -25,6 +29,7 @@ from argus_runtime.s3_verifier_service import (
 )
 from argus_runtime.s3_verify_orchestrator import (
     S3_VERIFY_WORKFLOW_TYPE,
+    S3CheckPluginPipelineRunner,
     InMemoryS3WorkflowStore,
     S3PipelineRunResult,
     S3VerifyOrchestrator,
@@ -48,6 +53,29 @@ class FailingPipelineRunner:
     def run(self, *, dispatch: S3VerificationDispatch, entrypoint_request: dict[str, object]) -> S3PipelineRunResult:
         self.calls += 1
         raise AssertionError("restart replay must not re-run an already completed pipeline activity")
+
+
+class _PassPlugin:
+    def __init__(self, check: str) -> None:
+        self.check = check
+
+    def describe(self) -> CheckPluginDescriptor:
+        return CheckPluginDescriptor(
+            check=self.check,
+            plugin_ref=f"argus.s3.plugins.{self.check.lower()}",
+            plugin_version="1.0.0",
+            determinism="deterministic",
+        )
+
+    def run(self, ctx: CheckPluginContext) -> CheckResult:
+        return CheckResult(
+            check=self.check,
+            status="PASS",
+            metrics={
+                "profile_ref": ctx.compiled_profile.profile_ref,
+                "job_id": ctx.job_id,
+            },
+        )
 
 
 class S3VerifyOrchestratorTests(unittest.TestCase):
@@ -144,6 +172,43 @@ class S3VerifyOrchestratorTests(unittest.TestCase):
                 "WorkflowCompleted",
             ],
         )
+
+    def test_check_plugin_pipeline_runner_wires_frozen_dispatch_to_report_evidence(self) -> None:
+        durable_store = InMemoryS3WorkflowStore()
+        runner = S3CheckPluginPipelineRunner(
+            artifact_store=self.artifact_store,
+            compiled_profile=_compiled_profile(),
+            plugins=tuple(
+                _PassPlugin(check)
+                for check in (
+                    "INJECTION",
+                    "NULL_CONTROL",
+                    "CROSS_CODE",
+                    "PHYSICAL_CONSISTENCY",
+                    "LEAKAGE",
+                    "CALIBRATION",
+                    "RECAP_BENCHMARK",
+                )
+            ),
+        )
+        orchestrator = self._orchestrator(durable_store, runner)
+        started = orchestrator.start(self._dispatch())
+
+        final = orchestrator.run_until_terminal(started.workflow_id)
+
+        self.assertEqual(final.status, "REPORTED")
+        assert final.report is not None
+        checks = {check["check"]: check for check in final.report["checks"]}
+        self.assertEqual(set(checks), set(check.check for check in _compiled_profile().checks))
+        for check_name, check in checks.items():
+            self.assertEqual(len(check["evidence_refs"]), 1)
+            evidence = json.loads(self.artifact_store.get_artifact(check["evidence_refs"][0]).decode("utf-8"))
+            self.assertEqual(evidence["schema"], "argus.s3.check_result_evidence.v1")
+            self.assertEqual(evidence["check"], check_name)
+            self.assertEqual(evidence["plugin_ref"], f"argus.s3.plugins.{check_name.lower()}")
+        output = json.loads(self.artifact_store.get_artifact(str(final.output_artifact_ref)).decode("utf-8"))
+        self.assertEqual(output["schema"], "argus.s3.pipeline_check_output.v1")
+        self.assertEqual(len(output["evidence_refs"]), 7)
 
     def test_event_snapshot_rehydrates_after_process_restart(self) -> None:
         original_store = InMemoryS3WorkflowStore()
@@ -267,6 +332,45 @@ class S3VerifyOrchestratorTests(unittest.TestCase):
             output_artifact_ref="c4://artifact/s3-t03-output",
             cost_actual_usd=0.0042,
         )
+
+
+def _compiled_profile() -> CompiledProfile:
+    checks = (
+        "INJECTION",
+        "NULL_CONTROL",
+        "CROSS_CODE",
+        "PHYSICAL_CONSISTENCY",
+        "LEAKAGE",
+        "CALIBRATION",
+        "RECAP_BENCHMARK",
+    )
+    return CompiledProfile(
+        profile_id="s3-orchestrator-plugin-runner",
+        revision=1,
+        profile_ref="c4://profile/s3-orchestrator-plugin-runner/v1",
+        subtopic="electroweak.phase_transition",
+        spec_hash="hash-s3-orchestrator-plugin-runner",
+        public_profile={"profile_id": "s3-orchestrator-plugin-runner", "revision": 1, "checks": list(checks)},
+        cost_estimate={"max_wallclock_s": 3.0},
+        checks=tuple(
+            CompiledCheckSpec(
+                check=check,
+                plugin_ref=f"argus.s3.plugins.{check.lower()}",
+                plugin_version="1.0.0",
+                mandatory=True,
+                thresholds={},
+                determinism="deterministic",
+                seed=31 + index,
+                tolerance={},
+                requires_independence=check == "CROSS_CODE",
+                budget={"max_wallclock_s": 3.0},
+                adapter=None,
+            )
+            for index, check in enumerate(checks)
+        ),
+        independence_policy={"requires_cross_code": True, "min_independent": 2},
+        determinism_profile={"deterministic_checks": list(checks)},
+    )
 
 
 if __name__ == "__main__":

@@ -12,6 +12,7 @@ from argus_core import (
     S1ReferencePhysicsHarness,
     tier_from_checks,
 )
+import argus_core.s1_reference as s1_reference_module
 from argus_core.s1_reference import _ReferenceS3ValidationClient
 
 
@@ -53,6 +54,45 @@ class S1ReferencePhysicsSubagentTests(unittest.TestCase):
         self.assertEqual(report["referee"]["referee_id"], "s3-reference-verifier")
         self.assertNotEqual(report["referee"]["referee_id"], "s1-reference-physics")
 
+    def test_reference_physics_demo_uses_plugin_host_evidence_for_validation_checks(self) -> None:
+        harness = S1ReferencePhysicsHarness()
+
+        result = harness.run_happy_path(job_id="job-r48-m1-plugin-host")
+        checks = {check["check"]: check for check in result.validation_report_payload["checks"]}
+        expected_plugin_refs = {
+            "INJECTION": "argus.s3.plugins.injection",
+            "NULL_CONTROL": "argus.s3.plugins.null_control",
+            "CROSS_CODE": "argus.s3.plugins.cross_code",
+            "PHYSICAL_CONSISTENCY": "argus.s3.plugins.physical_consistency",
+            "LEAKAGE": "argus.s3.plugins.leakage",
+            "CALIBRATION": "argus.s3.plugins.calibration",
+            "RECAP_BENCHMARK": "argus.s3.plugins.recap_benchmark",
+        }
+
+        self.assertEqual(set(checks), set(expected_plugin_refs))
+        for check_name, plugin_ref in expected_plugin_refs.items():
+            evidence_refs = checks[check_name].get("evidence_refs")
+            self.assertIsInstance(evidence_refs, list)
+            self.assertEqual(len(evidence_refs), 1)
+            evidence_payload = json.loads(harness.artifact_store.get_artifact(evidence_refs[0]).decode("utf-8"))
+            self.assertEqual(evidence_payload["schema"], "argus.s3.check_result_evidence.v1")
+            self.assertEqual(evidence_payload["check"], check_name)
+            self.assertEqual(evidence_payload["plugin_ref"], plugin_ref)
+            self.assertEqual(evidence_payload["plugin_version"], "1.0.0")
+
+    def test_reference_physics_demo_signer_uses_secretless_trust_store_boundary(self) -> None:
+        self.assertFalse(hasattr(s1_reference_module, "S1_REFERENCE_S3_REFEREE_SECRET"))
+        harness = S1ReferencePhysicsHarness()
+
+        result = harness.run_happy_path(job_id="job-r48-m2-secretless-signer")
+
+        verification = harness.report_verifier.verify(result.validation_report_payload)
+        self.assertTrue(verification.valid)
+        verifier_key = harness.s3_key_manager.get_key("s3-reference-referee-key")
+        self.assertIsNotNone(verifier_key)
+        assert verifier_key is not None
+        self.assertEqual(verifier_key.secret, b"")
+
     def test_reference_physics_checks_are_computed_from_c4_handoff_artifacts(self) -> None:
         harness = S1ReferencePhysicsHarness()
 
@@ -71,12 +111,18 @@ class S1ReferencePhysicsSubagentTests(unittest.TestCase):
                 "RECAP_BENCHMARK",
             },
         )
-        self.assertEqual(checks["INJECTION"]["metrics"]["observed_omega"], 0.02)
-        self.assertEqual(checks["INJECTION"]["metrics"]["expected_omega"], 0.02)
-        self.assertEqual(checks["NULL_CONTROL"]["metrics"]["null_alpha"], 0.0)
-        self.assertEqual(checks["PHYSICAL_CONSISTENCY"]["metrics"]["model_family"], "ewpt-tabular-reference")
-        self.assertTrue(checks["LEAKAGE"]["metrics"]["snapshot_ref"].startswith("c4://"))
-        self.assertEqual(checks["CALIBRATION"]["metrics"]["nominal_coverage"], 1.0)
+        self.assertEqual(checks["INJECTION"]["metrics"]["recovery_rate"], 1.0)
+        self.assertEqual(checks["INJECTION"]["metrics"]["linearity_slope"], 1.0)
+        self.assertEqual(checks["NULL_CONTROL"]["metrics"]["false_positives"], 0)
+        self.assertTrue(checks["PHYSICAL_CONSISTENCY"]["metrics"]["physical_consistency_pass"])
+        self.assertEqual(
+            checks["PHYSICAL_CONSISTENCY"]["metrics"]["sub_gates"]["asymptotic"]["comparisons"][0]["expected"],
+            0.02,
+        )
+        self.assertTrue(
+            checks["LEAKAGE"]["metrics"]["sub_gates"]["frozen_index_overlap"]["snapshot_ref"].startswith("c4://")
+        )
+        self.assertEqual(checks["CALIBRATION"]["metrics"]["nominal_coverage"], 0.68)
         recap_metrics = checks["RECAP_BENCHMARK"]["metrics"]
         self.assertTrue(recap_metrics["recap_benchmark_pass"])
         self.assertTrue(recap_metrics["truth_retained_server_side"])

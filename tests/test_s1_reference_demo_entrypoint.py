@@ -69,6 +69,8 @@ class S1ReferenceDemoEntryPointTests(unittest.TestCase):
                     "RECAP_BENCHMARK": "PASS",
                 },
             )
+            for check in evidence["checks"]:
+                self.assertEqual(len(check["evidence_refs"]), 1)
 
             artifacts = evidence["artifacts"]
             report_path = Path(artifacts["validation_report_path"])

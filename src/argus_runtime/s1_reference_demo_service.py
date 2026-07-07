@@ -8,11 +8,13 @@ from enum import Enum
 import json
 import os
 from pathlib import Path
+import shlex
 from typing import Any, Mapping
 
 from argus_core import S1ReferencePhysicsHarness, S1ReferencePhysicsRunResult
 
 from .http_json import JsonHttpApp, JsonRequest, serve_json_app
+from .s3_report_signer_service import RustS3ReportSigner
 
 
 S1_REFERENCE_DEMO_NAME = "s1-reference-physics"
@@ -21,7 +23,7 @@ S1_REFERENCE_DEMO_DEFAULT_JOB_ID = "s1-reference-demo"
 
 
 def build_reference_demo(job_id: str) -> tuple[dict[str, Any], dict[str, Any]]:
-    harness = S1ReferencePhysicsHarness()
+    harness = S1ReferencePhysicsHarness(s3_signer_factory=_reference_rust_s3_signer_factory)
     result = harness.run_happy_path(job_id=job_id)
     lineage_payload = _lineage_payload(harness, result)
     evidence = _evidence_payload(result)
@@ -54,6 +56,70 @@ def write_reference_demo_artifacts(
     paths["observatory_html_path"].write_text(str(artifacts["observatory_html"]), encoding="utf-8")
     evidence["artifacts"] = {key: str(path) for key, path in paths.items()}
     return evidence["artifacts"]
+
+
+class _ReferenceRustS3Signer:
+    def __init__(self, *, signer: RustS3ReportSigner) -> None:
+        self._signer = signer
+
+    @property
+    def key_id(self) -> str:
+        return self._signer.key_id
+
+    def sign(self, report: dict[str, Any]) -> dict[str, Any]:
+        return self._signer.sign(report).signed_report
+
+
+def _reference_rust_s3_signer_factory(key_id: str, key_material: bytes) -> _ReferenceRustS3Signer:
+    return _ReferenceRustS3Signer(
+        signer=RustS3ReportSigner(
+            command=_rust_s3_report_signer_command(),
+            key_id=key_id,
+            environment=_rust_s3_report_signer_environment(key_id=key_id, key_material=key_material),
+            timeout_s=float(os.environ.get("ARGUS_S1_REFERENCE_S3_SIGNER_TIMEOUT_S", "30")),
+        )
+    )
+
+
+def _rust_s3_report_signer_command() -> tuple[str, ...]:
+    configured = os.environ.get("ARGUS_S3_REPORT_SIGNER_COMMAND")
+    if configured:
+        return tuple(shlex.split(configured))
+    installed = Path("/usr/local/bin/argus-s3-report-signer")
+    if installed.exists():
+        return (str(installed),)
+    root = Path(__file__).resolve().parents[2]
+    release_binary = root / "bindings/rust/target/release/argus-s3-report-signer"
+    if release_binary.exists():
+        return (str(release_binary),)
+    return (
+        "cargo",
+        "run",
+        "--quiet",
+        "--manifest-path",
+        str(root / "bindings/rust/Cargo.toml"),
+        "--bin",
+        "argus-s3-report-signer",
+    )
+
+
+def _rust_s3_report_signer_environment(*, key_id: str, key_material: bytes) -> dict[str, str]:
+    return {
+        "ARGUS_S3_SIGNER_KEYS_JSON": json.dumps(
+            {
+                "provider": "rust-local-vault",
+                "keys": [
+                    {
+                        "key_id": key_id,
+                        "secret": key_material.decode("utf-8"),
+                        "revoked": False,
+                    }
+                ],
+            },
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+    }
 
 
 class S1ReferenceDemoApp:
@@ -156,6 +222,7 @@ def _check_summary(check: Any) -> dict[str, Any]:
         "check": str(body.get("check", "")),
         "status": str(body.get("status", "")),
         "metrics": dict(_mapping(body.get("metrics"))),
+        "evidence_refs": [str(ref) for ref in _sequence(body.get("evidence_refs"))],
     }
 
 

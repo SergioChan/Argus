@@ -8062,6 +8062,8 @@ def _check_to_contract(check: CheckResult) -> dict[str, Any]:
     }
     if check.metrics is not None:
         payload["metrics"] = check.metrics
+    if check.evidence_ref is not None:
+        payload["evidence_refs"] = [check.evidence_ref]
     return payload
 
 

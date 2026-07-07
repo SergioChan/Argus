@@ -11,7 +11,17 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 from typing import Any, Mapping, Protocol
 
-from argus_core import C3ReportSigner, CheckResult, Producer, S3ReportBuilder, S3Verifier, hash_json
+from argus_core import (
+    C3ReportSigner,
+    CheckPluginHost,
+    CheckResult,
+    CompiledProfile,
+    Lineage,
+    Producer,
+    S3ReportBuilder,
+    S3Verifier,
+    hash_json,
+)
 
 from .s3_verifier_service import S3VerificationDispatch, dispatch_digest
 
@@ -104,6 +114,97 @@ class S3PipelineRunner(Protocol):
         entrypoint_request: dict[str, Any],
     ) -> S3PipelineRunResult:
         """Run the frozen-pipeline activity and return a replayable outcome."""
+
+
+class S3CheckPluginPipelineRunner:
+    """Runs a frozen-pipeline verification dispatch through S3 check plugins."""
+
+    def __init__(
+        self,
+        *,
+        artifact_store: Any,
+        compiled_profile: CompiledProfile,
+        plugins: tuple[Any, ...],
+        actor_id: str = "s3.check-plugin-pipeline-runner",
+        cost_actual_usd: float = 0.0,
+    ) -> None:
+        if not hasattr(artifact_store, "create_artifact"):
+            raise TypeError("artifact_store must provide create_artifact")
+        if not isinstance(compiled_profile, CompiledProfile):
+            raise TypeError("compiled_profile must be a CompiledProfile")
+        if not plugins:
+            raise ValueError("plugins must contain at least one S3 check plugin")
+        self.artifact_store = artifact_store
+        self.compiled_profile = compiled_profile
+        self.plugins = tuple(plugins)
+        self.actor_id = actor_id
+        self.cost_actual_usd = float(cost_actual_usd)
+
+    def run(
+        self,
+        *,
+        dispatch: S3VerificationDispatch,
+        entrypoint_request: dict[str, Any],
+    ) -> S3PipelineRunResult:
+        checks = CheckPluginHost(
+            plugins=self.plugins,
+            artifact_store=self.artifact_store,
+            actor_id=self.actor_id,
+            job_id=dispatch.job_id,
+            trace_id=dispatch.trace_id,
+        ).run(self.compiled_profile)
+        evidence_refs = tuple(check.evidence_ref for check in checks if check.evidence_ref is not None)
+        output_record = self.artifact_store.create_artifact(
+            kind="s3_pipeline_check_output",
+            payload={
+                "schema": "argus.s3.pipeline_check_output.v1",
+                "workflow_type": S3_VERIFY_WORKFLOW_TYPE,
+                "request_id": dispatch.request_id,
+                "job_id": dispatch.job_id,
+                "profile_ref": dispatch.profile_ref,
+                "frozen_pipeline_ref": dispatch.frozen_pipeline_ref,
+                "compiled_profile_ref": self.compiled_profile.profile_ref,
+                "checks": [_check_payload(check) for check in checks],
+                "evidence_refs": list(evidence_refs),
+                "entrypoint_request_hash": hash_json(entrypoint_request),
+            },
+            producer=Producer(
+                subsystem="S3",
+                version="0.0.0",
+                actor_id=self.actor_id,
+                job_id=dispatch.job_id,
+            ),
+            lineage=Lineage(
+                input_refs=tuple(
+                    dict.fromkeys(
+                        (
+                            dispatch.frozen_pipeline_ref,
+                            *(
+                                str(ref)
+                                for ref in entrypoint_request.get("artifact_refs", ())
+                                if isinstance(ref, str)
+                            ),
+                            *evidence_refs,
+                        )
+                    )
+                ),
+                code_ref="argus-runtime:s3.check-plugin-pipeline-runner",
+                environment_digest=hash_json(
+                    {
+                        "runner": "s3-check-plugin-pipeline-runner:v1",
+                        "profile_ref": self.compiled_profile.profile_ref,
+                        "plugin_count": len(self.plugins),
+                    }
+                ),
+                job_id=dispatch.job_id,
+            ),
+        )
+        return S3PipelineRunResult.succeeded(
+            checks=checks,
+            output_artifact_ref=output_record.artifact_ref,
+            cost_actual_usd=self.cost_actual_usd,
+            evidence_refs=evidence_refs,
+        )
 
 
 @dataclass(frozen=True)

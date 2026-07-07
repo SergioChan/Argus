@@ -2417,6 +2417,8 @@ class ArgusM0ComposeTests(unittest.TestCase):
         self.assertIn("minio-data", rendered["volumes"])
         dockerfile = Path("deploy/argus-m0/python-service.Dockerfile").read_text(encoding="utf-8")
         self.assertIn("COPY schemas ./schemas", dockerfile)
+        self.assertIn("--bin argus-s3-report-signer", dockerfile)
+        self.assertIn("/usr/local/bin/argus-s3-report-signer", dockerfile)
 
     def _skip_or_fail(self, reason: str) -> None:
         if os.environ.get("ARGUS_REQUIRE_DOCKER_TESTS") == "1":
