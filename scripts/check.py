@@ -47,6 +47,7 @@ CHECKS = (
             "tests/test_s3_blind_data_manager.py",
             "tests/test_s3_check_plugin_host.py",
             "tests/test_s3_frozen_pipeline_runner.py",
+            "tests/test_s3_independence_resolver.py",
             "tests/test_s3_report_canonicalizer.py",
             "tests/test_s3_profile_resolver.py",
             "tests/test_s3_report_signer.py",

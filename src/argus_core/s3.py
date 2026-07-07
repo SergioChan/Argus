@@ -718,6 +718,184 @@ class CompiledProfile:
     determinism_profile: dict[str, Any]
 
 
+class S3IndependenceResolverError(S3Error):
+    """Raised when S3 cannot query C5 for independence evidence."""
+
+    def __init__(self, *, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
+@dataclass(frozen=True)
+class S3IndependenceResolution:
+    test_case: str
+    verdict: str
+    candidate_ids: tuple[str, ...]
+    cross_codes: tuple[str, ...]
+    rejected_candidate_ids: tuple[str, ...]
+    excluded_tags: tuple[str, ...]
+    degradations: tuple[str, ...]
+    min_independent: int
+    refused: bool = False
+    refusal_code: str | None = None
+    downgraded_profile_ref: str | None = None
+    max_claim_tier: str = "recapitulated-known"
+    c5_pinned_revisions: dict[str, int] | None = None
+
+    def to_independence_attestation(self) -> IndependenceAttestation:
+        return IndependenceAttestation(
+            candidate_ids=self.candidate_ids,
+            selected_entity_ids=self.cross_codes,
+            min_independent=self.min_independent,
+            lineage_disjoint=self.verdict == "INDEPENDENT",
+            correlation_warning=self.verdict != "INDEPENDENT",
+            excluded_tags=self.excluded_tags,
+        )
+
+    def to_check_result(self) -> "CheckResult":
+        metrics: dict[str, Any] = {
+            "test_case": self.test_case,
+            "verdict": self.verdict,
+            "candidate_ids": list(self.candidate_ids),
+            "cross_codes": list(self.cross_codes),
+            "rejected_candidate_ids": list(self.rejected_candidate_ids),
+            "excluded_tags": list(self.excluded_tags),
+            "degradations": list(self.degradations),
+            "min_independent": self.min_independent,
+            "refused": self.refused,
+            "refusal_code": self.refusal_code,
+            "max_claim_tier": self.max_claim_tier,
+            "c5_pinned_revisions": dict(self.c5_pinned_revisions or {}),
+        }
+        if self.downgraded_profile_ref is not None:
+            metrics["downgraded_profile_ref"] = self.downgraded_profile_ref
+        return CheckResult(
+            "CROSS_CODE",
+            "PASS" if self.verdict == "INDEPENDENT" else "INCONCLUSIVE",
+            metrics=metrics,
+        )
+
+    def as_payload(self) -> dict[str, Any]:
+        return {
+            "test_case": self.test_case,
+            "verdict": self.verdict,
+            "candidate_ids": list(self.candidate_ids),
+            "cross_codes": list(self.cross_codes),
+            "rejected_candidate_ids": list(self.rejected_candidate_ids),
+            "excluded_tags": list(self.excluded_tags),
+            "degradations": list(self.degradations),
+            "min_independent": self.min_independent,
+            "refused": self.refused,
+            "refusal_code": self.refusal_code,
+            "downgraded_profile_ref": self.downgraded_profile_ref,
+            "max_claim_tier": self.max_claim_tier,
+            "c5_pinned_revisions": dict(self.c5_pinned_revisions or {}),
+        }
+
+
+class S3IndependenceResolver:
+    """Resolve S3 cross-code independence through C5 without hiding rejected candidates."""
+
+    def __init__(self, *, c5_registry: Any) -> None:
+        if c5_registry is None or not hasattr(c5_registry, "resolve"):
+            raise S3IndependenceResolverError(
+                code="C5_REGISTRY_UNAVAILABLE",
+                message="S3 Independence Resolver requires a C5 registry with resolve()",
+            )
+        self._c5_registry = c5_registry
+
+    def resolve_cross_code(
+        self,
+        *,
+        subtopic: str,
+        code_under_test: CapabilityDescriptor,
+        required_scope: str = "c6.evaluate",
+        kind: str = "adapter",
+        min_independent: int = 1,
+        requested_tier: str | None = None,
+        policy: Mapping[str, Any] | None = None,
+    ) -> S3IndependenceResolution:
+        if not isinstance(min_independent, int) or min_independent < 1:
+            raise S3IndependenceResolverError(
+                code="INDEPENDENCE_MIN_INVALID",
+                message="min_independent must be a positive integer",
+            )
+        if not isinstance(code_under_test, CapabilityDescriptor):
+            raise S3IndependenceResolverError(
+                code="CODE_UNDER_TEST_INVALID",
+                message="code_under_test must be a C5 CapabilityDescriptor",
+            )
+        c5_resolution = self._resolve_c5(kind=kind, subtopic=subtopic, required_scope=required_scope)
+        excluded_tags = tuple(sorted(set(code_under_test.independence_tags)))
+        candidate_descriptors = tuple(
+            descriptor
+            for descriptor in c5_resolution.descriptors
+            if descriptor.entity_id != code_under_test.entity_id
+        )
+        selected: list[CapabilityDescriptor] = []
+        rejected: list[CapabilityDescriptor] = []
+        used_tags: set[str] = set()
+        excluded = set(excluded_tags)
+        for descriptor in candidate_descriptors:
+            tags = set(descriptor.independence_tags)
+            if not tags or tags & excluded or not tags.isdisjoint(used_tags):
+                rejected.append(descriptor)
+                continue
+            selected.append(descriptor)
+            used_tags.update(tags)
+
+        cross_codes = tuple(descriptor.entity_id for descriptor in selected)
+        independent = len(cross_codes) >= min_independent
+        policy_payload = dict(policy or {})
+        strict = bool(policy_payload.get("strict")) or str(policy_payload.get("mode", "")).lower() == "strict"
+        requested_novel = requested_tier == "novel-needs-human"
+        if independent:
+            verdict = "INDEPENDENT"
+            test_case = "S3-T14"
+        elif strict and requested_novel:
+            verdict = "REFUSED"
+            test_case = "S3-TC50"
+        elif requested_novel:
+            verdict = "NOT_INDEPENDENT" if rejected else "INDEPENDENCE_UNAVAILABLE"
+            test_case = "S3-TC23"
+        else:
+            verdict = "NOT_INDEPENDENT" if rejected else "INDEPENDENCE_UNAVAILABLE"
+            test_case = "S3-TC24"
+
+        degradation = () if independent else ("INDEPENDENCE_UNAVAILABLE",)
+        downgraded_profile_ref = policy_payload.get("downgraded_profile_ref")
+        if downgraded_profile_ref is not None and not isinstance(downgraded_profile_ref, str):
+            raise S3IndependenceResolverError(
+                code="DOWNGRADED_PROFILE_REF_INVALID",
+                message="downgraded_profile_ref must be a string when provided",
+            )
+        return S3IndependenceResolution(
+            test_case=test_case,
+            verdict=verdict,
+            candidate_ids=tuple(descriptor.entity_id for descriptor in candidate_descriptors),
+            cross_codes=cross_codes,
+            rejected_candidate_ids=tuple(descriptor.entity_id for descriptor in rejected),
+            excluded_tags=excluded_tags,
+            degradations=degradation,
+            min_independent=min_independent,
+            refused=verdict == "REFUSED",
+            refusal_code="INDEPENDENCE_UNAVAILABLE" if verdict == "REFUSED" else None,
+            downgraded_profile_ref=downgraded_profile_ref,
+            max_claim_tier="novel-needs-human" if independent else "recapitulated-known",
+            c5_pinned_revisions=dict(c5_resolution.pinned_revisions),
+        )
+
+    def _resolve_c5(self, *, kind: str, subtopic: str, required_scope: str):
+        try:
+            return self._c5_registry.resolve(kind=kind, subtopic=subtopic, required_scope=required_scope)
+        except Exception as exc:  # pragma: no cover - defensive wrapper for external C5 clients.
+            raise S3IndependenceResolverError(
+                code="C5_RESOLVE_FAILED",
+                message=f"C5 independence resolve failed: {exc}",
+            ) from exc
+
+
 class InMemoryVerifierProfileRegistry:
     """Append-only VerifierProfile registry used by S3-T07 tests and local flows."""
 
