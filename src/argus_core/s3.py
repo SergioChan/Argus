@@ -5910,6 +5910,245 @@ class S3CommittedValidationReport:
         return self.record.artifact_ref
 
 
+class S3ChallengeError(S3Error):
+    """Raised when an S3 challenge re-audit cannot be evaluated safely."""
+
+    def __init__(self, *, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
+@dataclass(frozen=True)
+class S3ChallengeCheckDelta:
+    check: str
+    match: str
+    policy: str
+    delta: float
+    tolerance: float
+    metric: str | None = None
+    original_value: Any | None = None
+    rerun_value: Any | None = None
+    reason: str | None = None
+
+
+@dataclass(frozen=True)
+class S3ChallengeResult:
+    challenge_ref: str
+    report_ref: str
+    match: str
+    alarm_raised: bool
+    canonical_hash_original: str
+    canonical_hash_rerun: str
+    signing_payload_hash_original: str
+    signing_payload_hash_rerun: str
+    check_deltas: tuple[S3ChallengeCheckDelta, ...]
+    test_cases: tuple[str, ...]
+    event_intents: tuple[str, ...] = ()
+    suspect_ref: str | None = None
+
+    def as_payload(self) -> dict[str, Any]:
+        payload = {
+            "schema": "argus.s3.challenge_result.v1",
+            "report_ref": self.report_ref,
+            "match": self.match,
+            "alarm_raised": self.alarm_raised,
+            "canonical_hash_original": self.canonical_hash_original,
+            "canonical_hash_rerun": self.canonical_hash_rerun,
+            "signing_payload_hash_original": self.signing_payload_hash_original,
+            "signing_payload_hash_rerun": self.signing_payload_hash_rerun,
+            "check_deltas": [_challenge_delta_payload(delta) for delta in self.check_deltas],
+            "test_cases": list(self.test_cases),
+            "event_intents": list(self.event_intents),
+        }
+        if self.suspect_ref is not None:
+            payload["suspect_ref"] = self.suspect_ref
+        return payload
+
+
+class S3ChallengeReauditEngine:
+    """Re-run C3 report checks from pinned artifacts and classify canary drift."""
+
+    def __init__(
+        self,
+        *,
+        artifact_store: Any,
+        report_verifier: C3ReportVerifier | None = None,
+        audit_ledger: Any | None = None,
+        producer: Producer | None = None,
+        code_ref: str = "argus-core:s3.challenge-reaudit",
+        environment_digest: str = "python:s3-challenge:v1",
+    ) -> None:
+        if not hasattr(artifact_store, "get_artifact") or not hasattr(artifact_store, "create_artifact"):
+            raise TypeError("artifact_store must provide get_artifact and create_artifact")
+        if not code_ref:
+            raise ValueError("code_ref must be non-empty")
+        if not environment_digest:
+            raise ValueError("environment_digest must be non-empty")
+        self.artifact_store = artifact_store
+        self.report_verifier = report_verifier
+        self.audit_ledger = audit_ledger
+        self.producer = producer or Producer(subsystem="S3", version="0.0.0", actor_id="s3.challenge")
+        self.code_ref = code_ref
+        self.environment_digest = environment_digest
+
+    def challenge(
+        self,
+        *,
+        report_ref: str,
+        rerun_checks: tuple[CheckResult, ...],
+        job_id: str | None = None,
+        trace_id: str | None = None,
+    ) -> S3ChallengeResult:
+        report = self._load_report(report_ref)
+        if self.report_verifier is not None:
+            verification = self.report_verifier.verify(report)
+            if not verification.valid:
+                raise S3ChallengeError(
+                    code="S3_CHALLENGE_REPORT_SIGNATURE_INVALID",
+                    message=f"ValidationReport signature is invalid: {verification.error_code or verification.reason}",
+                )
+
+        original = canonicalize_validation_report(report)
+        rerun_report = deepcopy(original.report)
+        rerun_report["checks"] = [_check_to_contract(check) for check in rerun_checks]
+        rerun_report["aggregate"] = {
+            **dict(rerun_report.get("aggregate") if isinstance(rerun_report.get("aggregate"), Mapping) else {}),
+            "passed": all(check.status == "PASS" for check in rerun_checks),
+            "score": _aggregate_score(rerun_checks),
+        }
+        rerun = canonicalize_validation_report(rerun_report)
+        deltas = _challenge_check_deltas(original.report["checks"], rerun_report["checks"])
+        event_intents: tuple[str, ...] = ()
+        alarm_raised = any(delta.match == "MISMATCH" for delta in deltas)
+        if alarm_raised:
+            match = "MISMATCH"
+            event_intents = ("s3.canary.alarm",)
+        elif original.digest == rerun.digest and all(delta.delta == 0 for delta in deltas):
+            match = "EXACT"
+        else:
+            match = "WITHIN_TOLERANCE"
+
+        test_cases = _challenge_test_cases(match, deltas)
+        preliminary = S3ChallengeResult(
+            challenge_ref="",
+            report_ref=report_ref,
+            match=match,
+            alarm_raised=alarm_raised,
+            canonical_hash_original=original.digest,
+            canonical_hash_rerun=rerun.digest,
+            signing_payload_hash_original=original.signing_payload_digest,
+            signing_payload_hash_rerun=rerun.signing_payload_digest,
+            check_deltas=deltas,
+            test_cases=test_cases,
+            event_intents=event_intents,
+        )
+        challenge_record = self.artifact_store.create_artifact(
+            kind="s3_challenge_result",
+            payload=preliminary.as_payload(),
+            producer=self.producer,
+            lineage=Lineage(
+                input_refs=(report_ref,),
+                code_ref=self.code_ref,
+                environment_digest=self.environment_digest,
+                job_id=job_id,
+            ),
+        )
+        suspect_ref: str | None = None
+        if alarm_raised:
+            suspect_ref = self._write_suspect_artifact(
+                report_ref=report_ref,
+                challenge_ref=challenge_record.artifact_ref,
+                deltas=deltas,
+                job_id=job_id,
+            )
+            self._append_audit_alarm(
+                report_ref=report_ref,
+                challenge_ref=challenge_record.artifact_ref,
+                suspect_ref=suspect_ref,
+                trace_id=trace_id,
+                deltas=deltas,
+            )
+        return S3ChallengeResult(
+            challenge_ref=challenge_record.artifact_ref,
+            report_ref=report_ref,
+            match=match,
+            alarm_raised=alarm_raised,
+            canonical_hash_original=original.digest,
+            canonical_hash_rerun=rerun.digest,
+            signing_payload_hash_original=original.signing_payload_digest,
+            signing_payload_hash_rerun=rerun.signing_payload_digest,
+            check_deltas=deltas,
+            test_cases=test_cases,
+            event_intents=event_intents,
+            suspect_ref=suspect_ref,
+        )
+
+    def _load_report(self, report_ref: str) -> dict[str, Any]:
+        if not report_ref:
+            raise S3ChallengeError(code="S3_CHALLENGE_REPORT_REF_REQUIRED", message="report_ref must be non-empty")
+        try:
+            payload = json.loads(self.artifact_store.get_artifact(report_ref).decode("utf-8"))
+        except (KeyError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise S3ChallengeError(
+                code="S3_CHALLENGE_REPORT_UNREADABLE",
+                message=f"report_ref could not be read as a ValidationReport: {report_ref}",
+            ) from exc
+        if not isinstance(payload, Mapping):
+            raise S3ChallengeError(code="S3_CHALLENGE_REPORT_INVALID", message="ValidationReport artifact must be an object")
+        return _validation_report_payload(payload)
+
+    def _write_suspect_artifact(
+        self,
+        *,
+        report_ref: str,
+        challenge_ref: str,
+        deltas: tuple[S3ChallengeCheckDelta, ...],
+        job_id: str | None,
+    ) -> str:
+        record = self.artifact_store.create_artifact(
+            kind="s3_challenge_suspect",
+            payload={
+                "schema": "argus.s3.challenge_suspect.v1",
+                "status": "SUSPECT",
+                "reason": "S3_CHALLENGE_MISMATCH",
+                "report_ref": report_ref,
+                "challenge_ref": challenge_ref,
+                "check_deltas": [_challenge_delta_payload(delta) for delta in deltas],
+                "event_intents": ["s3.canary.alarm"],
+            },
+            producer=self.producer,
+            lineage=Lineage(
+                input_refs=(report_ref, challenge_ref),
+                code_ref=self.code_ref,
+                environment_digest=self.environment_digest,
+                job_id=job_id,
+            ),
+        )
+        return record.artifact_ref
+
+    def _append_audit_alarm(
+        self,
+        *,
+        report_ref: str,
+        challenge_ref: str,
+        suspect_ref: str,
+        trace_id: str | None,
+        deltas: tuple[S3ChallengeCheckDelta, ...],
+    ) -> None:
+        if self.audit_ledger is None or not hasattr(self.audit_ledger, "append"):
+            return
+        payload = {
+            "report_ref": report_ref,
+            "challenge_ref": challenge_ref,
+            "suspect_ref": suspect_ref,
+            "mismatched_checks": [delta.check for delta in deltas if delta.match == "MISMATCH"],
+        }
+        if trace_id is not None:
+            payload["trace_id"] = trace_id
+        self.audit_ledger.append("s3.canary.alarm", payload)
+
+
 def canonicalize_validation_report(report: Mapping[str, Any]) -> CanonicalValidationReport:
     """Validate and canonicalize a C3 ValidationReport for stable BLAKE3 hashing."""
     payload = _validation_report_payload(report)
@@ -7343,6 +7582,275 @@ def _check_to_contract(check: CheckResult) -> dict[str, Any]:
     if check.metrics is not None:
         payload["metrics"] = check.metrics
     return payload
+
+
+def _challenge_delta_payload(delta: S3ChallengeCheckDelta) -> dict[str, Any]:
+    return {key: value for key, value in asdict(delta).items() if value is not None}
+
+
+def _challenge_check_deltas(
+    original_checks: Any,
+    rerun_checks: Any,
+) -> tuple[S3ChallengeCheckDelta, ...]:
+    original_by_name, order = _challenge_checks_by_name("original", original_checks)
+    rerun_by_name, rerun_order = _challenge_checks_by_name("rerun", rerun_checks)
+    for check in rerun_order:
+        if check not in original_by_name:
+            order.append(check)
+    deltas: list[S3ChallengeCheckDelta] = []
+    for check in order:
+        original = original_by_name.get(check)
+        rerun = rerun_by_name.get(check)
+        if original is None or rerun is None:
+            deltas.append(
+                S3ChallengeCheckDelta(
+                    check=check,
+                    match="MISMATCH",
+                    policy="presence:exact",
+                    delta=1.0,
+                    tolerance=0.0,
+                    reason="check_missing_from_original" if original is None else "check_missing_from_rerun",
+                )
+            )
+            continue
+        deltas.append(_challenge_check_delta(original, rerun))
+    return tuple(deltas)
+
+
+def _challenge_checks_by_name(label: str, checks: Any) -> tuple[dict[str, Mapping[str, Any]], list[str]]:
+    if not isinstance(checks, list):
+        raise S3ChallengeError(code="S3_CHALLENGE_CHECKS_INVALID", message=f"{label} checks must be an array")
+    by_name: dict[str, Mapping[str, Any]] = {}
+    order: list[str] = []
+    for item in checks:
+        if not isinstance(item, Mapping):
+            raise S3ChallengeError(code="S3_CHALLENGE_CHECK_INVALID", message=f"{label} check must be an object")
+        check = item.get("check")
+        if not isinstance(check, str) or not check:
+            raise S3ChallengeError(code="S3_CHALLENGE_CHECK_INVALID", message=f"{label} check name must be non-empty")
+        if check in by_name:
+            raise S3ChallengeError(code="S3_CHALLENGE_CHECK_DUPLICATE", message=f"{label} check is duplicated: {check}")
+        by_name[check] = item
+        order.append(check)
+    return by_name, order
+
+
+def _challenge_check_delta(original: Mapping[str, Any], rerun: Mapping[str, Any]) -> S3ChallengeCheckDelta:
+    check = str(original["check"])
+    if original.get("status") != rerun.get("status"):
+        return S3ChallengeCheckDelta(
+            check=check,
+            match="MISMATCH",
+            policy="status:exact",
+            delta=1.0,
+            tolerance=0.0,
+            original_value=original.get("status"),
+            rerun_value=rerun.get("status"),
+            reason="status_changed",
+        )
+    determinism = _challenge_determinism(original, rerun)
+    if determinism == "stochastic":
+        return _challenge_stochastic_delta(original, rerun)
+    policy = f"{determinism}:exact"
+    if _challenge_canonical_equal(original, rerun):
+        metric, original_value, rerun_value = _challenge_metric_pair(original, rerun)
+        return S3ChallengeCheckDelta(
+            check=check,
+            match="EXACT",
+            policy=policy,
+            delta=0.0,
+            tolerance=0.0,
+            metric=metric,
+            original_value=original_value,
+            rerun_value=rerun_value,
+        )
+    metric, original_value, rerun_value = _challenge_metric_pair(original, rerun)
+    return S3ChallengeCheckDelta(
+        check=check,
+        match="MISMATCH",
+        policy=policy,
+        delta=_challenge_numeric_delta(original_value, rerun_value),
+        tolerance=0.0,
+        metric=metric,
+        original_value=original_value,
+        rerun_value=rerun_value,
+        reason="check_contract_changed",
+    )
+
+
+def _challenge_stochastic_delta(original: Mapping[str, Any], rerun: Mapping[str, Any]) -> S3ChallengeCheckDelta:
+    check = str(original["check"])
+    tolerance = _challenge_tolerance(original, rerun)
+    if tolerance is None:
+        return S3ChallengeCheckDelta(
+            check=check,
+            match="MISMATCH",
+            policy="stochastic:tolerance_required",
+            delta=1.0,
+            tolerance=0.0,
+            reason="stochastic_tolerance_missing",
+        )
+    metric = tolerance["metric"]
+    original_value = _challenge_metric_value(original, metric)
+    rerun_value = _challenge_metric_value(rerun, metric)
+    if original_value is None or rerun_value is None:
+        return S3ChallengeCheckDelta(
+            check=check,
+            match="MISMATCH",
+            policy="stochastic:absolute_tolerance",
+            delta=1.0,
+            tolerance=tolerance["absolute"],
+            metric=metric,
+            original_value=original_value,
+            rerun_value=rerun_value,
+            reason="tolerance_metric_missing",
+        )
+    if _challenge_stochastic_metadata(original, metric) != _challenge_stochastic_metadata(rerun, metric):
+        return S3ChallengeCheckDelta(
+            check=check,
+            match="MISMATCH",
+            policy="stochastic:absolute_tolerance",
+            delta=_challenge_numeric_delta(original_value, rerun_value),
+            tolerance=tolerance["absolute"],
+            metric=metric,
+            original_value=original_value,
+            rerun_value=rerun_value,
+            reason="stochastic_metadata_changed",
+        )
+    delta = abs(rerun_value - original_value)
+    return S3ChallengeCheckDelta(
+        check=check,
+        match="WITHIN_TOLERANCE" if delta > 0 else "EXACT",
+        policy="stochastic:absolute_tolerance",
+        delta=delta,
+        tolerance=tolerance["absolute"],
+        metric=metric,
+        original_value=original_value,
+        rerun_value=rerun_value,
+        reason=None if delta <= tolerance["absolute"] else "outside_declared_tolerance",
+    ) if delta <= tolerance["absolute"] else S3ChallengeCheckDelta(
+        check=check,
+        match="MISMATCH",
+        policy="stochastic:absolute_tolerance",
+        delta=delta,
+        tolerance=tolerance["absolute"],
+        metric=metric,
+        original_value=original_value,
+        rerun_value=rerun_value,
+        reason="outside_declared_tolerance",
+    )
+
+
+def _challenge_determinism(original: Mapping[str, Any], rerun: Mapping[str, Any]) -> str:
+    for check in (original, rerun):
+        metrics = check.get("metrics")
+        if isinstance(metrics, Mapping):
+            value = metrics.get("determinism") or metrics.get("determinism_class")
+            if isinstance(value, str):
+                normalized = value.lower().replace("_", "-")
+                if normalized in {"deterministic", "seeded", "stochastic"}:
+                    return normalized
+    return "deterministic"
+
+
+def _challenge_tolerance(original: Mapping[str, Any], rerun: Mapping[str, Any]) -> dict[str, Any] | None:
+    for check in (original, rerun):
+        metrics = check.get("metrics")
+        if not isinstance(metrics, Mapping):
+            continue
+        for key in ("nondeterminism_tolerance", "tolerance"):
+            raw = metrics.get(key)
+            parsed = _parse_challenge_tolerance(raw, metrics)
+            if parsed is not None:
+                return parsed
+    return None
+
+
+def _parse_challenge_tolerance(raw: Any, metrics: Mapping[str, Any]) -> dict[str, Any] | None:
+    metric = "observed" if _challenge_metric_value_from_metrics(metrics, "observed") is not None else None
+    absolute: float | None = None
+    if isinstance(raw, Mapping):
+        raw_metric = raw.get("metric")
+        if isinstance(raw_metric, str) and raw_metric:
+            metric = raw_metric
+        for key in ("absolute", "abs", "max_delta", "absolute_tolerance"):
+            value = raw.get(key)
+            if _is_finite_number(value):
+                absolute = float(value)
+                break
+    elif _is_finite_number(raw):
+        absolute = float(raw)
+    if metric is None or absolute is None or absolute < 0:
+        return None
+    return {"metric": metric, "absolute": absolute}
+
+
+def _challenge_metric_pair(original: Mapping[str, Any], rerun: Mapping[str, Any]) -> tuple[str | None, Any | None, Any | None]:
+    metric = "observed"
+    original_value = _challenge_metric_value(original, metric)
+    rerun_value = _challenge_metric_value(rerun, metric)
+    if original_value is not None or rerun_value is not None:
+        return metric, original_value, rerun_value
+    metrics = original.get("metrics")
+    if isinstance(metrics, Mapping):
+        for key, value in metrics.items():
+            if key in {"determinism", "determinism_class", "seed", "nondeterminism_tolerance", "tolerance", "test_cases"}:
+                continue
+            if _is_finite_number(value):
+                return str(key), float(value), _challenge_metric_value(rerun, str(key))
+    return None, None, None
+
+
+def _challenge_metric_value(check: Mapping[str, Any], metric: str) -> float | None:
+    metrics = check.get("metrics")
+    if not isinstance(metrics, Mapping):
+        return None
+    return _challenge_metric_value_from_metrics(metrics, metric)
+
+
+def _challenge_metric_value_from_metrics(metrics: Mapping[str, Any], metric: str) -> float | None:
+    value = metrics.get(metric)
+    if _is_finite_number(value):
+        return float(value)
+    return None
+
+
+def _challenge_numeric_delta(original_value: Any | None, rerun_value: Any | None) -> float:
+    if _is_finite_number(original_value) and _is_finite_number(rerun_value):
+        return abs(float(rerun_value) - float(original_value))
+    return 1.0
+
+
+def _challenge_stochastic_metadata(check: Mapping[str, Any], metric: str) -> dict[str, Any]:
+    metrics = check.get("metrics")
+    if not isinstance(metrics, Mapping):
+        return {}
+    return {
+        str(key): value
+        for key, value in metrics.items()
+        if key not in {metric, "nondeterminism_tolerance", "tolerance"}
+    }
+
+
+def _challenge_canonical_equal(left: Mapping[str, Any], right: Mapping[str, Any]) -> bool:
+    return canonical_json_bytes(left) == canonical_json_bytes(right)
+
+
+def _is_finite_number(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(float(value))
+
+
+def _challenge_test_cases(match: str, deltas: tuple[S3ChallengeCheckDelta, ...]) -> tuple[str, ...]:
+    cases = ["S3-TC46"]
+    if match == "EXACT":
+        cases.insert(0, "S3-TC34")
+    elif match == "WITHIN_TOLERANCE":
+        cases.insert(0, "S3-TC35")
+    else:
+        cases.insert(0, "S3-TC36")
+    if any(delta.policy == "seeded:exact" for delta in deltas) and "S3-TC46" not in cases:
+        cases.append("S3-TC46")
+    return tuple(cases)
 
 
 def _dataclass_contract(value: Any) -> dict[str, Any]:
