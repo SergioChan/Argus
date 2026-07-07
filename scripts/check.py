@@ -55,6 +55,7 @@ CHECKS = (
             "tests/test_s3_leakage_check_plugin.py",
             "tests/test_s3_null_control_check_plugin.py",
             "tests/test_s3_physical_consistency_check_plugin.py",
+            "tests/test_s3_report_builder.py",
             "tests/test_s3_report_canonicalizer.py",
             "tests/test_s3_profile_resolver.py",
             "tests/test_s3_report_signer.py",

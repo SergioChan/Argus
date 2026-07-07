@@ -766,6 +766,11 @@ class InMemoryArtifactStore:
         record = self._record_by_ref(ref, require_unique_record=False)
         return self._object_store.get(record.content_hash)
 
+    def delete_artifact(self, artifact_ref: str) -> None:
+        if artifact_ref not in self._records:
+            raise KeyError(artifact_ref)
+        raise WriteOnceViolationError(f"artifact deletion is denied: {artifact_ref}")
+
     def get_record(self, artifact_ref: str) -> ArtifactRecord:
         record = self._record_by_ref(artifact_ref, require_unique_record=True)
         self._object_store.get(record.content_hash)

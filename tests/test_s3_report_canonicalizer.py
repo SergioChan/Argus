@@ -1,8 +1,13 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import os
+from pathlib import Path
+import shutil
+from tempfile import TemporaryDirectory
 import unittest
 
+import argus_core.s3 as s3_module
 from argus_core import (
     C3ReportSigner,
     ReportCanonicalizationError,
@@ -129,6 +134,29 @@ class S3ReportCanonicalizerTests(unittest.TestCase):
 
         self.assertEqual(raised.exception.code, "S3_REPORT_JSON_INVALID")
         self.assertIsNone(raised.exception.digest)
+
+    def test_schema_root_env_is_honored_in_packaged_runtime_layout(self) -> None:
+        schema_source = Path(__file__).resolve().parents[1] / "schemas" / "contracts" / "c3.validation-report.schema.json"
+        old_root = os.environ.get("ARGUS_SCHEMA_ROOT")
+        old_cwd = Path.cwd()
+        with TemporaryDirectory() as tmp, TemporaryDirectory() as cwd:
+            schema_root = Path(tmp) / "schemas"
+            (schema_root / "contracts").mkdir(parents=True)
+            shutil.copy2(schema_source, schema_root / "contracts" / "c3.validation-report.schema.json")
+            os.environ["ARGUS_SCHEMA_ROOT"] = str(schema_root)
+            os.chdir(cwd)
+            s3_module._c3_validation_report_validator.cache_clear()
+            s3_module._c3_verifier_profile_validator.cache_clear()
+            try:
+                self.assertEqual(canonicalize_validation_report(self.report).digest, EXPECTED_REPORT_DIGEST)
+            finally:
+                os.chdir(old_cwd)
+                if old_root is None:
+                    os.environ.pop("ARGUS_SCHEMA_ROOT", None)
+                else:
+                    os.environ["ARGUS_SCHEMA_ROOT"] = old_root
+                s3_module._c3_validation_report_validator.cache_clear()
+                s3_module._c3_verifier_profile_validator.cache_clear()
 
 
 def _reverse_nested_mappings(value):

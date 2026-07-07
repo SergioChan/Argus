@@ -4484,17 +4484,20 @@ def _build_validation_handoff_payload(
                 message=f"S3 validation report was rejected: {verification.reason or 'invalid'}",
             )
         )
-    report_record = artifact_store.create_artifact(
-        kind="report",
-        payload=validation_report_payload,
+    from .s3 import S3ReportBuilder
+
+    committed_report = S3ReportBuilder(
+        artifact_store=artifact_store,
         producer=Producer(subsystem="S3", version="0.0.0", actor_id="s3.validate"),
-        lineage=Lineage(
-            input_refs=(validation_request_record.artifact_ref, frozen_pipeline_record.artifact_ref, profile_ref),
-            code_ref="argus-core:s3.validate",
-            environment_digest="python:s3-validate:v1",
-            job_id=job_id,
-        ),
+        code_ref="argus-core:s3.validate",
+        environment_digest="python:s3-validate:v1",
+    ).commit_signed_report(
+        validation_report_payload,
+        input_refs=(validation_request_record.artifact_ref, frozen_pipeline_record.artifact_ref, profile_ref, *artifact_refs),
+        job_id=job_id,
     )
+    validation_report_payload = committed_report.report
+    report_record = committed_report.record
     report = build_subagent_report(
         artifact_refs=artifact_refs,
         validation_report_ref=report_record.artifact_ref,

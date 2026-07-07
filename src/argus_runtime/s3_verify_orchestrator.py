@@ -11,7 +11,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 from typing import Any, Mapping, Protocol
 
-from argus_core import C3ReportSigner, CheckResult, S3Verifier, hash_json
+from argus_core import C3ReportSigner, CheckResult, Producer, S3ReportBuilder, S3Verifier, hash_json
 
 from .s3_verifier_service import S3VerificationDispatch, dispatch_digest
 
@@ -118,6 +118,7 @@ class S3WorkflowState:
     dispatch_digest: str
     event_count: int
     report: dict[str, Any] | None = None
+    validation_report_ref: str | None = None
     output_artifact_ref: str | None = None
     partial_result_ref: str | None = None
     halt_reason: str | None = None
@@ -176,6 +177,13 @@ class S3VerifyOrchestrator:
         self.artifact_store = artifact_store
         self.task_queue = task_queue
         self.verifier = S3Verifier(verifier_id=verifier_id, signer_key_id=signer_key_id, signer=signer)
+        self.report_builder = S3ReportBuilder(
+            verifier=self.verifier,
+            artifact_store=artifact_store,
+            producer=Producer(subsystem="S3", version="0.0.0", actor_id="s3.verify-workflow"),
+            code_ref="argus-runtime:s3.verify-orchestrator",
+            environment_digest="python:s3-verify-orchestrator:v1",
+        )
         self.pipeline_runner = pipeline_runner
 
     def start(self, dispatch: S3VerificationDispatch) -> S3WorkflowState:
@@ -251,18 +259,30 @@ class S3VerifyOrchestrator:
 
         if "PipelineRunSucceeded" in event_types and "ReportProduced" not in event_types:
             result = _pipeline_result_from_payload(_last_event(events, "PipelineRunSucceeded").payload)
-            report = self.verifier.build_report(
+            committed_report = self.report_builder.build_and_commit_report(
                 profile_ref=dispatch.profile_ref,
                 frozen_pipeline_ref=dispatch.frozen_pipeline_ref,
                 checks=result.checks,
                 proponent_id=dispatch.caller_id,
+                input_refs=tuple(
+                    ref
+                    for ref in (
+                        dispatch.frozen_pipeline_ref,
+                        result.output_artifact_ref,
+                        *result.evidence_refs,
+                    )
+                    if ref
+                ),
+                job_id=dispatch.job_id,
             )
             self.store.append(
                 workflow_id,
                 "ReportProduced",
                 {
-                    "report": report,
-                    "report_digest": hash_json(report),
+                    "report": committed_report.report,
+                    "report_digest": hash_json(committed_report.report),
+                    "validation_report_ref": committed_report.validation_report_ref,
+                    "validation_report_digest": committed_report.canonical.digest,
                     "output_artifact_ref": result.output_artifact_ref,
                     "cost_actual_usd": result.cost_actual_usd,
                     "evidence_refs": list(result.evidence_refs),
@@ -293,6 +313,7 @@ class S3VerifyOrchestrator:
         started = events[0].payload
         status = S3WorkflowStatus.RUNNING
         report: dict[str, Any] | None = None
+        validation_report_ref: str | None = None
         output_artifact_ref: str | None = None
         partial_result_ref: str | None = None
         halt_reason: str | None = None
@@ -304,6 +325,7 @@ class S3VerifyOrchestrator:
                 report_payload = event.payload.get("report")
                 if isinstance(report_payload, Mapping):
                     report = {str(key): _jsonable(value) for key, value in report_payload.items()}
+                validation_report_ref = _optional_str(event.payload.get("validation_report_ref"))
                 output_artifact_ref = _optional_str(event.payload.get("output_artifact_ref"))
             elif event.event_type == "WorkflowCompleted":
                 status = str(event.payload.get("status") or status)
@@ -318,6 +340,7 @@ class S3VerifyOrchestrator:
             dispatch_digest=str(started["dispatch_digest"]),
             event_count=len(events),
             report=report,
+            validation_report_ref=validation_report_ref,
             output_artifact_ref=output_artifact_ref,
             partial_result_ref=partial_result_ref,
             halt_reason=halt_reason,

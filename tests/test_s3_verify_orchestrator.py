@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import unittest
 
 from argus_core import (
@@ -51,7 +52,10 @@ class FailingPipelineRunner:
 
 class S3VerifyOrchestratorTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.artifact_store = InMemoryArtifactStore()
+        self.trust_store = InMemoryVerifierTrustStore()
+        self.trust_store.register_key("s3-key", b"s3-secret")
+        self.signer = C3ReportSigner(key_id="s3-key", secret=b"s3-secret")
+        self.artifact_store = InMemoryArtifactStore(report_verifier=C3ReportVerifier(self.trust_store))
         self.frozen_record = self.artifact_store.create_artifact(
             kind="frozen_pipeline",
             payload={
@@ -77,9 +81,6 @@ class S3VerifyOrchestratorTests(unittest.TestCase):
                 seeds=("seed-s3-t03",),
             ),
         )
-        self.trust_store = InMemoryVerifierTrustStore()
-        self.trust_store.register_key("s3-key", b"s3-secret")
-        self.signer = C3ReportSigner(key_id="s3-key", secret=b"s3-secret")
 
     def test_api_starts_durable_verify_workflow(self) -> None:
         runner = CountingPipelineRunner(self._succeeded_pipeline_result())
@@ -125,10 +126,13 @@ class S3VerifyOrchestratorTests(unittest.TestCase):
         self.assertEqual(final.status, "REPORTED")
         self.assertEqual(replay_runner.calls, 0)
         self.assertIsNotNone(final.report)
+        self.assertIsNotNone(final.validation_report_ref)
         assert final.report is not None
         verification = C3ReportVerifier(self.trust_store).verify(final.report)
         self.assertTrue(verification.valid)
         self.assertEqual(verification.claim_tier, "recapitulated-known")
+        stored_report = json.loads(self.artifact_store.get_artifact(str(final.validation_report_ref)).decode("utf-8"))
+        self.assertEqual(stored_report, final.report)
         self.assertEqual(final.report["referee"]["distinct_from_proponent"], True)
         self.assertEqual(
             [event.event_type for event in durable_store.events(started.workflow_id)],

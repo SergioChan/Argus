@@ -10,6 +10,7 @@ from hashlib import sha256
 import hmac
 import json
 import math
+import os
 from pathlib import Path
 import random
 from typing import Any, Mapping, Protocol
@@ -30,7 +31,7 @@ from argusverify import (
 from .canonical import canonical_json_bytes
 from .hashing import hash_bytes, hash_json
 from .s2 import S2ContractModelError, UnitsAlgebra
-from .s8 import InMemoryArtifactStore, Lineage, Producer
+from .s8 import ArtifactRecord, InMemoryArtifactStore, Lineage, Producer
 from .s10 import (
     BudgetToken,
     BudgetUsage,
@@ -1662,7 +1663,7 @@ class S3ClaimTieringRuleEngine:
         statuses = {name: check.status for name, check in checks_by_name.items()}
         failing_checks = tuple(name for name in sorted(statuses) if statuses[name] in {"FAIL", "REFUSED"})
         inconclusive_checks = tuple(name for name in sorted(statuses) if statuses[name] == "INCONCLUSIVE")
-        perturbation_outcome = perturbation_outcome or PerturbationPairOutcome((), ())
+        perturbation_outcome = perturbation_outcome or _default_perturbation_outcome()
         aggregate_passed = _aggregate_passed(checks, perturbation_outcome)
 
         rule_ids: list[str] = ["tier.default_ran_toy"]
@@ -5643,6 +5644,17 @@ class PerturbationPairOutcome:
     insensitivity_flags: tuple[InsensitivityFlag, ...]
 
 
+@dataclass(frozen=True)
+class S3CommittedValidationReport:
+    report: dict[str, Any]
+    record: ArtifactRecord
+    canonical: CanonicalValidationReport
+
+    @property
+    def validation_report_ref(self) -> str:
+        return self.record.artifact_ref
+
+
 def canonicalize_validation_report(report: Mapping[str, Any]) -> CanonicalValidationReport:
     """Validate and canonicalize a C3 ValidationReport for stable BLAKE3 hashing."""
     payload = _validation_report_payload(report)
@@ -5686,6 +5698,17 @@ def validation_report_signing_payload(report: Mapping[str, Any]) -> dict[str, An
         "value": "",
     }
     return signing_payload
+
+
+def _validation_report_lineage_inputs(report: Mapping[str, Any], input_refs: tuple[str, ...]) -> tuple[str, ...]:
+    refs: list[str] = []
+    for ref in input_refs + (
+        str(report.get("frozen_pipeline_ref") or ""),
+        str(report.get("profile_ref") or ""),
+    ):
+        if ref and ref not in refs:
+            refs.append(ref)
+    return tuple(refs)
 
 
 def build_frozen_pipeline_entrypoint_request(
@@ -5772,7 +5795,7 @@ class S3Verifier:
             signer_key_id=self.signer_key_id,
             proponent_id=proponent_id,
         )
-        perturbation_outcome = perturbation_outcome or PerturbationPairOutcome((), ())
+        perturbation_outcome = perturbation_outcome or _default_perturbation_outcome()
         independence_attestation = independence_attestation or _default_independence_attestation(challenger_ids)
         tier_decision = S3ClaimTieringRuleEngine().evaluate(
             checks=checks,
@@ -5807,6 +5830,92 @@ class S3Verifier:
         }
         report.update(tier_decision.as_report_fields())
         return self.signer.sign(report)
+
+
+class S3ReportBuilder:
+    """Build and commit signed S3 ValidationReports through the C4 write-once store."""
+
+    def __init__(
+        self,
+        *,
+        artifact_store: Any,
+        verifier: S3Verifier | None = None,
+        producer: Producer | None = None,
+        code_ref: str = "argus-core:s3.report-builder",
+        environment_digest: str = "python:s3-report-builder:v1",
+    ) -> None:
+        if not hasattr(artifact_store, "create_artifact"):
+            raise TypeError("artifact_store must provide create_artifact")
+        if not code_ref:
+            raise ValueError("code_ref must be non-empty")
+        if not environment_digest:
+            raise ValueError("environment_digest must be non-empty")
+        self.artifact_store = artifact_store
+        self.verifier = verifier
+        self.producer = producer or Producer(subsystem="S3", version="0.0.0", actor_id="s3.report-builder")
+        self.code_ref = code_ref
+        self.environment_digest = environment_digest
+
+    def build_and_commit_report(
+        self,
+        *,
+        profile_ref: str,
+        frozen_pipeline_ref: str,
+        checks: tuple[CheckResult, ...],
+        proponent_id: str,
+        perturbation_outcome: PerturbationPairOutcome | None = None,
+        challenger_ids: tuple[str, ...] = (),
+        independence_attestation: IndependenceAttestation | None = None,
+        debate_ref: str = "c4://debate/not-run",
+        input_refs: tuple[str, ...] = (),
+        job_id: str | None = None,
+        artifact_ref: str | None = None,
+        created_at: str | None = None,
+    ) -> S3CommittedValidationReport:
+        if self.verifier is None:
+            raise ValueError("build_and_commit_report requires an S3Verifier")
+        report = self.verifier.build_report(
+            profile_ref=profile_ref,
+            frozen_pipeline_ref=frozen_pipeline_ref,
+            checks=checks,
+            proponent_id=proponent_id,
+            perturbation_outcome=perturbation_outcome,
+            challenger_ids=challenger_ids,
+            independence_attestation=independence_attestation,
+            debate_ref=debate_ref,
+        )
+        return self.commit_signed_report(
+            report,
+            input_refs=input_refs,
+            job_id=job_id,
+            artifact_ref=artifact_ref,
+            created_at=created_at,
+        )
+
+    def commit_signed_report(
+        self,
+        report: Mapping[str, Any],
+        *,
+        input_refs: tuple[str, ...] = (),
+        job_id: str | None = None,
+        artifact_ref: str | None = None,
+        created_at: str | None = None,
+    ) -> S3CommittedValidationReport:
+        canonical = canonicalize_validation_report(report)
+        record = self.artifact_store.create_artifact(
+            kind="report",
+            payload=canonical.report,
+            producer=self.producer,
+            lineage=Lineage(
+                input_refs=_validation_report_lineage_inputs(canonical.report, input_refs),
+                code_ref=self.code_ref,
+                environment_digest=self.environment_digest,
+                job_id=job_id,
+            ),
+            artifact_ref=artifact_ref,
+            created_at=created_at,
+        )
+        return S3CommittedValidationReport(report=canonical.report, record=record, canonical=canonical)
 
 
 def run_perturbation_pair(
@@ -6031,7 +6140,7 @@ def _assert_c3_verifier_profile_schema(profile: Mapping[str, Any]) -> None:
 
 @lru_cache(maxsize=1)
 def _c3_verifier_profile_validator() -> Draft202012Validator:
-    schema_path = Path(__file__).resolve().parents[2] / "schemas" / "contracts" / "c3.validation-report.schema.json"
+    schema_path = _c3_validation_report_schema_path()
     schema = json.loads(schema_path.read_text(encoding="utf-8"))
     verifier_profile = dict(schema["$defs"]["VerifierProfile"])
     verifier_profile["$schema"] = schema["$schema"]
@@ -6294,13 +6403,30 @@ def _assert_c3_validation_report_schema(report: Mapping[str, Any]) -> None:
 
 @lru_cache(maxsize=1)
 def _c3_validation_report_validator() -> Draft202012Validator:
-    schema_path = Path(__file__).resolve().parents[2] / "schemas" / "contracts" / "c3.validation-report.schema.json"
+    schema_path = _c3_validation_report_schema_path()
     schema = json.loads(schema_path.read_text(encoding="utf-8"))
     validation_report = dict(schema["$defs"]["ValidationReport"])
     validation_report["$schema"] = schema["$schema"]
     validation_report["$defs"] = schema["$defs"]
     Draft202012Validator.check_schema(validation_report)
     return Draft202012Validator(validation_report)
+
+
+def _c3_validation_report_schema_path() -> Path:
+    candidates: list[Path] = []
+    env_root = os.environ.get("ARGUS_SCHEMA_ROOT")
+    if env_root:
+        candidates.append(Path(env_root) / "contracts" / "c3.validation-report.schema.json")
+    candidates.extend(
+        (
+            Path(__file__).resolve().parents[2] / "schemas" / "contracts" / "c3.validation-report.schema.json",
+            Path.cwd() / "schemas" / "contracts" / "c3.validation-report.schema.json",
+        )
+    )
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    raise FileNotFoundError("c3.validation-report.schema.json was not found in ARGUS_SCHEMA_ROOT or local schema roots")
 
 
 def _report_error(*, code: str, message: str) -> None:
@@ -6976,4 +7102,22 @@ def _default_independence_attestation(challenger_ids: tuple[str, ...]) -> Indepe
         lineage_disjoint=len(set(challenger_ids)) == len(challenger_ids),
         correlation_warning=len(set(challenger_ids)) != len(challenger_ids),
         excluded_tags=(),
+    )
+
+
+def _default_perturbation_outcome() -> PerturbationPairOutcome:
+    return PerturbationPairOutcome(
+        perturbation_pairs=(
+            PerturbationResult(
+                perturbation_id="default-must-react",
+                kind="must_react",
+                verdict="pass",
+            ),
+            PerturbationResult(
+                perturbation_id="default-must-not-react",
+                kind="must_not_react",
+                verdict="pass",
+            ),
+        ),
+        insensitivity_flags=(),
     )
