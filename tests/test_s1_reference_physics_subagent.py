@@ -53,18 +53,36 @@ class S1ReferencePhysicsSubagentTests(unittest.TestCase):
         self.assertEqual(report["referee"]["referee_id"], "s3-reference-verifier")
         self.assertNotEqual(report["referee"]["referee_id"], "s1-reference-physics")
 
-    def test_reference_physics_six_checks_are_computed_from_c4_handoff_artifacts(self) -> None:
+    def test_reference_physics_checks_are_computed_from_c4_handoff_artifacts(self) -> None:
         harness = S1ReferencePhysicsHarness()
 
         result = harness.run_happy_path(job_id="job-s1-t28-check-metrics")
         checks = {check["check"]: check for check in result.validation_report_payload["checks"]}
 
+        self.assertEqual(
+            set(checks),
+            {
+                "INJECTION",
+                "NULL_CONTROL",
+                "CROSS_CODE",
+                "PHYSICAL_CONSISTENCY",
+                "LEAKAGE",
+                "CALIBRATION",
+                "RECAP_BENCHMARK",
+            },
+        )
         self.assertEqual(checks["INJECTION"]["metrics"]["observed_omega"], 0.02)
         self.assertEqual(checks["INJECTION"]["metrics"]["expected_omega"], 0.02)
         self.assertEqual(checks["NULL_CONTROL"]["metrics"]["null_alpha"], 0.0)
         self.assertEqual(checks["PHYSICAL_CONSISTENCY"]["metrics"]["model_family"], "ewpt-tabular-reference")
         self.assertTrue(checks["LEAKAGE"]["metrics"]["snapshot_ref"].startswith("c4://"))
         self.assertEqual(checks["CALIBRATION"]["metrics"]["nominal_coverage"], 1.0)
+        recap_metrics = checks["RECAP_BENCHMARK"]["metrics"]
+        self.assertTrue(recap_metrics["recap_benchmark_pass"])
+        self.assertTrue(recap_metrics["truth_retained_server_side"])
+        self.assertFalse(recap_metrics["truth_bytes_delivered_to_sandbox"])
+        self.assertFalse(recap_metrics["truth_hash_delivered_to_sandbox"])
+        self.assertFalse(recap_metrics["raw_truth_exposed"])
 
     def test_reference_perturbation_uses_c4_model_response_not_canned_literals(self) -> None:
         harness = S1ReferencePhysicsHarness()

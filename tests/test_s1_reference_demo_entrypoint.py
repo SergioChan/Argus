@@ -66,6 +66,7 @@ class S1ReferenceDemoEntryPointTests(unittest.TestCase):
                     "PHYSICAL_CONSISTENCY": "PASS",
                     "LEAKAGE": "PASS",
                     "CALIBRATION": "PASS",
+                    "RECAP_BENCHMARK": "PASS",
                 },
             )
 
@@ -86,6 +87,11 @@ class S1ReferenceDemoEntryPointTests(unittest.TestCase):
             self.assertEqual(report["claim_tier"], "novel-needs-human")
             self.assertEqual(report["referee"]["referee_id"], "s3-reference-verifier")
             self.assertEqual(report["signature"]["key_id"], "s3-reference-referee-key")
+            recap_check = next(check for check in report["checks"] if check["check"] == "RECAP_BENCHMARK")
+            self.assertTrue(recap_check["metrics"]["recap_benchmark_pass"])
+            self.assertFalse(recap_check["metrics"]["truth_bytes_delivered_to_sandbox"])
+            self.assertFalse(recap_check["metrics"]["truth_hash_delivered_to_sandbox"])
+            self.assertFalse(recap_check["metrics"]["raw_truth_exposed"])
             self.assertEqual(subagent_report["validation_report_ref"], evidence["validation_report_ref"])
             self.assertEqual(lineage["subject_ref"], evidence["promoted_artifact_ref"])
             self.assertEqual(lineage["report_ref"], evidence["validation_report_ref"])

@@ -103,7 +103,7 @@
           "type": "array",
           "items": {
             "type": "string",
-            "enum": ["INJECTION", "NULL_CONTROL", "CROSS_CODE", "PHYSICAL_CONSISTENCY", "LEAKAGE", "CALIBRATION", "PERTURBATION_PAIR", "INSENSITIVITY"]
+            "enum": ["INJECTION", "NULL_CONTROL", "CROSS_CODE", "PHYSICAL_CONSISTENCY", "LEAKAGE", "CALIBRATION", "RECAP_BENCHMARK", "PERTURBATION_PAIR", "INSENSITIVITY"]
           },
           "uniqueItems": true
         },

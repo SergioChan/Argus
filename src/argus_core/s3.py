@@ -129,6 +129,7 @@ S3_VERIFIER_PROFILE_CHECKS = frozenset(
         "PHYSICAL_CONSISTENCY",
         "LEAKAGE",
         "CALIBRATION",
+        "RECAP_BENCHMARK",
         "PERTURBATION_PAIR",
         "INSENSITIVITY",
     }
@@ -1589,7 +1590,7 @@ class CheckResult:
 
 S3_CLAIM_TIERS = ("ran-toy", "recapitulated-known", "novel-needs-human")
 S3_CHECK_STATUSES = ("PASS", "FAIL", "INCONCLUSIVE", "REFUSED")
-S3_RECAP_REQUIRED_CHECKS = ("INJECTION", "NULL_CONTROL", "PHYSICAL_CONSISTENCY", "CALIBRATION")
+S3_RECAP_REQUIRED_CHECKS = ("INJECTION", "NULL_CONTROL", "PHYSICAL_CONSISTENCY", "CALIBRATION", "RECAP_BENCHMARK")
 S3_NOVEL_REQUIRED_CHECKS = S3_RECAP_REQUIRED_CHECKS + ("CROSS_CODE", "LEAKAGE")
 S3_TIER_ORDER = {tier: index for index, tier in enumerate(S3_CLAIM_TIERS)}
 
@@ -1675,20 +1676,33 @@ class S3ClaimTieringRuleEngine:
         capped_from: str | None = None
 
         recap_statuses = {name: statuses.get(name) for name in S3_RECAP_REQUIRED_CHECKS}
+        recap_missing = tuple(name for name, value in recap_statuses.items() if value is None)
         recap_passed = all(value == "PASS" for value in recap_statuses.values())
         recap_inconclusive = tuple(
             name for name, value in recap_statuses.items() if value in {"INCONCLUSIVE", "REFUSED"}
         )
         recap_failed = tuple(name for name, value in recap_statuses.items() if value == "FAIL")
 
-        if recap_inconclusive:
+        if recap_missing:
+            _append_unique(rule_ids, "tier.recap_benchmark_required")
+            _append_unique(triggered_cases, "S3-T24")
+            if "RECAP_BENCHMARK" in recap_missing:
+                _append_unique(degradations, "RECAP_BENCHMARK_MISSING")
+        elif recap_inconclusive:
             _append_unique(rule_ids, "tier.mandatory_inconclusive_non_improvement")
             _append_unique(triggered_cases, "S3-TC37")
+            if "RECAP_BENCHMARK" in recap_inconclusive:
+                _append_unique(rule_ids, "tier.recap_benchmark_required")
+                _append_unique(triggered_cases, "S3-T24")
         elif recap_failed:
             _append_unique(rule_ids, "tier.recap_gate_failed")
+            if "RECAP_BENCHMARK" in recap_failed:
+                _append_unique(rule_ids, "tier.recap_benchmark_required")
+                _append_unique(triggered_cases, "S3-T24")
         elif recap_passed:
             claim_tier = "recapitulated-known"
             _append_unique(rule_ids, "tier.recap_required_checks_pass")
+            _append_unique(rule_ids, "tier.recap_benchmark_pass")
 
             leakage_status = statuses.get("LEAKAGE")
             cross_code_status = statuses.get("CROSS_CODE")
@@ -1939,6 +1953,15 @@ class S3LeakageCheckError(S3Error):
         self.message = message
 
 
+class S3RecapBenchmarkCheckError(S3Error):
+    """Raised when the S3 RECAP_BENCHMARK check cannot be evaluated safely."""
+
+    def __init__(self, *, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
 @dataclass(frozen=True)
 class S3InjectionSample:
     sample_id: str
@@ -2012,6 +2035,12 @@ class S3LeakageRewardLoopEvidence:
     aggregate_passed: bool
     s4_rejected_variant: bool
     s4_improvement_accepted: bool
+
+
+@dataclass(frozen=True)
+class S3RecapBenchmarkPrediction:
+    sample_id: str
+    prediction: float
 
 
 class S3InjectionCheckPlugin:
@@ -2310,6 +2339,133 @@ class S3CalibrationCheckPlugin:
                 "point_estimates_exposed": False,
                 "heldout_answers_exposed": False,
             },
+        )
+
+
+class S3RecapBenchmarkCheckPlugin:
+    """Concrete RECAP_BENCHMARK gate for held-out known-result recapitulation."""
+
+    def __init__(
+        self,
+        *,
+        blind_data_vault: InMemoryBlindDataVault,
+        blind_data_stage: BlindDataStage,
+        predictions: tuple[S3RecapBenchmarkPrediction, ...],
+        plugin_version: str = "1.0.0",
+    ) -> None:
+        self._blind_data_vault = blind_data_vault
+        self._blind_data_stage = blind_data_stage
+        self._predictions = tuple(predictions)
+        self._plugin_version = plugin_version
+
+    def describe(self) -> CheckPluginDescriptor:
+        return CheckPluginDescriptor(
+            check="RECAP_BENCHMARK",
+            plugin_ref="argus.s3.plugins.recap_benchmark",
+            plugin_version=self._plugin_version,
+            determinism="deterministic",
+            declared_inputs=(
+                "s3.recap_benchmark_opaque_input",
+                "s3.recap_benchmark_truth_verifier_zone",
+                "s3.frozen_pipeline_predictions",
+            ),
+        )
+
+    def run(self, ctx: CheckPluginContext) -> CheckResult:
+        if ctx.check_spec.check != "RECAP_BENCHMARK":
+            _s3_recap_error(
+                "S3_RECAP_BENCHMARK_CHECK_SPEC_MISMATCH",
+                f"recap-benchmark plugin cannot run {ctx.check_spec.check}",
+            )
+        if not isinstance(self._blind_data_vault, InMemoryBlindDataVault):
+            _s3_recap_error("S3_RECAP_BENCHMARK_VAULT_REQUIRED", "RECAP_BENCHMARK requires an S3 blind-data vault")
+        stage = _s3_recap_stage(self._blind_data_stage)
+        record = self._blind_data_vault.resolve(stage.blind_data_handle)
+        if record.dataset_kind != "recap_benchmark":
+            _s3_recap_error(
+                "S3_RECAP_BENCHMARK_KIND_INVALID",
+                "RECAP_BENCHMARK requires a blind dataset with dataset_kind=recap_benchmark",
+            )
+
+        absolute_tolerance = _s3_recap_optional_non_negative(
+            ctx.check_spec.thresholds.get("absolute_tolerance"),
+            field="absolute_tolerance",
+        )
+        relative_tolerance = _s3_recap_optional_non_negative(
+            ctx.check_spec.thresholds.get("relative_tolerance"),
+            field="relative_tolerance",
+        )
+        if absolute_tolerance is None and relative_tolerance is None:
+            _s3_recap_error(
+                "S3_RECAP_BENCHMARK_TOLERANCE_REQUIRED",
+                "RECAP_BENCHMARK requires absolute_tolerance or relative_tolerance",
+            )
+        min_recovered_fraction = _s3_recap_probability(
+            ctx.check_spec.thresholds.get("min_recovered_fraction", 1.0),
+            field="min_recovered_fraction",
+        )
+        truth_samples = _s3_recap_truth_samples(self._blind_data_vault.truth_for_scoring(stage.blind_data_handle))
+        predictions = _s3_recap_predictions(self._predictions)
+        recovered_count = 0
+        missing_prediction_count = 0
+        errors: list[float] = []
+        for sample_id, expected in truth_samples.items():
+            observed = predictions.get(sample_id)
+            if observed is None:
+                missing_prediction_count += 1
+                continue
+            tolerance = S3StatisticsLibrary.tolerance(
+                observed=observed,
+                expected=expected,
+                absolute_tolerance=absolute_tolerance,
+                relative_tolerance=relative_tolerance,
+            )
+            errors.append(tolerance.error)
+            if tolerance.passed:
+                recovered_count += 1
+        recovered_fraction = recovered_count / len(truth_samples)
+        recap_pass = missing_prediction_count == 0 and recovered_fraction >= min_recovered_fraction
+        failure_reasons = _s3_recap_failure_reasons(
+            recap_pass=recap_pass,
+            missing_prediction_count=missing_prediction_count,
+            recovered_fraction=recovered_fraction,
+            min_recovered_fraction=min_recovered_fraction,
+        )
+        metrics = {
+            "test_cases": ["S3-T24", "S3-TC32"],
+            "recap_benchmark_pass": recap_pass,
+            "sample_count": len(truth_samples),
+            "prediction_count": len(predictions),
+            "recovered_count": recovered_count,
+            "missing_prediction_count": missing_prediction_count,
+            "recovered_fraction": recovered_fraction,
+            "min_recovered_fraction": min_recovered_fraction,
+            "absolute_tolerance": absolute_tolerance,
+            "relative_tolerance": relative_tolerance,
+            "max_absolute_error": max(errors) if errors else None,
+            "failure_reasons": failure_reasons,
+            "recap_benchmark_ref": record.metadata_ref,
+            "blind_stage_ref": stage.stage_evidence_ref,
+            "truth_hash": stage.truth_hash,
+            "truth_retained_server_side": stage.truth_retained_server_side,
+            "truth_bytes_delivered_to_sandbox": stage.truth_bytes_delivered_to_sandbox,
+            "truth_hash_delivered_to_sandbox": stage.truth_hash_delivered_to_sandbox,
+            "raw_truth_exposed": False,
+            "sample_digest": hash_json(
+                {
+                    "truth_hash": stage.truth_hash,
+                    "prediction_ids": sorted(predictions),
+                    "prediction_values": [predictions[key] for key in sorted(predictions)],
+                }
+            ),
+            "max_claim_tier": "novel-needs-human" if recap_pass else "ran-toy",
+        }
+        if not recap_pass:
+            metrics["degradation"] = "RECAP_BENCHMARK_FAILED"
+        return CheckResult(
+            check="RECAP_BENCHMARK",
+            status="PASS" if recap_pass else "FAIL",
+            metrics=metrics,
         )
 
 
@@ -4495,6 +4651,105 @@ def _s3_calibration_positive_int(value: Any, *, field: str) -> int:
 
 def _s3_calibration_error(code: str, message: str) -> None:
     raise S3CalibrationCheckError(code=code, message=message)
+
+
+def _s3_recap_stage(stage: BlindDataStage) -> BlindDataStage:
+    if not isinstance(stage, BlindDataStage):
+        _s3_recap_error("S3_RECAP_BENCHMARK_STAGE_REQUIRED", "RECAP_BENCHMARK requires a blind-data stage")
+    if not stage.truth_retained_server_side:
+        _s3_recap_error(
+            "S3_RECAP_BENCHMARK_TRUTH_NOT_SERVER_SIDE",
+            "recap benchmark truth must remain verifier-zone server-side",
+        )
+    if stage.truth_bytes_delivered_to_sandbox or stage.truth_hash_delivered_to_sandbox:
+        _s3_recap_error(
+            "S3_RECAP_BENCHMARK_TRUTH_DELIVERED_TO_SANDBOX",
+            "recap benchmark truth or truth hash was delivered to the sandbox",
+        )
+    return stage
+
+
+def _s3_recap_truth_samples(value: Any) -> dict[str, float]:
+    if not isinstance(value, Mapping):
+        _s3_recap_error("S3_RECAP_BENCHMARK_TRUTH_INVALID", "truth payload must be a JSON object")
+    samples = value.get("samples")
+    if not isinstance(samples, list) or not samples:
+        _s3_recap_error("S3_RECAP_BENCHMARK_TRUTH_INVALID", "truth payload requires a non-empty samples list")
+    parsed: dict[str, float] = {}
+    for index, sample in enumerate(samples):
+        if not isinstance(sample, Mapping):
+            _s3_recap_error("S3_RECAP_BENCHMARK_TRUTH_INVALID", f"samples[{index}] must be an object")
+        sample_id = _s3_recap_text(sample.get("sample_id"), field=f"samples[{index}].sample_id")
+        if sample_id in parsed:
+            _s3_recap_error("S3_RECAP_BENCHMARK_DUPLICATE_SAMPLE", f"duplicate truth sample_id {sample_id}")
+        parsed[sample_id] = _s3_recap_float(sample.get("expected"), field=f"samples[{index}].expected")
+    return parsed
+
+
+def _s3_recap_predictions(predictions: tuple[S3RecapBenchmarkPrediction, ...]) -> dict[str, float]:
+    if not predictions:
+        _s3_recap_error("S3_RECAP_BENCHMARK_PREDICTIONS_REQUIRED", "predictions must be non-empty")
+    parsed: dict[str, float] = {}
+    for index, prediction in enumerate(predictions):
+        if not isinstance(prediction, S3RecapBenchmarkPrediction):
+            _s3_recap_error("S3_RECAP_BENCHMARK_PREDICTION_INVALID", f"predictions[{index}] is invalid")
+        sample_id = _s3_recap_text(prediction.sample_id, field=f"predictions[{index}].sample_id")
+        if sample_id in parsed:
+            _s3_recap_error("S3_RECAP_BENCHMARK_DUPLICATE_SAMPLE", f"duplicate prediction sample_id {sample_id}")
+        parsed[sample_id] = _s3_recap_float(prediction.prediction, field=f"predictions[{index}].prediction")
+    return parsed
+
+
+def _s3_recap_failure_reasons(
+    *,
+    recap_pass: bool,
+    missing_prediction_count: int,
+    recovered_fraction: float,
+    min_recovered_fraction: float,
+) -> list[str]:
+    if recap_pass:
+        return []
+    reasons: list[str] = []
+    if missing_prediction_count:
+        reasons.append("MISSING_PREDICTIONS")
+    if recovered_fraction < min_recovered_fraction:
+        reasons.append("RECOVERY_FRACTION_BELOW_THRESHOLD")
+    return reasons or ["RECAP_BENCHMARK_FAILED"]
+
+
+def _s3_recap_text(value: Any, *, field: str) -> str:
+    if not isinstance(value, str) or not value:
+        _s3_recap_error("S3_RECAP_BENCHMARK_FIELD_INVALID", f"{field} must be a non-empty string")
+    return value
+
+
+def _s3_recap_float(value: Any, *, field: str) -> float:
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        _s3_recap_error("S3_RECAP_BENCHMARK_FLOAT_INVALID", f"{field} must be numeric")
+    result = float(value)
+    if not math.isfinite(result):
+        _s3_recap_error("S3_RECAP_BENCHMARK_FLOAT_NONFINITE", f"{field} must be finite")
+    return result
+
+
+def _s3_recap_optional_non_negative(value: Any, *, field: str) -> float | None:
+    if value is None:
+        return None
+    result = _s3_recap_float(value, field=field)
+    if result < 0:
+        _s3_recap_error("S3_RECAP_BENCHMARK_THRESHOLD_INVALID", f"{field} must be non-negative")
+    return result
+
+
+def _s3_recap_probability(value: Any, *, field: str) -> float:
+    result = _s3_recap_float(value, field=field)
+    if not 0.0 <= result <= 1.0:
+        _s3_recap_error("S3_RECAP_BENCHMARK_THRESHOLD_INVALID", f"{field} must be in [0, 1]")
+    return result
+
+
+def _s3_recap_error(code: str, message: str) -> None:
+    raise S3RecapBenchmarkCheckError(code=code, message=message)
 
 
 def _s3_cross_code_independence_resolution(

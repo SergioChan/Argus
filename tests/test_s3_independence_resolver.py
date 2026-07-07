@@ -102,6 +102,7 @@ class S3IndependenceResolverTests(unittest.TestCase):
             CheckResult("NULL_CONTROL", "PASS"),
             CheckResult("PHYSICAL_CONSISTENCY", "PASS"),
             CheckResult("CALIBRATION", "PASS"),
+            CheckResult("RECAP_BENCHMARK", "PASS", metrics={"test_cases": ["S3-T24", "S3-TC32"]}),
         )
 
     @staticmethod

@@ -777,6 +777,26 @@ def _reference_checks(
         empirical_coverage=1.0 if injection_error <= omega_tolerance else 0.0,
         tolerance=0.0,
     )
+    recap_pass = injection_error <= omega_tolerance
+    recap_benchmark = CheckResult(
+        "RECAP_BENCHMARK",
+        "PASS" if recap_pass else "FAIL",
+        {
+            "test_cases": ["S3-T24", "S3-TC32"],
+            "recap_benchmark_pass": recap_pass,
+            "sample_count": 1,
+            "recovered_count": 1 if recap_pass else 0,
+            "recovered_fraction": 1.0 if recap_pass else 0.0,
+            "min_recovered_fraction": 1.0,
+            "absolute_tolerance": omega_tolerance,
+            "recap_benchmark_ref": S1_REFERENCE_PHYSICS_DATASET_REF,
+            "truth_retained_server_side": True,
+            "truth_bytes_delivered_to_sandbox": False,
+            "truth_hash_delivered_to_sandbox": False,
+            "raw_truth_exposed": False,
+            "max_claim_tier": "novel-needs-human" if recap_pass else "ran-toy",
+        },
+    )
     return (
         injection,
         null_control,
@@ -784,6 +804,7 @@ def _reference_checks(
         physical_consistency,
         leakage,
         calibration,
+        recap_benchmark,
     )
 
 

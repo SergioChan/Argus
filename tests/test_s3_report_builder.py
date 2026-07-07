@@ -137,6 +137,7 @@ class S3ReportBuilderTests(unittest.TestCase):
                 CheckResult("NULL_CONTROL", "PASS"),
                 CheckResult("PHYSICAL_CONSISTENCY", "PASS"),
                 CheckResult("CALIBRATION", "PASS"),
+                CheckResult("RECAP_BENCHMARK", "PASS", metrics={"test_cases": ["S3-T24", "S3-TC32"]}),
             ),
             proponent_id="s1-reference-physics",
             perturbation_outcome=outcome,
@@ -156,7 +157,10 @@ class S3ReportBuilderTests(unittest.TestCase):
         profile = self.store.create_artifact(
             kind="profile",
             artifact_ref="c4://profile/s3-t23/ewpt-r1",
-            payload={"schema": "argus.s3.profile.v1", "checks": ["INJECTION", "NULL_CONTROL", "PHYSICAL_CONSISTENCY", "CALIBRATION"]},
+            payload={
+                "schema": "argus.s3.profile.v1",
+                "checks": ["INJECTION", "NULL_CONTROL", "PHYSICAL_CONSISTENCY", "CALIBRATION", "RECAP_BENCHMARK"],
+            },
             producer=Producer(subsystem="S3", version="0.0.0", actor_id="s3.profile-registry"),
             lineage=Lineage(input_refs=(), code_ref="git:s3-profile", environment_digest="oci:s3-profile"),
         )

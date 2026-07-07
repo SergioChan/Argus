@@ -1503,6 +1503,7 @@ def _battery_s1_reference_physics_demo(evidence: dict[str, Any], s1_reference_de
         "PHYSICAL_CONSISTENCY",
         "LEAKAGE",
         "CALIBRATION",
+        "RECAP_BENCHMARK",
     }
     checks = response.get("checks")
     if not isinstance(checks, list):
@@ -1513,7 +1514,7 @@ def _battery_s1_reference_physics_demo(evidence: dict[str, Any], s1_reference_de
         if isinstance(check, dict)
     }
     if statuses != {check: "PASS" for check in expected_checks}:
-        raise AssertionError(f"S1 reference demo did not return six PASS checks: {statuses}")
+        raise AssertionError(f"S1 reference demo did not return seven PASS checks: {statuses}")
     if response.get("final_state") != "REPORTED":
         raise AssertionError(f"S1 reference demo did not reach REPORTED: {response}")
     if response.get("claim_tier") != "novel-needs-human" or response.get("claim_tier_is_candidate") is not True:
@@ -2824,6 +2825,10 @@ def _m0_validation_report(*, claim_tier: str, aggregate_passed: bool = True) -> 
         "frozen_pipeline_ref": "c4://pipeline/m0-spine/baseline",
         "checks": [
             {"check": "INJECTION", "status": "PASS"},
+            {"check": "NULL_CONTROL", "status": "PASS"},
+            {"check": "PHYSICAL_CONSISTENCY", "status": "PASS"},
+            {"check": "CALIBRATION", "status": "PASS"},
+            {"check": "RECAP_BENCHMARK", "status": "PASS"},
             {"check": "LEAKAGE", "status": "PASS"},
             {"check": "CROSS_CODE", "status": "PASS"},
         ],

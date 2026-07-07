@@ -124,6 +124,7 @@ class S3ClaimTieringRuleEngineTests(unittest.TestCase):
                 CheckResult("NULL_CONTROL", "INCONCLUSIVE", metrics={"degradations": ["BUDGET"]}),
                 CheckResult("PHYSICAL_CONSISTENCY", "PASS"),
                 CheckResult("CALIBRATION", "PASS"),
+                CheckResult("RECAP_BENCHMARK", "PASS", metrics={"test_cases": ["S3-T24", "S3-TC32"]}),
                 CheckResult("CROSS_CODE", "PASS"),
                 CheckResult("LEAKAGE", "PASS"),
             ),
@@ -163,6 +164,7 @@ class S3ClaimTieringRuleEngineTests(unittest.TestCase):
             CheckResult("NULL_CONTROL", "PASS"),
             CheckResult("PHYSICAL_CONSISTENCY", "PASS"),
             CheckResult("CALIBRATION", "PASS"),
+            CheckResult("RECAP_BENCHMARK", "PASS", metrics={"test_cases": ["S3-T24", "S3-TC32"]}),
         )
 
     def _novel_checks(self) -> tuple[CheckResult, ...]:

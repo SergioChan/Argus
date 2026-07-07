@@ -366,6 +366,7 @@ class ArgusM0RuntimeServiceTests(unittest.TestCase):
                     {"check": "PHYSICAL_CONSISTENCY", "status": "PASS"},
                     {"check": "LEAKAGE", "status": "PASS"},
                     {"check": "CALIBRATION", "status": "PASS"},
+                    {"check": "RECAP_BENCHMARK", "status": "PASS"},
                 ],
             }
 

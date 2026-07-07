@@ -262,6 +262,7 @@ class S3VerifyOrchestratorTests(unittest.TestCase):
                 CheckResult("NULL_CONTROL", "PASS"),
                 CheckResult("PHYSICAL_CONSISTENCY", "PASS"),
                 CheckResult("CALIBRATION", "PASS"),
+                CheckResult("RECAP_BENCHMARK", "PASS", metrics={"test_cases": ["S3-T24", "S3-TC32"]}),
             ),
             output_artifact_ref="c4://artifact/s3-t03-output",
             cost_actual_usd=0.0042,

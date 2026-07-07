@@ -206,12 +206,7 @@ class S3VerifierReportTests(unittest.TestCase):
         self.verifier = S3Verifier(verifier_id="s3-referee", signer_key_id="s3-key", signer=self.signer)
 
     def test_tier_rule_assigns_recap_and_novel_candidate(self) -> None:
-        recap_checks = (
-            CheckResult("INJECTION", "PASS"),
-            CheckResult("NULL_CONTROL", "PASS"),
-            CheckResult("PHYSICAL_CONSISTENCY", "PASS"),
-            CheckResult("CALIBRATION", "PASS"),
-        )
+        recap_checks = self._recap_checks()
         novel_checks = recap_checks + (
             CheckResult("CROSS_CODE", "PASS"),
             CheckResult("LEAKAGE", "PASS"),
@@ -241,12 +236,7 @@ class S3VerifierReportTests(unittest.TestCase):
             profile_ref="c4://profile/ewpt/v1",
             frozen_pipeline_ref="c4://pipeline/ewpt/baseline",
             proponent_id="builder",
-            checks=(
-                CheckResult("INJECTION", "PASS"),
-                CheckResult("NULL_CONTROL", "PASS"),
-                CheckResult("PHYSICAL_CONSISTENCY", "PASS"),
-                CheckResult("CALIBRATION", "PASS"),
-            ),
+            checks=self._recap_checks(),
             perturbation_outcome=outcome,
             challenger_ids=("challenger-a", "challenger-b"),
             debate_ref="c4://debate/example",
@@ -342,11 +332,7 @@ class S3VerifierReportTests(unittest.TestCase):
             profile_ref="c4://profile/ewpt/v1",
             frozen_pipeline_ref="c4://pipeline/ewpt/baseline",
             proponent_id="builder",
-            checks=(
-                CheckResult("INJECTION", "PASS"),
-                CheckResult("NULL_CONTROL", "PASS"),
-                CheckResult("PHYSICAL_CONSISTENCY", "PASS"),
-                CheckResult("CALIBRATION", "PASS"),
+            checks=self._recap_checks() + (
                 CheckResult("CROSS_CODE", "PASS"),
                 CheckResult("LEAKAGE", "PASS"),
             ),
@@ -426,11 +412,7 @@ class S3VerifierReportTests(unittest.TestCase):
                     profile_ref="c4://profile/ewpt/v1",
                     frozen_pipeline_ref="c4://pipeline/ewpt/baseline",
                     proponent_id="builder",
-                    checks=(
-                        CheckResult("INJECTION", "PASS"),
-                        CheckResult("NULL_CONTROL", "PASS"),
-                        CheckResult("PHYSICAL_CONSISTENCY", "PASS"),
-                        CheckResult("CALIBRATION", "PASS"),
+                    checks=self._recap_checks() + (
                         CheckResult("CROSS_CODE", "PASS"),
                         CheckResult("LEAKAGE", "PASS"),
                     ),
@@ -442,6 +424,16 @@ class S3VerifierReportTests(unittest.TestCase):
                 self.assertEqual(report["claim_tier"], "recapitulated-known")
                 self.assertFalse(report["claim_tier_is_candidate"])
                 self.assertTrue(C3ReportVerifier(self.trust_store).verify(report).valid)
+
+    @staticmethod
+    def _recap_checks() -> tuple[CheckResult, ...]:
+        return (
+            CheckResult("INJECTION", "PASS"),
+            CheckResult("NULL_CONTROL", "PASS"),
+            CheckResult("PHYSICAL_CONSISTENCY", "PASS"),
+            CheckResult("CALIBRATION", "PASS"),
+            CheckResult("RECAP_BENCHMARK", "PASS", metrics={"test_cases": ["S3-T24", "S3-TC32"]}),
+        )
 
     @staticmethod
     def _challenger(entity_id: str, *, tags: tuple[str, ...]) -> CapabilityDescriptor:
