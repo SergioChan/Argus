@@ -45,6 +45,7 @@ CHECKS = (
             "src/argus_runtime/s3_verify_orchestrator.py",
             "src/argusverify/__init__.py",
             "tests/test_s3_check_plugin_host.py",
+            "tests/test_s3_frozen_pipeline_runner.py",
             "tests/test_s3_report_canonicalizer.py",
             "tests/test_s3_profile_resolver.py",
             "tests/test_s3_report_signer.py",

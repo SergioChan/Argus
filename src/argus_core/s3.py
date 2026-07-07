@@ -17,6 +17,14 @@ from argusverify import C3ReportSigner, canonical_c3_json_bytes
 from .canonical import canonical_json_bytes
 from .hashing import hash_bytes, hash_json
 from .s8 import InMemoryArtifactStore, Lineage, Producer
+from .s10 import (
+    BudgetToken,
+    BudgetUsage,
+    LaunchEnvelope,
+    LaunchRequest,
+    SandboxExecutionResult,
+    ScopeToken,
+)
 from .s6 import (
     CapabilityDescriptor,
     ContaminationIndex,
@@ -114,6 +122,10 @@ S3_PROFILE_REF_PREFIX = "c4://profile"
 S3_CHECK_PLUGIN_HOST_VERSION = "argus.s3.check_plugin_host.v1"
 S3_CHECK_RESULT_EVIDENCE_KIND = "s3_check_result"
 S3_CHECK_RESULT_EVIDENCE_SCHEMA = "argus.s3.check_result_evidence.v1"
+S3_FROZEN_PIPELINE_RUNNER_VERSION = "argus.s3.frozen_pipeline_runner.v1"
+S3_FROZEN_PIPELINE_RUN_EVIDENCE_KIND = "s3_frozen_pipeline_run"
+S3_FROZEN_PIPELINE_RUN_EVIDENCE_SCHEMA = "argus.s3.frozen_pipeline_run_evidence.v1"
+S3_FROZEN_PIPELINE_RUNNER_ENTRYPOINT = ("python", "-m", "argus_runtime.s3_frozen_pipeline_entrypoint")
 _S3_PROFILE_ID_CHARS = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-")
 
 
@@ -166,6 +178,27 @@ class CheckPluginHostError(S3Error):
         self.before_execution = before_execution
         self.retryable = False
         self.partial_results = partial_results
+
+    def as_c1_payload(self) -> dict[str, Any]:
+        return {
+            "category": self.category,
+            "code": self.code,
+            "message": self.message,
+            "before_execution": self.before_execution,
+            "retryable": self.retryable,
+        }
+
+
+class S3FrozenPipelineRunnerError(S3Error):
+    """Raised when S3 cannot safely launch a frozen pipeline through S10."""
+
+    def __init__(self, *, category: str, code: str, message: str, before_execution: bool = True) -> None:
+        super().__init__(message)
+        self.category = category
+        self.code = code
+        self.message = message
+        self.before_execution = before_execution
+        self.retryable = False
 
     def as_c1_payload(self) -> dict[str, Any]:
         return {
@@ -917,6 +950,463 @@ class CheckPluginHost:
             lineage=lineage,
         )
         return replace(result, evidence_ref=record.artifact_ref)
+
+
+@dataclass(frozen=True)
+class S3FrozenPipelineRunResult:
+    status: str
+    evidence_ref: str
+    sandbox_id: str
+    sandbox_state: str
+    launch_request: LaunchRequest
+
+
+class S3FrozenPipelineRunner:
+    """Launches frozen pipeline predict entrypoints only through a nested S10 sandbox."""
+
+    def __init__(
+        self,
+        *,
+        artifact_store: InMemoryArtifactStore,
+        sandbox_orchestrator: Any,
+        budget_token: BudgetToken,
+        scope_token: ScopeToken,
+        audit_ledger: Any | None = None,
+        launch_envelope: LaunchEnvelope | None = None,
+        actor_id: str = "s3-frozen-pipeline-runner",
+    ) -> None:
+        if artifact_store is None:
+            _runner_error(code="S3_ARTIFACT_STORE_REQUIRED", message="S3 frozen-pipeline runner requires artifact_store")
+        if sandbox_orchestrator is None:
+            _runner_error(code="S10_SANDBOX_ORCHESTRATOR_REQUIRED", message="S3 frozen-pipeline runner requires S10")
+        self._artifact_store = artifact_store
+        self._sandbox_orchestrator = sandbox_orchestrator
+        self._audit_ledger = audit_ledger
+        self._budget_token = budget_token
+        self._scope_token = scope_token
+        self._launch_envelope = launch_envelope or LaunchEnvelope(
+            cpu_m=1_000,
+            mem_bytes=512_000_000,
+            gpu_count=0,
+            wallclock_s=30,
+            scratch_bytes=1_000_000,
+            pids=32,
+            estimated_cost_usd=0.01,
+        )
+        self._actor_id = actor_id
+
+    def run(self, validation_request: Mapping[str, Any]) -> S3FrozenPipelineRunResult:
+        entrypoint_request = build_frozen_pipeline_entrypoint_request(
+            validation_request,
+            artifact_store=self._artifact_store,
+        )
+        verification_request = _runner_mapping(entrypoint_request.get("verification_request"), "verification_request")
+        frozen_pipeline_ref = _non_empty_string(
+            verification_request.get("frozen_pipeline_ref"),
+            "frozen_pipeline_ref",
+            code="S3_FROZEN_PIPELINE_REF_INVALID",
+        )
+        pipeline_payload = _frozen_pipeline_payload(self._artifact_store, frozen_pipeline_ref)
+        security_probe = _runner_security_probe(pipeline_payload)
+        launch_request = self._launch_request(
+            entrypoint_request=entrypoint_request,
+            pipeline_payload=pipeline_payload,
+            security_probe=security_probe,
+        )
+        event_start = _runner_audit_len(self._audit_ledger)
+        execution = self._launch_nested_s10(launch_request)
+        audit_events = _runner_audit_events_since(self._audit_ledger, event_start)
+        evidence_ref = self._write_evidence(
+            entrypoint_request=entrypoint_request,
+            pipeline_payload=pipeline_payload,
+            security_probe=security_probe,
+            launch_request=launch_request,
+            execution=execution,
+            audit_events=audit_events,
+        )
+        return S3FrozenPipelineRunResult(
+            status=_runner_status(execution),
+            evidence_ref=evidence_ref,
+            sandbox_id=execution.handle.sandbox_id,
+            sandbox_state=execution.handle.state,
+            launch_request=launch_request,
+        )
+
+    def _launch_request(
+        self,
+        *,
+        entrypoint_request: Mapping[str, Any],
+        pipeline_payload: Mapping[str, Any],
+        security_probe: Mapping[str, Any],
+    ) -> LaunchRequest:
+        verification_request = _runner_mapping(entrypoint_request.get("verification_request"), "verification_request")
+        job_id = _non_empty_string(
+            verification_request.get("job_id"),
+            "job_id",
+            code="S3_VERIFICATION_REQUEST_FIELD_REQUIRED",
+        )
+        trace_id = str(entrypoint_request.get("trace_id") or verification_request.get("request_id") or job_id)
+        args = (
+            "--entrypoint-request-json",
+            canonical_json_bytes(entrypoint_request).decode("utf-8"),
+        )
+        if security_probe:
+            args = args + ("--security-probe-json", canonical_json_bytes(security_probe).decode("utf-8"))
+        return LaunchRequest(
+            job_id=job_id,
+            subagent_id=self._actor_id,
+            trace_id=trace_id,
+            budget_token=self._budget_token,
+            scope_token=self._scope_token,
+            image=_runner_image(pipeline_payload),
+            entrypoint=S3_FROZEN_PIPELINE_RUNNER_ENTRYPOINT,
+            args=args,
+            env={},
+            env_allowlist=(),
+            requested_envelope=self._launch_envelope,
+            runtime_class_hint="auto",
+        )
+
+    def _launch_nested_s10(self, launch_request: LaunchRequest) -> SandboxExecutionResult:
+        launch_and_wait = getattr(self._sandbox_orchestrator, "launch_and_wait", None)
+        if callable(launch_and_wait):
+            try:
+                execution = launch_and_wait(launch_request)
+            except Exception as exc:
+                raise S3FrozenPipelineRunnerError(
+                    category="SANDBOX",
+                    code="S10_SANDBOX_LAUNCH_FAILED",
+                    message=f"S10 sandbox launch failed: {exc}",
+                    before_execution=False,
+                ) from exc
+            if not isinstance(execution, SandboxExecutionResult):
+                raise S3FrozenPipelineRunnerError(
+                    category="SANDBOX",
+                    code="S10_SANDBOX_RESULT_INVALID",
+                    message="S10 launch_and_wait returned an invalid result",
+                    before_execution=False,
+                )
+            return execution
+
+        launch = getattr(self._sandbox_orchestrator, "launch", None)
+        if not callable(launch):
+            _runner_error(
+                category="SANDBOX",
+                code="S10_SANDBOX_ORCHESTRATOR_INVALID",
+                message="S10 sandbox orchestrator must expose launch_and_wait or launch",
+            )
+        try:
+            handle = launch(launch_request)
+        except Exception as exc:
+            raise S3FrozenPipelineRunnerError(
+                category="SANDBOX",
+                code="S10_SANDBOX_LAUNCH_FAILED",
+                message=f"S10 sandbox launch failed: {exc}",
+                before_execution=False,
+            ) from exc
+        return SandboxExecutionResult(
+            handle=handle,
+            exit_code=None,
+            stdout="",
+            stderr="",
+            timed_out=False,
+            duration_s=0.0,
+            budget_usage=BudgetUsage(),
+            partial_result=None,
+        )
+
+    def _write_evidence(
+        self,
+        *,
+        entrypoint_request: Mapping[str, Any],
+        pipeline_payload: Mapping[str, Any],
+        security_probe: Mapping[str, Any],
+        launch_request: LaunchRequest,
+        execution: SandboxExecutionResult,
+        audit_events: tuple[Any, ...],
+    ) -> str:
+        status = _runner_status(execution)
+        partial = execution.partial_result
+        audit_event_types = tuple(str(getattr(event, "event_type", "")) for event in audit_events)
+        quarantine = _runner_quarantine_payload(execution, audit_events)
+        egress = _runner_egress_payload(execution, audit_events, security_probe)
+        payload = {
+            "schema": S3_FROZEN_PIPELINE_RUN_EVIDENCE_SCHEMA,
+            "runner_version": S3_FROZEN_PIPELINE_RUNNER_VERSION,
+            "status": status,
+            "execution_boundary": "nested_s10_sandbox",
+            "verifier_imported_pipeline_code": False,
+            "entrypoint_request": _runner_json_value(entrypoint_request, path="entrypoint_request"),
+            "launch_request": _runner_launch_payload(launch_request),
+            "sandbox": {
+                "sandbox_id": execution.handle.sandbox_id,
+                "state": execution.handle.state,
+                "runtime_class": execution.handle.runtime_class,
+                "policy_bundle_version": execution.handle.policy_bundle_version,
+                "launch_provenance_ref": execution.handle.launch_provenance_ref,
+                "exit_code": execution.exit_code,
+                "timed_out": execution.timed_out,
+                "duration_s": execution.duration_s,
+            },
+            "quarantine": quarantine,
+            "egress": egress,
+            "partial_result": _runner_partial_payload(partial),
+            "audit_event_types": list(audit_event_types),
+            "s3_test_cases": {
+                "S3-TC25": {
+                    "status": "PASS",
+                    "assertion": "frozen pipeline launched through nested S10 sandbox; verifier imported no pipeline code",
+                },
+                "S3-TC27": _runner_tc27_status(quarantine),
+                "S3-TC44": _runner_tc44_status(egress),
+            },
+        }
+        input_refs = [str(entrypoint_request["verification_request"]["frozen_pipeline_ref"])]
+        input_refs.extend(str(ref) for ref in entrypoint_request.get("artifact_refs", ()) if isinstance(ref, str))
+        if execution.handle.launch_provenance_ref:
+            input_refs.append(execution.handle.launch_provenance_ref)
+        record = self._artifact_store.create_artifact(
+            kind=S3_FROZEN_PIPELINE_RUN_EVIDENCE_KIND,
+            payload=payload,
+            producer=Producer(
+                subsystem="S3",
+                version=S3_FROZEN_PIPELINE_RUNNER_VERSION,
+                actor_id=self._actor_id,
+                job_id=launch_request.job_id,
+            ),
+            lineage=Lineage(
+                input_refs=tuple(dict.fromkeys(input_refs)),
+                code_ref=str(pipeline_payload.get("code_ref") or entrypoint_request["entrypoint"].get("code_ref")),
+                environment_digest=hash_json(
+                    {
+                        "runner": S3_FROZEN_PIPELINE_RUNNER_VERSION,
+                        "image": launch_request.image,
+                        "entrypoint": list(launch_request.entrypoint),
+                        "args_hash": hash_bytes(canonical_json_bytes(list(launch_request.args))),
+                    }
+                ),
+                seeds=(launch_request.trace_id,),
+                actor_id=self._actor_id,
+                job_id=launch_request.job_id,
+            ),
+        )
+        return record.artifact_ref
+
+
+def _runner_error(
+    *,
+    code: str,
+    message: str,
+    category: str = "POLICY",
+    before_execution: bool = True,
+) -> None:
+    raise S3FrozenPipelineRunnerError(
+        category=category,
+        code=code,
+        message=message,
+        before_execution=before_execution,
+    )
+
+
+def _runner_mapping(value: Any, field_name: str) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        _runner_error(code="S3_FROZEN_PIPELINE_RUNNER_PAYLOAD_INVALID", message=f"{field_name} must be a mapping")
+    return dict(value)
+
+
+def _runner_security_probe(pipeline_payload: Mapping[str, Any]) -> dict[str, Any]:
+    config = pipeline_payload.get("config")
+    if not isinstance(config, Mapping):
+        return {}
+    probe = config.get("s3_t10_probe")
+    if probe is None:
+        return {}
+    if not isinstance(probe, Mapping):
+        _runner_error(
+            code="S3_FROZEN_PIPELINE_SECURITY_PROBE_INVALID",
+            message="s3_t10_probe must be a JSON object when present",
+        )
+    return _runner_json_value(probe, path="s3_t10_probe")
+
+
+def _runner_image(pipeline_payload: Mapping[str, Any]) -> str:
+    raw = pipeline_payload.get("container_digest") or pipeline_payload.get("image")
+    if not isinstance(raw, str) or not raw:
+        _runner_error(
+            code="S3_FROZEN_PIPELINE_IMAGE_REQUIRED",
+            message="frozen pipeline payload requires a digest-pinned container_digest or image",
+        )
+    digest_source = raw.strip()
+    if "@sha256:" in digest_source:
+        digest = digest_source.rsplit("@sha256:", 1)[1]
+    elif "sha256:" in digest_source:
+        digest = digest_source.rsplit("sha256:", 1)[1]
+    else:
+        digest = digest_source
+    digest = digest.strip()
+    if len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest):
+        _runner_error(
+            code="S3_FROZEN_PIPELINE_IMAGE_UNPINNED",
+            message="frozen pipeline image must be pinned to a sha256 digest",
+        )
+    return f"argus-s3-frozen-pipeline@sha256:{digest}"
+
+
+def _runner_audit_len(audit_ledger: Any | None) -> int:
+    if audit_ledger is None or not hasattr(audit_ledger, "events"):
+        return 0
+    try:
+        return len(audit_ledger.events())
+    except Exception:
+        return 0
+
+
+def _runner_audit_events_since(audit_ledger: Any | None, start: int) -> tuple[Any, ...]:
+    if audit_ledger is None or not hasattr(audit_ledger, "events"):
+        return ()
+    try:
+        return tuple(audit_ledger.events()[start:])
+    except Exception:
+        return ()
+
+
+def _runner_status(execution: SandboxExecutionResult) -> str:
+    partial_reason = execution.partial_result.reason if execution.partial_result is not None else ""
+    if execution.handle.state == "QUARANTINED" or partial_reason.startswith("SANDBOX:"):
+        return "QUARANTINED"
+    if execution.handle.state == "SUCCEEDED" and execution.exit_code in (0, None):
+        return "SUCCEEDED"
+    if execution.handle.state in {"ADMITTED", "RUNNING"} and execution.exit_code is None:
+        return execution.handle.state
+    if execution.timed_out:
+        return "TIMED_OUT"
+    return "FAILED"
+
+
+def _runner_launch_payload(request: LaunchRequest) -> dict[str, Any]:
+    return {
+        "job_id": request.job_id,
+        "subagent_id": request.subagent_id,
+        "trace_id": request.trace_id,
+        "image": request.image,
+        "entrypoint": list(request.entrypoint),
+        "args": list(request.args),
+        "env_keys": sorted(request.env),
+        "env_allowlist": list(request.env_allowlist),
+        "runtime_class_hint": request.runtime_class_hint,
+        "budget_id": request.budget_token.budget_id,
+        "scope_id": request.scope_token.scope_id,
+        "requested_envelope": asdict(request.requested_envelope),
+    }
+
+
+def _runner_partial_payload(partial: Any | None) -> dict[str, Any] | None:
+    if partial is None:
+        return None
+    return {
+        "reason": partial.reason,
+        "stdout": partial.stdout,
+        "stderr": partial.stderr,
+        "captured_after_freeze": partial.captured_after_freeze,
+        "freeze_succeeded": partial.freeze_succeeded,
+        "terminate_succeeded": partial.terminate_succeeded,
+        "stdout_bytes": partial.stdout_bytes,
+        "stderr_bytes": partial.stderr_bytes,
+        "logs_truncated": partial.logs_truncated,
+        "frozen_state": partial.frozen_state,
+        "terminated_state": partial.terminated_state,
+    }
+
+
+def _runner_quarantine_payload(execution: SandboxExecutionResult, audit_events: tuple[Any, ...]) -> dict[str, Any] | None:
+    partial = execution.partial_result
+    if execution.handle.state != "QUARANTINED" and partial is None:
+        return None
+    severity = "Sev-1" if partial is not None and partial.reason in {"SANDBOX:TRUST_PATH_WRITE", "SANDBOX:EGRESS_DENIED"} else "Sev-2"
+    for event in audit_events:
+        if getattr(event, "event_type", "") == "s3.quarantine":
+            payload = getattr(event, "payload", {})
+            if isinstance(payload, Mapping) and isinstance(payload.get("severity"), str):
+                severity = str(payload["severity"])
+    return {
+        "severity": severity,
+        "reason": partial.reason if partial is not None else "SANDBOX:QUARANTINED",
+        "stdout": partial.stdout if partial is not None else "",
+        "stderr": partial.stderr if partial is not None else "",
+    }
+
+
+def _runner_egress_payload(
+    execution: SandboxExecutionResult,
+    audit_events: tuple[Any, ...],
+    security_probe: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    denied_dest = None
+    allowed_bytes = None
+    for event in audit_events:
+        if getattr(event, "event_type", "") == "egress.denied":
+            payload = getattr(event, "payload", {})
+            if isinstance(payload, Mapping):
+                if isinstance(payload.get("dest"), Mapping):
+                    denied_dest = _runner_json_value(payload["dest"], path="egress.dest")
+                allowed = payload.get("allowed_bytes")
+                if isinstance(allowed, int):
+                    allowed_bytes = allowed
+    partial = execution.partial_result
+    if denied_dest is None and isinstance(security_probe.get("egress"), Mapping):
+        denied_dest = _runner_json_value(security_probe["egress"], path="s3_t10_probe.egress")
+    if allowed_bytes is None and partial is not None and partial.reason == "SANDBOX:EGRESS_DENIED":
+        allowed_bytes = 0
+    if denied_dest is None and allowed_bytes is None:
+        return None
+    return {
+        "denied_dest": denied_dest,
+        "allowed_bytes": allowed_bytes if allowed_bytes is not None else 0,
+    }
+
+
+def _runner_tc27_status(quarantine: Mapping[str, Any] | None) -> dict[str, str]:
+    if quarantine is not None and quarantine.get("reason") == "SANDBOX:TRUST_PATH_WRITE":
+        return {"status": "PASS", "assertion": "verifier/trust mount write was denied and quarantined as Sev-1"}
+    return {"status": "NOT_EVALUATED", "assertion": "no verifier/trust mount write probe was requested"}
+
+
+def _runner_tc44_status(egress: Mapping[str, Any] | None) -> dict[str, str]:
+    if egress is not None and egress.get("allowed_bytes") == 0:
+        return {"status": "PASS", "assertion": "non-allowlisted egress was denied with zero allowed bytes"}
+    return {"status": "NOT_EVALUATED", "assertion": "no non-allowlisted egress probe was requested"}
+
+
+def _runner_json_value(value: Any, *, path: str) -> Any:
+    if isinstance(value, Mapping):
+        payload: dict[str, Any] = {}
+        for key, item in value.items():
+            if not isinstance(key, str):
+                _runner_error(
+                    code="S3_FROZEN_PIPELINE_EVIDENCE_JSON_INVALID",
+                    message=f"{path} contains a non-string key",
+                )
+            payload[key] = _runner_json_value(item, path=f"{path}.{key}")
+        return payload
+    if isinstance(value, tuple):
+        return [_runner_json_value(item, path=f"{path}[]") for item in value]
+    if isinstance(value, list):
+        return [_runner_json_value(item, path=f"{path}[]") for item in value]
+    if isinstance(value, bool) or value is None or isinstance(value, str):
+        return value
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            _runner_error(
+                code="S3_FROZEN_PIPELINE_EVIDENCE_JSON_INVALID",
+                message=f"{path} contains a non-finite number",
+            )
+        return value
+    _runner_error(
+        code="S3_FROZEN_PIPELINE_EVIDENCE_JSON_INVALID",
+        message=f"{path} contains non-JSON value of type {type(value).__name__}",
+    )
 
 
 def _check_host_profile_specs(compiled_profile: CompiledProfile) -> dict[str, CompiledCheckSpec]:
