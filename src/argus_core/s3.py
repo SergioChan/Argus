@@ -21,6 +21,7 @@ from .s6 import (
     FrozenContaminationSnapshot,
     IndependenceAttestation,
 )
+from .s7 import AdapterDescriptor, AdapterVersionError, select_adapter_version
 
 
 class S3Error(Exception):
@@ -120,6 +121,27 @@ class VerifierProfileRegistryError(S3Error):
         self.message = message
 
 
+class S3ProfileCompilerError(S3Error):
+    """Raised when S3 cannot resolve or compile a verifier profile safely."""
+
+    def __init__(self, *, category: str, code: str, message: str) -> None:
+        super().__init__(message)
+        self.category = category
+        self.code = code
+        self.message = message
+        self.before_execution = True
+        self.retryable = False
+
+    def as_c1_payload(self) -> dict[str, Any]:
+        return {
+            "category": self.category,
+            "code": self.code,
+            "message": self.message,
+            "before_execution": self.before_execution,
+            "retryable": self.retryable,
+        }
+
+
 @dataclass(frozen=True)
 class VerifierProfileStatusEvent:
     profile_id: str
@@ -153,6 +175,57 @@ class VerifierProfileRevision:
             "checks": list(self.checks),
             "cost_estimate": _profile_json_value(self.cost_estimate, path="cost_estimate"),
         }
+
+
+@dataclass(frozen=True)
+class S3CostCeiling:
+    max_profile_wallclock_s: float | None = None
+    max_profile_cost_usd: float | None = None
+    max_check_wallclock_s: float | None = None
+    max_check_cost_usd: float | None = None
+    allowed_adapter_cost_classes: tuple[str, ...] = ("standard", "low")
+
+
+@dataclass(frozen=True)
+class CompiledC6Adapter:
+    adapter_id: str
+    requested_major: int | None
+    selected_adapter_id: str
+    selected_version: str
+    determinism: str
+    cost_class: str
+    provenance_ref: str
+    c5_revision: int
+    c5_provenance_ref: str
+
+
+@dataclass(frozen=True)
+class CompiledCheckSpec:
+    check: str
+    plugin_ref: str
+    plugin_version: str
+    mandatory: bool
+    thresholds: dict[str, Any]
+    determinism: str
+    seed: int | None
+    tolerance: dict[str, Any]
+    requires_independence: bool
+    budget: dict[str, Any]
+    adapter: CompiledC6Adapter | None = None
+
+
+@dataclass(frozen=True)
+class CompiledProfile:
+    profile_id: str
+    revision: int
+    profile_ref: str
+    subtopic: str
+    spec_hash: str
+    public_profile: dict[str, Any]
+    cost_estimate: dict[str, Any]
+    checks: tuple[CompiledCheckSpec, ...]
+    independence_policy: dict[str, Any]
+    determinism_profile: dict[str, Any]
 
 
 class InMemoryVerifierProfileRegistry:
@@ -280,6 +353,259 @@ def build_verifier_profile_revision(
 ) -> VerifierProfileRevision:
     """Build a normalized VerifierProfile revision after a registry assigns the revision."""
     return _build_verifier_profile_revision(spec, revision=revision, status=status)
+
+
+class S3ProfileCompiler:
+    """Resolve an immutable VerifierProfile revision and compile S3 preflight metadata."""
+
+    def __init__(
+        self,
+        *,
+        profile_registry: Any,
+        adapter_descriptors: tuple[AdapterDescriptor, ...] = (),
+        capability_registry: Any | None = None,
+        cost_ceiling: S3CostCeiling | None = None,
+    ) -> None:
+        self._profile_registry = profile_registry
+        self._adapter_descriptors = tuple(adapter_descriptors)
+        self._capability_registry = capability_registry
+        self._cost_ceiling = cost_ceiling or S3CostCeiling()
+
+    def compile(self, *, profile_ref: str, subtopic: str | None = None) -> CompiledProfile:
+        profile = self._resolve_profile(profile_ref)
+        if subtopic is not None and profile.subtopic != subtopic:
+            _compiler_error(
+                category="VERIFIER_UNAVAILABLE",
+                code="PROFILE_UNSUPPORTED",
+                message=f"VerifierProfile {profile.profile_ref} does not support subtopic {subtopic}",
+            )
+        if profile.status != "active":
+            _compiler_error(
+                category="VERIFIER_UNAVAILABLE",
+                code="PROFILE_UNSUPPORTED",
+                message=f"VerifierProfile {profile.profile_ref} is not active",
+            )
+        self._assert_profile_cost_ceiling(profile.cost_estimate)
+        check_specs = tuple(self._compile_check(profile, check) for check in profile.checks)
+        return CompiledProfile(
+            profile_id=profile.profile_id,
+            revision=profile.revision,
+            profile_ref=profile.profile_ref,
+            subtopic=profile.subtopic,
+            spec_hash=profile.spec_hash,
+            public_profile=profile.to_c3_profile(),
+            cost_estimate=dict(profile.cost_estimate),
+            checks=check_specs,
+            independence_policy=_compiler_mapping(profile.spec_json.get("independence_policy"), default={}),
+            determinism_profile=_determinism_profile(check_specs),
+        )
+
+    def _resolve_profile(self, profile_ref: str) -> VerifierProfileRevision:
+        if not isinstance(profile_ref, str) or not profile_ref:
+            _compiler_error(
+                category="VERIFIER_UNAVAILABLE",
+                code="PROFILE_REF_REQUIRED",
+                message="S3 Profile Compiler requires a non-empty profile_ref",
+            )
+        if self._profile_registry is None or not hasattr(self._profile_registry, "get_by_ref"):
+            _compiler_error(
+                category="VERIFIER_UNAVAILABLE",
+                code="PROFILE_REGISTRY_UNAVAILABLE",
+                message="S3 Profile Compiler requires a registry with get_by_ref",
+            )
+        try:
+            profile = self._profile_registry.get_by_ref(profile_ref)
+        except VerifierProfileRegistryError as exc:
+            raise S3ProfileCompilerError(
+                category="VERIFIER_UNAVAILABLE",
+                code="PROFILE_UNSUPPORTED" if exc.code == "S3_PROFILE_NOT_FOUND" else exc.code,
+                message=exc.message,
+            ) from exc
+        if not isinstance(profile, VerifierProfileRevision):
+            _compiler_error(
+                category="VERIFIER_UNAVAILABLE",
+                code="PROFILE_INVALID",
+                message="profile registry returned an invalid VerifierProfile revision",
+            )
+        return profile
+
+    def _compile_check(self, profile: VerifierProfileRevision, check: str) -> CompiledCheckSpec:
+        spec = _check_spec_for(profile, check)
+        plugin_version = _semver_string(spec.get("plugin_version") or "1.0.0", field_name=f"{check}.plugin_version")
+        thresholds = _compiler_mapping(spec.get("thresholds"), default=_thresholds_for(profile, check))
+        budget = _compiler_mapping(spec.get("budget"), default={})
+        self._assert_check_cost_ceiling(check=check, budget=budget)
+        adapter = self._compile_adapter(profile=profile, check=check, spec=spec)
+        determinism = _check_determinism(profile=profile, check=check, spec=spec, adapter=adapter)
+        seed = _check_seed(profile=profile, spec=spec)
+        if determinism == "seeded" and seed is None:
+            _compiler_error(category="POLICY", code="PROFILE_UNSUPPORTED", message=f"{check} seeded determinism requires a seed")
+        tolerance = _compiler_mapping(spec.get("tolerance"), default={})
+        return CompiledCheckSpec(
+            check=check,
+            plugin_ref=_non_empty_plugin_ref(spec.get("plugin_ref") or f"argus.s3.checks.{check.lower()}"),
+            plugin_version=plugin_version,
+            mandatory=bool(spec.get("mandatory", True)),
+            thresholds=thresholds,
+            determinism=determinism,
+            seed=seed,
+            tolerance=tolerance,
+            requires_independence=_requires_independence(profile=profile, check=check, spec=spec),
+            budget=budget,
+            adapter=adapter,
+        )
+
+    def _compile_adapter(
+        self,
+        *,
+        profile: VerifierProfileRevision,
+        check: str,
+        spec: Mapping[str, Any],
+    ) -> CompiledC6Adapter | None:
+        adapter_id = spec.get("adapter_id") or spec.get("adapter_ref") or spec.get("c6_adapter_id")
+        if adapter_id is None:
+            return None
+        if not isinstance(adapter_id, str) or not adapter_id:
+            _compiler_error(category="POLICY", code="C6_ADAPTER_UNSUPPORTED", message=f"{check} adapter_id must be non-empty")
+        requested_major = _optional_positive_int(spec.get("adapter_major"), field_name=f"{check}.adapter_major")
+        selected = self._select_adapter_descriptor(adapter_id=adapter_id, requested_major=requested_major)
+        c5_descriptor = self._resolve_c5_adapter_descriptor(adapter_id=adapter_id, subtopic=profile.subtopic)
+        self._assert_adapter_cost_ceiling(adapter_id=adapter_id, cost_class=selected.cost_class)
+        return CompiledC6Adapter(
+            adapter_id=adapter_id,
+            requested_major=requested_major,
+            selected_adapter_id=selected.adapter_id,
+            selected_version=selected.version,
+            determinism=selected.determinism,
+            cost_class=selected.cost_class,
+            provenance_ref=selected.provenance_ref,
+            c5_revision=c5_descriptor.revision,
+            c5_provenance_ref=c5_descriptor.provenance_ref,
+        )
+
+    def _select_adapter_descriptor(self, *, adapter_id: str, requested_major: int | None) -> AdapterDescriptor:
+        candidates = tuple(descriptor for descriptor in self._adapter_descriptors if descriptor.adapter_id == adapter_id)
+        if not candidates:
+            _compiler_error(
+                category="POLICY",
+                code="C6_ADAPTER_UNSUPPORTED",
+                message=f"C6 adapter {adapter_id} is not in the S3 compiler descriptor catalog",
+            )
+        try:
+            if requested_major is not None:
+                selection = select_adapter_version(candidates, requested_major=requested_major)
+                return next(
+                    descriptor
+                    for descriptor in candidates
+                    if descriptor.adapter_id == selection.selected_adapter_id and descriptor.version == selection.selected_version
+                )
+            return max(candidates, key=lambda descriptor: _parse_semver_tuple(descriptor.version))
+        except (AdapterVersionError, StopIteration) as exc:
+            raise S3ProfileCompilerError(
+                category="POLICY",
+                code="C6_ADAPTER_UNSUPPORTED",
+                message=str(exc),
+            ) from exc
+
+    def _resolve_c5_adapter_descriptor(self, *, adapter_id: str, subtopic: str) -> CapabilityDescriptor:
+        if self._capability_registry is None or not hasattr(self._capability_registry, "get"):
+            _compiler_error(
+                category="POLICY",
+                code="C6_ADAPTER_UNSUPPORTED",
+                message="S3 Profile Compiler requires a C5 registry for C6 adapter resolution",
+            )
+        try:
+            descriptor = self._capability_registry.get(adapter_id)
+        except (KeyError, LookupError) as exc:
+            raise S3ProfileCompilerError(
+                category="POLICY",
+                code="C6_ADAPTER_UNSUPPORTED",
+                message=f"C6 adapter {adapter_id} was not resolvable through C5",
+            ) from exc
+        if not isinstance(descriptor, CapabilityDescriptor):
+            _compiler_error(category="POLICY", code="C6_ADAPTER_UNSUPPORTED", message="C5 returned an invalid adapter descriptor")
+        if descriptor.kind != "adapter" or descriptor.owner_subsystem != "S7":
+            _compiler_error(category="POLICY", code="C6_ADAPTER_UNSUPPORTED", message=f"{adapter_id} is not an S7 adapter")
+        if "C6" not in descriptor.contract_versions:
+            _compiler_error(category="POLICY", code="C6_ADAPTER_UNSUPPORTED", message=f"{adapter_id} does not declare C6")
+        if descriptor.subtopics and subtopic not in descriptor.subtopics:
+            _compiler_error(
+                category="POLICY",
+                code="C6_ADAPTER_UNSUPPORTED",
+                message=f"C6 adapter {adapter_id} does not support subtopic {subtopic}",
+            )
+        scopes = set(descriptor.capability_scopes)
+        if "evaluate" not in scopes and "c6.evaluate" not in scopes:
+            _compiler_error(
+                category="POLICY",
+                code="C6_ADAPTER_UNSUPPORTED",
+                message=f"C6 adapter {adapter_id} does not expose evaluate",
+            )
+        if descriptor.status != "active":
+            _compiler_error(category="POLICY", code="C6_ADAPTER_UNSUPPORTED", message=f"C6 adapter {adapter_id} is not active")
+        return descriptor
+
+    def _assert_profile_cost_ceiling(self, cost_estimate: Mapping[str, Any]) -> None:
+        self._assert_numeric_ceiling(
+            value=cost_estimate.get("max_wallclock_s"),
+            ceiling=self._cost_ceiling.max_profile_wallclock_s,
+            field_name="cost_estimate.max_wallclock_s",
+        )
+        self._assert_numeric_ceiling(
+            value=cost_estimate.get("max_cost_usd"),
+            ceiling=self._cost_ceiling.max_profile_cost_usd,
+            field_name="cost_estimate.max_cost_usd",
+        )
+
+    def _assert_check_cost_ceiling(self, *, check: str, budget: Mapping[str, Any]) -> None:
+        self._assert_numeric_ceiling(
+            value=budget.get("max_wallclock_s"),
+            ceiling=self._cost_ceiling.max_check_wallclock_s,
+            field_name=f"{check}.budget.max_wallclock_s",
+        )
+        self._assert_numeric_ceiling(
+            value=budget.get("max_cost_usd"),
+            ceiling=self._cost_ceiling.max_check_cost_usd,
+            field_name=f"{check}.budget.max_cost_usd",
+        )
+
+    def _assert_adapter_cost_ceiling(self, *, adapter_id: str, cost_class: str) -> None:
+        if cost_class not in self._cost_ceiling.allowed_adapter_cost_classes:
+            _compiler_error(
+                category="POLICY",
+                code="C6_COST_CEILING_EXCEEDED",
+                message=f"C6 adapter {adapter_id} cost_class {cost_class} exceeds the S3 profile compiler ceiling",
+            )
+
+    @staticmethod
+    def _assert_numeric_ceiling(*, value: Any, ceiling: float | None, field_name: str) -> None:
+        if ceiling is None:
+            return
+        numeric = _optional_number(value, field_name=field_name)
+        if numeric is None or numeric > ceiling:
+            _compiler_error(
+                category="POLICY",
+                code="C6_COST_CEILING_EXCEEDED",
+                message=f"{field_name} exceeds the S3 profile compiler ceiling",
+            )
+
+
+def compile_verifier_profile(
+    *,
+    profile_ref: str,
+    profile_registry: Any,
+    subtopic: str | None = None,
+    adapter_descriptors: tuple[AdapterDescriptor, ...] = (),
+    capability_registry: Any | None = None,
+    cost_ceiling: S3CostCeiling | None = None,
+) -> CompiledProfile:
+    compiler = S3ProfileCompiler(
+        profile_registry=profile_registry,
+        adapter_descriptors=adapter_descriptors,
+        capability_registry=capability_registry,
+        cost_ceiling=cost_ceiling,
+    )
+    return compiler.compile(profile_ref=profile_ref, subtopic=subtopic)
 
 
 @dataclass(frozen=True)
@@ -718,6 +1044,190 @@ def _c3_verifier_profile_validator() -> Draft202012Validator:
 
 def _profile_error(*, code: str, message: str) -> None:
     raise VerifierProfileRegistryError(code=code, message=message)
+
+
+def _compiler_error(*, category: str, code: str, message: str) -> None:
+    raise S3ProfileCompilerError(category=category, code=code, message=message)
+
+
+def _compiler_mapping(value: Any, *, default: Mapping[str, Any]) -> dict[str, Any]:
+    if value is None:
+        return dict(default)
+    if not isinstance(value, Mapping):
+        _compiler_error(category="POLICY", code="PROFILE_UNSUPPORTED", message="profile compiler expected a JSON object")
+    payload = _profile_json_value(value, path="CompiledProfile")
+    if not isinstance(payload, dict):
+        _compiler_error(category="POLICY", code="PROFILE_UNSUPPORTED", message="profile compiler expected a JSON object")
+    return payload
+
+
+def _check_spec_for(profile: VerifierProfileRevision, check: str) -> dict[str, Any]:
+    specs = _check_specs_by_check(profile)
+    return dict(specs.get(check, {"check": check}))
+
+
+def _check_specs_by_check(profile: VerifierProfileRevision) -> dict[str, dict[str, Any]]:
+    raw_specs = profile.spec_json.get("check_specs")
+    if raw_specs is None:
+        return {}
+    if isinstance(raw_specs, Mapping):
+        values = []
+        for check, value in raw_specs.items():
+            payload = _compiler_mapping(value, default={})
+            payload.setdefault("check", check)
+            values.append(payload)
+    elif isinstance(raw_specs, list):
+        values = [_compiler_mapping(value, default={}) for value in raw_specs]
+    else:
+        _compiler_error(category="POLICY", code="PROFILE_UNSUPPORTED", message="check_specs must be a JSON object or array")
+
+    known_checks = set(profile.checks)
+    compiled: dict[str, dict[str, Any]] = {}
+    for spec in values:
+        check = spec.get("check") or spec.get("check_id") or spec.get("type")
+        if not isinstance(check, str) or not check:
+            _compiler_error(category="POLICY", code="PROFILE_UNSUPPORTED", message="check_specs entries require check")
+        if check not in S3_VERIFIER_PROFILE_CHECKS or check not in known_checks:
+            _compiler_error(category="POLICY", code="PROFILE_UNSUPPORTED", message=f"unsupported profile check spec: {check}")
+        if check in compiled:
+            _compiler_error(category="POLICY", code="PROFILE_UNSUPPORTED", message=f"duplicate profile check spec: {check}")
+        compiled[check] = dict(spec)
+    return compiled
+
+
+def _thresholds_for(profile: VerifierProfileRevision, check: str) -> dict[str, Any]:
+    thresholds = profile.spec_json.get("thresholds")
+    if not isinstance(thresholds, Mapping):
+        return {}
+    value = thresholds.get(check)
+    if value is None:
+        return {}
+    return _compiler_mapping(value, default={})
+
+
+def _non_empty_plugin_ref(value: Any) -> str:
+    if not isinstance(value, str) or not value:
+        _compiler_error(category="POLICY", code="PROFILE_UNSUPPORTED", message="check plugin_ref must be a non-empty string")
+    return value
+
+
+def _semver_string(value: Any, *, field_name: str) -> str:
+    if not isinstance(value, str) or not value:
+        _compiler_error(category="POLICY", code="PROFILE_UNSUPPORTED", message=f"{field_name} must be a non-empty semver string")
+    _parse_semver_tuple(value)
+    return value
+
+
+def _parse_semver_tuple(value: str) -> tuple[int, int, int]:
+    parts = value.split(".")
+    if len(parts) != 3:
+        _compiler_error(category="POLICY", code="PROFILE_UNSUPPORTED", message=f"invalid semver: {value}")
+    try:
+        parsed = tuple(int(part) for part in parts)
+    except ValueError as exc:
+        raise S3ProfileCompilerError(
+            category="POLICY",
+            code="PROFILE_UNSUPPORTED",
+            message=f"invalid semver: {value}",
+        ) from exc
+    if any(part < 0 for part in parsed):
+        _compiler_error(category="POLICY", code="PROFILE_UNSUPPORTED", message=f"invalid semver: {value}")
+    return parsed  # type: ignore[return-value]
+
+
+def _optional_positive_int(value: Any, *, field_name: str) -> int | None:
+    if value is None:
+        return None
+    if not isinstance(value, int) or value < 1:
+        _compiler_error(category="POLICY", code="PROFILE_UNSUPPORTED", message=f"{field_name} must be a positive integer")
+    return value
+
+
+def _optional_number(value: Any, *, field_name: str) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)):
+        _compiler_error(category="POLICY", code="PROFILE_UNSUPPORTED", message=f"{field_name} must be a finite number")
+    if float(value) < 0:
+        _compiler_error(category="POLICY", code="PROFILE_UNSUPPORTED", message=f"{field_name} must be non-negative")
+    return float(value)
+
+
+def _check_determinism(
+    *,
+    profile: VerifierProfileRevision,
+    check: str,
+    spec: Mapping[str, Any],
+    adapter: CompiledC6Adapter | None,
+) -> str:
+    value = spec.get("determinism")
+    if value is None and adapter is not None:
+        value = adapter.determinism
+    if value is None:
+        determinism_policy = profile.spec_json.get("determinism_policy")
+        if isinstance(determinism_policy, Mapping):
+            value = determinism_policy.get("class")
+    if value is None:
+        value = "deterministic"
+    if value not in {"deterministic", "seeded", "stochastic"}:
+        _compiler_error(category="POLICY", code="PROFILE_UNSUPPORTED", message=f"{check} determinism is unsupported")
+    return str(value)
+
+
+def _check_seed(*, profile: VerifierProfileRevision, spec: Mapping[str, Any]) -> int | None:
+    seed = spec.get("seed")
+    if seed is None:
+        determinism_policy = profile.spec_json.get("determinism_policy")
+        if isinstance(determinism_policy, Mapping):
+            seed = determinism_policy.get("seed")
+    if seed is None:
+        return None
+    if not isinstance(seed, int):
+        _compiler_error(category="POLICY", code="PROFILE_UNSUPPORTED", message="seeded profile checks require an integer seed")
+    return seed
+
+
+def _requires_independence(*, profile: VerifierProfileRevision, check: str, spec: Mapping[str, Any]) -> bool:
+    value = spec.get("requires_independence")
+    if isinstance(value, bool):
+        return value
+    independence_policy = profile.spec_json.get("independence_policy")
+    if isinstance(independence_policy, Mapping):
+        if check == "CROSS_CODE" and bool(independence_policy.get("requires_cross_code")):
+            return True
+        required_checks = independence_policy.get("requires_checks")
+        if isinstance(required_checks, list) and check in required_checks:
+            return True
+    return check == "CROSS_CODE"
+
+
+def _determinism_profile(checks: tuple[CompiledCheckSpec, ...]) -> dict[str, Any]:
+    deterministic: list[str] = []
+    seeded: list[dict[str, Any]] = []
+    stochastic: list[dict[str, Any]] = []
+    adapter_determinism: list[dict[str, Any]] = []
+    for check in checks:
+        if check.determinism == "deterministic":
+            deterministic.append(check.check)
+        elif check.determinism == "seeded":
+            seeded.append({"check": check.check, "seed": check.seed})
+        elif check.determinism == "stochastic":
+            stochastic.append({"check": check.check, "tolerance": dict(check.tolerance)})
+        if check.adapter is not None:
+            adapter_determinism.append(
+                {
+                    "check": check.check,
+                    "adapter_id": check.adapter.adapter_id,
+                    "adapter_version": check.adapter.selected_version,
+                    "determinism": check.adapter.determinism,
+                }
+            )
+    return {
+        "deterministic_checks": deterministic,
+        "seeded_checks": seeded,
+        "stochastic_checks": stochastic,
+        "adapter_determinism": adapter_determinism,
+    }
 
 
 def _validation_report_payload(value: Mapping[str, Any] | Any) -> dict[str, Any]:
