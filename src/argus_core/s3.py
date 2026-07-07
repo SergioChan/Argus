@@ -8,6 +8,7 @@ from functools import lru_cache
 import json
 import math
 from pathlib import Path
+import random
 from typing import Any, Mapping, Protocol
 from uuid import NAMESPACE_URL, uuid4, uuid5
 
@@ -250,6 +251,15 @@ class S3BlindDataVaultError(S3Error):
         return payload
 
 
+class S3StatisticsError(S3Error):
+    """Raised when an S3 statistics helper receives invalid input."""
+
+    def __init__(self, *, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
 @dataclass(frozen=True)
 class VerifierProfileStatusEvent:
     profile_id: str
@@ -318,6 +328,343 @@ class _BlindDatasetEntry:
     record: BlindDatasetRecord
     opaque_input: Any
     truth: Any
+
+
+@dataclass(frozen=True)
+class S3ToleranceResult:
+    observed: float
+    expected: float
+    error: float
+    tolerance: float
+    absolute_tolerance: float | None
+    relative_tolerance: float | None
+    passed: bool
+    tolerance_policy: str = "max(abs, rel*scale)"
+
+    def as_payload(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class S3AgreementResult:
+    chi_square: float
+    dof: int
+    reduced_chi_square: float
+    z_scores: tuple[float, ...]
+    max_observed_abs_z: float
+    max_allowed_abs_z: float
+    max_allowed_reduced_chi_square: float
+    p_value: float
+    alpha: float
+    passed: bool
+    method: str = "chi-square-z-agreement"
+
+    def as_payload(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class S3CoverageResult:
+    empirical_coverage: float
+    nominal_coverage: float
+    tolerance: float
+    covered_count: int
+    total_count: int
+    absolute_error: float
+    passed: bool
+    method: str = "empirical-interval-coverage"
+
+    def as_payload(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class S3PITUniformityResult:
+    ks_statistic: float
+    p_value: float
+    alpha: float
+    sample_count: int
+    passed: bool
+    method: str = "pit-ks-uniformity"
+
+    def as_payload(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class S3BinomialBoundResult:
+    false_positives: int
+    trials: int
+    observed_rate: float
+    upper_bound: float
+    confidence_level: float
+    max_rate: float | None
+    passed: bool
+    method: str = "exact-binomial-one-sided"
+
+    def as_payload(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class S3BootstrapCIResult:
+    estimate: float
+    lower: float
+    upper: float
+    confidence_level: float
+    statistic: str
+    seed: int
+    resamples: int
+    samples_digest: str
+    method: str = "percentile-bootstrap"
+
+    def as_payload(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class S3MultipleComparisonResult:
+    p_values: tuple[float, ...]
+    adjusted_p_values: tuple[float, ...]
+    thresholds: tuple[float, ...]
+    rejected: tuple[bool, ...]
+    naive_rejected: tuple[bool, ...]
+    corrected_decision_differs_from_naive: bool
+    alpha: float
+    method: str
+    test_case: str = "S3-TC45"
+
+    def as_payload(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+class S3StatisticsLibrary:
+    """Seeded, pure statistics helpers shared by S3 check families."""
+
+    @staticmethod
+    def tolerance(
+        *,
+        observed: float,
+        expected: float,
+        absolute_tolerance: float | None = None,
+        relative_tolerance: float | None = None,
+    ) -> S3ToleranceResult:
+        observed_value = _s3_stats_float(observed, field="observed")
+        expected_value = _s3_stats_float(expected, field="expected")
+        if absolute_tolerance is None and relative_tolerance is None:
+            _s3_stats_error("STAT_TOLERANCE_REQUIRED", "absolute_tolerance or relative_tolerance is required")
+        abs_tol = _s3_stats_optional_non_negative(absolute_tolerance, field="absolute_tolerance")
+        rel_tol = _s3_stats_optional_non_negative(relative_tolerance, field="relative_tolerance")
+        candidates: list[float] = []
+        if abs_tol is not None:
+            candidates.append(abs_tol)
+        if rel_tol is not None:
+            candidates.append(rel_tol * max(abs(expected_value), 1.0))
+        tolerance = max(candidates)
+        error = abs(observed_value - expected_value)
+        return S3ToleranceResult(
+            observed=observed_value,
+            expected=expected_value,
+            error=error,
+            tolerance=tolerance,
+            absolute_tolerance=abs_tol,
+            relative_tolerance=rel_tol,
+            passed=error <= tolerance,
+        )
+
+    @staticmethod
+    def chi_square_z_agreement(
+        *,
+        observed: tuple[float, ...] | list[float],
+        expected: tuple[float, ...] | list[float],
+        observed_uncertainty: tuple[float, ...] | list[float],
+        expected_uncertainty: tuple[float, ...] | list[float] | None = None,
+        max_abs_z: float = 3.0,
+        max_reduced_chi_square: float = 2.0,
+        alpha: float = 0.05,
+    ) -> S3AgreementResult:
+        observed_values = _s3_stats_sequence(observed, field="observed")
+        expected_values = _s3_stats_sequence(expected, field="expected")
+        observed_sigma = _s3_stats_sequence(observed_uncertainty, field="observed_uncertainty")
+        expected_sigma = (
+            _s3_stats_sequence(expected_uncertainty, field="expected_uncertainty")
+            if expected_uncertainty is not None
+            else tuple(0.0 for _ in observed_values)
+        )
+        _s3_stats_same_length(
+            observed=observed_values,
+            expected=expected_values,
+            observed_uncertainty=observed_sigma,
+            expected_uncertainty=expected_sigma,
+        )
+        allowed_z = _s3_stats_positive(max_abs_z, field="max_abs_z")
+        allowed_reduced = _s3_stats_positive(max_reduced_chi_square, field="max_reduced_chi_square")
+        alpha_value = _s3_stats_probability(alpha, field="alpha", allow_zero=False, allow_one=False)
+        z_scores: list[float] = []
+        for index, (obs, exp, obs_sigma, exp_sigma) in enumerate(
+            zip(observed_values, expected_values, observed_sigma, expected_sigma, strict=True)
+        ):
+            if obs_sigma < 0 or exp_sigma < 0:
+                _s3_stats_error("STAT_NEGATIVE_UNCERTAINTY", f"uncertainty at index {index} must be non-negative")
+            combined_sigma = math.sqrt(obs_sigma * obs_sigma + exp_sigma * exp_sigma)
+            if combined_sigma <= 0:
+                _s3_stats_error("STAT_ZERO_UNCERTAINTY", f"combined uncertainty at index {index} must be positive")
+            z_scores.append((obs - exp) / combined_sigma)
+        chi_square = sum(z * z for z in z_scores)
+        dof = len(z_scores)
+        reduced = chi_square / dof
+        p_value = _s3_stats_chi_square_survival(chi_square, dof)
+        max_observed_z = max(abs(z) for z in z_scores)
+        passed = max_observed_z <= allowed_z and reduced <= allowed_reduced and p_value >= alpha_value
+        return S3AgreementResult(
+            chi_square=chi_square,
+            dof=dof,
+            reduced_chi_square=reduced,
+            z_scores=tuple(z_scores),
+            max_observed_abs_z=max_observed_z,
+            max_allowed_abs_z=allowed_z,
+            max_allowed_reduced_chi_square=allowed_reduced,
+            p_value=p_value,
+            alpha=alpha_value,
+            passed=passed,
+        )
+
+    @staticmethod
+    def coverage(
+        *,
+        truth: tuple[float, ...] | list[float],
+        lower: tuple[float, ...] | list[float],
+        upper: tuple[float, ...] | list[float],
+        nominal_coverage: float,
+        tolerance: float,
+    ) -> S3CoverageResult:
+        truth_values = _s3_stats_sequence(truth, field="truth")
+        lower_values = _s3_stats_sequence(lower, field="lower")
+        upper_values = _s3_stats_sequence(upper, field="upper")
+        _s3_stats_same_length(truth=truth_values, lower=lower_values, upper=upper_values)
+        nominal = _s3_stats_probability(nominal_coverage, field="nominal_coverage")
+        tolerance_value = _s3_stats_non_negative(tolerance, field="tolerance")
+        covered = 0
+        for index, (truth_value, lower_value, upper_value) in enumerate(
+            zip(truth_values, lower_values, upper_values, strict=True)
+        ):
+            if lower_value > upper_value:
+                _s3_stats_error("STAT_INTERVAL_INVALID", f"lower bound exceeds upper bound at index {index}")
+            if lower_value <= truth_value <= upper_value:
+                covered += 1
+        empirical = covered / len(truth_values)
+        error = abs(empirical - nominal)
+        return S3CoverageResult(
+            empirical_coverage=empirical,
+            nominal_coverage=nominal,
+            tolerance=tolerance_value,
+            covered_count=covered,
+            total_count=len(truth_values),
+            absolute_error=error,
+            passed=error <= tolerance_value,
+        )
+
+    @staticmethod
+    def pit_uniformity(pit_values: tuple[float, ...] | list[float], *, alpha: float = 0.05) -> S3PITUniformityResult:
+        values = _s3_stats_sequence(pit_values, field="pit_values")
+        for index, value in enumerate(values):
+            if value < 0 or value > 1:
+                _s3_stats_error("STAT_PIT_OUT_OF_RANGE", f"PIT value at index {index} must be in [0, 1]")
+        alpha_value = _s3_stats_probability(alpha, field="alpha", allow_zero=False, allow_one=False)
+        ordered = tuple(sorted(values))
+        n = len(ordered)
+        ks_statistic = 0.0
+        for index, value in enumerate(ordered, start=1):
+            ks_statistic = max(ks_statistic, index / n - value, value - (index - 1) / n)
+        p_value = _s3_stats_ks_uniform_p_value(ks_statistic, n)
+        return S3PITUniformityResult(
+            ks_statistic=ks_statistic,
+            p_value=p_value,
+            alpha=alpha_value,
+            sample_count=n,
+            passed=p_value >= alpha_value,
+        )
+
+    @staticmethod
+    def false_positive_rate_bound(
+        *,
+        false_positives: int,
+        trials: int,
+        confidence_level: float = 0.95,
+        max_rate: float | None = None,
+    ) -> S3BinomialBoundResult:
+        if not isinstance(false_positives, int) or not isinstance(trials, int):
+            _s3_stats_error("STAT_INVALID_COUNTS", "false_positives and trials must be integers")
+        if trials <= 0 or false_positives < 0 or false_positives > trials:
+            _s3_stats_error("STAT_INVALID_COUNTS", "false_positives must satisfy 0 <= k <= trials and trials > 0")
+        confidence = _s3_stats_probability(
+            confidence_level,
+            field="confidence_level",
+            allow_zero=False,
+            allow_one=False,
+        )
+        max_rate_value = _s3_stats_probability(max_rate, field="max_rate") if max_rate is not None else None
+        observed_rate = false_positives / trials
+        upper = _s3_stats_binomial_upper_bound(false_positives, trials, confidence)
+        return S3BinomialBoundResult(
+            false_positives=false_positives,
+            trials=trials,
+            observed_rate=observed_rate,
+            upper_bound=upper,
+            confidence_level=confidence,
+            max_rate=max_rate_value,
+            passed=True if max_rate_value is None else upper <= max_rate_value,
+        )
+
+    @staticmethod
+    def bootstrap_ci(
+        values: tuple[float, ...] | list[float],
+        *,
+        seed: int,
+        resamples: int = 1000,
+        confidence_level: float = 0.95,
+        statistic: str = "mean",
+    ) -> S3BootstrapCIResult:
+        values_tuple = _s3_stats_sequence(values, field="values")
+        if not isinstance(seed, int):
+            _s3_stats_error("STAT_SEED_INVALID", "seed must be an integer")
+        if not isinstance(resamples, int) or resamples < 1:
+            _s3_stats_error("STAT_RESAMPLES_INVALID", "resamples must be a positive integer")
+        confidence = _s3_stats_probability(
+            confidence_level,
+            field="confidence_level",
+            allow_zero=False,
+            allow_one=False,
+        )
+        estimate = _s3_stats_statistic(values_tuple, statistic)
+        rng = random.Random(seed)
+        samples: list[float] = []
+        n = len(values_tuple)
+        for _ in range(resamples):
+            sample = tuple(values_tuple[rng.randrange(n)] for _ in range(n))
+            samples.append(_s3_stats_statistic(sample, statistic))
+        samples.sort()
+        tail = (1.0 - confidence) / 2.0
+        lower = _s3_stats_percentile(samples, tail)
+        upper = _s3_stats_percentile(samples, 1.0 - tail)
+        return S3BootstrapCIResult(
+            estimate=estimate,
+            lower=lower,
+            upper=upper,
+            confidence_level=confidence,
+            statistic=statistic,
+            seed=seed,
+            resamples=resamples,
+            samples_digest=hash_json(samples),
+        )
+
+    @staticmethod
+    def benjamini_hochberg(p_values: tuple[float, ...] | list[float], *, alpha: float = 0.05) -> S3MultipleComparisonResult:
+        return _s3_stats_multiple_comparison(p_values, alpha=alpha, method="benjamini-hochberg")
+
+    @staticmethod
+    def bonferroni(p_values: tuple[float, ...] | list[float], *, alpha: float = 0.05) -> S3MultipleComparisonResult:
+        return _s3_stats_multiple_comparison(p_values, alpha=alpha, method="bonferroni")
 
 
 @dataclass(frozen=True)
@@ -3184,6 +3531,218 @@ def run_cross_code_check(
         status="PASS" if max_z <= z_max else "FAIL",
         metrics={"max_z": max_z, "z_max": z_max},
     )
+
+
+def _s3_stats_error(code: str, message: str) -> None:
+    raise S3StatisticsError(code=code, message=message)
+
+
+def _s3_stats_float(value: float, *, field: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        _s3_stats_error("STAT_VALUE_INVALID", f"{field} must be a finite number")
+    float_value = float(value)
+    if not math.isfinite(float_value):
+        _s3_stats_error("STAT_VALUE_INVALID", f"{field} must be a finite number")
+    return float_value
+
+
+def _s3_stats_sequence(values: tuple[float, ...] | list[float], *, field: str) -> tuple[float, ...]:
+    if not isinstance(values, (tuple, list)):
+        _s3_stats_error("STAT_SEQUENCE_INVALID", f"{field} must be a list or tuple")
+    if len(values) == 0:
+        _s3_stats_error("STAT_SEQUENCE_EMPTY", f"{field} must be non-empty")
+    return tuple(_s3_stats_float(value, field=f"{field}[{index}]") for index, value in enumerate(values))
+
+
+def _s3_stats_same_length(**series: tuple[float, ...]) -> None:
+    lengths = {name: len(values) for name, values in series.items()}
+    if len(set(lengths.values())) != 1:
+        _s3_stats_error("STAT_LENGTH_MISMATCH", "statistical input series must have equal lengths")
+
+
+def _s3_stats_optional_non_negative(value: float | None, *, field: str) -> float | None:
+    if value is None:
+        return None
+    return _s3_stats_non_negative(value, field=field)
+
+
+def _s3_stats_non_negative(value: float, *, field: str) -> float:
+    float_value = _s3_stats_float(value, field=field)
+    if float_value < 0:
+        _s3_stats_error("STAT_NEGATIVE_VALUE", f"{field} must be non-negative")
+    return float_value
+
+
+def _s3_stats_positive(value: float, *, field: str) -> float:
+    float_value = _s3_stats_float(value, field=field)
+    if float_value <= 0:
+        _s3_stats_error("STAT_NON_POSITIVE_VALUE", f"{field} must be positive")
+    return float_value
+
+
+def _s3_stats_probability(
+    value: float | None,
+    *,
+    field: str,
+    allow_zero: bool = True,
+    allow_one: bool = True,
+) -> float:
+    if value is None:
+        _s3_stats_error("STAT_PROBABILITY_REQUIRED", f"{field} is required")
+    float_value = _s3_stats_float(value, field=field)
+    lower_ok = float_value >= 0 if allow_zero else float_value > 0
+    upper_ok = float_value <= 1 if allow_one else float_value < 1
+    if not (lower_ok and upper_ok):
+        interval = "[0, 1]" if allow_zero and allow_one else "(0, 1)"
+        _s3_stats_error("STAT_PROBABILITY_INVALID", f"{field} must be in {interval}")
+    return float_value
+
+
+def _s3_stats_chi_square_survival(chi_square: float, dof: int) -> float:
+    if chi_square < 0 or dof <= 0:
+        _s3_stats_error("STAT_CHI_SQUARE_INVALID", "chi_square must be non-negative and dof must be positive")
+    if chi_square == 0:
+        return 1.0
+    z = ((chi_square / dof) ** (1.0 / 3.0) - (1.0 - 2.0 / (9.0 * dof))) / math.sqrt(2.0 / (9.0 * dof))
+    return max(0.0, min(1.0, 0.5 * math.erfc(z / math.sqrt(2.0))))
+
+
+def _s3_stats_ks_uniform_p_value(ks_statistic: float, sample_count: int) -> float:
+    if sample_count <= 0:
+        _s3_stats_error("STAT_KS_INVALID", "sample_count must be positive")
+    if ks_statistic <= 0:
+        return 1.0
+    root_n = math.sqrt(sample_count)
+    lam = (root_n + 0.12 + 0.11 / root_n) * ks_statistic
+    total = 0.0
+    for index in range(1, 101):
+        term = 2.0 * ((-1.0) ** (index - 1)) * math.exp(-2.0 * index * index * lam * lam)
+        total += term
+        if abs(term) < 1e-12:
+            break
+    return max(0.0, min(1.0, total))
+
+
+def _s3_stats_binomial_cdf(successes: int, trials: int, probability: float) -> float:
+    if probability <= 0:
+        return 1.0
+    if probability >= 1:
+        return 1.0 if successes >= trials else 0.0
+    term = (1.0 - probability) ** trials
+    total = term
+    for count in range(0, successes):
+        term *= (trials - count) / (count + 1) * probability / (1.0 - probability)
+        total += term
+    return max(0.0, min(1.0, total))
+
+
+def _s3_stats_binomial_upper_bound(false_positives: int, trials: int, confidence_level: float) -> float:
+    if false_positives >= trials:
+        return 1.0
+    tail_probability = 1.0 - confidence_level
+    low = 0.0
+    high = 1.0
+    for _ in range(80):
+        mid = (low + high) / 2.0
+        cdf = _s3_stats_binomial_cdf(false_positives, trials, mid)
+        if cdf > tail_probability:
+            low = mid
+        else:
+            high = mid
+    return high
+
+
+def _s3_stats_statistic(values: tuple[float, ...], statistic: str) -> float:
+    if statistic == "mean":
+        return sum(values) / len(values)
+    if statistic == "median":
+        ordered = tuple(sorted(values))
+        midpoint = len(ordered) // 2
+        if len(ordered) % 2 == 1:
+            return ordered[midpoint]
+        return (ordered[midpoint - 1] + ordered[midpoint]) / 2.0
+    _s3_stats_error("STATISTIC_UNSUPPORTED", f"unsupported bootstrap statistic: {statistic}")
+
+
+def _s3_stats_percentile(sorted_values: list[float], probability: float) -> float:
+    if not sorted_values:
+        _s3_stats_error("STAT_SEQUENCE_EMPTY", "sorted_values must be non-empty")
+    probability = _s3_stats_probability(probability, field="probability")
+    if len(sorted_values) == 1:
+        return sorted_values[0]
+    position = probability * (len(sorted_values) - 1)
+    lower_index = math.floor(position)
+    upper_index = math.ceil(position)
+    if lower_index == upper_index:
+        return sorted_values[lower_index]
+    fraction = position - lower_index
+    return sorted_values[lower_index] * (1.0 - fraction) + sorted_values[upper_index] * fraction
+
+
+def _s3_stats_multiple_comparison(
+    p_values: tuple[float, ...] | list[float],
+    *,
+    alpha: float,
+    method: str,
+) -> S3MultipleComparisonResult:
+    values = _s3_stats_sequence(p_values, field="p_values")
+    for index, value in enumerate(values):
+        _s3_stats_probability(value, field=f"p_values[{index}]")
+    alpha_value = _s3_stats_probability(alpha, field="alpha", allow_zero=False, allow_one=False)
+    if method == "benjamini-hochberg":
+        adjusted, thresholds, rejected = _s3_stats_bh(values, alpha_value)
+    elif method == "bonferroni":
+        adjusted, thresholds, rejected = _s3_stats_bonferroni(values, alpha_value)
+    else:
+        _s3_stats_error("STAT_CORRECTION_UNSUPPORTED", f"unsupported multiple-comparison method: {method}")
+    naive = tuple(value <= alpha_value for value in values)
+    return S3MultipleComparisonResult(
+        p_values=values,
+        adjusted_p_values=adjusted,
+        thresholds=thresholds,
+        rejected=rejected,
+        naive_rejected=naive,
+        corrected_decision_differs_from_naive=rejected != naive,
+        alpha=alpha_value,
+        method=method,
+    )
+
+
+def _s3_stats_bh(values: tuple[float, ...], alpha: float) -> tuple[tuple[float, ...], tuple[float, ...], tuple[bool, ...]]:
+    total = len(values)
+    ordered = sorted(enumerate(values), key=lambda item: (item[1], item[0]))
+    thresholds_by_index = [0.0] * total
+    rejected_by_index = [False] * total
+    adjusted_by_sorted = [0.0] * total
+    max_rejected_rank = 0
+    for rank, (original_index, p_value) in enumerate(ordered, start=1):
+        threshold = alpha * rank / total
+        thresholds_by_index[original_index] = threshold
+        if p_value <= threshold:
+            max_rejected_rank = rank
+    running = 1.0
+    for rank in range(total, 0, -1):
+        original_index, p_value = ordered[rank - 1]
+        running = min(running, p_value * total / rank)
+        adjusted_by_sorted[rank - 1] = min(1.0, running)
+        if rank <= max_rejected_rank:
+            rejected_by_index[original_index] = True
+    adjusted_by_index = [0.0] * total
+    for rank, (original_index, _) in enumerate(ordered):
+        adjusted_by_index[original_index] = adjusted_by_sorted[rank]
+    return tuple(adjusted_by_index), tuple(thresholds_by_index), tuple(rejected_by_index)
+
+
+def _s3_stats_bonferroni(
+    values: tuple[float, ...],
+    alpha: float,
+) -> tuple[tuple[float, ...], tuple[float, ...], tuple[bool, ...]]:
+    total = len(values)
+    threshold = alpha / total
+    adjusted = tuple(min(1.0, value * total) for value in values)
+    thresholds = tuple(threshold for _ in values)
+    rejected = tuple(value <= threshold for value in values)
+    return adjusted, thresholds, rejected
 
 
 def attest_challenger_independence(
