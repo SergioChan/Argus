@@ -151,6 +151,12 @@ S3_BLIND_DATA_STAGE_KIND = "s3_blind_data_stage"
 S3_BLIND_DATA_STAGE_SCHEMA = "argus.s3.blind_data_stage.v1"
 S3_BLIND_DATA_QUARANTINE_KIND = "s3_blind_data_quarantine"
 S3_BLIND_DATA_QUARANTINE_SCHEMA = "argus.s3.blind_data_quarantine.v1"
+S3_DEGRADATION_DECISION_KIND = "s3_degradation_decision"
+S3_DEGRADATION_DECISION_SCHEMA = "argus.s3.degradation_decision.v1"
+S3_FAIL_CLOSED_KIND = "s3_fail_closed"
+S3_FAIL_CLOSED_SCHEMA = "argus.s3.fail_closed.v1"
+S3_REPORT_QUARANTINE_KIND = "s3_report_quarantine"
+S3_REPORT_QUARANTINE_SCHEMA = "argus.s3.report_quarantine.v1"
 _S3_PROFILE_ID_CHARS = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-")
 
 
@@ -5910,6 +5916,481 @@ class S3CommittedValidationReport:
         return self.record.artifact_ref
 
 
+@dataclass(frozen=True)
+class S3DegradationRecord:
+    code: str
+    detail: str
+    tier_effect: str
+    category: str = "DEGRADATION"
+    severity: str = "degraded"
+    check: str | None = None
+    test_cases: tuple[str, ...] = ()
+    retryable: bool = False
+    evidence_ref: str | None = None
+
+    def as_payload(self) -> dict[str, Any]:
+        payload = {
+            "code": self.code,
+            "detail": self.detail,
+            "tier_effect": self.tier_effect,
+            "category": self.category,
+            "severity": self.severity,
+            "check": self.check,
+            "test_cases": list(self.test_cases),
+            "retryable": self.retryable,
+        }
+        if self.evidence_ref is not None:
+            payload["evidence_ref"] = self.evidence_ref
+        return payload
+
+
+@dataclass(frozen=True)
+class S3DegradationQuarantineResult:
+    status: str
+    category: str
+    code: str
+    message: str
+    retryable: bool
+    degradations: tuple[S3DegradationRecord, ...] = ()
+    checks: tuple[CheckResult, ...] = ()
+    evidence_ref: str | None = None
+    report_ref: str | None = None
+    quarantine_ref: str | None = None
+
+    def as_c1_payload(self) -> dict[str, Any]:
+        payload = {
+            "category": self.category,
+            "code": self.code,
+            "message": self.message,
+            "retryable": self.retryable,
+            "status": self.status,
+        }
+        if self.report_ref is not None:
+            payload["report_ref"] = self.report_ref
+        if self.quarantine_ref is not None:
+            payload["quarantine_ref"] = self.quarantine_ref
+        if self.evidence_ref is not None:
+            payload["evidence_ref"] = self.evidence_ref
+        return payload
+
+
+class S3DegradationQuarantineEngine:
+    """S3 degradation/quarantine policy surface for fail-closed verifier outcomes."""
+
+    def __init__(
+        self,
+        *,
+        artifact_store: Any,
+        report_verifier: C3ReportVerifier | None = None,
+        audit_ledger: Any | None = None,
+        producer: Producer | None = None,
+        code_ref: str = "argus-core:s3.degradation-quarantine",
+        environment_digest: str = "python:s3-degradation-quarantine:v1",
+    ) -> None:
+        if not hasattr(artifact_store, "create_artifact"):
+            raise TypeError("artifact_store must provide create_artifact")
+        if not code_ref:
+            raise ValueError("code_ref must be non-empty")
+        if not environment_digest:
+            raise ValueError("environment_digest must be non-empty")
+        self.artifact_store = artifact_store
+        self.report_verifier = report_verifier
+        self.audit_ledger = audit_ledger
+        self.producer = producer or Producer(subsystem="S3", version="0.0.0", actor_id="s3.degradation")
+        self.code_ref = code_ref
+        self.environment_digest = environment_digest
+
+    def apply_degradation_policy(
+        self,
+        *,
+        checks: tuple[CheckResult, ...],
+        job_id: str | None = None,
+        trace_id: str | None = None,
+    ) -> S3DegradationQuarantineResult:
+        normalized_checks: list[CheckResult] = []
+        degradations: list[S3DegradationRecord] = []
+        for check in checks:
+            records = _s3_degradation_records_for_check(check)
+            degradations.extend(records)
+            normalized_checks.append(_s3_check_with_degradation_records(check, records))
+
+        status = "DEGRADED" if degradations else "OK"
+        evidence_ref = self._write_decision_evidence(
+            kind=S3_DEGRADATION_DECISION_KIND,
+            schema=S3_DEGRADATION_DECISION_SCHEMA,
+            status=status,
+            category="DEGRADATION",
+            code="S3_DEGRADATION_RECORDED" if degradations else "S3_NO_DEGRADATION",
+            message="S3 degradation policy applied",
+            degradations=tuple(degradations),
+            checks=tuple(normalized_checks),
+            job_id=job_id,
+            trace_id=trace_id,
+        )
+        return S3DegradationQuarantineResult(
+            status=status,
+            category="DEGRADATION",
+            code="S3_DEGRADATION_RECORDED" if degradations else "S3_NO_DEGRADATION",
+            message="S3 degradation policy applied",
+            retryable=False,
+            degradations=tuple(degradations),
+            checks=tuple(normalized_checks),
+            evidence_ref=evidence_ref,
+        )
+
+    def build_budget_breach_partial_report(
+        self,
+        *,
+        report_builder: "S3ReportBuilder",
+        profile_ref: str,
+        frozen_pipeline_ref: str,
+        completed_checks: tuple[CheckResult, ...],
+        scheduled_checks: tuple[str, ...],
+        proponent_id: str,
+        budget_actual_usd: float,
+        budget_cap_usd: float,
+        input_refs: tuple[str, ...] = (),
+        job_id: str | None = None,
+        trace_id: str | None = None,
+    ) -> S3DegradationQuarantineResult:
+        completed_by_name = _s3_unique_completed_checks(completed_checks)
+        ordered_checks: list[CheckResult] = []
+        degradations: list[S3DegradationRecord] = []
+        for check_name in scheduled_checks:
+            if not isinstance(check_name, str) or not check_name:
+                raise ValueError("scheduled_checks must contain non-empty check names")
+            if check_name in completed_by_name:
+                check = completed_by_name[check_name]
+                records = _s3_degradation_records_for_check(check)
+                degradations.extend(records)
+                ordered_checks.append(_s3_check_with_degradation_records(check, records))
+                continue
+            record = S3DegradationRecord(
+                code="BUDGET",
+                detail=f"{check_name} did not run because S3 budget was breached",
+                tier_effect="partial_report_unrun_check",
+                category="BUDGET",
+                severity="degraded",
+                check=check_name,
+                test_cases=("S3-TC40",),
+                retryable=False,
+            )
+            degradations.append(record)
+            ordered_checks.append(
+                CheckResult(
+                    check_name,
+                    "INCONCLUSIVE",
+                    metrics={
+                        "category": "BUDGET",
+                        "degradations": ["BUDGET"],
+                        "degradation_details": [record.as_payload()],
+                        "test_cases": ["S3-TC40"],
+                        "budget_actual_usd": float(budget_actual_usd),
+                        "budget_cap_usd": float(budget_cap_usd),
+                        "max_claim_tier": "ran-toy",
+                    },
+                )
+            )
+        if len(ordered_checks) != len(set(scheduled_checks)):
+            raise ValueError("scheduled_checks must be unique")
+
+        committed = report_builder.build_and_commit_report(
+            profile_ref=profile_ref,
+            frozen_pipeline_ref=frozen_pipeline_ref,
+            checks=tuple(ordered_checks),
+            proponent_id=proponent_id,
+            input_refs=input_refs,
+            job_id=job_id,
+        )
+        evidence_ref = self._write_decision_evidence(
+            kind=S3_DEGRADATION_DECISION_KIND,
+            schema=S3_DEGRADATION_DECISION_SCHEMA,
+            status="PARTIAL_REPORT_EMITTED",
+            category="BUDGET",
+            code="S3_BUDGET_BREACH",
+            message="S3 budget breach halted verification and emitted a signed partial report",
+            degradations=tuple(degradations),
+            checks=tuple(ordered_checks),
+            report_ref=committed.validation_report_ref,
+            job_id=job_id,
+            trace_id=trace_id,
+        )
+        return S3DegradationQuarantineResult(
+            status="PARTIAL_REPORT_EMITTED",
+            category="BUDGET",
+            code="S3_BUDGET_BREACH",
+            message="S3 budget breach halted verification and emitted a signed partial report",
+            retryable=False,
+            degradations=tuple(degradations),
+            checks=tuple(ordered_checks),
+            evidence_ref=evidence_ref,
+            report_ref=committed.validation_report_ref,
+        )
+
+    def build_signed_report_or_fail_closed(
+        self,
+        *,
+        report_builder: "S3ReportBuilder",
+        profile_ref: str,
+        frozen_pipeline_ref: str,
+        checks: tuple[CheckResult, ...],
+        proponent_id: str,
+        input_refs: tuple[str, ...] = (),
+        job_id: str | None = None,
+        trace_id: str | None = None,
+    ) -> S3DegradationQuarantineResult:
+        try:
+            committed = report_builder.build_and_commit_report(
+                profile_ref=profile_ref,
+                frozen_pipeline_ref=frozen_pipeline_ref,
+                checks=checks,
+                proponent_id=proponent_id,
+                input_refs=input_refs,
+                job_id=job_id,
+            )
+        except S3KeyManagementError as exc:
+            if "UNAVAILABLE" not in exc.code:
+                raise
+            evidence_ref = self._write_fail_closed_evidence(
+                status="RETRYABLE",
+                category="SIGNING_UNAVAILABLE",
+                code="S3_SIGNING_UNAVAILABLE",
+                message=exc.message,
+                retryable=True,
+                input_refs=input_refs,
+                job_id=job_id,
+                trace_id=trace_id,
+            )
+            _blind_audit(
+                self.audit_ledger,
+                "s3.signing.unavailable",
+                {
+                    "category": "SIGNING_UNAVAILABLE",
+                    "code": "S3_SIGNING_UNAVAILABLE",
+                    "evidence_ref": evidence_ref,
+                    "job_id": job_id,
+                    "trace_id": trace_id,
+                },
+            )
+            return S3DegradationQuarantineResult(
+                status="RETRYABLE",
+                category="SIGNING_UNAVAILABLE",
+                code="S3_SIGNING_UNAVAILABLE",
+                message=exc.message,
+                retryable=True,
+                evidence_ref=evidence_ref,
+            )
+        return S3DegradationQuarantineResult(
+            status="REPORT_EMITTED",
+            category="OK",
+            code="S3_REPORT_EMITTED",
+            message="S3 signed report emitted",
+            retryable=False,
+            checks=checks,
+            report_ref=committed.validation_report_ref,
+        )
+
+    def result_from_blind_data_error(
+        self,
+        error: S3BlindDataVaultError,
+        *,
+        job_id: str | None = None,
+        trace_id: str | None = None,
+    ) -> S3DegradationQuarantineResult:
+        evidence_ref = self._write_decision_evidence(
+            kind=S3_DEGRADATION_DECISION_KIND,
+            schema=S3_DEGRADATION_DECISION_SCHEMA,
+            status="QUARANTINED",
+            category=error.category,
+            code=error.code,
+            message=error.message,
+            degradations=(),
+            checks=(),
+            quarantine_ref=error.quarantine_ref or None,
+            job_id=job_id,
+            trace_id=trace_id,
+        )
+        return S3DegradationQuarantineResult(
+            status="QUARANTINED",
+            category=error.category,
+            code=error.code,
+            message=error.message,
+            retryable=error.retryable,
+            evidence_ref=evidence_ref,
+            quarantine_ref=error.quarantine_ref or None,
+        )
+
+    def quarantine_invalid_consumed_report(
+        self,
+        *,
+        report: Mapping[str, Any],
+        report_ref: str,
+        job_id: str | None = None,
+        trace_id: str | None = None,
+    ) -> S3DegradationQuarantineResult:
+        if self.report_verifier is None:
+            raise ValueError("quarantine_invalid_consumed_report requires report_verifier")
+        verification = self.report_verifier.verify(dict(report))
+        if verification.valid:
+            return S3DegradationQuarantineResult(
+                status="ACCEPTED",
+                category="OK",
+                code="S3_REPORT_SIGNATURE_VALID",
+                message="consumed report signature is valid",
+                retryable=False,
+                report_ref=report_ref,
+            )
+        quarantine_ref = self._write_report_quarantine(
+            report=report,
+            report_ref=report_ref,
+            verification=verification,
+            job_id=job_id,
+            trace_id=trace_id,
+        )
+        return S3DegradationQuarantineResult(
+            status="QUARANTINED",
+            category="QUARANTINE",
+            code="S3_REPORT_SIGNATURE_INVALID",
+            message="consumed ValidationReport signature is invalid",
+            retryable=False,
+            quarantine_ref=quarantine_ref,
+        )
+
+    def _write_decision_evidence(
+        self,
+        *,
+        kind: str,
+        schema: str,
+        status: str,
+        category: str,
+        code: str,
+        message: str,
+        degradations: tuple[S3DegradationRecord, ...],
+        checks: tuple[CheckResult, ...],
+        report_ref: str | None = None,
+        quarantine_ref: str | None = None,
+        job_id: str | None = None,
+        trace_id: str | None = None,
+    ) -> str:
+        payload = {
+            "schema": schema,
+            "status": status,
+            "category": category,
+            "code": code,
+            "message": message,
+            "degradations": [record.as_payload() for record in degradations],
+            "checks": [_check_to_contract(check) for check in checks],
+            "job_id": job_id,
+            "trace_id": trace_id,
+        }
+        if report_ref is not None:
+            payload["report_ref"] = report_ref
+        if quarantine_ref is not None:
+            payload["quarantine_ref"] = quarantine_ref
+        input_refs = tuple(ref for ref in (report_ref, quarantine_ref) if ref)
+        record = self.artifact_store.create_artifact(
+            kind=kind,
+            payload=payload,
+            producer=self.producer,
+            lineage=Lineage(
+                input_refs=input_refs,
+                code_ref=self.code_ref,
+                environment_digest=self.environment_digest,
+                job_id=job_id,
+            ),
+        )
+        return record.artifact_ref
+
+    def _write_fail_closed_evidence(
+        self,
+        *,
+        status: str,
+        category: str,
+        code: str,
+        message: str,
+        retryable: bool,
+        input_refs: tuple[str, ...],
+        job_id: str | None,
+        trace_id: str | None,
+    ) -> str:
+        payload = {
+            "schema": S3_FAIL_CLOSED_SCHEMA,
+            "status": status,
+            "category": category,
+            "code": code,
+            "message": message,
+            "retryable": retryable,
+            "report_emitted": False,
+            "unsigned_report_emitted": False,
+            "job_id": job_id,
+            "trace_id": trace_id,
+        }
+        record = self.artifact_store.create_artifact(
+            kind=S3_FAIL_CLOSED_KIND,
+            payload=payload,
+            producer=self.producer,
+            lineage=Lineage(
+                input_refs=input_refs,
+                code_ref=self.code_ref,
+                environment_digest=self.environment_digest,
+                job_id=job_id,
+            ),
+        )
+        return record.artifact_ref
+
+    def _write_report_quarantine(
+        self,
+        *,
+        report: Mapping[str, Any],
+        report_ref: str,
+        verification: C3SignatureVerification,
+        job_id: str | None,
+        trace_id: str | None,
+    ) -> str:
+        payload = {
+            "schema": S3_REPORT_QUARANTINE_SCHEMA,
+            "status": "QUARANTINED",
+            "report_ref": report_ref,
+            "quarantine": {
+                "severity": "Sev-1",
+                "reason": "S3:REPORT_SIGNATURE_INVALID",
+            },
+            "verification": {
+                "valid": verification.valid,
+                "reason": verification.reason,
+                "error_code": verification.error_code,
+                "signer_key_id": verification.key_id,
+            },
+            "report_digest": hash_json(report),
+            "job_id": job_id,
+            "trace_id": trace_id,
+        }
+        record = self.artifact_store.create_artifact(
+            kind=S3_REPORT_QUARANTINE_KIND,
+            payload=payload,
+            producer=self.producer,
+            lineage=Lineage(
+                input_refs=(report_ref,),
+                code_ref=self.code_ref,
+                environment_digest=self.environment_digest,
+                job_id=job_id,
+            ),
+        )
+        _blind_audit(
+            self.audit_ledger,
+            "s3.quarantine",
+            {
+                "severity": "Sev-1",
+                "reason": "S3:REPORT_SIGNATURE_INVALID",
+                "quarantine_ref": record.artifact_ref,
+                "report_ref": report_ref,
+                "job_id": job_id,
+                "trace_id": trace_id,
+            },
+        )
+        return record.artifact_ref
+
+
 class S3ChallengeError(S3Error):
     """Raised when an S3 challenge re-audit cannot be evaluated safely."""
 
@@ -7582,6 +8063,81 @@ def _check_to_contract(check: CheckResult) -> dict[str, Any]:
     if check.metrics is not None:
         payload["metrics"] = check.metrics
     return payload
+
+
+def _s3_degradation_records_for_check(check: CheckResult) -> tuple[S3DegradationRecord, ...]:
+    metrics = check.metrics if isinstance(check.metrics, Mapping) else {}
+    records: list[S3DegradationRecord] = []
+    if check.check == "PHYSICAL_CONSISTENCY" and check.status == "FAIL":
+        sub_gates = metrics.get("sub_gates")
+        asymptotic = sub_gates.get("asymptotic") if isinstance(sub_gates, Mapping) else None
+        test_cases = _string_tuple(metrics.get("test_cases"))
+        asymptotic_failed = (
+            "S3-TC16" in test_cases
+            or (
+                isinstance(asymptotic, Mapping)
+                and (asymptotic.get("status") == "FAIL" or asymptotic.get("asymptotic_pass") is False)
+            )
+        )
+        if asymptotic_failed:
+            records.append(
+                S3DegradationRecord(
+                    code="PHYSICAL_ASYMPTOTIC_LIMIT_FAIL",
+                    detail="PHYSICAL_CONSISTENCY asymptotic-limit gate failed",
+                    tier_effect="blocks_recap_and_novel",
+                    category="DEGRADATION",
+                    severity="degraded",
+                    check="PHYSICAL_CONSISTENCY",
+                    test_cases=("S3-TC16",),
+                    retryable=False,
+                )
+            )
+    return tuple(records)
+
+
+def _s3_check_with_degradation_records(
+    check: CheckResult,
+    records: tuple[S3DegradationRecord, ...],
+) -> CheckResult:
+    if not records:
+        return check
+    metrics = dict(check.metrics or {})
+    codes = list(_string_tuple(metrics.get("degradations")))
+    details = list(metrics.get("degradation_details") or ())
+    if not isinstance(details, list):
+        details = []
+    test_cases = list(_string_tuple(metrics.get("test_cases")))
+    for record in records:
+        _append_unique(codes, record.code)
+        details.append(record.as_payload())
+        for test_case in record.test_cases:
+            _append_unique(test_cases, test_case)
+    metrics["degradations"] = codes
+    metrics["degradation_details"] = details
+    if test_cases:
+        metrics["test_cases"] = test_cases
+    if check.status != "PASS" and "max_claim_tier" not in metrics:
+        metrics["max_claim_tier"] = "ran-toy"
+    return replace(check, metrics=metrics)
+
+
+def _s3_unique_completed_checks(checks: tuple[CheckResult, ...]) -> dict[str, CheckResult]:
+    by_name: dict[str, CheckResult] = {}
+    for check in checks:
+        if check.check in by_name:
+            raise ValueError(f"duplicate completed check: {check.check}")
+        by_name[check.check] = check
+    return by_name
+
+
+def _string_tuple(value: Any) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    if isinstance(value, str):
+        return (value,)
+    if not isinstance(value, (list, tuple)):
+        return ()
+    return tuple(item for item in value if isinstance(item, str) and item)
 
 
 def _challenge_delta_payload(delta: S3ChallengeCheckDelta) -> dict[str, Any]:
