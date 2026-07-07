@@ -1614,6 +1614,139 @@ class CheckPlugin(Protocol):
         ...
 
 
+class S3InjectionCheckError(S3Error):
+    """Raised when the S3 INJECTION check cannot be evaluated safely."""
+
+    def __init__(self, *, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
+@dataclass(frozen=True)
+class S3InjectionSample:
+    sample_id: str
+    injected_value: float
+    recovered_value: float
+
+
+class S3InjectionCheckPlugin:
+    """Concrete INJECTION check plugin for S3-TC04/05/05b."""
+
+    def __init__(
+        self,
+        *,
+        samples: tuple[S3InjectionSample, ...],
+        plugin_version: str = "1.0.0",
+    ) -> None:
+        self._samples = tuple(samples)
+        self._plugin_version = plugin_version
+
+    def describe(self) -> CheckPluginDescriptor:
+        return CheckPluginDescriptor(
+            check="INJECTION",
+            plugin_ref="argus.s3.plugins.injection",
+            plugin_version=self._plugin_version,
+            determinism="deterministic",
+            declared_inputs=(
+                "s3.blind_data_stage",
+                "s3.frozen_pipeline_observations",
+            ),
+        )
+
+    def run(self, ctx: CheckPluginContext) -> CheckResult:
+        if ctx.check_spec.check != "INJECTION":
+            _s3_injection_error(
+                "S3_INJECTION_CHECK_SPEC_MISMATCH",
+                f"injection plugin cannot run {ctx.check_spec.check}",
+            )
+        samples = _s3_injection_samples(self._samples)
+        recovery_rate_min = _s3_injection_probability(
+            ctx.check_spec.thresholds.get("recovery_rate_min"),
+            field="recovery_rate_min",
+            allow_zero=False,
+        )
+        relative_tolerance = _s3_injection_optional_non_negative(
+            ctx.check_spec.tolerance.get("relative_tolerance"),
+            field="relative_tolerance",
+        )
+        absolute_tolerance = _s3_injection_optional_non_negative(
+            ctx.check_spec.tolerance.get("absolute_tolerance"),
+            field="absolute_tolerance",
+        )
+        if relative_tolerance is None and absolute_tolerance is None:
+            _s3_injection_error(
+                "S3_INJECTION_TOLERANCE_REQUIRED",
+                "INJECTION requires relative_tolerance or absolute_tolerance",
+            )
+        slope_tolerance = _s3_injection_positive(
+            ctx.check_spec.tolerance.get("slope_tolerance"),
+            field="slope_tolerance",
+        )
+        intercept_tolerance_abs = _s3_injection_non_negative(
+            ctx.check_spec.tolerance.get("intercept_tolerance_abs"),
+            field="intercept_tolerance_abs",
+        )
+
+        recovered_count = 0
+        for _sample_id, injected, recovered in samples:
+            tolerance_result = S3StatisticsLibrary.tolerance(
+                observed=recovered,
+                expected=injected,
+                absolute_tolerance=absolute_tolerance,
+                relative_tolerance=relative_tolerance,
+            )
+            if tolerance_result.passed:
+                recovered_count += 1
+        recovery_rate = recovered_count / len(samples)
+        recovery_pass = recovery_rate >= recovery_rate_min
+
+        slope, intercept = _s3_injection_linear_fit(samples)
+        slope_result = S3StatisticsLibrary.tolerance(
+            observed=slope,
+            expected=1.0,
+            absolute_tolerance=slope_tolerance,
+        )
+        intercept_result = S3StatisticsLibrary.tolerance(
+            observed=intercept,
+            expected=0.0,
+            absolute_tolerance=intercept_tolerance_abs,
+        )
+        amplitude_linearity_pass = slope_result.passed and intercept_result.passed
+        failure_reason = _s3_injection_linearity_failure_reason(
+            slope_pass=slope_result.passed,
+            intercept_pass=intercept_result.passed,
+        )
+        status = "PASS" if recovery_pass and amplitude_linearity_pass else "FAIL"
+        test_cases = ["S3-TC04"]
+        if not recovery_pass:
+            test_cases.append("S3-TC05")
+        test_cases.append("S3-TC05b")
+
+        return CheckResult(
+            check="INJECTION",
+            status=status,
+            metrics={
+                "test_cases": test_cases,
+                "sample_count": len(samples),
+                "sample_digest": _s3_injection_samples_digest(samples),
+                "recovered_count": recovered_count,
+                "recovery_rate": recovery_rate,
+                "recovery_rate_min": recovery_rate_min,
+                "recovery_pass": recovery_pass,
+                "relative_tolerance": relative_tolerance,
+                "absolute_tolerance": absolute_tolerance,
+                "tolerance_policy": "max(abs, rel*scale)",
+                "linearity_slope": slope,
+                "linearity_intercept": intercept,
+                "slope_tolerance": slope_tolerance,
+                "intercept_tolerance_abs": intercept_tolerance_abs,
+                "amplitude_linearity_pass": amplitude_linearity_pass,
+                "linearity_failure_reason": failure_reason,
+            },
+        )
+
+
 class CheckPluginHost:
     """Runs compiled S3 check plugins with dependency-aware concurrency and C4 evidence."""
 
@@ -3012,6 +3145,115 @@ def _check_host_error(
         before_execution=before_execution,
         partial_results=partial_results,
     )
+
+
+def _s3_injection_samples(samples: tuple[S3InjectionSample, ...]) -> tuple[tuple[str, float, float], ...]:
+    if not samples:
+        _s3_injection_error("S3_INJECTION_SAMPLES_REQUIRED", "INJECTION requires at least two planted samples")
+    normalized: list[tuple[str, float, float]] = []
+    seen: set[str] = set()
+    for index, sample in enumerate(samples):
+        if not isinstance(sample, S3InjectionSample):
+            _s3_injection_error(
+                "S3_INJECTION_SAMPLE_INVALID",
+                f"sample at index {index} must be S3InjectionSample",
+            )
+        sample_id = sample.sample_id
+        if not isinstance(sample_id, str) or not sample_id:
+            _s3_injection_error("S3_INJECTION_SAMPLE_ID_INVALID", "sample_id must be a non-empty string")
+        if sample_id in seen:
+            _s3_injection_error("S3_INJECTION_SAMPLE_DUPLICATE", f"duplicate sample_id {sample_id}")
+        seen.add(sample_id)
+        injected = _s3_injection_float(sample.injected_value, field=f"{sample_id}.injected_value")
+        recovered = _s3_injection_float(sample.recovered_value, field=f"{sample_id}.recovered_value")
+        normalized.append((sample_id, injected, recovered))
+    if len(normalized) < 2:
+        _s3_injection_error("S3_INJECTION_SAMPLES_REQUIRED", "INJECTION requires at least two planted samples")
+    return tuple(normalized)
+
+
+def _s3_injection_samples_digest(samples: tuple[tuple[str, float, float], ...]) -> str:
+    return hash_json(
+        [
+            {
+                "sample_id": sample_id,
+                "injected_value": injected,
+                "recovered_value": recovered,
+            }
+            for sample_id, injected, recovered in samples
+        ]
+    )
+
+
+def _s3_injection_linear_fit(samples: tuple[tuple[str, float, float], ...]) -> tuple[float, float]:
+    injected_values = tuple(injected for _sample_id, injected, _recovered in samples)
+    recovered_values = tuple(recovered for _sample_id, _injected, recovered in samples)
+    x_mean = sum(injected_values) / len(injected_values)
+    y_mean = sum(recovered_values) / len(recovered_values)
+    centered_x = tuple(value - x_mean for value in injected_values)
+    ss_xx = sum(value * value for value in centered_x)
+    if ss_xx <= 0:
+        _s3_injection_error(
+            "S3_INJECTION_AMPLITUDE_GRID_DEGENERATE",
+            "INJECTION amplitude grid must contain at least two distinct amplitudes",
+        )
+    ss_xy = sum((x - x_mean) * (y - y_mean) for x, y in zip(injected_values, recovered_values, strict=True))
+    slope = ss_xy / ss_xx
+    intercept = y_mean - slope * x_mean
+    if not math.isfinite(slope) or not math.isfinite(intercept):
+        _s3_injection_error("S3_INJECTION_LINEARITY_NONFINITE", "INJECTION linear fit produced non-finite values")
+    return slope, intercept
+
+
+def _s3_injection_linearity_failure_reason(*, slope_pass: bool, intercept_pass: bool) -> str | None:
+    if slope_pass and intercept_pass:
+        return None
+    if not slope_pass and not intercept_pass:
+        return "SLOPE_AND_INTERCEPT_OUT_OF_TOLERANCE"
+    if not slope_pass:
+        return "SLOPE_OUT_OF_TOLERANCE"
+    return "INTERCEPT_OUT_OF_TOLERANCE"
+
+
+def _s3_injection_float(value: Any, *, field: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        _s3_injection_error("S3_INJECTION_VALUE_INVALID", f"{field} must be numeric")
+    numeric = float(value)
+    if not math.isfinite(numeric):
+        _s3_injection_error("S3_INJECTION_VALUE_NONFINITE", f"{field} must be finite")
+    return numeric
+
+
+def _s3_injection_probability(value: Any, *, field: str, allow_zero: bool = True) -> float:
+    numeric = _s3_injection_float(value, field=field)
+    lower_ok = numeric >= 0 if allow_zero else numeric > 0
+    if not lower_ok or numeric > 1:
+        _s3_injection_error("S3_INJECTION_PROBABILITY_INVALID", f"{field} must be in (0, 1]")
+    return numeric
+
+
+def _s3_injection_positive(value: Any, *, field: str) -> float:
+    numeric = _s3_injection_float(value, field=field)
+    if numeric <= 0:
+        _s3_injection_error("S3_INJECTION_VALUE_INVALID", f"{field} must be positive")
+    return numeric
+
+
+def _s3_injection_non_negative(value: Any, *, field: str) -> float:
+    numeric = _s3_injection_float(value, field=field)
+    if numeric < 0:
+        _s3_injection_error("S3_INJECTION_VALUE_INVALID", f"{field} must be non-negative")
+    return numeric
+
+
+def _s3_injection_optional_non_negative(value: Any, *, field: str) -> float | None:
+    if value is None:
+        return None
+    return _s3_injection_non_negative(value, field=field)
+
+
+def _s3_injection_error(code: str, message: str) -> None:
+    raise S3InjectionCheckError(code=code, message=message)
 
 
 @dataclass(frozen=True)
