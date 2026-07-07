@@ -376,7 +376,16 @@ def _pipeline_result_from_payload(payload: Mapping[str, Any]) -> S3PipelineRunRe
 
 
 def _check_payload(check: CheckResult) -> dict[str, Any]:
-    return {"check": check.check, "status": check.status, "metrics": _jsonable(check.metrics)}
+    payload = {"check": check.check, "status": check.status, "metrics": _jsonable(check.metrics)}
+    if check.evidence_ref is not None:
+        payload["evidence_ref"] = check.evidence_ref
+    if check.plugin_ref is not None:
+        payload["plugin_ref"] = check.plugin_ref
+    if check.plugin_version is not None:
+        payload["plugin_version"] = check.plugin_version
+    if check.dependencies:
+        payload["dependencies"] = list(check.dependencies)
+    return payload
 
 
 def _check_from_payload(value: Any) -> CheckResult:
@@ -387,6 +396,10 @@ def _check_from_payload(value: Any) -> CheckResult:
         check=_required_str(value, "check"),
         status=_required_str(value, "status"),
         metrics=dict(metrics) if isinstance(metrics, Mapping) else None,
+        evidence_ref=_optional_str(value.get("evidence_ref")),
+        plugin_ref=_optional_str(value.get("plugin_ref")),
+        plugin_version=_optional_str(value.get("plugin_version")),
+        dependencies=tuple(str(item) for item in value.get("dependencies") or ()),
     )
 
 

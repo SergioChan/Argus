@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, replace
 from functools import lru_cache
 import json
 import math
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, Protocol
 from uuid import NAMESPACE_URL, uuid4, uuid5
 
 from jsonschema import Draft202012Validator
@@ -15,6 +16,7 @@ from jsonschema import Draft202012Validator
 from argusverify import C3ReportSigner, canonical_c3_json_bytes
 from .canonical import canonical_json_bytes
 from .hashing import hash_bytes, hash_json
+from .s8 import InMemoryArtifactStore, Lineage, Producer
 from .s6 import (
     CapabilityDescriptor,
     ContaminationIndex,
@@ -109,6 +111,9 @@ S3_VERIFIER_PROFILE_CHECKS = frozenset(
     }
 )
 S3_PROFILE_REF_PREFIX = "c4://profile"
+S3_CHECK_PLUGIN_HOST_VERSION = "argus.s3.check_plugin_host.v1"
+S3_CHECK_RESULT_EVIDENCE_KIND = "s3_check_result"
+S3_CHECK_RESULT_EVIDENCE_SCHEMA = "argus.s3.check_result_evidence.v1"
 _S3_PROFILE_ID_CHARS = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-")
 
 
@@ -131,6 +136,36 @@ class S3ProfileCompilerError(S3Error):
         self.message = message
         self.before_execution = True
         self.retryable = False
+
+    def as_c1_payload(self) -> dict[str, Any]:
+        return {
+            "category": self.category,
+            "code": self.code,
+            "message": self.message,
+            "before_execution": self.before_execution,
+            "retryable": self.retryable,
+        }
+
+
+class CheckPluginHostError(S3Error):
+    """Raised when the S3 check-plugin host fails closed."""
+
+    def __init__(
+        self,
+        *,
+        category: str,
+        code: str,
+        message: str,
+        before_execution: bool,
+        partial_results: tuple[CheckResult, ...] = (),
+    ) -> None:
+        super().__init__(message)
+        self.category = category
+        self.code = code
+        self.message = message
+        self.before_execution = before_execution
+        self.retryable = False
+        self.partial_results = partial_results
 
     def as_c1_payload(self) -> dict[str, Any]:
         return {
@@ -613,6 +648,511 @@ class CheckResult:
     check: str
     status: str
     metrics: dict[str, Any] | None = None
+    evidence_ref: str | None = None
+    plugin_ref: str | None = None
+    plugin_version: str | None = None
+    dependencies: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class CheckPluginDescriptor:
+    check: str
+    plugin_ref: str
+    plugin_version: str
+    dependencies: tuple[str, ...] = ()
+    determinism: str = "deterministic"
+    declared_inputs: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class CheckPluginContext:
+    compiled_profile: CompiledProfile
+    check_spec: CompiledCheckSpec
+    completed_results: Mapping[str, CheckResult]
+    artifact_store: InMemoryArtifactStore | None = None
+    actor_id: str = "s3-check-plugin-host"
+    job_id: str | None = None
+    trace_id: str | None = None
+
+
+class CheckPlugin(Protocol):
+    def describe(self) -> CheckPluginDescriptor:
+        ...
+
+    def run(self, ctx: CheckPluginContext) -> CheckResult:
+        ...
+
+
+class CheckPluginHost:
+    """Runs compiled S3 check plugins with dependency-aware concurrency and C4 evidence."""
+
+    def __init__(
+        self,
+        *,
+        plugins: tuple[CheckPlugin, ...],
+        artifact_store: InMemoryArtifactStore | None = None,
+        max_workers: int | None = None,
+        actor_id: str = "s3-check-plugin-host",
+        job_id: str | None = None,
+        trace_id: str | None = None,
+    ) -> None:
+        if max_workers is not None and max_workers < 1:
+            _check_host_error(
+                category="POLICY",
+                code="CHECK_PLUGIN_MAX_WORKERS_INVALID",
+                message="max_workers must be positive",
+                before_execution=True,
+            )
+        self._plugins = tuple(plugins)
+        self._artifact_store = artifact_store
+        self._max_workers = max_workers
+        self._actor_id = actor_id
+        self._job_id = job_id
+        self._trace_id = trace_id
+
+    def run(self, compiled_profile: CompiledProfile) -> tuple[CheckResult, ...]:
+        specs_by_check = _check_host_profile_specs(compiled_profile)
+        plugin_entries = _check_host_plugin_entries(self._plugins)
+        dependencies_by_check = _check_host_dependencies(
+            compiled_profile=compiled_profile,
+            specs_by_check=specs_by_check,
+            plugin_entries=plugin_entries,
+        )
+        _check_host_assert_acyclic(dependencies_by_check)
+
+        pending = set(specs_by_check)
+        completed: dict[str, CheckResult] = {}
+        while pending:
+            for check in tuple(pending):
+                failed_dependencies = tuple(
+                    dependency
+                    for dependency in dependencies_by_check[check]
+                    if dependency in completed and completed[dependency].status != "PASS"
+                )
+                if failed_dependencies:
+                    _check_host_error(
+                        category="CHECK_FAILED",
+                        code="CHECK_PLUGIN_DEPENDENCY_FAILED",
+                        message=(
+                            f"{check} blocked by failed dependency checks: "
+                            + ", ".join(sorted(failed_dependencies))
+                        ),
+                        before_execution=False,
+                        partial_results=_check_host_ordered_results(compiled_profile, completed),
+                    )
+
+            ready = tuple(
+                spec.check
+                for spec in compiled_profile.checks
+                if spec.check in pending and set(dependencies_by_check[spec.check]).issubset(completed)
+            )
+            if not ready:
+                _check_host_error(
+                    category="POLICY",
+                    code="CHECK_PLUGIN_DEPENDENCY_CYCLE",
+                    message="check plugin dependency graph has no runnable node",
+                    before_execution=True,
+                )
+
+            max_workers = min(len(ready), self._max_workers or len(ready))
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = {
+                    executor.submit(
+                        self._run_one,
+                        compiled_profile,
+                        specs_by_check[check],
+                        plugin_entries[check][0],
+                        plugin_entries[check][1],
+                        {dependency: completed[dependency] for dependency in dependencies_by_check[check]},
+                    ): check
+                    for check in ready
+                }
+                layer_results: dict[str, CheckResult] = {}
+                for future in as_completed(futures):
+                    check = futures[future]
+                    try:
+                        layer_results[check] = future.result()
+                    except CheckPluginHostError as exc:
+                        if exc.partial_results:
+                            raise
+                        _check_host_error(
+                            category=exc.category,
+                            code=exc.code,
+                            message=exc.message,
+                            before_execution=exc.before_execution,
+                            partial_results=_check_host_ordered_results(compiled_profile, completed),
+                        )
+                    except Exception as exc:
+                        _check_host_error(
+                            category="CHECK_FAILED",
+                            code="CHECK_PLUGIN_FAILED",
+                            message=f"{check} plugin failed: {exc}",
+                            before_execution=False,
+                            partial_results=_check_host_ordered_results(compiled_profile, completed),
+                        )
+
+            for check in ready:
+                completed[check] = layer_results[check]
+                pending.remove(check)
+
+        return _check_host_ordered_results(compiled_profile, completed)
+
+    def _run_one(
+        self,
+        compiled_profile: CompiledProfile,
+        check_spec: CompiledCheckSpec,
+        plugin: CheckPlugin,
+        descriptor: CheckPluginDescriptor,
+        completed_results: dict[str, CheckResult],
+    ) -> CheckResult:
+        ctx = CheckPluginContext(
+            compiled_profile=compiled_profile,
+            check_spec=check_spec,
+            completed_results=dict(completed_results),
+            artifact_store=self._artifact_store,
+            actor_id=self._actor_id,
+            job_id=self._job_id,
+            trace_id=self._trace_id,
+        )
+        result = plugin.run(ctx)
+        if not isinstance(result, CheckResult):
+            _check_host_error(
+                category="CHECK_FAILED",
+                code="CHECK_PLUGIN_INVALID_RESULT",
+                message=f"{check_spec.check} plugin did not return CheckResult",
+                before_execution=False,
+                partial_results=tuple(completed_results.values()),
+            )
+        if result.check != check_spec.check:
+            _check_host_error(
+                category="CHECK_FAILED",
+                code="CHECK_PLUGIN_RESULT_CHECK_MISMATCH",
+                message=f"{check_spec.check} plugin returned result for {result.check}",
+                before_execution=False,
+                partial_results=tuple(completed_results.values()),
+            )
+        if result.status not in {"PASS", "FAIL", "INCONCLUSIVE"}:
+            _check_host_error(
+                category="CHECK_FAILED",
+                code="CHECK_PLUGIN_RESULT_STATUS_INVALID",
+                message=f"{check_spec.check} plugin returned unsupported status {result.status}",
+                before_execution=False,
+                partial_results=tuple(completed_results.values()),
+            )
+        enriched = replace(
+            result,
+            plugin_ref=descriptor.plugin_ref,
+            plugin_version=descriptor.plugin_version,
+            dependencies=descriptor.dependencies,
+        )
+        return self._write_evidence(compiled_profile, check_spec, descriptor, enriched, completed_results)
+
+    def _write_evidence(
+        self,
+        compiled_profile: CompiledProfile,
+        check_spec: CompiledCheckSpec,
+        descriptor: CheckPluginDescriptor,
+        result: CheckResult,
+        completed_results: dict[str, CheckResult],
+    ) -> CheckResult:
+        if self._artifact_store is None:
+            return result
+        dependency_refs = {
+            check: dependency_result.evidence_ref
+            for check, dependency_result in completed_results.items()
+            if dependency_result.evidence_ref is not None
+        }
+        payload = {
+            "schema": S3_CHECK_RESULT_EVIDENCE_SCHEMA,
+            "profile_id": compiled_profile.profile_id,
+            "profile_revision": compiled_profile.revision,
+            "profile_ref": compiled_profile.profile_ref,
+            "profile_spec_hash": compiled_profile.spec_hash,
+            "subtopic": compiled_profile.subtopic,
+            "check": result.check,
+            "status": result.status,
+            "metrics": _check_host_json_value(result.metrics or {}, path="metrics"),
+            "plugin_ref": descriptor.plugin_ref,
+            "plugin_version": descriptor.plugin_version,
+            "determinism": descriptor.determinism,
+            "declared_inputs": list(descriptor.declared_inputs),
+            "dependencies": list(descriptor.dependencies),
+            "dependency_evidence_refs": dependency_refs,
+            "thresholds": _check_host_json_value(check_spec.thresholds, path="thresholds"),
+            "budget": _check_host_json_value(check_spec.budget, path="budget"),
+            "seed": check_spec.seed,
+            "tolerance": _check_host_json_value(check_spec.tolerance, path="tolerance"),
+            "requires_independence": check_spec.requires_independence,
+            "trace_id": self._trace_id,
+        }
+        input_refs = [compiled_profile.profile_ref]
+        if check_spec.adapter is not None:
+            input_refs.append(check_spec.adapter.provenance_ref)
+            input_refs.append(check_spec.adapter.c5_provenance_ref)
+        input_refs.extend(ref for ref in dependency_refs.values() if ref is not None)
+        lineage = Lineage(
+            input_refs=tuple(dict.fromkeys(input_refs)),
+            code_ref=f"{descriptor.plugin_ref}@{descriptor.plugin_version}",
+            environment_digest=hash_json(
+                {
+                    "host": S3_CHECK_PLUGIN_HOST_VERSION,
+                    "plugin_ref": descriptor.plugin_ref,
+                    "plugin_version": descriptor.plugin_version,
+                    "determinism": descriptor.determinism,
+                }
+            ),
+            seeds=(str(check_spec.seed),) if check_spec.seed is not None else (),
+            actor_id=self._actor_id,
+            job_id=self._job_id,
+        )
+        record = self._artifact_store.create_artifact(
+            kind=S3_CHECK_RESULT_EVIDENCE_KIND,
+            payload=payload,
+            producer=Producer(
+                subsystem="S3",
+                version=S3_CHECK_PLUGIN_HOST_VERSION,
+                actor_id=self._actor_id,
+                job_id=self._job_id,
+            ),
+            lineage=lineage,
+        )
+        return replace(result, evidence_ref=record.artifact_ref)
+
+
+def _check_host_profile_specs(compiled_profile: CompiledProfile) -> dict[str, CompiledCheckSpec]:
+    specs_by_check: dict[str, CompiledCheckSpec] = {}
+    duplicates: list[str] = []
+    for spec in compiled_profile.checks:
+        _check_host_non_empty_string(spec.check, "check")
+        if spec.check in specs_by_check:
+            duplicates.append(spec.check)
+            continue
+        specs_by_check[spec.check] = spec
+    if duplicates:
+        _check_host_error(
+            category="POLICY",
+            code="CHECK_PLUGIN_DUPLICATE_CHECK",
+            message="compiled profile contains duplicate checks: " + ", ".join(sorted(set(duplicates))),
+            before_execution=True,
+        )
+    return specs_by_check
+
+
+def _check_host_plugin_entries(
+    plugins: tuple[CheckPlugin, ...],
+) -> dict[str, tuple[CheckPlugin, CheckPluginDescriptor]]:
+    entries: dict[str, tuple[CheckPlugin, CheckPluginDescriptor]] = {}
+    duplicates: list[str] = []
+    for plugin in plugins:
+        try:
+            descriptor = plugin.describe()
+        except Exception as exc:
+            _check_host_error(
+                category="VERIFIER_UNAVAILABLE",
+                code="CHECK_PLUGIN_DESCRIPTOR_FAILED",
+                message=f"check plugin descriptor failed: {exc}",
+                before_execution=True,
+            )
+        if not isinstance(descriptor, CheckPluginDescriptor):
+            _check_host_error(
+                category="VERIFIER_UNAVAILABLE",
+                code="CHECK_PLUGIN_DESCRIPTOR_INVALID",
+                message="check plugin describe() must return CheckPluginDescriptor",
+                before_execution=True,
+            )
+        _check_host_descriptor_valid(descriptor)
+        if descriptor.check in entries:
+            duplicates.append(descriptor.check)
+            continue
+        entries[descriptor.check] = (plugin, descriptor)
+    if duplicates:
+        _check_host_error(
+            category="POLICY",
+            code="CHECK_PLUGIN_DUPLICATE_PLUGIN",
+            message="multiple plugins registered for checks: " + ", ".join(sorted(set(duplicates))),
+            before_execution=True,
+        )
+    return entries
+
+
+def _check_host_dependencies(
+    *,
+    compiled_profile: CompiledProfile,
+    specs_by_check: Mapping[str, CompiledCheckSpec],
+    plugin_entries: Mapping[str, tuple[CheckPlugin, CheckPluginDescriptor]],
+) -> dict[str, tuple[str, ...]]:
+    dependencies_by_check: dict[str, tuple[str, ...]] = {}
+    for spec in compiled_profile.checks:
+        entry = plugin_entries.get(spec.check)
+        if entry is None:
+            _check_host_error(
+                category="VERIFIER_UNAVAILABLE",
+                code="CHECK_PLUGIN_UNAVAILABLE",
+                message=f"compiled profile requires unavailable check plugin: {spec.check}",
+                before_execution=True,
+            )
+        _plugin, descriptor = entry
+        if descriptor.plugin_ref != spec.plugin_ref or descriptor.plugin_version != spec.plugin_version:
+            _check_host_error(
+                category="VERIFIER_UNAVAILABLE",
+                code="CHECK_PLUGIN_DESCRIPTOR_MISMATCH",
+                message=(
+                    f"{spec.check} plugin descriptor does not match compiled spec "
+                    f"{spec.plugin_ref}@{spec.plugin_version}"
+                ),
+                before_execution=True,
+            )
+        if descriptor.determinism != spec.determinism:
+            _check_host_error(
+                category="VERIFIER_UNAVAILABLE",
+                code="CHECK_PLUGIN_DETERMINISM_MISMATCH",
+                message=f"{spec.check} plugin determinism does not match compiled spec",
+                before_execution=True,
+            )
+        seen_dependencies: list[str] = []
+        for dependency in descriptor.dependencies:
+            _check_host_non_empty_string(dependency, "dependency")
+            if dependency == spec.check:
+                _check_host_error(
+                    category="POLICY",
+                    code="CHECK_PLUGIN_DEPENDENCY_CYCLE",
+                    message=f"{spec.check} depends on itself",
+                    before_execution=True,
+                )
+            if dependency not in specs_by_check:
+                _check_host_error(
+                    category="POLICY",
+                    code="CHECK_PLUGIN_DEPENDENCY_UNDECLARED",
+                    message=f"{spec.check} depends on undeclared check {dependency}",
+                    before_execution=True,
+                )
+            if dependency not in seen_dependencies:
+                seen_dependencies.append(dependency)
+        dependencies_by_check[spec.check] = tuple(seen_dependencies)
+    return dependencies_by_check
+
+
+def _check_host_assert_acyclic(dependencies_by_check: Mapping[str, tuple[str, ...]]) -> None:
+    visiting: set[str] = set()
+    visited: set[str] = set()
+
+    def visit(check: str, path: tuple[str, ...]) -> None:
+        if check in visiting:
+            cycle = " -> ".join(path + (check,))
+            _check_host_error(
+                category="POLICY",
+                code="CHECK_PLUGIN_DEPENDENCY_CYCLE",
+                message=f"check plugin dependency cycle detected: {cycle}",
+                before_execution=True,
+            )
+        if check in visited:
+            return
+        visiting.add(check)
+        for dependency in dependencies_by_check.get(check, ()):
+            visit(dependency, path + (check,))
+        visiting.remove(check)
+        visited.add(check)
+
+    for check in sorted(dependencies_by_check):
+        visit(check, ())
+
+
+def _check_host_descriptor_valid(descriptor: CheckPluginDescriptor) -> None:
+    _check_host_non_empty_string(descriptor.check, "check")
+    _check_host_non_empty_string(descriptor.plugin_ref, "plugin_ref")
+    _check_host_non_empty_string(descriptor.plugin_version, "plugin_version")
+    _check_host_non_empty_string(descriptor.determinism, "determinism")
+    if not isinstance(descriptor.dependencies, tuple) or not all(
+        isinstance(dependency, str) and dependency for dependency in descriptor.dependencies
+    ):
+        _check_host_error(
+            category="VERIFIER_UNAVAILABLE",
+            code="CHECK_PLUGIN_DESCRIPTOR_INVALID",
+            message=f"{descriptor.check} descriptor dependencies must be a tuple of non-empty strings",
+            before_execution=True,
+        )
+    if not isinstance(descriptor.declared_inputs, tuple) or not all(
+        isinstance(input_name, str) and input_name for input_name in descriptor.declared_inputs
+    ):
+        _check_host_error(
+            category="VERIFIER_UNAVAILABLE",
+            code="CHECK_PLUGIN_DESCRIPTOR_INVALID",
+            message=f"{descriptor.check} descriptor declared_inputs must be a tuple of non-empty strings",
+            before_execution=True,
+        )
+
+
+def _check_host_non_empty_string(value: Any, field_name: str) -> str:
+    if not isinstance(value, str) or not value:
+        _check_host_error(
+            category="VERIFIER_UNAVAILABLE",
+            code="CHECK_PLUGIN_DESCRIPTOR_INVALID",
+            message=f"check plugin {field_name} must be a non-empty string",
+            before_execution=True,
+        )
+    return value
+
+
+def _check_host_json_value(value: Any, *, path: str) -> Any:
+    if isinstance(value, Mapping):
+        payload: dict[str, Any] = {}
+        for key, item in value.items():
+            if not isinstance(key, str):
+                _check_host_error(
+                    category="CHECK_FAILED",
+                    code="CHECK_PLUGIN_EVIDENCE_JSON_INVALID",
+                    message=f"{path} contains a non-string key",
+                    before_execution=False,
+                )
+            payload[key] = _check_host_json_value(item, path=f"{path}.{key}")
+        return payload
+    if isinstance(value, tuple):
+        return [_check_host_json_value(item, path=f"{path}[]") for item in value]
+    if isinstance(value, list):
+        return [_check_host_json_value(item, path=f"{path}[]") for item in value]
+    if isinstance(value, bool) or value is None or isinstance(value, str):
+        return value
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            _check_host_error(
+                category="CHECK_FAILED",
+                code="CHECK_PLUGIN_EVIDENCE_JSON_INVALID",
+                message=f"{path} contains a non-finite number",
+                before_execution=False,
+            )
+        return value
+    _check_host_error(
+        category="CHECK_FAILED",
+        code="CHECK_PLUGIN_EVIDENCE_JSON_INVALID",
+        message=f"{path} contains non-JSON value of type {type(value).__name__}",
+        before_execution=False,
+    )
+
+
+def _check_host_ordered_results(
+    compiled_profile: CompiledProfile,
+    completed: Mapping[str, CheckResult],
+) -> tuple[CheckResult, ...]:
+    return tuple(completed[spec.check] for spec in compiled_profile.checks if spec.check in completed)
+
+
+def _check_host_error(
+    *,
+    category: str,
+    code: str,
+    message: str,
+    before_execution: bool,
+    partial_results: tuple[CheckResult, ...] = (),
+) -> None:
+    raise CheckPluginHostError(
+        category=category,
+        code=code,
+        message=message,
+        before_execution=before_execution,
+        partial_results=partial_results,
+    )
 
 
 @dataclass(frozen=True)

@@ -228,6 +228,11 @@ from .s1_reference import (
 )
 from .s3 import (
     CanonicalValidationReport,
+    CheckPlugin,
+    CheckPluginContext,
+    CheckPluginDescriptor,
+    CheckPluginHost,
+    CheckPluginHostError,
     CheckResult,
     CompiledC6Adapter,
     CompiledCheckSpec,
@@ -625,6 +630,11 @@ __all__ = [
     "CapabilityDescriptor",
     "CalibrationAdvisoryCheck",
     "CalibrationRepairAction",
+    "CheckPlugin",
+    "CheckPluginContext",
+    "CheckPluginDescriptor",
+    "CheckPluginHost",
+    "CheckPluginHostError",
     "CheckResult",
     "ControlTower",
     "DAG",
