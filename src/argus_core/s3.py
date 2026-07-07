@@ -126,6 +126,15 @@ S3_FROZEN_PIPELINE_RUNNER_VERSION = "argus.s3.frozen_pipeline_runner.v1"
 S3_FROZEN_PIPELINE_RUN_EVIDENCE_KIND = "s3_frozen_pipeline_run"
 S3_FROZEN_PIPELINE_RUN_EVIDENCE_SCHEMA = "argus.s3.frozen_pipeline_run_evidence.v1"
 S3_FROZEN_PIPELINE_RUNNER_ENTRYPOINT = ("python", "-m", "argus_runtime.s3_frozen_pipeline_entrypoint")
+S3_BLIND_DATA_VAULT_VERSION = "argus.s3.blind_data_vault.v1"
+S3_BLIND_DATA_METADATA_KIND = "s3_blind_dataset_metadata"
+S3_BLIND_DATA_METADATA_SCHEMA = "argus.s3.blind_dataset_metadata.v1"
+S3_BLIND_OPAQUE_INPUT_KIND = "s3_blind_opaque_input"
+S3_BLIND_OPAQUE_INPUT_SCHEMA = "argus.s3.blind_opaque_input.v1"
+S3_BLIND_DATA_STAGE_KIND = "s3_blind_data_stage"
+S3_BLIND_DATA_STAGE_SCHEMA = "argus.s3.blind_data_stage.v1"
+S3_BLIND_DATA_QUARANTINE_KIND = "s3_blind_data_quarantine"
+S3_BLIND_DATA_QUARANTINE_SCHEMA = "argus.s3.blind_data_quarantine.v1"
 _S3_PROFILE_ID_CHARS = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-")
 
 
@@ -210,6 +219,37 @@ class S3FrozenPipelineRunnerError(S3Error):
         }
 
 
+class S3BlindDataVaultError(S3Error):
+    """Raised when S3 blind-data staging fails closed."""
+
+    def __init__(
+        self,
+        *,
+        category: str,
+        code: str,
+        message: str,
+        quarantine_ref: str | None = None,
+        retryable: bool = False,
+    ) -> None:
+        super().__init__(message)
+        self.category = category
+        self.code = code
+        self.message = message
+        self.quarantine_ref = quarantine_ref or ""
+        self.retryable = retryable
+
+    def as_c1_payload(self) -> dict[str, Any]:
+        payload = {
+            "category": self.category,
+            "code": self.code,
+            "message": self.message,
+            "retryable": self.retryable,
+        }
+        if self.quarantine_ref:
+            payload["quarantine_ref"] = self.quarantine_ref
+        return payload
+
+
 @dataclass(frozen=True)
 class VerifierProfileStatusEvent:
     profile_id: str
@@ -243,6 +283,41 @@ class VerifierProfileRevision:
             "checks": list(self.checks),
             "cost_estimate": _profile_json_value(self.cost_estimate, path="cost_estimate"),
         }
+
+
+@dataclass(frozen=True)
+class BlindDatasetRecord:
+    handle: str
+    handle_hash: str
+    dataset_id: str
+    version: str
+    split: str
+    dataset_kind: str
+    opaque_input_hash: str
+    truth_hash: str
+    expected_opaque_input_hash: str
+    expected_truth_hash: str
+    metadata_ref: str
+
+
+@dataclass(frozen=True)
+class BlindDataStage:
+    blind_data_handle: str
+    handle_hash: str
+    opaque_input_ref: str
+    opaque_input_hash: str
+    truth_hash: str
+    stage_evidence_ref: str
+    truth_retained_server_side: bool = True
+    truth_bytes_delivered_to_sandbox: bool = False
+    truth_hash_delivered_to_sandbox: bool = False
+
+
+@dataclass(frozen=True)
+class _BlindDatasetEntry:
+    record: BlindDatasetRecord
+    opaque_input: Any
+    truth: Any
 
 
 @dataclass(frozen=True)
@@ -952,6 +1027,312 @@ class CheckPluginHost:
         return replace(result, evidence_ref=record.artifact_ref)
 
 
+class InMemoryBlindDataVault:
+    """Verifier-zone-only blind-data vault used by S3-T12 local flows."""
+
+    def __init__(
+        self,
+        *,
+        artifact_store: InMemoryArtifactStore,
+        audit_ledger: Any | None = None,
+        actor_id: str = "s3-blind-data-vault",
+    ) -> None:
+        if artifact_store is None:
+            _blind_error(code="S3_ARTIFACT_STORE_REQUIRED", message="Blind-data vault requires artifact_store")
+        self._artifact_store = artifact_store
+        self._audit_ledger = audit_ledger
+        self._actor_id = actor_id
+        self._entries: dict[str, _BlindDatasetEntry] = {}
+
+    def register_dataset(
+        self,
+        *,
+        dataset_id: str,
+        version: str,
+        split: str,
+        dataset_kind: str,
+        opaque_input: Any,
+        truth: Any,
+        expected_opaque_input_hash: str | None = None,
+        expected_truth_hash: str | None = None,
+    ) -> BlindDatasetRecord:
+        dataset_id = _blind_non_empty(dataset_id, "dataset_id")
+        version = _blind_non_empty(version, "version")
+        split = _blind_non_empty(split, "split")
+        dataset_kind = _blind_non_empty(dataset_kind, "dataset_kind")
+        handle = f"blind://vault/{dataset_id}/{version}/{split}"
+        if handle in self._entries:
+            _blind_error(
+                code="S3_BLIND_DATA_HANDLE_EXISTS",
+                message=f"blind dataset already exists for handle {handle}",
+            )
+        _blind_assert_no_label_material(
+            opaque_input,
+            code="S3_BLIND_OPAQUE_INPUT_LABEL_MATERIAL_FORBIDDEN",
+            path="opaque_input",
+        )
+        opaque_payload = _blind_json_value(opaque_input, path="opaque_input")
+        truth_payload = _blind_json_value(truth, path="truth")
+        opaque_input_hash = hash_json(opaque_payload)
+        truth_hash = hash_json(truth_payload)
+        expected_opaque_input_hash = _blind_hash_or_default(
+            expected_opaque_input_hash,
+            opaque_input_hash,
+            "expected_opaque_input_hash",
+        )
+        expected_truth_hash = _blind_hash_or_default(expected_truth_hash, truth_hash, "expected_truth_hash")
+        handle_hash = hash_json({"blind_data_handle": handle})
+        metadata_payload = {
+            "schema": S3_BLIND_DATA_METADATA_SCHEMA,
+            "vault_version": S3_BLIND_DATA_VAULT_VERSION,
+            "dataset_id": dataset_id,
+            "version": version,
+            "split": split,
+            "dataset_kind": dataset_kind,
+            "handle_hash": handle_hash,
+            "opaque_input_hash": opaque_input_hash,
+            "truth_hash": truth_hash,
+            "expected_opaque_input_hash": expected_opaque_input_hash,
+            "expected_truth_hash": expected_truth_hash,
+            "truth_material_stored_server_side": True,
+            "raw_truth_in_c4": False,
+        }
+        metadata_record = self._artifact_store.create_artifact(
+            kind=S3_BLIND_DATA_METADATA_KIND,
+            payload=metadata_payload,
+            producer=Producer(
+                subsystem="S3",
+                version=S3_BLIND_DATA_VAULT_VERSION,
+                actor_id=self._actor_id,
+            ),
+            lineage=Lineage(
+                input_refs=(),
+                code_ref=S3_BLIND_DATA_VAULT_VERSION,
+                environment_digest=hash_json(
+                    {
+                        "vault": S3_BLIND_DATA_VAULT_VERSION,
+                        "kind": S3_BLIND_DATA_METADATA_KIND,
+                    }
+                ),
+                actor_id=self._actor_id,
+            ),
+        )
+        record = BlindDatasetRecord(
+            handle=handle,
+            handle_hash=handle_hash,
+            dataset_id=dataset_id,
+            version=version,
+            split=split,
+            dataset_kind=dataset_kind,
+            opaque_input_hash=opaque_input_hash,
+            truth_hash=truth_hash,
+            expected_opaque_input_hash=expected_opaque_input_hash,
+            expected_truth_hash=expected_truth_hash,
+            metadata_ref=metadata_record.artifact_ref,
+        )
+        self._entries[handle] = _BlindDatasetEntry(record=record, opaque_input=opaque_payload, truth=truth_payload)
+        return record
+
+    def resolve(self, handle: str) -> BlindDatasetRecord:
+        entry = self._entry(handle)
+        return entry.record
+
+    def truth_for_scoring(self, handle: str) -> Any:
+        entry = self._entry(handle)
+        return json.loads(canonical_json_bytes(entry.truth).decode("utf-8"))
+
+    def _entry(self, handle: str) -> _BlindDatasetEntry:
+        handle = _blind_non_empty(handle, "blind_data_handle")
+        try:
+            return self._entries[handle]
+        except KeyError:
+            _blind_error(
+                code="S3_BLIND_DATA_HANDLE_NOT_FOUND",
+                message=f"blind dataset handle was not found: {handle}",
+            )
+
+
+class S3BlindDataManager:
+    """Stages verifier-zone blind data as sandbox-visible opaque input artifacts."""
+
+    def __init__(
+        self,
+        *,
+        artifact_store: InMemoryArtifactStore,
+        vault: InMemoryBlindDataVault,
+        audit_ledger: Any | None = None,
+        actor_id: str = "s3-blind-data-manager",
+    ) -> None:
+        if artifact_store is None:
+            _blind_error(code="S3_ARTIFACT_STORE_REQUIRED", message="Blind-data manager requires artifact_store")
+        if not isinstance(vault, InMemoryBlindDataVault):
+            _blind_error(code="S3_BLIND_DATA_VAULT_REQUIRED", message="Blind-data manager requires a vault")
+        self._artifact_store = artifact_store
+        self._vault = vault
+        self._audit_ledger = audit_ledger
+        self._actor_id = actor_id
+
+    def stage_for_pipeline(self, *, blind_data_handle: str, job_id: str, trace_id: str | None = None) -> BlindDataStage:
+        job_id = _blind_non_empty(job_id, "job_id")
+        entry = self._vault._entry(blind_data_handle)
+        record = entry.record
+        mismatch = _blind_integrity_mismatch(record)
+        if mismatch is not None:
+            quarantine_ref = self._write_quarantine(record=record, mismatch=mismatch, job_id=job_id, trace_id=trace_id)
+            raise S3BlindDataVaultError(
+                category="QUARANTINE",
+                code="S3_BLIND_DATA_HASH_MISMATCH",
+                message=f"blind dataset integrity mismatch for {mismatch['field']}",
+                quarantine_ref=quarantine_ref,
+                retryable=False,
+            )
+
+        opaque_payload = {
+            "schema": S3_BLIND_OPAQUE_INPUT_SCHEMA,
+            "vault_version": S3_BLIND_DATA_VAULT_VERSION,
+            "handle_hash": record.handle_hash,
+            "dataset_id": record.dataset_id,
+            "version": record.version,
+            "split": record.split,
+            "dataset_kind": record.dataset_kind,
+            "opaque_input": _blind_json_value(entry.opaque_input, path="opaque_input"),
+            "opaque_input_hash": record.opaque_input_hash,
+            "truth_bytes_present": False,
+            "truth_hash_present": False,
+        }
+        opaque_record = self._artifact_store.create_artifact(
+            kind=S3_BLIND_OPAQUE_INPUT_KIND,
+            payload=opaque_payload,
+            producer=Producer(
+                subsystem="S3",
+                version=S3_BLIND_DATA_VAULT_VERSION,
+                actor_id=self._actor_id,
+                job_id=job_id,
+            ),
+            lineage=Lineage(
+                input_refs=(record.metadata_ref,),
+                code_ref=S3_BLIND_DATA_VAULT_VERSION,
+                environment_digest=hash_json(
+                    {
+                        "vault": S3_BLIND_DATA_VAULT_VERSION,
+                        "kind": S3_BLIND_OPAQUE_INPUT_KIND,
+                    }
+                ),
+                actor_id=self._actor_id,
+                job_id=job_id,
+            ),
+        )
+        stage_payload = {
+            "schema": S3_BLIND_DATA_STAGE_SCHEMA,
+            "vault_version": S3_BLIND_DATA_VAULT_VERSION,
+            "status": "STAGED",
+            "handle_hash": record.handle_hash,
+            "dataset_id": record.dataset_id,
+            "version": record.version,
+            "split": record.split,
+            "dataset_kind": record.dataset_kind,
+            "metadata_ref": record.metadata_ref,
+            "opaque_input_ref": opaque_record.artifact_ref,
+            "opaque_input_hash": record.opaque_input_hash,
+            "truth_hash": record.truth_hash,
+            "truth_retained_server_side": True,
+            "truth_bytes_delivered_to_sandbox": False,
+            "truth_hash_delivered_to_sandbox": False,
+            "job_id": job_id,
+            "trace_id": trace_id,
+        }
+        stage_record = self._artifact_store.create_artifact(
+            kind=S3_BLIND_DATA_STAGE_KIND,
+            payload=stage_payload,
+            producer=Producer(
+                subsystem="S3",
+                version=S3_BLIND_DATA_VAULT_VERSION,
+                actor_id=self._actor_id,
+                job_id=job_id,
+            ),
+            lineage=Lineage(
+                input_refs=(record.metadata_ref, opaque_record.artifact_ref),
+                code_ref=S3_BLIND_DATA_VAULT_VERSION,
+                environment_digest=hash_json(
+                    {
+                        "vault": S3_BLIND_DATA_VAULT_VERSION,
+                        "kind": S3_BLIND_DATA_STAGE_KIND,
+                    }
+                ),
+                actor_id=self._actor_id,
+                job_id=job_id,
+            ),
+        )
+        return BlindDataStage(
+            blind_data_handle=record.handle,
+            handle_hash=record.handle_hash,
+            opaque_input_ref=opaque_record.artifact_ref,
+            opaque_input_hash=record.opaque_input_hash,
+            truth_hash=record.truth_hash,
+            stage_evidence_ref=stage_record.artifact_ref,
+        )
+
+    def _write_quarantine(
+        self,
+        *,
+        record: BlindDatasetRecord,
+        mismatch: Mapping[str, Any],
+        job_id: str,
+        trace_id: str | None,
+    ) -> str:
+        payload = {
+            "schema": S3_BLIND_DATA_QUARANTINE_SCHEMA,
+            "vault_version": S3_BLIND_DATA_VAULT_VERSION,
+            "status": "QUARANTINED",
+            "handle_hash": record.handle_hash,
+            "metadata_ref": record.metadata_ref,
+            "mismatch": _blind_json_value(dict(mismatch), path="mismatch"),
+            "quarantine": {
+                "severity": "Sev-1",
+                "reason": "S3:BLIND_HASH_MISMATCH",
+            },
+            "truth_bytes_delivered_to_sandbox": False,
+            "truth_hash_delivered_to_sandbox": False,
+            "job_id": job_id,
+            "trace_id": trace_id,
+        }
+        quarantine_record = self._artifact_store.create_artifact(
+            kind=S3_BLIND_DATA_QUARANTINE_KIND,
+            payload=payload,
+            producer=Producer(
+                subsystem="S3",
+                version=S3_BLIND_DATA_VAULT_VERSION,
+                actor_id=self._actor_id,
+                job_id=job_id,
+            ),
+            lineage=Lineage(
+                input_refs=(record.metadata_ref,),
+                code_ref=S3_BLIND_DATA_VAULT_VERSION,
+                environment_digest=hash_json(
+                    {
+                        "vault": S3_BLIND_DATA_VAULT_VERSION,
+                        "kind": S3_BLIND_DATA_QUARANTINE_KIND,
+                    }
+                ),
+                actor_id=self._actor_id,
+                job_id=job_id,
+            ),
+        )
+        _blind_audit(
+            self._audit_ledger,
+            "s3.quarantine",
+            {
+                "severity": "Sev-1",
+                "reason": "S3:BLIND_HASH_MISMATCH",
+                "quarantine_ref": quarantine_record.artifact_ref,
+                "handle_hash": record.handle_hash,
+                "mismatch_field": mismatch.get("field"),
+                "job_id": job_id,
+            },
+        )
+        return quarantine_record.artifact_ref
+
+
 @dataclass(frozen=True)
 class S3FrozenPipelineRunResult:
     status: str
@@ -973,6 +1354,7 @@ class S3FrozenPipelineRunner:
         scope_token: ScopeToken,
         audit_ledger: Any | None = None,
         launch_envelope: LaunchEnvelope | None = None,
+        blind_data_manager: S3BlindDataManager | None = None,
         actor_id: str = "s3-frozen-pipeline-runner",
     ) -> None:
         if artifact_store is None:
@@ -993,9 +1375,13 @@ class S3FrozenPipelineRunner:
             pids=32,
             estimated_cost_usd=0.01,
         )
+        self._blind_data_manager = blind_data_manager
         self._actor_id = actor_id
 
     def run(self, validation_request: Mapping[str, Any]) -> S3FrozenPipelineRunResult:
+        blind_data_stage = self._stage_blind_data(validation_request)
+        if blind_data_stage is not None:
+            validation_request = _runner_request_with_blind_stage(validation_request, blind_data_stage)
         entrypoint_request = build_frozen_pipeline_entrypoint_request(
             validation_request,
             artifact_store=self._artifact_store,
@@ -1023,6 +1409,7 @@ class S3FrozenPipelineRunner:
             launch_request=launch_request,
             execution=execution,
             audit_events=audit_events,
+            blind_data_stage=blind_data_stage,
         )
         return S3FrozenPipelineRunResult(
             status=_runner_status(execution),
@@ -1030,6 +1417,23 @@ class S3FrozenPipelineRunner:
             sandbox_id=execution.handle.sandbox_id,
             sandbox_state=execution.handle.state,
             launch_request=launch_request,
+        )
+
+    def _stage_blind_data(self, validation_request: Mapping[str, Any]) -> BlindDataStage | None:
+        if self._blind_data_manager is None:
+            return None
+        request_payload = _runner_mapping(validation_request, "validation_request")
+        blind_data_handle = _blind_data_handle(request_payload)
+        job_id = _non_empty_string(
+            request_payload.get("job_id"),
+            "job_id",
+            code="S3_VERIFICATION_REQUEST_FIELD_REQUIRED",
+        )
+        trace_id = _optional_non_empty_string(request_payload.get("trace_id"), "trace_id")
+        return self._blind_data_manager.stage_for_pipeline(
+            blind_data_handle=blind_data_handle,
+            job_id=job_id,
+            trace_id=trace_id,
         )
 
     def _launch_request(
@@ -1124,6 +1528,7 @@ class S3FrozenPipelineRunner:
         launch_request: LaunchRequest,
         execution: SandboxExecutionResult,
         audit_events: tuple[Any, ...],
+        blind_data_stage: BlindDataStage | None,
     ) -> str:
         status = _runner_status(execution)
         partial = execution.partial_result
@@ -1150,6 +1555,7 @@ class S3FrozenPipelineRunner:
             },
             "quarantine": quarantine,
             "egress": egress,
+            "blind_data_stage": _runner_blind_data_stage_payload(blind_data_stage),
             "partial_result": _runner_partial_payload(partial),
             "audit_event_types": list(audit_event_types),
             "s3_test_cases": {
@@ -1157,12 +1563,16 @@ class S3FrozenPipelineRunner:
                     "status": "PASS",
                     "assertion": "frozen pipeline launched through nested S10 sandbox; verifier imported no pipeline code",
                 },
+                "S3-TC26": _runner_tc26_status(blind_data_stage),
                 "S3-TC27": _runner_tc27_status(quarantine),
                 "S3-TC44": _runner_tc44_status(egress),
             },
         }
         input_refs = [str(entrypoint_request["verification_request"]["frozen_pipeline_ref"])]
         input_refs.extend(str(ref) for ref in entrypoint_request.get("artifact_refs", ()) if isinstance(ref, str))
+        if blind_data_stage is not None:
+            input_refs.append(blind_data_stage.stage_evidence_ref)
+            input_refs.append(blind_data_stage.opaque_input_ref)
         if execution.handle.launch_provenance_ref:
             input_refs.append(execution.handle.launch_provenance_ref)
         record = self._artifact_store.create_artifact(
@@ -1191,6 +1601,142 @@ class S3FrozenPipelineRunner:
             ),
         )
         return record.artifact_ref
+
+
+def _blind_error(
+    *,
+    code: str,
+    message: str,
+    category: str = "POLICY",
+    quarantine_ref: str | None = None,
+) -> None:
+    raise S3BlindDataVaultError(
+        category=category,
+        code=code,
+        message=message,
+        quarantine_ref=quarantine_ref,
+    )
+
+
+def _blind_non_empty(value: Any, field_name: str) -> str:
+    if not isinstance(value, str) or not value:
+        _blind_error(code="S3_BLIND_DATA_FIELD_REQUIRED", message=f"{field_name} must be a non-empty string")
+    return value
+
+
+def _blind_hash_or_default(value: Any, default: str, field_name: str) -> str:
+    if value is None:
+        return default
+    if not isinstance(value, str) or not value.startswith("blake3:"):
+        _blind_error(code="S3_BLIND_DATA_HASH_INVALID", message=f"{field_name} must be a BLAKE3 hash")
+    return value
+
+
+def _blind_assert_no_label_material(value: Any, *, code: str, path: str) -> None:
+    if isinstance(value, Mapping):
+        for key, item in value.items():
+            key_text = str(key).lower()
+            if key_text in S3_FORBIDDEN_LABEL_MATERIAL_FIELDS:
+                _blind_error(code=code, message=f"{path}.{key} contains forbidden label or truth material")
+            _blind_assert_no_label_material(item, code=code, path=f"{path}.{key}")
+    elif isinstance(value, list | tuple):
+        for index, item in enumerate(value):
+            _blind_assert_no_label_material(item, code=code, path=f"{path}[{index}]")
+
+
+def _blind_json_value(value: Any, *, path: str) -> Any:
+    if isinstance(value, Mapping):
+        payload: dict[str, Any] = {}
+        for key, item in value.items():
+            if not isinstance(key, str):
+                _blind_error(code="S3_BLIND_DATA_JSON_INVALID", message=f"{path} contains a non-string key")
+            payload[key] = _blind_json_value(item, path=f"{path}.{key}")
+        return payload
+    if isinstance(value, tuple):
+        return [_blind_json_value(item, path=f"{path}[]") for item in value]
+    if isinstance(value, list):
+        return [_blind_json_value(item, path=f"{path}[]") for item in value]
+    if isinstance(value, bool) or value is None or isinstance(value, str):
+        return value
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            _blind_error(code="S3_BLIND_DATA_JSON_INVALID", message=f"{path} contains a non-finite number")
+        return value
+    _blind_error(
+        code="S3_BLIND_DATA_JSON_INVALID",
+        message=f"{path} contains non-JSON value of type {type(value).__name__}",
+    )
+
+
+def _blind_integrity_mismatch(record: BlindDatasetRecord) -> dict[str, str] | None:
+    if record.expected_opaque_input_hash != record.opaque_input_hash:
+        return {
+            "field": "opaque_input_hash",
+            "expected_hash": record.expected_opaque_input_hash,
+            "actual_hash": record.opaque_input_hash,
+        }
+    if record.expected_truth_hash != record.truth_hash:
+        return {
+            "field": "truth_hash",
+            "expected_hash": record.expected_truth_hash,
+            "actual_hash": record.truth_hash,
+        }
+    return None
+
+
+def _blind_audit(audit_ledger: Any | None, event_type: str, payload: Mapping[str, Any]) -> None:
+    if audit_ledger is None:
+        return
+    append = getattr(audit_ledger, "append", None)
+    if not callable(append):
+        return
+    try:
+        append(event_type, dict(payload))
+    except Exception:
+        return
+
+
+def _runner_request_with_blind_stage(
+    validation_request: Mapping[str, Any],
+    blind_data_stage: BlindDataStage,
+) -> dict[str, Any]:
+    request = _runner_mapping(validation_request, "validation_request")
+    request["blind_data_handle"] = blind_data_stage.opaque_input_ref
+    if "blind_dataset_handle" in request:
+        request["blind_dataset_handle"] = blind_data_stage.opaque_input_ref
+    artifact_refs = list(request.get("artifact_refs") or [])
+    artifact_refs.append(blind_data_stage.opaque_input_ref)
+    request["artifact_refs"] = list(dict.fromkeys(str(ref) for ref in artifact_refs))
+    return request
+
+
+def _runner_blind_data_stage_payload(stage: BlindDataStage | None) -> dict[str, Any] | None:
+    if stage is None:
+        return None
+    return {
+        "stage_evidence_ref": stage.stage_evidence_ref,
+        "handle_hash": stage.handle_hash,
+        "vault_handle_hash": stage.handle_hash,
+        "opaque_input_ref": stage.opaque_input_ref,
+        "opaque_input_hash": stage.opaque_input_hash,
+        "truth_hash": stage.truth_hash,
+        "truth_retained_server_side": stage.truth_retained_server_side,
+        "truth_bytes_delivered_to_sandbox": stage.truth_bytes_delivered_to_sandbox,
+        "truth_hash_delivered_to_sandbox": stage.truth_hash_delivered_to_sandbox,
+    }
+
+
+def _runner_tc26_status(stage: BlindDataStage | None) -> dict[str, str]:
+    if (
+        stage is not None
+        and stage.truth_retained_server_side
+        and not stage.truth_bytes_delivered_to_sandbox
+        and not stage.truth_hash_delivered_to_sandbox
+    ):
+        return {"status": "PASS", "assertion": "only opaque blind input was staged into the nested sandbox"}
+    return {"status": "NOT_EVALUATED", "assertion": "no blind-data manager was configured for this run"}
 
 
 def _runner_error(
