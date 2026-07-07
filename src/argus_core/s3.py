@@ -29,6 +29,7 @@ from argusverify import (
 )
 from .canonical import canonical_json_bytes
 from .hashing import hash_bytes, hash_json
+from .s2 import S2ContractModelError, UnitsAlgebra
 from .s8 import InMemoryArtifactStore, Lineage, Producer
 from .s10 import (
     BudgetToken,
@@ -1641,6 +1642,15 @@ class S3CrossCodeCheckError(S3Error):
         self.message = message
 
 
+class S3PhysicalConsistencyCheckError(S3Error):
+    """Raised when the S3 PHYSICAL_CONSISTENCY check cannot be evaluated safely."""
+
+    def __init__(self, *, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
 @dataclass(frozen=True)
 class S3InjectionSample:
     sample_id: str
@@ -1665,6 +1675,20 @@ class S3CrossCodeSample:
     pipeline_units: str
     reference_units: str
     extrapolation_flag: bool = False
+
+
+@dataclass(frozen=True)
+class S3PhysicalConsistencySample:
+    sample_id: str
+    observable: str
+    value: float
+    units: str
+    expected_units: str
+    non_negative: bool = False
+    normalization_group: str | None = None
+    symmetry_transform: str | None = None
+    transformed_value: float | None = None
+    asymptotic_expected: float | None = None
 
 
 class S3InjectionCheckPlugin:
@@ -2034,6 +2058,115 @@ class S3CrossCodeCheckPlugin:
                 "cross_code_pass": cross_code_pass,
                 "numeric_coercion_performed": False,
                 "failure_reason": None if cross_code_pass else "AGREEMENT_OUT_OF_BOUNDS",
+            },
+        )
+
+
+class S3PhysicalConsistencyCheckPlugin:
+    """Concrete PHYSICAL_CONSISTENCY check plugin for S3-TC12/13/14/15/16."""
+
+    def __init__(
+        self,
+        *,
+        samples: tuple[S3PhysicalConsistencySample, ...],
+        plugin_version: str = "1.0.0",
+        units_algebra: UnitsAlgebra | None = None,
+    ) -> None:
+        self._samples = tuple(samples)
+        self._plugin_version = plugin_version
+        self._units_algebra = units_algebra or UnitsAlgebra()
+
+    def describe(self) -> CheckPluginDescriptor:
+        return CheckPluginDescriptor(
+            check="PHYSICAL_CONSISTENCY",
+            plugin_ref="argus.s3.plugins.physical_consistency",
+            plugin_version=self._plugin_version,
+            determinism="deterministic",
+            declared_inputs=(
+                "c2.units_contract",
+                "s3.frozen_pipeline_observations",
+                "s3.physical_consistency_profile",
+            ),
+        )
+
+    def run(self, ctx: CheckPluginContext) -> CheckResult:
+        if ctx.check_spec.check != "PHYSICAL_CONSISTENCY":
+            _s3_physical_consistency_error(
+                "S3_PHYSICAL_CONSISTENCY_CHECK_SPEC_MISMATCH",
+                f"physical-consistency plugin cannot run {ctx.check_spec.check}",
+            )
+        samples = _s3_physical_consistency_samples(self._samples)
+        mandatory_gates = _s3_physical_consistency_mandatory_gates(
+            ctx.check_spec.thresholds.get("mandatory_gates"),
+        )
+        normalization_epsilon = _s3_physical_consistency_non_negative(
+            ctx.check_spec.thresholds.get("normalization_epsilon", 0.0),
+            field="normalization_epsilon",
+        )
+        absolute_tolerance = _s3_physical_consistency_optional_non_negative(
+            ctx.check_spec.tolerance.get("absolute_tolerance"),
+            field="absolute_tolerance",
+        )
+        relative_tolerance = _s3_physical_consistency_optional_non_negative(
+            ctx.check_spec.tolerance.get("relative_tolerance"),
+            field="relative_tolerance",
+        )
+        if ("symmetry" in mandatory_gates or "asymptotic" in mandatory_gates) and (
+            absolute_tolerance is None and relative_tolerance is None
+        ):
+            _s3_physical_consistency_error(
+                "S3_PHYSICAL_CONSISTENCY_TOLERANCE_REQUIRED",
+                "PHYSICAL_CONSISTENCY symmetry/asymptotic gates require absolute_tolerance or relative_tolerance",
+            )
+
+        sub_gates = {
+            "dimensional": _s3_physical_consistency_dimensional_gate(
+                samples=samples,
+                units_algebra=self._units_algebra,
+            ),
+            "positivity": _s3_physical_consistency_positivity_gate(samples),
+            "normalization": _s3_physical_consistency_normalization_gate(
+                samples=samples,
+                epsilon=normalization_epsilon,
+            ),
+            "symmetry": _s3_physical_consistency_symmetry_gate(
+                samples=samples,
+                absolute_tolerance=absolute_tolerance,
+                relative_tolerance=relative_tolerance,
+            ),
+            "asymptotic": _s3_physical_consistency_asymptotic_gate(
+                samples=samples,
+                absolute_tolerance=absolute_tolerance,
+                relative_tolerance=relative_tolerance,
+            ),
+        }
+        _s3_physical_consistency_assert_mandatory_gates(mandatory_gates, sub_gates)
+        failed_mandatory = tuple(gate for gate in mandatory_gates if sub_gates[gate]["status"] != "PASS")
+        physical_consistency_pass = not failed_mandatory
+        failure_reasons = [
+            _S3_PHYSICAL_CONSISTENCY_FAILURE_REASONS[gate]
+            for gate in failed_mandatory
+        ]
+        test_cases = _s3_physical_consistency_test_cases(
+            mandatory_gates=mandatory_gates,
+            failed_gates=failed_mandatory,
+        )
+
+        return CheckResult(
+            check="PHYSICAL_CONSISTENCY",
+            status="PASS" if physical_consistency_pass else "FAIL",
+            metrics={
+                "test_cases": test_cases,
+                "sample_count": len(samples),
+                "sample_digest": _s3_physical_consistency_samples_digest(samples),
+                "mandatory_gates": list(mandatory_gates),
+                "physical_consistency_pass": physical_consistency_pass,
+                "failure_reasons": failure_reasons,
+                "sub_gates": sub_gates,
+                "normalization_epsilon": normalization_epsilon,
+                "absolute_tolerance": absolute_tolerance,
+                "relative_tolerance": relative_tolerance,
+                "units_algebra": "argus.s3.units_algebra.v1",
             },
         )
 
@@ -3870,6 +4003,407 @@ def _s3_cross_code_positive_int(value: Any, *, field: str) -> int:
 
 def _s3_cross_code_error(code: str, message: str) -> None:
     raise S3CrossCodeCheckError(code=code, message=message)
+
+
+_S3_PHYSICAL_CONSISTENCY_ALLOWED_GATES = frozenset(
+    {"dimensional", "positivity", "normalization", "symmetry", "asymptotic"}
+)
+_S3_PHYSICAL_CONSISTENCY_TEST_CASES = {
+    "dimensional": "S3-TC12",
+    "positivity": "S3-TC13",
+    "normalization": "S3-TC14",
+    "symmetry": "S3-TC15",
+    "asymptotic": "S3-TC16",
+}
+_S3_PHYSICAL_CONSISTENCY_FAILURE_REASONS = {
+    "dimensional": "DIMENSION_MISMATCH",
+    "positivity": "NEGATIVE_NON_NEGATIVE_OBSERVABLE",
+    "normalization": "NORMALIZATION_BOUND_EXCEEDED",
+    "symmetry": "SYMMETRY_INVARIANCE_VIOLATION",
+    "asymptotic": "ASYMPTOTIC_LIMIT_VIOLATION",
+}
+
+
+def _s3_physical_consistency_samples(
+    samples: tuple[S3PhysicalConsistencySample, ...],
+) -> tuple[dict[str, Any], ...]:
+    if not samples:
+        _s3_physical_consistency_error(
+            "S3_PHYSICAL_CONSISTENCY_SAMPLES_REQUIRED",
+            "PHYSICAL_CONSISTENCY requires at least one sample",
+        )
+    normalized: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for index, sample in enumerate(samples):
+        if not isinstance(sample, S3PhysicalConsistencySample):
+            _s3_physical_consistency_error(
+                "S3_PHYSICAL_CONSISTENCY_SAMPLE_INVALID",
+                f"sample at index {index} must be S3PhysicalConsistencySample",
+            )
+        sample_id = _s3_physical_consistency_text(sample.sample_id, field="sample_id")
+        if sample_id in seen:
+            _s3_physical_consistency_error(
+                "S3_PHYSICAL_CONSISTENCY_SAMPLE_DUPLICATE",
+                f"duplicate sample_id {sample_id}",
+            )
+        seen.add(sample_id)
+        symmetry_transform = _s3_physical_consistency_optional_text(
+            sample.symmetry_transform,
+            field=f"{sample_id}.symmetry_transform",
+        )
+        transformed_value = _s3_physical_consistency_optional_float(
+            sample.transformed_value,
+            field=f"{sample_id}.transformed_value",
+        )
+        if (symmetry_transform is None) != (transformed_value is None):
+            _s3_physical_consistency_error(
+                "S3_PHYSICAL_CONSISTENCY_SYMMETRY_PAIR_INVALID",
+                f"{sample_id} must provide both symmetry_transform and transformed_value",
+            )
+        normalized.append(
+            {
+                "sample_id": sample_id,
+                "observable": _s3_physical_consistency_text(sample.observable, field=f"{sample_id}.observable"),
+                "value": _s3_physical_consistency_float(sample.value, field=f"{sample_id}.value"),
+                "units": _s3_physical_consistency_text(sample.units, field=f"{sample_id}.units"),
+                "expected_units": _s3_physical_consistency_text(
+                    sample.expected_units,
+                    field=f"{sample_id}.expected_units",
+                ),
+                "non_negative": _s3_physical_consistency_bool(
+                    sample.non_negative,
+                    field=f"{sample_id}.non_negative",
+                ),
+                "normalization_group": _s3_physical_consistency_optional_text(
+                    sample.normalization_group,
+                    field=f"{sample_id}.normalization_group",
+                ),
+                "symmetry_transform": symmetry_transform,
+                "transformed_value": transformed_value,
+                "asymptotic_expected": _s3_physical_consistency_optional_float(
+                    sample.asymptotic_expected,
+                    field=f"{sample_id}.asymptotic_expected",
+                ),
+            }
+        )
+    return tuple(normalized)
+
+
+def _s3_physical_consistency_mandatory_gates(value: Any) -> tuple[str, ...]:
+    if not isinstance(value, list | tuple) or not value:
+        _s3_physical_consistency_error(
+            "S3_PHYSICAL_CONSISTENCY_MANDATORY_GATES_REQUIRED",
+            "PHYSICAL_CONSISTENCY requires a non-empty mandatory_gates list",
+        )
+    gates: list[str] = []
+    seen: set[str] = set()
+    for item in value:
+        if not isinstance(item, str) or not item.strip():
+            _s3_physical_consistency_error(
+                "S3_PHYSICAL_CONSISTENCY_MANDATORY_GATE_INVALID",
+                "mandatory_gates entries must be non-empty strings",
+            )
+        gate = item.strip().lower().replace("-", "_")
+        if gate not in _S3_PHYSICAL_CONSISTENCY_ALLOWED_GATES:
+            _s3_physical_consistency_error(
+                "S3_PHYSICAL_CONSISTENCY_MANDATORY_GATE_INVALID",
+                f"unsupported PHYSICAL_CONSISTENCY gate: {gate}",
+            )
+        if gate not in seen:
+            seen.add(gate)
+            gates.append(gate)
+    return tuple(gates)
+
+
+def _s3_physical_consistency_assert_mandatory_gates(
+    mandatory_gates: tuple[str, ...],
+    sub_gates: Mapping[str, Mapping[str, Any]],
+) -> None:
+    for gate in mandatory_gates:
+        result = sub_gates[gate]
+        if result["evaluated_count"] <= 0:
+            _s3_physical_consistency_error(
+                "S3_PHYSICAL_CONSISTENCY_MANDATORY_GATE_MISSING",
+                f"mandatory PHYSICAL_CONSISTENCY gate {gate} has no evaluable samples",
+            )
+
+
+def _s3_physical_consistency_dimensional_gate(
+    *,
+    samples: tuple[dict[str, Any], ...],
+    units_algebra: UnitsAlgebra,
+) -> dict[str, Any]:
+    mismatches: list[dict[str, Any]] = []
+    dimensions_seen: list[str] = []
+    for sample in samples:
+        try:
+            actual = units_algebra.dimension(sample["units"])
+            expected = units_algebra.dimension(sample["expected_units"])
+        except S2ContractModelError as exc:
+            _s3_physical_consistency_error(
+                "S3_PHYSICAL_CONSISTENCY_UNITS_INVALID",
+                f"invalid units for {sample['observable']}: {exc}",
+            )
+        actual_text = str(actual)
+        expected_text = str(expected)
+        dimensions_seen.append(actual_text)
+        dimensions_seen.append(expected_text)
+        if actual != expected:
+            mismatches.append(
+                {
+                    "observable": sample["observable"],
+                    "sample_digest": _s3_physical_consistency_sample_digest(sample),
+                    "units": sample["units"],
+                    "expected_units": sample["expected_units"],
+                    "actual_dimension": actual_text,
+                    "expected_dimension": expected_text,
+                }
+            )
+    return {
+        "status": "FAIL" if mismatches else "PASS",
+        "evaluated_count": len(samples),
+        "dimension_mismatch_count": len(mismatches),
+        "mismatches": mismatches,
+        "dimensions_seen": sorted(set(dimensions_seen)),
+    }
+
+
+def _s3_physical_consistency_positivity_gate(samples: tuple[dict[str, Any], ...]) -> dict[str, Any]:
+    checked = tuple(sample for sample in samples if sample["non_negative"])
+    offending = [
+        {
+            "observable": sample["observable"],
+            "sample_digest": _s3_physical_consistency_sample_digest(sample),
+            "value": sample["value"],
+        }
+        for sample in checked
+        if sample["value"] < 0
+    ]
+    values = tuple(sample["value"] for sample in checked)
+    return {
+        "status": "NOT_EVALUATED" if not checked else ("FAIL" if offending else "PASS"),
+        "evaluated_count": len(checked),
+        "negative_count": len(offending),
+        "min_output": min(values) if values else None,
+        "offending_points": offending,
+    }
+
+
+def _s3_physical_consistency_normalization_gate(
+    *,
+    samples: tuple[dict[str, Any], ...],
+    epsilon: float,
+) -> dict[str, Any]:
+    groups: dict[str, list[dict[str, Any]]] = {}
+    for sample in samples:
+        group = sample["normalization_group"]
+        if group is not None:
+            groups.setdefault(group, []).append(sample)
+    group_results: list[dict[str, Any]] = []
+    for group, group_samples in sorted(groups.items()):
+        total = sum(sample["value"] for sample in group_samples)
+        passed = total <= 1.0 + epsilon
+        group_results.append(
+            {
+                "group": group,
+                "sample_count": len(group_samples),
+                "sum": total,
+                "epsilon": epsilon,
+                "limit": 1.0 + epsilon,
+                "passed": passed,
+            }
+        )
+    failed = [result for result in group_results if not result["passed"]]
+    return {
+        "status": "NOT_EVALUATED" if not group_results else ("FAIL" if failed else "PASS"),
+        "evaluated_count": len(group_results),
+        "failed_group_count": len(failed),
+        "group_results": group_results,
+        "epsilon": epsilon,
+    }
+
+
+def _s3_physical_consistency_symmetry_gate(
+    *,
+    samples: tuple[dict[str, Any], ...],
+    absolute_tolerance: float | None,
+    relative_tolerance: float | None,
+) -> dict[str, Any]:
+    comparisons = tuple(sample for sample in samples if sample["transformed_value"] is not None)
+    results: list[dict[str, Any]] = []
+    for sample in comparisons:
+        tolerance = S3StatisticsLibrary.tolerance(
+            observed=sample["transformed_value"],
+            expected=sample["value"],
+            absolute_tolerance=absolute_tolerance,
+            relative_tolerance=relative_tolerance,
+        )
+        results.append(
+            {
+                "observable": sample["observable"],
+                "sample_digest": _s3_physical_consistency_sample_digest(sample),
+                "symmetry_transform": sample["symmetry_transform"],
+                "error": tolerance.error,
+                "tolerance": tolerance.tolerance,
+                "passed": tolerance.passed,
+            }
+        )
+    failed = [result for result in results if not result["passed"]]
+    max_error = max((result["error"] for result in results), default=0.0)
+    return {
+        "status": "NOT_EVALUATED" if not results else ("FAIL" if failed else "PASS"),
+        "evaluated_count": len(results),
+        "symmetry_pass": bool(results) and not failed,
+        "failed_count": len(failed),
+        "max_error": max_error,
+        "comparisons": results,
+    }
+
+
+def _s3_physical_consistency_asymptotic_gate(
+    *,
+    samples: tuple[dict[str, Any], ...],
+    absolute_tolerance: float | None,
+    relative_tolerance: float | None,
+) -> dict[str, Any]:
+    comparisons = tuple(sample for sample in samples if sample["asymptotic_expected"] is not None)
+    results: list[dict[str, Any]] = []
+    for sample in comparisons:
+        tolerance = S3StatisticsLibrary.tolerance(
+            observed=sample["value"],
+            expected=sample["asymptotic_expected"],
+            absolute_tolerance=absolute_tolerance,
+            relative_tolerance=relative_tolerance,
+        )
+        results.append(
+            {
+                "observable": sample["observable"],
+                "sample_digest": _s3_physical_consistency_sample_digest(sample),
+                "error": tolerance.error,
+                "tolerance": tolerance.tolerance,
+                "expected": sample["asymptotic_expected"],
+                "passed": tolerance.passed,
+            }
+        )
+    failed = [result for result in results if not result["passed"]]
+    max_error = max((result["error"] for result in results), default=0.0)
+    return {
+        "status": "NOT_EVALUATED" if not results else ("FAIL" if failed else "PASS"),
+        "evaluated_count": len(results),
+        "asymptotic_pass": bool(results) and not failed,
+        "failed_count": len(failed),
+        "max_error": max_error,
+        "comparisons": results,
+    }
+
+
+def _s3_physical_consistency_test_cases(
+    *,
+    mandatory_gates: tuple[str, ...],
+    failed_gates: tuple[str, ...],
+) -> list[str]:
+    gates = failed_gates if failed_gates else mandatory_gates
+    return [
+        _S3_PHYSICAL_CONSISTENCY_TEST_CASES[gate]
+        for gate in gates
+    ]
+
+
+def _s3_physical_consistency_samples_digest(samples: tuple[dict[str, Any], ...]) -> str:
+    return hash_json(
+        [
+            {
+                "sample_id": sample["sample_id"],
+                "observable": sample["observable"],
+                "value": sample["value"],
+                "units": sample["units"],
+                "expected_units": sample["expected_units"],
+                "non_negative": sample["non_negative"],
+                "normalization_group": sample["normalization_group"],
+                "symmetry_transform": sample["symmetry_transform"],
+                "transformed_value": sample["transformed_value"],
+                "asymptotic_expected": sample["asymptotic_expected"],
+            }
+            for sample in samples
+        ]
+    )
+
+
+def _s3_physical_consistency_sample_digest(sample: Mapping[str, Any]) -> str:
+    return hash_json(
+        {
+            "sample_id": sample["sample_id"],
+            "observable": sample["observable"],
+            "value": sample["value"],
+            "units": sample["units"],
+            "expected_units": sample["expected_units"],
+        }
+    )
+
+
+def _s3_physical_consistency_text(value: Any, *, field: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        _s3_physical_consistency_error(
+            "S3_PHYSICAL_CONSISTENCY_TEXT_INVALID",
+            f"{field} must be a non-empty string",
+        )
+    return value.strip()
+
+
+def _s3_physical_consistency_optional_text(value: Any, *, field: str) -> str | None:
+    if value is None:
+        return None
+    return _s3_physical_consistency_text(value, field=field)
+
+
+def _s3_physical_consistency_bool(value: Any, *, field: str) -> bool:
+    if not isinstance(value, bool):
+        _s3_physical_consistency_error(
+            "S3_PHYSICAL_CONSISTENCY_BOOL_INVALID",
+            f"{field} must be boolean",
+        )
+    return value
+
+
+def _s3_physical_consistency_float(value: Any, *, field: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        _s3_physical_consistency_error(
+            "S3_PHYSICAL_CONSISTENCY_VALUE_INVALID",
+            f"{field} must be numeric",
+        )
+    numeric = float(value)
+    if not math.isfinite(numeric):
+        _s3_physical_consistency_error(
+            "S3_PHYSICAL_CONSISTENCY_VALUE_NONFINITE",
+            f"{field} must be finite",
+        )
+    return numeric
+
+
+def _s3_physical_consistency_optional_float(value: Any, *, field: str) -> float | None:
+    if value is None:
+        return None
+    return _s3_physical_consistency_float(value, field=field)
+
+
+def _s3_physical_consistency_non_negative(value: Any, *, field: str) -> float:
+    numeric = _s3_physical_consistency_float(value, field=field)
+    if numeric < 0:
+        _s3_physical_consistency_error(
+            "S3_PHYSICAL_CONSISTENCY_VALUE_INVALID",
+            f"{field} must be non-negative",
+        )
+    return numeric
+
+
+def _s3_physical_consistency_optional_non_negative(value: Any, *, field: str) -> float | None:
+    if value is None:
+        return None
+    return _s3_physical_consistency_non_negative(value, field=field)
+
+
+def _s3_physical_consistency_error(code: str, message: str) -> None:
+    raise S3PhysicalConsistencyCheckError(code=code, message=message)
 
 
 @dataclass(frozen=True)
