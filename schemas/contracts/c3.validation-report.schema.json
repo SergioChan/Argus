@@ -26,6 +26,53 @@
       "type": "string",
       "enum": ["ran-toy", "recapitulated-known", "novel-needs-human"]
     },
+    "ClaimTieringJustification": {
+      "type": "object",
+      "required": [
+        "requested_tier",
+        "rule_ids",
+        "test_cases",
+        "failing_checks",
+        "inconclusive_checks",
+        "degradations",
+        "aggregate_passed",
+        "reward_effect",
+        "reward_admissible"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "requested_tier": { "$ref": "#/$defs/ClaimTier" },
+        "capped_from": { "$ref": "#/$defs/ClaimTier" },
+        "rule_ids": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "uniqueItems": true
+        },
+        "test_cases": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "uniqueItems": true
+        },
+        "failing_checks": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "uniqueItems": true
+        },
+        "inconclusive_checks": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "uniqueItems": true
+        },
+        "degradations": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "uniqueItems": true
+        },
+        "aggregate_passed": { "type": "boolean" },
+        "reward_effect": { "type": "string", "enum": ["eligible", "non-improvement"] },
+        "reward_admissible": { "type": "boolean" }
+      }
+    },
     "CheckStatus": {
       "type": "string",
       "enum": ["PASS", "FAIL", "INCONCLUSIVE", "REFUSED"]
@@ -176,6 +223,32 @@
         },
         "claim_tier": { "$ref": "#/$defs/ClaimTier" },
         "claim_tier_is_candidate": { "type": "boolean" },
+        "claim_tier_justification": {
+          "$ref": "#/$defs/ClaimTieringJustification",
+          "default": {
+            "requested_tier": "novel-needs-human",
+            "rule_ids": [],
+            "test_cases": [],
+            "failing_checks": [],
+            "inconclusive_checks": [],
+            "degradations": [],
+            "aggregate_passed": false,
+            "reward_effect": "non-improvement",
+            "reward_admissible": false
+          }
+        },
+        "degradations": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "uniqueItems": true,
+          "default": []
+        },
+        "event_intents": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "uniqueItems": true,
+          "default": []
+        },
         "signature": {
           "type": "object",
           "required": ["algorithm", "key_id", "value"],

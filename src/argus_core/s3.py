@@ -1586,6 +1586,275 @@ class CheckResult:
     dependencies: tuple[str, ...] = ()
 
 
+S3_CLAIM_TIERS = ("ran-toy", "recapitulated-known", "novel-needs-human")
+S3_CHECK_STATUSES = ("PASS", "FAIL", "INCONCLUSIVE", "REFUSED")
+S3_RECAP_REQUIRED_CHECKS = ("INJECTION", "NULL_CONTROL", "PHYSICAL_CONSISTENCY", "CALIBRATION")
+S3_NOVEL_REQUIRED_CHECKS = S3_RECAP_REQUIRED_CHECKS + ("CROSS_CODE", "LEAKAGE")
+S3_TIER_ORDER = {tier: index for index, tier in enumerate(S3_CLAIM_TIERS)}
+
+
+class S3ClaimTieringError(S3Error):
+    """Raised when S3 claim tiering cannot fail closed deterministically."""
+
+    def __init__(self, *, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
+@dataclass(frozen=True)
+class S3ClaimTieringDecision:
+    claim_tier: str
+    claim_tier_is_candidate: bool
+    aggregate_passed: bool
+    reward_effect: str
+    reward_admissible: bool
+    rule_ids: tuple[str, ...]
+    test_cases: tuple[str, ...]
+    degradations: tuple[str, ...]
+    event_intents: tuple[str, ...]
+    checks: tuple[CheckResult, ...]
+    requested_tier: str
+    capped_from: str | None = None
+    failing_checks: tuple[str, ...] = ()
+    inconclusive_checks: tuple[str, ...] = ()
+
+    def as_report_fields(self) -> dict[str, Any]:
+        justification: dict[str, Any] = {
+            "requested_tier": self.requested_tier,
+            "rule_ids": list(self.rule_ids),
+            "test_cases": list(self.test_cases),
+            "failing_checks": list(self.failing_checks),
+            "inconclusive_checks": list(self.inconclusive_checks),
+            "degradations": list(self.degradations),
+            "aggregate_passed": self.aggregate_passed,
+            "reward_effect": self.reward_effect,
+            "reward_admissible": self.reward_admissible,
+        }
+        if self.capped_from is not None:
+            justification["capped_from"] = self.capped_from
+        return {
+            "claim_tier_justification": justification,
+            "degradations": list(self.degradations),
+            "event_intents": list(self.event_intents),
+        }
+
+
+class S3ClaimTieringRuleEngine:
+    """Deterministic monotone rule engine for S3 claim tier assignment."""
+
+    def evaluate(
+        self,
+        *,
+        checks: tuple[CheckResult, ...],
+        independence_attestation: IndependenceAttestation | None = None,
+        requested_tier: str = "novel-needs-human",
+        perturbation_outcome: "PerturbationPairOutcome | None" = None,
+    ) -> S3ClaimTieringDecision:
+        if requested_tier not in S3_TIER_ORDER:
+            raise S3ClaimTieringError(
+                code="UNKNOWN_REQUESTED_TIER",
+                message=f"requested_tier must be one of {S3_CLAIM_TIERS}",
+            )
+
+        checks_by_name = self._checks_by_name(checks)
+        degradations, test_cases, max_claim_tier = self._extract_check_metadata(checks)
+        statuses = {name: check.status for name, check in checks_by_name.items()}
+        failing_checks = tuple(name for name in sorted(statuses) if statuses[name] in {"FAIL", "REFUSED"})
+        inconclusive_checks = tuple(name for name in sorted(statuses) if statuses[name] == "INCONCLUSIVE")
+        perturbation_outcome = perturbation_outcome or PerturbationPairOutcome((), ())
+        aggregate_passed = _aggregate_passed(checks, perturbation_outcome)
+
+        rule_ids: list[str] = ["tier.default_ran_toy"]
+        event_intents: list[str] = ["s3.report.issued"]
+        triggered_cases = list(test_cases)
+        claim_tier = "ran-toy"
+        reward_effect = "non-improvement"
+        reward_admissible = False
+        capped_from: str | None = None
+
+        recap_statuses = {name: statuses.get(name) for name in S3_RECAP_REQUIRED_CHECKS}
+        recap_passed = all(value == "PASS" for value in recap_statuses.values())
+        recap_inconclusive = tuple(
+            name for name, value in recap_statuses.items() if value in {"INCONCLUSIVE", "REFUSED"}
+        )
+        recap_failed = tuple(name for name, value in recap_statuses.items() if value == "FAIL")
+
+        if recap_inconclusive:
+            _append_unique(rule_ids, "tier.mandatory_inconclusive_non_improvement")
+            _append_unique(triggered_cases, "S3-TC37")
+        elif recap_failed:
+            _append_unique(rule_ids, "tier.recap_gate_failed")
+        elif recap_passed:
+            claim_tier = "recapitulated-known"
+            _append_unique(rule_ids, "tier.recap_required_checks_pass")
+
+            leakage_status = statuses.get("LEAKAGE")
+            cross_code_status = statuses.get("CROSS_CODE")
+            independence_satisfied = (
+                _novel_independence_satisfied(independence_attestation)
+                if independence_attestation is not None
+                else False
+            )
+
+            if leakage_status == "FAIL":
+                _append_unique(rule_ids, "tier.leakage_fail_caps_novel")
+                _append_unique(triggered_cases, "S3-TC21")
+            elif cross_code_status == "INCONCLUSIVE":
+                if "INDEPENDENCE_UNAVAILABLE" in degradations:
+                    _append_unique(rule_ids, "tier.independence_unavailable_cap")
+                    _append_unique(triggered_cases, "S3-TC23")
+                    _append_unique(degradations, "INDEPENDENCE_UNAVAILABLE")
+                else:
+                    claim_tier = "ran-toy"
+                    _append_unique(rule_ids, "tier.mandatory_inconclusive_non_improvement")
+                    _append_unique(triggered_cases, "S3-TC37")
+            elif cross_code_status in {"FAIL", "REFUSED"}:
+                _append_unique(rule_ids, "tier.cross_code_not_pass_cap")
+            elif leakage_status in {"INCONCLUSIVE", "REFUSED"}:
+                _append_unique(rule_ids, "tier.leakage_not_pass_cap")
+            elif cross_code_status == "PASS" and leakage_status == "PASS":
+                if independence_satisfied:
+                    if aggregate_passed:
+                        claim_tier = "novel-needs-human"
+                        reward_effect = "eligible"
+                        reward_admissible = True
+                        _append_unique(rule_ids, "tier.novel_candidate_only")
+                        _append_unique(triggered_cases, "S3-TC22")
+                        _append_unique(event_intents, "s3.report.candidate_novel")
+                    else:
+                        claim_tier = "ran-toy"
+                        _append_unique(rule_ids, "tier.aggregate_failure_non_improvement")
+                else:
+                    _append_unique(rule_ids, "tier.independence_unavailable_cap")
+                    _append_unique(triggered_cases, "S3-TC23")
+                    _append_unique(degradations, "INDEPENDENCE_UNAVAILABLE")
+            elif not aggregate_passed:
+                claim_tier = "ran-toy"
+                _append_unique(rule_ids, "tier.aggregate_failure_non_improvement")
+
+        if max_claim_tier is not None and S3_TIER_ORDER[claim_tier] > S3_TIER_ORDER[max_claim_tier]:
+            capped_from = claim_tier
+            claim_tier = max_claim_tier
+            reward_effect = "non-improvement"
+            reward_admissible = False
+            _append_unique(rule_ids, "tier.check_max_claim_tier_cap")
+
+        if S3_TIER_ORDER[claim_tier] > S3_TIER_ORDER[requested_tier]:
+            capped_from = capped_from or claim_tier
+            claim_tier = requested_tier
+            reward_effect = "non-improvement"
+            reward_admissible = False
+            _append_unique(rule_ids, "tier.requested_tier_cap")
+
+        claim_tier_is_candidate = claim_tier == "novel-needs-human" and aggregate_passed
+        if not claim_tier_is_candidate and "s3.report.candidate_novel" in event_intents:
+            event_intents.remove("s3.report.candidate_novel")
+        if claim_tier != "novel-needs-human":
+            reward_effect = "non-improvement"
+            reward_admissible = False
+
+        return S3ClaimTieringDecision(
+            claim_tier=claim_tier,
+            claim_tier_is_candidate=claim_tier_is_candidate,
+            aggregate_passed=aggregate_passed,
+            reward_effect=reward_effect,
+            reward_admissible=reward_admissible,
+            rule_ids=tuple(rule_ids),
+            test_cases=tuple(triggered_cases),
+            degradations=tuple(degradations),
+            event_intents=tuple(event_intents),
+            checks=checks,
+            requested_tier=requested_tier,
+            capped_from=capped_from,
+            failing_checks=failing_checks,
+            inconclusive_checks=inconclusive_checks,
+        )
+
+    def _checks_by_name(self, checks: tuple[CheckResult, ...]) -> dict[str, CheckResult]:
+        checks_by_name: dict[str, CheckResult] = {}
+        for check in checks:
+            if not check.check:
+                raise S3ClaimTieringError(code="INVALID_CHECK_NAME", message="check name must be non-empty")
+            if check.check in checks_by_name:
+                raise S3ClaimTieringError(code="DUPLICATE_CHECK", message=f"duplicate check: {check.check}")
+            if check.status not in S3_CHECK_STATUSES:
+                raise S3ClaimTieringError(
+                    code="UNKNOWN_CHECK_STATUS",
+                    message=f"{check.check} status must be one of {S3_CHECK_STATUSES}",
+                )
+            checks_by_name[check.check] = check
+        return checks_by_name
+
+    def _extract_check_metadata(self, checks: tuple[CheckResult, ...]) -> tuple[list[str], list[str], str | None]:
+        degradations: list[str] = []
+        test_cases: list[str] = []
+        max_claim_tier: str | None = None
+        for check in checks:
+            metrics = check.metrics or {}
+            if not isinstance(metrics, dict):
+                raise S3ClaimTieringError(
+                    code="INVALID_CHECK_METRICS",
+                    message=f"{check.check} metrics must be a JSON object",
+                )
+            self._append_metric_strings(metrics.get("degradations", ()), degradations, "degradations", check.check)
+            degradation = metrics.get("degradation")
+            if degradation is not None:
+                if not isinstance(degradation, str) or not degradation:
+                    raise S3ClaimTieringError(
+                        code="INVALID_CHECK_METRICS",
+                        message=f"{check.check} degradation must be a non-empty string",
+                    )
+                _append_unique(degradations, degradation)
+            self._append_metric_strings(metrics.get("test_cases", ()), test_cases, "test_cases", check.check)
+            test_case = metrics.get("test_case")
+            if test_case is not None:
+                if not isinstance(test_case, str) or not test_case:
+                    raise S3ClaimTieringError(
+                        code="INVALID_CHECK_METRICS",
+                        message=f"{check.check} test_case must be a non-empty string",
+                    )
+                _append_unique(test_cases, test_case)
+            check_cap = metrics.get("max_claim_tier")
+            if check_cap is not None:
+                if check_cap not in S3_TIER_ORDER:
+                    raise S3ClaimTieringError(
+                        code="UNKNOWN_MAX_CLAIM_TIER",
+                        message=f"{check.check} max_claim_tier must be one of {S3_CLAIM_TIERS}",
+                    )
+                if max_claim_tier is None or S3_TIER_ORDER[check_cap] < S3_TIER_ORDER[max_claim_tier]:
+                    max_claim_tier = check_cap
+        return degradations, test_cases, max_claim_tier
+
+    @staticmethod
+    def _append_metric_strings(raw: Any, target: list[str], field: str, check_name: str) -> None:
+        if raw in (None, ()):
+            return
+        if not isinstance(raw, (list, tuple)):
+            raise S3ClaimTieringError(
+                code="INVALID_CHECK_METRICS",
+                message=f"{check_name} {field} must be a list of non-empty strings",
+            )
+        for value in raw:
+            if not isinstance(value, str) or not value:
+                raise S3ClaimTieringError(
+                    code="INVALID_CHECK_METRICS",
+                    message=f"{check_name} {field} must contain only non-empty strings",
+                )
+            _append_unique(target, value)
+
+    @staticmethod
+    def _independence_unavailable(attestation: IndependenceAttestation | None) -> bool:
+        if attestation is None:
+            return True
+        selected_ids = tuple(attestation.selected_entity_ids)
+        return (
+            len(selected_ids) < attestation.min_independent
+            or not attestation.lineage_disjoint
+            or attestation.correlation_warning
+        )
+
+
 @dataclass(frozen=True)
 class CheckPluginDescriptor:
     check: str
@@ -5505,20 +5774,23 @@ class S3Verifier:
         )
         perturbation_outcome = perturbation_outcome or PerturbationPairOutcome((), ())
         independence_attestation = independence_attestation or _default_independence_attestation(challenger_ids)
-        aggregate_passed = _aggregate_passed(checks, perturbation_outcome)
-        base_claim_tier = tier_from_checks(checks) if aggregate_passed else "ran-toy"
-        claim_tier = _tier_after_independence_gate(base_claim_tier, independence_attestation)
+        tier_decision = S3ClaimTieringRuleEngine().evaluate(
+            checks=checks,
+            independence_attestation=independence_attestation,
+            requested_tier="novel-needs-human",
+            perturbation_outcome=perturbation_outcome,
+        )
         report = {
             "report_id": str(uuid4()),
             "profile_ref": profile_ref,
             "frozen_pipeline_ref": frozen_pipeline_ref,
             "checks": [_check_to_contract(check) for check in checks],
             "aggregate": {
-                "passed": aggregate_passed,
+                "passed": tier_decision.aggregate_passed,
                 "score": _aggregate_score(checks),
             },
-            "claim_tier": claim_tier,
-            "claim_tier_is_candidate": claim_tier == "novel-needs-human",
+            "claim_tier": tier_decision.claim_tier,
+            "claim_tier_is_candidate": tier_decision.claim_tier_is_candidate,
             "perturbation_pairs": [_dataclass_contract(pair) for pair in perturbation_outcome.perturbation_pairs],
             "insensitivity_flags": [_dataclass_contract(flag) for flag in perturbation_outcome.insensitivity_flags],
             "challenger_panel": {
@@ -5533,6 +5805,7 @@ class S3Verifier:
             "referee": referee,
             "debate_ref": debate_ref,
         }
+        report.update(tier_decision.as_report_fields())
         return self.signer.sign(report)
 
 
@@ -6625,13 +6898,19 @@ def attest_challenger_independence(
 
 
 def tier_from_checks(checks: tuple[CheckResult, ...]) -> str:
-    statuses = {check.check: check.status for check in checks}
-    recap_required = ("INJECTION", "NULL_CONTROL", "PHYSICAL_CONSISTENCY", "CALIBRATION")
-    if not all(statuses.get(check) == "PASS" for check in recap_required):
-        return "ran-toy"
-    if statuses.get("CROSS_CODE") == "PASS" and statuses.get("LEAKAGE") == "PASS":
-        return "novel-needs-human"
-    return "recapitulated-known"
+    trusted_default = IndependenceAttestation(
+        candidate_ids=("legacy-cross-code-a", "legacy-cross-code-b"),
+        selected_entity_ids=("legacy-cross-code-a", "legacy-cross-code-b"),
+        min_independent=2,
+        lineage_disjoint=True,
+        correlation_warning=False,
+        excluded_tags=(),
+    )
+    return S3ClaimTieringRuleEngine().evaluate(
+        checks=checks,
+        independence_attestation=trusted_default,
+        requested_tier="novel-needs-human",
+    ).claim_tier
 
 
 def _tier_after_independence_gate(claim_tier: str, attestation: IndependenceAttestation) -> str:
@@ -6654,6 +6933,11 @@ def _novel_independence_satisfied(attestation: IndependenceAttestation) -> bool:
         and attestation.lineage_disjoint
         and not attestation.correlation_warning
     )
+
+
+def _append_unique(items: list[str], value: str) -> None:
+    if value not in items:
+        items.append(value)
 
 
 def _aggregate_passed(checks: tuple[CheckResult, ...], perturbation_outcome: PerturbationPairOutcome) -> bool:

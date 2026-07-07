@@ -86,7 +86,7 @@ export const contracts = [
       "S11",
       "S12"
     ],
-    "schema_sha256": "sha256:ffcf9e88f2d4f2d481cca9cd4e4abca740e6ee519c0b7f5aec1abccc70a88769"
+    "schema_sha256": "sha256:e1f50884f3e3d2aa1e3456373047ea76452b047ca9ceb518d839d37226103f11"
   },
   {
     "id": "C4",
