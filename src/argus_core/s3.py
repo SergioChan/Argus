@@ -1651,6 +1651,15 @@ class S3PhysicalConsistencyCheckError(S3Error):
         self.message = message
 
 
+class S3LeakageCheckError(S3Error):
+    """Raised when the S3 LEAKAGE check cannot be evaluated safely."""
+
+    def __init__(self, *, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
 @dataclass(frozen=True)
 class S3InjectionSample:
     sample_id: str
@@ -1689,6 +1698,31 @@ class S3PhysicalConsistencySample:
     symmetry_transform: str | None = None
     transformed_value: float | None = None
     asymptotic_expected: float | None = None
+
+
+@dataclass(frozen=True)
+class S3LeakageTextItem:
+    item_id: str
+    text: str
+    source_ref: str = ""
+
+
+@dataclass(frozen=True)
+class S3LeakageTargetRow:
+    row_id: str
+    features: Mapping[str, Any]
+    label_hash: str
+
+
+@dataclass(frozen=True)
+class S3LeakageRewardLoopEvidence:
+    variant_id: str
+    leaked_label_variant_score: float
+    baseline_score: float
+    shuffled_null_collapsed: bool
+    aggregate_passed: bool
+    s4_rejected_variant: bool
+    s4_improvement_accepted: bool
 
 
 class S3InjectionCheckPlugin:
@@ -2167,6 +2201,135 @@ class S3PhysicalConsistencyCheckPlugin:
                 "absolute_tolerance": absolute_tolerance,
                 "relative_tolerance": relative_tolerance,
                 "units_algebra": "argus.s3.units_algebra.v1",
+            },
+        )
+
+
+class S3LeakageCheckPlugin:
+    """Concrete LEAKAGE / contamination screen plugin for S3-TC17/18/48."""
+
+    def __init__(
+        self,
+        *,
+        training_inputs: tuple[S3LeakageTextItem, ...] = (),
+        blind_test_items: tuple[S3LeakageTextItem, ...] = (),
+        candidate_text: str | None = None,
+        contamination_index: ContaminationIndex | None = None,
+        contamination_snapshot: FrozenContaminationSnapshot | None = None,
+        target_leakage_rows: tuple[S3LeakageTargetRow, ...] = (),
+        reward_loop_evidence: S3LeakageRewardLoopEvidence | None = None,
+        plugin_version: str = "1.0.0",
+    ) -> None:
+        self._training_inputs = tuple(training_inputs)
+        self._blind_test_items = tuple(blind_test_items)
+        self._candidate_text = candidate_text
+        self._contamination_index = contamination_index
+        self._contamination_snapshot = contamination_snapshot
+        self._target_leakage_rows = tuple(target_leakage_rows)
+        self._reward_loop_evidence = reward_loop_evidence
+        self._plugin_version = plugin_version
+
+    def describe(self) -> CheckPluginDescriptor:
+        return CheckPluginDescriptor(
+            check="LEAKAGE",
+            plugin_ref="argus.s3.plugins.leakage",
+            plugin_version=self._plugin_version,
+            determinism="deterministic",
+            declared_inputs=(
+                "c4.training_lineage",
+                "s3.blind_test_manifest",
+                "s6.frozen_contamination_index",
+                "s4.reward_loop_evidence",
+            ),
+        )
+
+    def run(self, ctx: CheckPluginContext) -> CheckResult:
+        if ctx.check_spec.check != "LEAKAGE":
+            _s3_leakage_error(
+                "S3_LEAKAGE_CHECK_SPEC_MISMATCH",
+                f"leakage plugin cannot run {ctx.check_spec.check}",
+            )
+        mandatory_gates = _s3_leakage_mandatory_gates(ctx.check_spec.thresholds.get("mandatory_gates"))
+        overlap_threshold = _s3_leakage_probability(
+            ctx.check_spec.thresholds.get("overlap_threshold"),
+            field="overlap_threshold",
+        )
+        frozen_index_threshold = _s3_leakage_probability(
+            ctx.check_spec.thresholds.get("frozen_index_threshold"),
+            field="frozen_index_threshold",
+        )
+        target_purity_threshold = _s3_leakage_probability(
+            ctx.check_spec.thresholds.get("target_leakage_purity_threshold"),
+            field="target_leakage_purity_threshold",
+        )
+        target_min_support = _s3_leakage_positive_int(
+            ctx.check_spec.thresholds.get("target_leakage_min_support", 2),
+            field="target_leakage_min_support",
+        )
+        shingle_size = _s3_leakage_positive_int(
+            ctx.check_spec.thresholds.get("shingle_size", 5),
+            field="shingle_size",
+        )
+        min_reward_score_delta = _s3_leakage_non_negative(
+            ctx.check_spec.thresholds.get("min_reward_score_delta", 0.0),
+            field="min_reward_score_delta",
+        )
+
+        sub_gates = {
+            "train_test_overlap": _s3_leakage_train_test_overlap_gate(
+                training_inputs=_s3_leakage_text_items(self._training_inputs, collection="training_inputs"),
+                blind_test_items=_s3_leakage_text_items(self._blind_test_items, collection="blind_test_items"),
+                threshold=overlap_threshold,
+                shingle_size=shingle_size,
+            ),
+            "frozen_index_overlap": _s3_leakage_frozen_index_gate(
+                candidate_text=self._candidate_text,
+                contamination_index=self._contamination_index,
+                contamination_snapshot=self._contamination_snapshot,
+                threshold=frozen_index_threshold,
+            ),
+            "target_leakage": _s3_leakage_target_gate(
+                rows=_s3_leakage_target_rows(self._target_leakage_rows),
+                purity_threshold=target_purity_threshold,
+                min_support=target_min_support,
+            ),
+            "reward_loop_rejection": _s3_leakage_reward_loop_gate(
+                evidence=_s3_leakage_reward_loop_evidence(self._reward_loop_evidence),
+                min_reward_score_delta=min_reward_score_delta,
+            ),
+        }
+        _s3_leakage_assert_mandatory_gates(mandatory_gates, sub_gates)
+        failed_gates = tuple(gate for gate, result in sub_gates.items() if result["status"] == "FAIL")
+        leakage_pass = not failed_gates
+        test_cases = _s3_leakage_test_cases(
+            mandatory_gates=mandatory_gates,
+            failed_gates=failed_gates,
+        )
+        failure_reasons = [
+            _S3_LEAKAGE_FAILURE_REASONS[gate]
+            for gate in failed_gates
+        ]
+        novelty_blocked = not leakage_pass
+
+        return CheckResult(
+            check="LEAKAGE",
+            status="PASS" if leakage_pass else "FAIL",
+            metrics={
+                "test_cases": test_cases,
+                "leakage_pass": leakage_pass,
+                "novelty_blocked": novelty_blocked,
+                "max_claim_tier": "novel-needs-human" if leakage_pass else "recapitulated-known",
+                "failure_reasons": failure_reasons,
+                "mandatory_gates": list(mandatory_gates),
+                "sub_gates": sub_gates,
+                "overlap_threshold": overlap_threshold,
+                "frozen_index_threshold": frozen_index_threshold,
+                "target_leakage_purity_threshold": target_purity_threshold,
+                "target_leakage_min_support": target_min_support,
+                "shingle_size": shingle_size,
+                "min_reward_score_delta": min_reward_score_delta,
+                "content_exposed": False,
+                "blind_labels_exposed": False,
             },
         )
 
@@ -4404,6 +4567,527 @@ def _s3_physical_consistency_optional_non_negative(value: Any, *, field: str) ->
 
 def _s3_physical_consistency_error(code: str, message: str) -> None:
     raise S3PhysicalConsistencyCheckError(code=code, message=message)
+
+
+_S3_LEAKAGE_ALLOWED_GATES = frozenset(
+    {"train_test_overlap", "frozen_index_overlap", "target_leakage", "reward_loop_rejection"}
+)
+_S3_LEAKAGE_TEST_CASES = {
+    "train_test_overlap": "S3-TC17",
+    "frozen_index_overlap": "S3-TC18",
+    "target_leakage": "S3-TC48",
+    "reward_loop_rejection": "S3-TC48",
+}
+_S3_LEAKAGE_FAILURE_REASONS = {
+    "train_test_overlap": "TRAIN_TEST_OVERLAP",
+    "frozen_index_overlap": "FROZEN_INDEX_OVERLAP",
+    "target_leakage": "TARGET_LEAKAGE",
+    "reward_loop_rejection": "REWARD_LOOP_LEAKED_LABEL_VARIANT",
+}
+
+
+def _s3_leakage_mandatory_gates(value: Any) -> tuple[str, ...]:
+    if not isinstance(value, list | tuple) or not value:
+        _s3_leakage_error(
+            "S3_LEAKAGE_MANDATORY_GATES_REQUIRED",
+            "LEAKAGE requires a non-empty mandatory_gates list",
+        )
+    gates: list[str] = []
+    seen: set[str] = set()
+    for item in value:
+        if not isinstance(item, str) or not item.strip():
+            _s3_leakage_error(
+                "S3_LEAKAGE_MANDATORY_GATE_INVALID",
+                "mandatory_gates entries must be non-empty strings",
+            )
+        gate = item.strip().lower().replace("-", "_")
+        if gate not in _S3_LEAKAGE_ALLOWED_GATES:
+            _s3_leakage_error(
+                "S3_LEAKAGE_MANDATORY_GATE_INVALID",
+                f"unsupported LEAKAGE gate: {gate}",
+            )
+        if gate not in seen:
+            seen.add(gate)
+            gates.append(gate)
+    return tuple(gates)
+
+
+def _s3_leakage_assert_mandatory_gates(
+    mandatory_gates: tuple[str, ...],
+    sub_gates: Mapping[str, Mapping[str, Any]],
+) -> None:
+    for gate in mandatory_gates:
+        result = sub_gates[gate]
+        if result["evaluated_count"] <= 0:
+            _s3_leakage_error(
+                "S3_LEAKAGE_MANDATORY_GATE_MISSING",
+                f"mandatory LEAKAGE gate {gate} has no evaluable inputs",
+            )
+
+
+def _s3_leakage_text_items(
+    items: tuple[S3LeakageTextItem, ...],
+    *,
+    collection: str,
+) -> tuple[dict[str, Any], ...]:
+    normalized: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for index, item in enumerate(items):
+        if not isinstance(item, S3LeakageTextItem):
+            _s3_leakage_error(
+                "S3_LEAKAGE_TEXT_ITEM_INVALID",
+                f"{collection}[{index}] must be S3LeakageTextItem",
+            )
+        item_id = _s3_leakage_text(item.item_id, field=f"{collection}[{index}].item_id")
+        if item_id in seen:
+            _s3_leakage_error(
+                "S3_LEAKAGE_TEXT_ITEM_DUPLICATE",
+                f"duplicate {collection} item_id {item_id}",
+            )
+        seen.add(item_id)
+        text = _s3_leakage_text(item.text, field=f"{item_id}.text")
+        source_ref = _s3_leakage_optional_text(item.source_ref, field=f"{item_id}.source_ref") or ""
+        normalized.append(
+            {
+                "item_id": item_id,
+                "text_hash": hash_bytes(text.encode("utf-8")),
+                "source_ref": source_ref,
+                "shingles": text,
+            }
+        )
+    return tuple(normalized)
+
+
+def _s3_leakage_train_test_overlap_gate(
+    *,
+    training_inputs: tuple[dict[str, Any], ...],
+    blind_test_items: tuple[dict[str, Any], ...],
+    threshold: float,
+    shingle_size: int,
+) -> dict[str, Any]:
+    if not training_inputs or not blind_test_items:
+        return {
+            "status": "NOT_EVALUATED",
+            "evaluated_count": 0,
+            "training_item_count": len(training_inputs),
+            "blind_item_count": len(blind_test_items),
+            "overlap_count": 0,
+            "overlap_set": [],
+            "method": "blake3-shingle-jaccard",
+        }
+    training_shingles = {
+        item["item_id"]: _s3_leakage_hashed_shingles(item["shingles"], shingle_size=shingle_size)
+        for item in training_inputs
+    }
+    blind_shingles = {
+        item["item_id"]: _s3_leakage_hashed_shingles(item["shingles"], shingle_size=shingle_size)
+        for item in blind_test_items
+    }
+    overlaps: list[dict[str, Any]] = []
+    for training in training_inputs:
+        for blind in blind_test_items:
+            similarity = _s3_leakage_jaccard(
+                training_shingles[training["item_id"]],
+                blind_shingles[blind["item_id"]],
+            )
+            if similarity >= threshold:
+                overlaps.append(
+                    {
+                        "training_id": training["item_id"],
+                        "blind_id": blind["item_id"],
+                        "similarity": similarity,
+                        "threshold": threshold,
+                        "training_source_ref": training["source_ref"],
+                        "blind_source_ref": blind["source_ref"],
+                        "pair_digest": hash_json(
+                            {
+                                "training_id": training["item_id"],
+                                "blind_id": blind["item_id"],
+                                "training_text_hash": training["text_hash"],
+                                "blind_text_hash": blind["text_hash"],
+                            }
+                        ),
+                    }
+                )
+    return {
+        "status": "FAIL" if overlaps else "PASS",
+        "evaluated_count": len(training_inputs) * len(blind_test_items),
+        "training_item_count": len(training_inputs),
+        "blind_item_count": len(blind_test_items),
+        "training_digest": _s3_leakage_text_items_digest(training_inputs),
+        "blind_digest": _s3_leakage_text_items_digest(blind_test_items),
+        "overlap_count": len(overlaps),
+        "overlap_set": overlaps,
+        "method": "blake3-shingle-jaccard",
+    }
+
+
+def _s3_leakage_frozen_index_gate(
+    *,
+    candidate_text: str | None,
+    contamination_index: ContaminationIndex | None,
+    contamination_snapshot: FrozenContaminationSnapshot | None,
+    threshold: float,
+) -> dict[str, Any]:
+    if candidate_text is None and contamination_index is None and contamination_snapshot is None:
+        return {
+            "status": "NOT_EVALUATED",
+            "evaluated_count": 0,
+            "method": "s6-frozen-contamination-index",
+            "matched_doc_id": None,
+            "max_similarity": 0.0,
+        }
+    candidate = _s3_leakage_text(candidate_text, field="candidate_text")
+    if not isinstance(contamination_index, ContaminationIndex):
+        _s3_leakage_error(
+            "S3_LEAKAGE_CONTAMINATION_INDEX_REQUIRED",
+            "frozen-index LEAKAGE gate requires ContaminationIndex",
+        )
+    if not isinstance(contamination_snapshot, FrozenContaminationSnapshot):
+        _s3_leakage_error(
+            "S3_LEAKAGE_CONTAMINATION_SNAPSHOT_REQUIRED",
+            "frozen-index LEAKAGE gate requires FrozenContaminationSnapshot",
+        )
+    try:
+        verified = contamination_index.verify_snapshot(contamination_snapshot)
+        result = contamination_index.query(snapshot=contamination_snapshot, text=candidate, threshold=threshold)
+    except Exception as exc:
+        _s3_leakage_error(
+            "S3_LEAKAGE_FROZEN_INDEX_QUERY_FAILED",
+            f"frozen contamination index query failed: {exc}",
+        )
+    if not verified:
+        _s3_leakage_error(
+            "S3_LEAKAGE_FROZEN_INDEX_SNAPSHOT_INVALID",
+            "frozen contamination index snapshot content hash did not verify",
+        )
+    return {
+        "status": "FAIL" if result.leakage else "PASS",
+        "evaluated_count": 1,
+        "snapshot_ref": result.snapshot_ref,
+        "snapshot_version": contamination_snapshot.version,
+        "snapshot_content_hash": contamination_snapshot.content_hash,
+        "document_count": len(contamination_snapshot.document_ids),
+        "candidate_query_hash": result.query_hash,
+        "max_similarity": result.max_overlap,
+        "threshold": threshold,
+        "matched_doc_id": result.matched_doc_id,
+        "method": "s6-frozen-contamination-index",
+    }
+
+
+def _s3_leakage_target_rows(rows: tuple[S3LeakageTargetRow, ...]) -> tuple[dict[str, Any], ...]:
+    normalized: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for index, row in enumerate(rows):
+        if not isinstance(row, S3LeakageTargetRow):
+            _s3_leakage_error(
+                "S3_LEAKAGE_TARGET_ROW_INVALID",
+                f"target_leakage_rows[{index}] must be S3LeakageTargetRow",
+            )
+        row_id = _s3_leakage_text(row.row_id, field=f"target_leakage_rows[{index}].row_id")
+        if row_id in seen:
+            _s3_leakage_error("S3_LEAKAGE_TARGET_ROW_DUPLICATE", f"duplicate target row_id {row_id}")
+        seen.add(row_id)
+        if not isinstance(row.features, Mapping) or not row.features:
+            _s3_leakage_error("S3_LEAKAGE_TARGET_FEATURES_INVALID", f"{row_id}.features must be a non-empty mapping")
+        features: dict[str, Any] = {}
+        for feature_name, feature_value in row.features.items():
+            feature = _s3_leakage_text(feature_name, field=f"{row_id}.features[]")
+            features[feature] = _s3_leakage_json_scalar(feature_value, field=f"{row_id}.{feature}")
+        normalized.append(
+            {
+                "row_id": row_id,
+                "features": features,
+                "label_hash": _s3_leakage_text(row.label_hash, field=f"{row_id}.label_hash"),
+            }
+        )
+    return tuple(normalized)
+
+
+def _s3_leakage_target_gate(
+    *,
+    rows: tuple[dict[str, Any], ...],
+    purity_threshold: float,
+    min_support: int,
+) -> dict[str, Any]:
+    if not rows:
+        return {
+            "status": "NOT_EVALUATED",
+            "evaluated_count": 0,
+            "row_count": 0,
+            "leaked_feature_count": 0,
+            "leaked_features": [],
+            "method": "deterministic-target-purity-probe",
+        }
+    feature_names = sorted({feature for row in rows for feature in row["features"]})
+    leaked_features: list[dict[str, Any]] = []
+    feature_results: list[dict[str, Any]] = []
+    for feature_name in feature_names:
+        value_labels: dict[str, dict[str, int]] = {}
+        support = 0
+        for row in rows:
+            if feature_name not in row["features"]:
+                continue
+            support += 1
+            value_digest = hash_json({"feature": feature_name, "value": row["features"][feature_name]})
+            labels = value_labels.setdefault(value_digest, {})
+            label_digest = hash_json({"label_hash": row["label_hash"]})
+            labels[label_digest] = labels.get(label_digest, 0) + 1
+        if support < min_support or not value_labels:
+            continue
+        majority = sum(max(counts.values()) for counts in value_labels.values())
+        purity = majority / support
+        repeated_value_present = any(sum(counts.values()) > 1 for counts in value_labels.values())
+        result = {
+            "feature_digest": hash_json({"feature": feature_name}),
+            "support": support,
+            "distinct_value_count": len(value_labels),
+            "purity": purity,
+            "purity_threshold": purity_threshold,
+            "repeated_value_present": repeated_value_present,
+        }
+        feature_results.append(result)
+        if purity >= purity_threshold and repeated_value_present:
+            leaked_features.append(result)
+    return {
+        "status": "FAIL" if leaked_features else "PASS",
+        "evaluated_count": len(rows),
+        "row_count": len(rows),
+        "row_digest": _s3_leakage_target_rows_digest(rows),
+        "feature_count": len(feature_names),
+        "leaked_feature_count": len(leaked_features),
+        "leaked_features": leaked_features,
+        "feature_results": feature_results,
+        "purity_threshold": purity_threshold,
+        "min_support": min_support,
+        "method": "deterministic-target-purity-probe",
+    }
+
+
+def _s3_leakage_reward_loop_evidence(
+    evidence: S3LeakageRewardLoopEvidence | None,
+) -> dict[str, Any] | None:
+    if evidence is None:
+        return None
+    if not isinstance(evidence, S3LeakageRewardLoopEvidence):
+        _s3_leakage_error(
+            "S3_LEAKAGE_REWARD_EVIDENCE_INVALID",
+            "reward_loop_evidence must be S3LeakageRewardLoopEvidence",
+        )
+    return {
+        "variant_id": _s3_leakage_text(evidence.variant_id, field="reward_loop.variant_id"),
+        "leaked_label_variant_score": _s3_leakage_non_negative(
+            evidence.leaked_label_variant_score,
+            field="reward_loop.leaked_label_variant_score",
+        ),
+        "baseline_score": _s3_leakage_non_negative(
+            evidence.baseline_score,
+            field="reward_loop.baseline_score",
+        ),
+        "shuffled_null_collapsed": _s3_leakage_bool(
+            evidence.shuffled_null_collapsed,
+            field="reward_loop.shuffled_null_collapsed",
+        ),
+        "aggregate_passed": _s3_leakage_bool(
+            evidence.aggregate_passed,
+            field="reward_loop.aggregate_passed",
+        ),
+        "s4_rejected_variant": _s3_leakage_bool(
+            evidence.s4_rejected_variant,
+            field="reward_loop.s4_rejected_variant",
+        ),
+        "s4_improvement_accepted": _s3_leakage_bool(
+            evidence.s4_improvement_accepted,
+            field="reward_loop.s4_improvement_accepted",
+        ),
+    }
+
+
+def _s3_leakage_reward_loop_gate(
+    *,
+    evidence: dict[str, Any] | None,
+    min_reward_score_delta: float,
+) -> dict[str, Any]:
+    if evidence is None:
+        return {
+            "status": "NOT_EVALUATED",
+            "evaluated_count": 0,
+            "method": "s4-leaked-label-reward-loop",
+        }
+    score_delta = evidence["leaked_label_variant_score"] - evidence["baseline_score"]
+    leaked_label_variant_detected = score_delta > min_reward_score_delta
+    s4_non_improvement = evidence["s4_rejected_variant"] and not evidence["s4_improvement_accepted"]
+    rejected_safely = (
+        evidence["shuffled_null_collapsed"]
+        and evidence["aggregate_passed"] is False
+        and s4_non_improvement
+    )
+    failure_reason: str | None = None
+    if leaked_label_variant_detected and not rejected_safely:
+        failure_reason = "LEAKED_LABEL_VARIANT_NOT_REJECTED"
+    elif leaked_label_variant_detected:
+        failure_reason = "LEAKED_LABEL_VARIANT_REJECTED"
+    return {
+        "status": "FAIL" if leaked_label_variant_detected else "PASS",
+        "evaluated_count": 1,
+        "variant_id": evidence["variant_id"],
+        "variant_digest": hash_json({"variant_id": evidence["variant_id"]}),
+        "leaked_label_variant_score": evidence["leaked_label_variant_score"],
+        "baseline_score": evidence["baseline_score"],
+        "score_delta": score_delta,
+        "min_reward_score_delta": min_reward_score_delta,
+        "leaked_label_variant_detected": leaked_label_variant_detected,
+        "shuffled_null_collapsed": evidence["shuffled_null_collapsed"],
+        "aggregate_passed": evidence["aggregate_passed"],
+        "s4_rejected_variant": evidence["s4_rejected_variant"],
+        "s4_improvement_accepted": evidence["s4_improvement_accepted"],
+        "s4_non_improvement": s4_non_improvement,
+        "rejected_safely": rejected_safely,
+        "failure_reason": failure_reason,
+        "method": "s4-leaked-label-reward-loop",
+    }
+
+
+def _s3_leakage_test_cases(
+    *,
+    mandatory_gates: tuple[str, ...],
+    failed_gates: tuple[str, ...],
+) -> list[str]:
+    gates = failed_gates if failed_gates else mandatory_gates
+    test_cases: list[str] = []
+    for gate in gates:
+        test_case = _S3_LEAKAGE_TEST_CASES[gate]
+        if test_case not in test_cases:
+            test_cases.append(test_case)
+    return test_cases
+
+
+def _s3_leakage_hashed_shingles(text: str, *, shingle_size: int) -> frozenset[str]:
+    tokens = _s3_leakage_tokens(text)
+    if not tokens:
+        _s3_leakage_error("S3_LEAKAGE_TEXT_EMPTY", "text must contain at least one token")
+    if len(tokens) < shingle_size:
+        shingles = (" ".join(tokens),)
+    else:
+        shingles = tuple(
+            " ".join(tokens[index:index + shingle_size])
+            for index in range(0, len(tokens) - shingle_size + 1)
+        )
+    return frozenset(hash_bytes(shingle.encode("utf-8")) for shingle in shingles)
+
+
+def _s3_leakage_tokens(text: str) -> tuple[str, ...]:
+    stopwords = {"a", "an", "the"}
+    tokens = tuple(
+        token
+        for token in (part.strip(".,;:()[]{}").lower() for part in text.split())
+        if token and token not in stopwords
+    )
+    return tokens
+
+
+def _s3_leakage_jaccard(left: frozenset[str], right: frozenset[str]) -> float:
+    if not left and not right:
+        return 1.0
+    if not left or not right:
+        return 0.0
+    return len(left & right) / len(left | right)
+
+
+def _s3_leakage_text_items_digest(items: tuple[dict[str, Any], ...]) -> str:
+    return hash_json(
+        [
+            {
+                "item_id": item["item_id"],
+                "text_hash": item["text_hash"],
+                "source_ref": item["source_ref"],
+            }
+            for item in items
+        ]
+    )
+
+
+def _s3_leakage_target_rows_digest(rows: tuple[dict[str, Any], ...]) -> str:
+    return hash_json(
+        [
+            {
+                "row_id": row["row_id"],
+                "feature_digests": {
+                    feature: hash_json({"feature": feature, "value": value})
+                    for feature, value in sorted(row["features"].items())
+                },
+                "label_digest": hash_json({"label_hash": row["label_hash"]}),
+            }
+            for row in rows
+        ]
+    )
+
+
+def _s3_leakage_text(value: Any, *, field: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        _s3_leakage_error("S3_LEAKAGE_TEXT_INVALID", f"{field} must be a non-empty string")
+    return value.strip()
+
+
+def _s3_leakage_optional_text(value: Any, *, field: str) -> str | None:
+    if value is None:
+        return None
+    return _s3_leakage_text(value, field=field)
+
+
+def _s3_leakage_bool(value: Any, *, field: str) -> bool:
+    if not isinstance(value, bool):
+        _s3_leakage_error("S3_LEAKAGE_BOOL_INVALID", f"{field} must be boolean")
+    return value
+
+
+def _s3_leakage_float(value: Any, *, field: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        _s3_leakage_error("S3_LEAKAGE_VALUE_INVALID", f"{field} must be numeric")
+    numeric = float(value)
+    if not math.isfinite(numeric):
+        _s3_leakage_error("S3_LEAKAGE_VALUE_NONFINITE", f"{field} must be finite")
+    return numeric
+
+
+def _s3_leakage_non_negative(value: Any, *, field: str) -> float:
+    numeric = _s3_leakage_float(value, field=field)
+    if numeric < 0:
+        _s3_leakage_error("S3_LEAKAGE_VALUE_INVALID", f"{field} must be non-negative")
+    return numeric
+
+
+def _s3_leakage_probability(value: Any, *, field: str) -> float:
+    numeric = _s3_leakage_float(value, field=field)
+    if numeric < 0 or numeric > 1:
+        _s3_leakage_error("S3_LEAKAGE_PROBABILITY_INVALID", f"{field} must be in [0, 1]")
+    return numeric
+
+
+def _s3_leakage_positive_int(value: Any, *, field: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        _s3_leakage_error("S3_LEAKAGE_INTEGER_INVALID", f"{field} must be a positive integer")
+    return value
+
+
+def _s3_leakage_json_scalar(value: Any, *, field: str) -> Any:
+    if isinstance(value, bool) or value is None or isinstance(value, str):
+        return value
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            _s3_leakage_error("S3_LEAKAGE_FEATURE_VALUE_NONFINITE", f"{field} must be finite")
+        return value
+    _s3_leakage_error(
+        "S3_LEAKAGE_FEATURE_VALUE_INVALID",
+        f"{field} must be a JSON scalar",
+    )
+
+
+def _s3_leakage_error(code: str, message: str) -> None:
+    raise S3LeakageCheckError(code=code, message=message)
 
 
 @dataclass(frozen=True)
