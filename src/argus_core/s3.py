@@ -90,6 +90,15 @@ class FrozenPipelineEntrypointContractError(S3Error):
         }
 
 
+class S3PerturbationError(S3Error, ValueError):
+    """Raised when perturbation-pair inputs or model outputs fail closed."""
+
+    def __init__(self, *, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
 S3_FROZEN_PIPELINE_ENTRYPOINT_REQUEST_SCHEMA = "argus.s3.frozen_pipeline_entrypoint_request.v1"
 S3_REPORT_CANONICALIZATION_SPEC_VERSION = "argus.s3.validation_report.canonical.v1"
 S3_REPORT_DIGEST_ALGORITHM = "BLAKE3"
@@ -5876,8 +5885,8 @@ class PerturbationResult:
     perturbation_id: str
     kind: str
     verdict: str
-    amplitude_linearity: dict[str, float] | None = None
-    observed_degradation: dict[str, float] | None = None
+    amplitude_linearity: dict[str, Any] | None = None
+    observed_degradation: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -5903,6 +5912,28 @@ class CanonicalValidationReport:
 class PerturbationPairOutcome:
     perturbation_pairs: tuple[PerturbationResult, ...]
     insensitivity_flags: tuple[InsensitivityFlag, ...]
+
+
+@dataclass(frozen=True)
+class S3PerturbationSpec:
+    perturbation_id: str
+    kind: str = "bidirectional"
+    must_react_amplitudes: tuple[float, ...] = (0.25, 0.5, 1.0)
+    must_not_react_variants: tuple[str, ...] = ("noise", "label_shuffle", "fake_contamination")
+    slope_tolerance: float = 0.1
+    intercept_tolerance_abs: float = 0.05
+    null_abs_tolerance: float = 0.05
+    degradation_fraction_threshold: float = 0.2
+    baseline_signal: float = 1.0
+    sensitivity_floor: float = 0.05
+
+
+@dataclass(frozen=True)
+class S3PerturbationProbe:
+    perturbation_id: str
+    kind: str
+    amplitude: float = 0.0
+    variant: str | None = None
 
 
 @dataclass(frozen=True)
@@ -6894,27 +6925,143 @@ class S3ReportBuilder:
 
 
 def run_perturbation_pair(
+    model_ref: Any | None = None,
+    perturbation_spec: S3PerturbationSpec | Mapping[str, Any] | None = None,
     *,
-    perturbation_id: str,
-    must_react_expected: float,
-    must_react_observed: float,
-    must_not_react_observed: float,
-    unperturbed_headline: float,
-    perturbed_headline: float,
+    perturbation_id: str | None = None,
+    must_react_expected: float | None = None,
+    must_react_observed: float | None = None,
+    must_not_react_observed: float | None = None,
+    unperturbed_headline: float | None = None,
+    perturbed_headline: float | None = None,
     relative_tolerance: float = 0.1,
     null_abs_tolerance: float = 0.05,
     sensitivity_floor: float = 0.05,
 ) -> PerturbationPairOutcome:
-    must_react_error = abs(must_react_observed - must_react_expected)
-    allowed_error = max(abs(must_react_expected) * relative_tolerance, sensitivity_floor)
+    if model_ref is not None or perturbation_spec is not None:
+        if perturbation_spec is None:
+            _s3_perturbation_error(
+                "S3_PERTURBATION_SPEC_MISSING",
+                "perturbation_spec is required when model_ref is provided",
+            )
+        if any(
+            value is not None
+            for value in (
+                perturbation_id,
+                must_react_expected,
+                must_react_observed,
+                must_not_react_observed,
+                unperturbed_headline,
+                perturbed_headline,
+            )
+        ):
+            _s3_perturbation_error(
+                "S3_PERTURBATION_API_MIXED",
+                "model_ref/spec API cannot be mixed with legacy scalar arguments",
+            )
+        return _run_perturbation_pair_from_spec(model_ref=model_ref, perturbation_spec=perturbation_spec)
+
+    return _run_legacy_perturbation_pair(
+        perturbation_id=perturbation_id,
+        must_react_expected=must_react_expected,
+        must_react_observed=must_react_observed,
+        must_not_react_observed=must_not_react_observed,
+        unperturbed_headline=unperturbed_headline,
+        perturbed_headline=perturbed_headline,
+        relative_tolerance=relative_tolerance,
+        null_abs_tolerance=null_abs_tolerance,
+        sensitivity_floor=sensitivity_floor,
+    )
+
+
+def _run_perturbation_pair_from_spec(
+    *,
+    model_ref: Any,
+    perturbation_spec: S3PerturbationSpec | Mapping[str, Any],
+) -> PerturbationPairOutcome:
+    spec = _normalize_perturbation_spec(perturbation_spec)
+    react_points = _run_must_react_grid(model_ref=model_ref, spec=spec)
+    slope, intercept = _fit_recovered_vs_planted(react_points)
+    react_pass = (
+        1.0 - spec.slope_tolerance <= slope <= 1.0 + spec.slope_tolerance
+        and abs(intercept) <= spec.intercept_tolerance_abs
+    )
+
+    degradation = _run_must_not_react_variants(model_ref=model_ref, spec=spec)
+    null_pass = all(item["passed"] for item in degradation)
+    insensitivity_flags = _must_not_react_insensitivity_flags(spec=spec, degradation=degradation)
+
+    return PerturbationPairOutcome(
+        perturbation_pairs=(
+            PerturbationResult(
+                perturbation_id=spec.perturbation_id,
+                kind="must_react",
+                verdict="pass" if react_pass else "fail",
+                amplitude_linearity={
+                    "slope": slope,
+                    "intercept": intercept,
+                    "slope_tolerance": spec.slope_tolerance,
+                    "intercept_tolerance_abs": spec.intercept_tolerance_abs,
+                    "sample_count": len(react_points),
+                    "points": tuple(
+                        {
+                            "planted_amplitude": planted,
+                            "recovered_amplitude": recovered,
+                            "residual": recovered - (slope * planted + intercept),
+                        }
+                        for planted, recovered in react_points
+                    ),
+                },
+            ),
+            PerturbationResult(
+                perturbation_id=spec.perturbation_id,
+                kind="must_not_react",
+                verdict="pass" if null_pass else "fail",
+                observed_degradation={
+                    "observed_signal": max((item["abs_observed_signal"] for item in degradation), default=0.0),
+                    "max_observed_signal": max((item["abs_observed_signal"] for item in degradation), default=0.0),
+                    "max_degradation_threshold": max((item["threshold"] for item in degradation), default=0.0),
+                    "variant_count": len(degradation),
+                    "variants": tuple(degradation),
+                },
+            ),
+        ),
+        insensitivity_flags=tuple(insensitivity_flags),
+    )
+
+
+def _run_legacy_perturbation_pair(
+    *,
+    perturbation_id: str | None,
+    must_react_expected: float | None,
+    must_react_observed: float | None,
+    must_not_react_observed: float | None,
+    unperturbed_headline: float | None,
+    perturbed_headline: float | None,
+    relative_tolerance: float,
+    null_abs_tolerance: float,
+    sensitivity_floor: float,
+) -> PerturbationPairOutcome:
+    normalized_id = _s3_perturbation_id(perturbation_id)
+    expected = _s3_perturbation_finite(must_react_expected, field="must_react_expected")
+    observed = _s3_perturbation_finite(must_react_observed, field="must_react_observed")
+    null_observed = _s3_perturbation_finite(must_not_react_observed, field="must_not_react_observed")
+    unperturbed = _s3_perturbation_finite(unperturbed_headline, field="unperturbed_headline")
+    perturbed = _s3_perturbation_finite(perturbed_headline, field="perturbed_headline")
+    relative_tolerance = _s3_perturbation_nonnegative(relative_tolerance, field="relative_tolerance")
+    null_abs_tolerance = _s3_perturbation_nonnegative(null_abs_tolerance, field="null_abs_tolerance")
+    sensitivity_floor = _s3_perturbation_nonnegative(sensitivity_floor, field="sensitivity_floor")
+
+    must_react_error = abs(observed - expected)
+    allowed_error = max(abs(expected) * relative_tolerance, sensitivity_floor)
     must_react_pass = must_react_error <= allowed_error
-    must_not_react_pass = abs(must_not_react_observed) <= null_abs_tolerance
+    must_not_react_pass = abs(null_observed) <= null_abs_tolerance
 
     flags: list[InsensitivityFlag] = []
-    if abs(unperturbed_headline) > sensitivity_floor and abs(unperturbed_headline - perturbed_headline) <= sensitivity_floor:
+    if abs(unperturbed) > sensitivity_floor and abs(unperturbed - perturbed) <= sensitivity_floor:
         flags.append(
             InsensitivityFlag(
-                perturbation_id=perturbation_id,
+                perturbation_id=normalized_id,
                 reason="headline_result_invariant_under_should-react_perturbation",
             )
         )
@@ -6922,27 +7069,295 @@ def run_perturbation_pair(
     return PerturbationPairOutcome(
         perturbation_pairs=(
             PerturbationResult(
-                perturbation_id=perturbation_id,
+                perturbation_id=normalized_id,
                 kind="must_react",
                 verdict="pass" if must_react_pass else "fail",
                 amplitude_linearity={
-                    "expected": must_react_expected,
-                    "observed": must_react_observed,
+                    "expected": expected,
+                    "observed": observed,
                     "absolute_error": must_react_error,
                 },
             ),
             PerturbationResult(
-                perturbation_id=perturbation_id,
+                perturbation_id=normalized_id,
                 kind="must_not_react",
                 verdict="pass" if must_not_react_pass else "fail",
                 observed_degradation={
-                    "observed_signal": must_not_react_observed,
+                    "observed_signal": null_observed,
                     "absolute_tolerance": null_abs_tolerance,
                 },
             ),
         ),
         insensitivity_flags=tuple(flags),
     )
+
+
+def _normalize_perturbation_spec(spec: S3PerturbationSpec | Mapping[str, Any]) -> S3PerturbationSpec:
+    if isinstance(spec, Mapping):
+        default_spec = S3PerturbationSpec(perturbation_id=str(spec.get("perturbation_id") or spec.get("id") or ""))
+        spec = S3PerturbationSpec(
+            perturbation_id=default_spec.perturbation_id,
+            kind=str(spec.get("kind", "bidirectional")),
+            must_react_amplitudes=tuple(
+                spec.get("must_react_amplitudes") or spec.get("amplitudes") or default_spec.must_react_amplitudes
+            ),
+            must_not_react_variants=tuple(
+                spec.get("must_not_react_variants") or spec.get("null_variants") or default_spec.must_not_react_variants
+            ),
+            slope_tolerance=spec.get("slope_tolerance", 0.1),
+            intercept_tolerance_abs=spec.get("intercept_tolerance_abs", 0.05),
+            null_abs_tolerance=spec.get("null_abs_tolerance", 0.05),
+            degradation_fraction_threshold=spec.get("degradation_fraction_threshold", 0.2),
+            baseline_signal=spec.get("baseline_signal", 1.0),
+            sensitivity_floor=spec.get("sensitivity_floor", 0.05),
+        )
+    if not isinstance(spec, S3PerturbationSpec):
+        _s3_perturbation_error("S3_PERTURBATION_SPEC_INVALID", "perturbation_spec must be a mapping or S3PerturbationSpec")
+
+    perturbation_id = _s3_perturbation_id(spec.perturbation_id)
+    kind = spec.kind.lower()
+    if kind not in {"bidirectional", "must_react", "must_not_react"}:
+        _s3_perturbation_error("S3_PERTURBATION_KIND_INVALID", "perturbation kind must be bidirectional, must_react, or must_not_react")
+
+    amplitudes = tuple(_s3_perturbation_positive_finite(value, field="must_react_amplitudes") for value in spec.must_react_amplitudes)
+    if len(amplitudes) < 2:
+        _s3_perturbation_error("S3_PERTURBATION_GRID_TOO_SMALL", "must_react_amplitudes must contain at least two amplitudes")
+    if len(set(amplitudes)) != len(amplitudes):
+        _s3_perturbation_error("S3_PERTURBATION_GRID_DUPLICATE", "must_react_amplitudes must not contain duplicate amplitudes")
+
+    variants = tuple(str(value) for value in spec.must_not_react_variants if str(value))
+    if not variants:
+        _s3_perturbation_error("S3_PERTURBATION_NULL_VARIANTS_MISSING", "must_not_react_variants must not be empty")
+    if len(set(variants)) != len(variants):
+        _s3_perturbation_error("S3_PERTURBATION_NULL_VARIANTS_DUPLICATE", "must_not_react_variants must not contain duplicate variants")
+
+    return S3PerturbationSpec(
+        perturbation_id=perturbation_id,
+        kind=kind,
+        must_react_amplitudes=amplitudes,
+        must_not_react_variants=variants,
+        slope_tolerance=_s3_perturbation_positive_finite(spec.slope_tolerance, field="slope_tolerance"),
+        intercept_tolerance_abs=_s3_perturbation_nonnegative(spec.intercept_tolerance_abs, field="intercept_tolerance_abs"),
+        null_abs_tolerance=_s3_perturbation_nonnegative(spec.null_abs_tolerance, field="null_abs_tolerance"),
+        degradation_fraction_threshold=_s3_perturbation_fraction(spec.degradation_fraction_threshold, field="degradation_fraction_threshold"),
+        baseline_signal=_s3_perturbation_finite(spec.baseline_signal, field="baseline_signal"),
+        sensitivity_floor=_s3_perturbation_nonnegative(spec.sensitivity_floor, field="sensitivity_floor"),
+    )
+
+
+def _run_must_react_grid(*, model_ref: Any, spec: S3PerturbationSpec) -> tuple[tuple[float, float], ...]:
+    points: list[tuple[float, float]] = []
+    for amplitude in spec.must_react_amplitudes:
+        probe = S3PerturbationProbe(
+            perturbation_id=spec.perturbation_id,
+            kind="must_react",
+            amplitude=amplitude,
+        )
+        output = _run_model_perturbation(model_ref, probe)
+        recovered = _s3_perturbation_output_number(
+            output,
+            field="recovered_amplitude",
+            aliases=("observed", "observed_amplitude", "recovered"),
+        )
+        points.append((amplitude, recovered))
+    return tuple(points)
+
+
+def _run_must_not_react_variants(*, model_ref: Any, spec: S3PerturbationSpec) -> tuple[dict[str, Any], ...]:
+    degradation: list[dict[str, Any]] = []
+    for variant in spec.must_not_react_variants:
+        probe = S3PerturbationProbe(
+            perturbation_id=spec.perturbation_id,
+            kind="must_not_react",
+            variant=variant,
+        )
+        output = _run_model_perturbation(model_ref, probe)
+        observed = _s3_perturbation_output_number(
+            output,
+            field="observed_signal",
+            aliases=("observed", "signal", "manufactured_signal"),
+        )
+        baseline = _s3_perturbation_optional_output_number(output, field="baseline_signal")
+        if baseline is None:
+            baseline = spec.baseline_signal
+        threshold = max(spec.null_abs_tolerance, abs(baseline) * spec.degradation_fraction_threshold)
+        abs_observed = abs(observed)
+        degradation.append(
+            {
+                "variant": variant,
+                "observed_signal": observed,
+                "abs_observed_signal": abs_observed,
+                "baseline_signal": baseline,
+                "threshold": threshold,
+                "passed": abs_observed <= threshold,
+            }
+        )
+    return tuple(degradation)
+
+
+def _must_not_react_insensitivity_flags(
+    *,
+    spec: S3PerturbationSpec,
+    degradation: tuple[dict[str, Any], ...],
+) -> tuple[InsensitivityFlag, ...]:
+    flags: list[InsensitivityFlag] = []
+    for item in degradation:
+        baseline = float(item["baseline_signal"])
+        observed = float(item["observed_signal"])
+        unchanged_band = max(spec.sensitivity_floor, abs(baseline) * spec.degradation_fraction_threshold)
+        if abs(baseline) > spec.sensitivity_floor and abs(abs(baseline) - abs(observed)) <= unchanged_band:
+            flags.append(
+                InsensitivityFlag(
+                    perturbation_id=spec.perturbation_id,
+                    reason="must_not_react_signal_survived_unchanged",
+                )
+            )
+            break
+    return tuple(flags)
+
+
+def _fit_recovered_vs_planted(points: tuple[tuple[float, float], ...]) -> tuple[float, float]:
+    count = len(points)
+    mean_x = sum(point[0] for point in points) / count
+    mean_y = sum(point[1] for point in points) / count
+    denominator = sum((point[0] - mean_x) ** 2 for point in points)
+    if denominator <= 0:
+        _s3_perturbation_error("S3_PERTURBATION_GRID_DEGENERATE", "must_react_amplitudes must span a non-zero grid")
+    slope = sum((x - mean_x) * (y - mean_y) for x, y in points) / denominator
+    intercept = mean_y - slope * mean_x
+    return slope, intercept
+
+
+def _run_model_perturbation(model_ref: Any, probe: S3PerturbationProbe) -> Mapping[str, Any]:
+    if hasattr(model_ref, "run_perturbation"):
+        output = model_ref.run_perturbation(probe)
+    elif callable(model_ref):
+        output = model_ref(probe)
+    elif isinstance(model_ref, Mapping):
+        output = _mapping_model_perturbation_output(model_ref, probe)
+    else:
+        _s3_perturbation_error(
+            "S3_PERTURBATION_MODEL_INVALID",
+            "model_ref must be callable, expose run_perturbation, or be a mapping of perturbation observations",
+        )
+    if not isinstance(output, Mapping):
+        _s3_perturbation_error("S3_PERTURBATION_OUTPUT_INVALID", "model perturbation output must be a mapping")
+    return output
+
+
+def _mapping_model_perturbation_output(model_ref: Mapping[str, Any], probe: S3PerturbationProbe) -> Mapping[str, Any]:
+    if probe.kind == "must_react":
+        observations = model_ref.get("must_react_observations") or model_ref.get("must_react")
+        matched = _mapping_observation_by_amplitude(observations, probe.amplitude)
+        if matched is not None:
+            return matched
+        if _is_finite_number(model_ref.get("recovery_slope")):
+            intercept = float(model_ref.get("recovery_intercept", 0.0))
+            return {"recovered_amplitude": float(model_ref["recovery_slope"]) * probe.amplitude + intercept}
+    else:
+        observations = model_ref.get("must_not_react_observations") or model_ref.get("must_not_react")
+        matched = _mapping_observation_by_variant(observations, probe.variant)
+        if matched is not None:
+            return matched
+        null_signals = model_ref.get("null_signals")
+        if isinstance(null_signals, Mapping) and probe.variant in null_signals:
+            return {
+                "observed_signal": null_signals[probe.variant],
+                "baseline_signal": model_ref.get("baseline_signal", 1.0),
+            }
+    _s3_perturbation_error(
+        "S3_PERTURBATION_OBSERVATION_MISSING",
+        f"missing perturbation observation for {probe.kind}",
+    )
+
+
+def _mapping_observation_by_amplitude(observations: Any, amplitude: float) -> Mapping[str, Any] | None:
+    if isinstance(observations, Mapping):
+        for key, value in observations.items():
+            if _is_finite_number(key) and float(key) == amplitude and isinstance(value, Mapping):
+                return value
+            if isinstance(key, str):
+                try:
+                    key_value = float(key)
+                except ValueError:
+                    continue
+                if key_value == amplitude and isinstance(value, Mapping):
+                    return value
+    if isinstance(observations, (list, tuple)):
+        for item in observations:
+            if not isinstance(item, Mapping):
+                continue
+            candidate = item.get("amplitude", item.get("planted_amplitude"))
+            if _is_finite_number(candidate) and float(candidate) == amplitude:
+                return item
+    return None
+
+
+def _mapping_observation_by_variant(observations: Any, variant: str | None) -> Mapping[str, Any] | None:
+    if variant is None:
+        return None
+    if isinstance(observations, Mapping):
+        value = observations.get(variant)
+        if isinstance(value, Mapping):
+            return value
+    if isinstance(observations, (list, tuple)):
+        for item in observations:
+            if isinstance(item, Mapping) and item.get("variant") == variant:
+                return item
+    return None
+
+
+def _s3_perturbation_output_number(output: Mapping[str, Any], *, field: str, aliases: tuple[str, ...] = ()) -> float:
+    value = output.get(field)
+    if value is None:
+        for alias in aliases:
+            value = output.get(alias)
+            if value is not None:
+                break
+    return _s3_perturbation_finite(value, field=field)
+
+
+def _s3_perturbation_optional_output_number(output: Mapping[str, Any], *, field: str) -> float | None:
+    if field not in output or output[field] is None:
+        return None
+    return _s3_perturbation_finite(output[field], field=field)
+
+
+def _s3_perturbation_id(value: Any) -> str:
+    if not isinstance(value, str) or not value:
+        _s3_perturbation_error("S3_PERTURBATION_ID_INVALID", "perturbation_id must be a non-empty string")
+    return value
+
+
+def _s3_perturbation_finite(value: Any, *, field: str) -> float:
+    if not _is_finite_number(value):
+        _s3_perturbation_error("S3_PERTURBATION_NUMBER_INVALID", f"{field} must be finite")
+    return float(value)
+
+
+def _s3_perturbation_positive_finite(value: Any, *, field: str) -> float:
+    numeric = _s3_perturbation_finite(value, field=field)
+    if numeric <= 0:
+        _s3_perturbation_error("S3_PERTURBATION_NUMBER_INVALID", f"{field} must be positive")
+    return numeric
+
+
+def _s3_perturbation_nonnegative(value: Any, *, field: str) -> float:
+    numeric = _s3_perturbation_finite(value, field=field)
+    if numeric < 0:
+        _s3_perturbation_error("S3_PERTURBATION_NUMBER_INVALID", f"{field} must be non-negative")
+    return numeric
+
+
+def _s3_perturbation_fraction(value: Any, *, field: str) -> float:
+    numeric = _s3_perturbation_finite(value, field=field)
+    if numeric <= 0 or numeric >= 1:
+        _s3_perturbation_error("S3_PERTURBATION_NUMBER_INVALID", f"{field} must be in (0, 1)")
+    return numeric
+
+
+def _s3_perturbation_error(code: str, message: str) -> None:
+    raise S3PerturbationError(code=code, message=message)
 
 
 def build_referee_block(*, referee_id: str, signer_key_id: str, proponent_id: str) -> dict[str, Any]:

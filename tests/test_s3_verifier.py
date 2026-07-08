@@ -20,6 +20,7 @@ from argus_core import (
     Lineage,
     Producer,
     RefereePolicyError,
+    S3PerturbationSpec,
     S3Verifier,
     SignerIdentityError,
     SourceDocument,
@@ -40,6 +41,157 @@ C3_SCHEMA_PATH = ROOT / "schemas" / "contracts" / "c3.validation-report.schema.j
 
 
 class S3PerturbationOracleTests(unittest.TestCase):
+    class _LinearPerturbationModel:
+        def __init__(
+            self,
+            *,
+            recovery_slope: float = 1.0,
+            recovery_intercept: float = 0.0,
+            null_signals: dict[str, float] | None = None,
+            baseline_signal: float = 1.0,
+        ) -> None:
+            self.recovery_slope = recovery_slope
+            self.recovery_intercept = recovery_intercept
+            self.null_signals = null_signals or {}
+            self.baseline_signal = baseline_signal
+
+        def run_perturbation(self, probe):
+            if probe.kind == "must_react":
+                return {
+                    "recovered_amplitude": self.recovery_slope * probe.amplitude + self.recovery_intercept,
+                }
+            return {
+                "observed_signal": self.null_signals.get(probe.variant, 0.01),
+                "baseline_signal": self.baseline_signal,
+            }
+
+    def test_must_react_grid_recovers_planted_signal_with_amplitude_linearity(self) -> None:
+        outcome = run_perturbation_pair(
+            self._LinearPerturbationModel(recovery_slope=1.01, recovery_intercept=0.004),
+            S3PerturbationSpec(
+                perturbation_id="pair-grid",
+                kind="must_react",
+                must_react_amplitudes=(0.25, 0.5, 1.0, 2.0),
+                must_not_react_variants=("noise", "label_shuffle", "fake_contamination"),
+                slope_tolerance=0.05,
+                intercept_tolerance_abs=0.02,
+                null_abs_tolerance=0.05,
+                degradation_fraction_threshold=0.2,
+            ),
+        )
+
+        must_react = next(pair for pair in outcome.perturbation_pairs if pair.kind == "must_react")
+        self.assertEqual(must_react.verdict, "pass")
+        self.assertAlmostEqual(must_react.amplitude_linearity["slope"], 1.01)
+        self.assertAlmostEqual(must_react.amplitude_linearity["intercept"], 0.004)
+        self.assertEqual(must_react.amplitude_linearity["sample_count"], 4)
+        self.assertEqual({pair.kind for pair in outcome.perturbation_pairs}, {"must_react", "must_not_react"})
+        self.assertEqual(outcome.insensitivity_flags, ())
+
+    def test_mapping_spec_shorthand_uses_bidirectional_defaults(self) -> None:
+        outcome = run_perturbation_pair(
+            self._LinearPerturbationModel(),
+            {
+                "perturbation_id": "pair-shorthand",
+                "kind": "must_react",
+            },
+        )
+
+        must_react = next(pair for pair in outcome.perturbation_pairs if pair.kind == "must_react")
+        must_not_react = next(pair for pair in outcome.perturbation_pairs if pair.kind == "must_not_react")
+        self.assertEqual(must_react.verdict, "pass")
+        self.assertEqual(must_react.amplitude_linearity["sample_count"], 3)
+        self.assertEqual(must_not_react.verdict, "pass")
+        self.assertEqual(must_not_react.observed_degradation["variant_count"], 3)
+
+    def test_must_react_grid_fails_for_blind_or_insensitive_model(self) -> None:
+        outcome = run_perturbation_pair(
+            self._LinearPerturbationModel(recovery_slope=0.0),
+            S3PerturbationSpec(
+                perturbation_id="pair-blind",
+                must_react_amplitudes=(0.2, 0.5, 1.0, 1.5),
+            ),
+        )
+
+        must_react = next(pair for pair in outcome.perturbation_pairs if pair.kind == "must_react")
+        self.assertEqual(must_react.verdict, "fail")
+        self.assertLess(must_react.amplitude_linearity["slope"], 0.1)
+
+    def test_must_not_react_degrades_noise_shuffle_and_fake_contamination(self) -> None:
+        outcome = run_perturbation_pair(
+            self._LinearPerturbationModel(
+                null_signals={
+                    "noise": 0.01,
+                    "label_shuffle": 0.03,
+                    "fake_contamination": 0.04,
+                },
+                baseline_signal=1.0,
+            ),
+            S3PerturbationSpec(
+                perturbation_id="pair-null",
+                kind="must_not_react",
+                must_react_amplitudes=(0.25, 0.75, 1.25),
+                must_not_react_variants=("noise", "label_shuffle", "fake_contamination"),
+                degradation_fraction_threshold=0.2,
+            ),
+        )
+
+        must_not_react = next(pair for pair in outcome.perturbation_pairs if pair.kind == "must_not_react")
+        self.assertEqual(must_not_react.verdict, "pass")
+        self.assertLessEqual(must_not_react.observed_degradation["max_observed_signal"], 0.2)
+        self.assertEqual(must_not_react.observed_degradation["variant_count"], 3)
+        self.assertEqual(outcome.insensitivity_flags, ())
+
+    def test_must_not_react_fails_when_strong_signal_survives_unchanged(self) -> None:
+        outcome = run_perturbation_pair(
+            self._LinearPerturbationModel(
+                null_signals={
+                    "noise": 1.0,
+                    "label_shuffle": 0.98,
+                    "fake_contamination": 1.02,
+                },
+                baseline_signal=1.0,
+            ),
+            S3PerturbationSpec(
+                perturbation_id="pair-unchanged",
+                must_react_amplitudes=(0.25, 0.75, 1.25),
+                must_not_react_variants=("noise", "label_shuffle", "fake_contamination"),
+                degradation_fraction_threshold=0.2,
+            ),
+        )
+
+        must_not_react = next(pair for pair in outcome.perturbation_pairs if pair.kind == "must_not_react")
+        self.assertEqual(must_not_react.verdict, "fail")
+        self.assertGreater(must_not_react.observed_degradation["max_observed_signal"], 0.9)
+        self.assertTrue(
+            any(flag.reason == "must_not_react_signal_survived_unchanged" for flag in outcome.insensitivity_flags)
+        )
+
+    def test_perturbation_specs_fail_closed_on_invalid_grid_or_outputs(self) -> None:
+        with self.assertRaisesRegex(ValueError, "duplicate"):
+            run_perturbation_pair(
+                self._LinearPerturbationModel(),
+                S3PerturbationSpec(
+                    perturbation_id="pair-duplicate",
+                    must_react_amplitudes=(0.25, 0.25, 1.0),
+                ),
+            )
+
+        class NonFiniteModel:
+            def run_perturbation(self, probe):
+                if probe.kind == "must_react":
+                    return {"recovered_amplitude": float("nan")}
+                return {"observed_signal": 0.0, "baseline_signal": 1.0}
+
+        with self.assertRaisesRegex(ValueError, "finite"):
+            run_perturbation_pair(
+                NonFiniteModel(),
+                S3PerturbationSpec(
+                    perturbation_id="pair-nonfinite",
+                    must_react_amplitudes=(0.25, 0.5, 1.0),
+                ),
+            )
+
     def test_bidirectional_pair_passes_when_signal_recovers_and_null_degrades(self) -> None:
         outcome = run_perturbation_pair(
             perturbation_id="pair-1",
