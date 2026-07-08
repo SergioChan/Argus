@@ -5897,6 +5897,34 @@ class InsensitivityFlag:
 
 
 @dataclass(frozen=True)
+class InsensitivityProbe:
+    perturbation_id: str
+    variant: str
+    baseline_headline: float | None = None
+    perturbed_headline: float | None = None
+    expected_reaction: str = "degrade"
+    sensitivity_floor: float | None = None
+    minimum_baseline_signal: float | None = None
+    reason: str | None = None
+
+
+@dataclass(frozen=True)
+class InsensitivityPerturbationSet:
+    perturbation_id: str
+    probes: tuple[InsensitivityProbe, ...]
+    sensitivity_floor: float = 0.05
+    minimum_baseline_signal: float = 0.05
+
+
+@dataclass(frozen=True)
+class InsensitivityReport:
+    insensitivity_detected: bool
+    insensitivity_flags: tuple[InsensitivityFlag, ...]
+    probe_results: tuple[dict[str, Any], ...]
+    must_not_react_pass: bool
+
+
+@dataclass(frozen=True)
 class CanonicalValidationReport:
     spec_version: str
     hash_algorithm: str
@@ -6972,6 +7000,259 @@ def run_perturbation_pair(
         null_abs_tolerance=null_abs_tolerance,
         sensitivity_floor=sensitivity_floor,
     )
+
+
+def detect_insensitivity(
+    model_ref: Any,
+    perturbation_set: InsensitivityPerturbationSet | Mapping[str, Any],
+) -> InsensitivityReport:
+    spec = _normalize_insensitivity_perturbation_set(perturbation_set)
+    flags: list[InsensitivityFlag] = []
+    probe_results: list[dict[str, Any]] = []
+
+    for probe in spec.probes:
+        output = _run_model_insensitivity_probe(model_ref, probe)
+        baseline = _s3_perturbation_output_number(
+            output,
+            field="baseline_headline",
+            aliases=("baseline", "unperturbed_headline", "baseline_signal", "unperturbed"),
+        )
+        perturbed = _s3_perturbation_output_number(
+            output,
+            field="perturbed_headline",
+            aliases=("perturbed", "observed_signal", "headline", "observed", "manufactured_signal"),
+        )
+        floor = (
+            _s3_perturbation_nonnegative(probe.sensitivity_floor, field="sensitivity_floor")
+            if probe.sensitivity_floor is not None
+            else spec.sensitivity_floor
+        )
+        minimum_signal = (
+            _s3_perturbation_nonnegative(probe.minimum_baseline_signal, field="minimum_baseline_signal")
+            if probe.minimum_baseline_signal is not None
+            else spec.minimum_baseline_signal
+        )
+        delta = abs(baseline - perturbed)
+        strong_baseline = abs(baseline) >= minimum_signal
+        invariant = strong_baseline and delta <= floor
+        reason = probe.reason or f"invariant_to_{probe.variant}_perturbation"
+
+        probe_results.append(
+            {
+                "perturbation_id": probe.perturbation_id,
+                "variant": probe.variant,
+                "baseline_headline": baseline,
+                "perturbed_headline": perturbed,
+                "delta": delta,
+                "sensitivity_floor": floor,
+                "minimum_baseline_signal": minimum_signal,
+                "strong_baseline": strong_baseline,
+                "expected_reaction": probe.expected_reaction,
+                "verdict": "fail" if invariant else "pass",
+            }
+        )
+        if invariant:
+            flags.append(
+                InsensitivityFlag(
+                    perturbation_id=probe.perturbation_id,
+                    reason=reason,
+                )
+            )
+
+    insensitivity_detected = bool(flags)
+    return InsensitivityReport(
+        insensitivity_detected=insensitivity_detected,
+        insensitivity_flags=tuple(flags),
+        probe_results=tuple(probe_results),
+        must_not_react_pass=not insensitivity_detected,
+    )
+
+
+def _normalize_insensitivity_perturbation_set(
+    perturbation_set: InsensitivityPerturbationSet | Mapping[str, Any],
+) -> InsensitivityPerturbationSet:
+    if isinstance(perturbation_set, Mapping):
+        perturbation_id = str(perturbation_set.get("perturbation_id") or perturbation_set.get("id") or "")
+        raw_probes = perturbation_set.get("probes") or perturbation_set.get("perturbations")
+        if raw_probes is None and perturbation_set.get("variant") is not None:
+            raw_probes = (perturbation_set,)
+        elif isinstance(raw_probes, (Mapping, InsensitivityProbe)):
+            raw_probes = (raw_probes,)
+        perturbation_set = InsensitivityPerturbationSet(
+            perturbation_id=perturbation_id,
+            probes=tuple(raw_probes or ()),
+            sensitivity_floor=perturbation_set.get("sensitivity_floor", 0.05),
+            minimum_baseline_signal=perturbation_set.get("minimum_baseline_signal", 0.05),
+        )
+    if not isinstance(perturbation_set, InsensitivityPerturbationSet):
+        _s3_perturbation_error(
+            "S3_INSENSITIVITY_SET_INVALID",
+            "perturbation_set must be a mapping or InsensitivityPerturbationSet",
+        )
+
+    perturbation_id = _s3_perturbation_id(perturbation_set.perturbation_id)
+    floor = _s3_perturbation_nonnegative(perturbation_set.sensitivity_floor, field="sensitivity_floor")
+    minimum_signal = _s3_perturbation_nonnegative(
+        perturbation_set.minimum_baseline_signal,
+        field="minimum_baseline_signal",
+    )
+    if not perturbation_set.probes:
+        _s3_perturbation_error("S3_INSENSITIVITY_PROBES_MISSING", "insensitivity probes must not be empty")
+
+    probes = tuple(
+        _normalize_insensitivity_probe(raw, default_perturbation_id=perturbation_id)
+        for raw in perturbation_set.probes
+    )
+    seen: set[tuple[str, str]] = set()
+    for probe in probes:
+        key = (probe.perturbation_id, probe.variant)
+        if key in seen:
+            _s3_perturbation_error("S3_INSENSITIVITY_PROBE_DUPLICATE", "insensitivity probes must not contain duplicates")
+        seen.add(key)
+    return InsensitivityPerturbationSet(
+        perturbation_id=perturbation_id,
+        probes=probes,
+        sensitivity_floor=floor,
+        minimum_baseline_signal=minimum_signal,
+    )
+
+
+def _normalize_insensitivity_probe(raw: Any, *, default_perturbation_id: str) -> InsensitivityProbe:
+    if isinstance(raw, InsensitivityProbe):
+        probe = raw
+    elif isinstance(raw, Mapping):
+        probe = InsensitivityProbe(
+            perturbation_id=str(raw.get("perturbation_id") or raw.get("id") or default_perturbation_id),
+            variant=str(raw.get("variant") or raw.get("kind") or ""),
+            baseline_headline=raw.get(
+                "baseline_headline",
+                raw.get("baseline", raw.get("unperturbed_headline", raw.get("baseline_signal"))),
+            ),
+            perturbed_headline=raw.get(
+                "perturbed_headline",
+                raw.get("perturbed", raw.get("observed_signal", raw.get("observed"))),
+            ),
+            expected_reaction=str(raw.get("expected_reaction", "degrade")),
+            sensitivity_floor=raw.get("sensitivity_floor"),
+            minimum_baseline_signal=raw.get("minimum_baseline_signal"),
+            reason=raw.get("reason"),
+        )
+    else:
+        _s3_perturbation_error("S3_INSENSITIVITY_PROBE_INVALID", "insensitivity probe must be a mapping or InsensitivityProbe")
+
+    perturbation_id = _s3_perturbation_id(probe.perturbation_id or default_perturbation_id)
+    variant = probe.variant
+    if not isinstance(variant, str) or not variant:
+        _s3_perturbation_error("S3_INSENSITIVITY_VARIANT_INVALID", "insensitivity probe variant must be a non-empty string")
+    expected_reaction = probe.expected_reaction.lower().replace("-", "_").replace(" ", "_")
+    if expected_reaction not in {"degrade", "change", "should_react"}:
+        _s3_perturbation_error(
+            "S3_INSENSITIVITY_EXPECTATION_INVALID",
+            "expected_reaction must be degrade, change, or should_react",
+        )
+    baseline = (
+        _s3_perturbation_finite(probe.baseline_headline, field="baseline_headline")
+        if probe.baseline_headline is not None
+        else None
+    )
+    perturbed = (
+        _s3_perturbation_finite(probe.perturbed_headline, field="perturbed_headline")
+        if probe.perturbed_headline is not None
+        else None
+    )
+    floor = (
+        _s3_perturbation_nonnegative(probe.sensitivity_floor, field="sensitivity_floor")
+        if probe.sensitivity_floor is not None
+        else None
+    )
+    minimum_signal = (
+        _s3_perturbation_nonnegative(probe.minimum_baseline_signal, field="minimum_baseline_signal")
+        if probe.minimum_baseline_signal is not None
+        else None
+    )
+    reason = probe.reason
+    if reason is not None and (not isinstance(reason, str) or not reason):
+        _s3_perturbation_error("S3_INSENSITIVITY_REASON_INVALID", "insensitivity reason must be a non-empty string")
+    return InsensitivityProbe(
+        perturbation_id=perturbation_id,
+        variant=variant,
+        baseline_headline=baseline,
+        perturbed_headline=perturbed,
+        expected_reaction=expected_reaction,
+        sensitivity_floor=floor,
+        minimum_baseline_signal=minimum_signal,
+        reason=reason,
+    )
+
+
+def _run_model_insensitivity_probe(model_ref: Any, probe: InsensitivityProbe) -> Mapping[str, Any]:
+    if probe.baseline_headline is not None and probe.perturbed_headline is not None:
+        return {
+            "baseline_headline": probe.baseline_headline,
+            "perturbed_headline": probe.perturbed_headline,
+        }
+    if hasattr(model_ref, "run_insensitivity_probe"):
+        output = model_ref.run_insensitivity_probe(probe)
+    elif hasattr(model_ref, "run_perturbation"):
+        output = model_ref.run_perturbation(
+            S3PerturbationProbe(
+                perturbation_id=probe.perturbation_id,
+                kind="must_not_react",
+                variant=probe.variant,
+            )
+        )
+    elif callable(model_ref):
+        output = model_ref(probe)
+    elif isinstance(model_ref, Mapping):
+        output = _mapping_model_insensitivity_output(model_ref, probe)
+    else:
+        _s3_perturbation_error(
+            "S3_INSENSITIVITY_MODEL_INVALID",
+            "model_ref must be callable, expose run_insensitivity_probe/run_perturbation, or be a mapping",
+        )
+    if not isinstance(output, Mapping):
+        _s3_perturbation_error("S3_INSENSITIVITY_OUTPUT_INVALID", "insensitivity probe output must be a mapping")
+    return output
+
+
+def _mapping_model_insensitivity_output(model_ref: Mapping[str, Any], probe: InsensitivityProbe) -> Mapping[str, Any]:
+    observations = (
+        model_ref.get("insensitivity_observations")
+        or model_ref.get("insensitivity")
+        or model_ref.get("observations")
+    )
+    matched = _mapping_insensitivity_observation_by_probe(observations, probe)
+    if matched is not None:
+        return matched
+    if any(key in model_ref for key in ("baseline_headline", "baseline", "unperturbed_headline", "baseline_signal")) and any(
+        key in model_ref for key in ("perturbed_headline", "perturbed", "observed_signal", "headline", "observed")
+    ):
+        return model_ref
+    _s3_perturbation_error(
+        "S3_INSENSITIVITY_OBSERVATION_MISSING",
+        f"missing insensitivity observation for {probe.perturbation_id}:{probe.variant}",
+    )
+
+
+def _mapping_insensitivity_observation_by_probe(observations: Any, probe: InsensitivityProbe) -> Mapping[str, Any] | None:
+    if isinstance(observations, Mapping):
+        for key in (
+            f"{probe.perturbation_id}:{probe.variant}",
+            probe.variant,
+            probe.perturbation_id,
+        ):
+            value = observations.get(key)
+            if isinstance(value, Mapping):
+                return value
+    if isinstance(observations, (list, tuple)):
+        for item in observations:
+            if not isinstance(item, Mapping):
+                continue
+            item_variant = item.get("variant")
+            item_id = item.get("perturbation_id", item.get("id", probe.perturbation_id))
+            if item_variant == probe.variant and item_id == probe.perturbation_id:
+                return item
+    return None
 
 
 def _run_perturbation_pair_from_spec(
