@@ -174,6 +174,40 @@ class S4EvolverTests(unittest.TestCase):
         self.assertTrue(fail_verdict.insensitivity_detected)
         self.assertEqual(fail_verdict.reason, "INSENSITIVITY")
 
+    def test_debate_verdict_rejects_non_gameable_false_even_with_valid_signature(self) -> None:
+        report = self._signed_report(candidate_ref=self.candidate.artifact_ref, outcome=self._passing_outcome())
+        tampered = deepcopy(report)
+        tampered["referee"]["non_gameable"] = False
+        tampered = self.signer.sign(tampered)
+        verification = self.report_verifier.verify(tampered)
+
+        verdict = challenge_verdict_from_report(
+            report=tampered,
+            verification=verification,
+            proponent_id="builder",
+        )
+
+        self.assertTrue(verification.valid)
+        self.assertEqual(verdict.overall, "FAIL")
+        self.assertEqual(verdict.reason, "REFEREE_TAMPERED")
+
+    def test_debate_verdict_rejects_spoofed_referee_signer_even_with_valid_signature(self) -> None:
+        report = self._signed_report(candidate_ref=self.candidate.artifact_ref, outcome=self._passing_outcome())
+        tampered = deepcopy(report)
+        tampered["referee"]["signed_by"] = "builder-key"
+        tampered = self.signer.sign(tampered)
+        verification = self.report_verifier.verify(tampered)
+
+        verdict = challenge_verdict_from_report(
+            report=tampered,
+            verification=verification,
+            proponent_id="builder",
+        )
+
+        self.assertTrue(verification.valid)
+        self.assertEqual(verdict.overall, "FAIL")
+        self.assertEqual(verdict.reason, "REFEREE_TAMPERED")
+
     def test_select_challenger_panel_requires_independence_and_diversity(self) -> None:
         panel = select_challenger_panel(
             challengers=(

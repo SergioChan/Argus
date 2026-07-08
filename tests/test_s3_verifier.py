@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 import json
 from pathlib import Path
 import unittest
@@ -34,6 +35,7 @@ from argus_core import (
     canonical_json_bytes,
     challenge_verdict_from_report,
     detect_insensitivity,
+    enforce_non_gameable_referee,
     run_calibration_check,
     run_cross_code_check,
     run_leakage_check,
@@ -474,6 +476,47 @@ class S3VerifierReportTests(unittest.TestCase):
         with self.assertRaises(SignerIdentityError):
             S3Verifier(verifier_id="s3-referee", signer_key_id="spoofed-key", signer=self.signer)
 
+    def test_self_attestation_is_rejected_before_signature_emission(self) -> None:
+        class SpySigner:
+            key_id = "s3-key"
+
+            def __init__(self) -> None:
+                self.sign_calls = 0
+
+            def sign(self, report: dict[str, object]) -> dict[str, object]:
+                self.sign_calls += 1
+                return report
+
+        spy = SpySigner()
+        verifier = S3Verifier(verifier_id="builder", signer_key_id="s3-key", signer=spy)
+
+        with self.assertRaises(RefereePolicyError):
+            verifier.build_report(
+                profile_ref="c4://profile/ewpt/v1",
+                frozen_pipeline_ref="c4://pipeline/ewpt/baseline",
+                proponent_id="builder",
+                checks=self._recap_checks(),
+            )
+
+        self.assertEqual(spy.sign_calls, 0)
+
+    def test_non_gameable_referee_policy_rejects_spoofed_signed_by_with_valid_signature(self) -> None:
+        report = self.verifier.build_report(
+            profile_ref="c4://profile/ewpt/v1",
+            frozen_pipeline_ref="c4://pipeline/ewpt/baseline",
+            proponent_id="builder",
+            checks=self._recap_checks(),
+            perturbation_outcome=self._passing_perturbation_outcome(),
+        )
+        spoofed = deepcopy(report)
+        spoofed["referee"]["signed_by"] = "builder-key"
+        spoofed = self.signer.sign(spoofed)
+
+        verification = C3ReportVerifier(self.trust_store).verify(spoofed)
+        self.assertTrue(verification.valid)
+        with self.assertRaises(RefereePolicyError):
+            enforce_non_gameable_referee(spoofed, proponent_id="builder")
+
     def test_signed_report_verifies_with_c3_library(self) -> None:
         outcome = run_perturbation_pair(
             perturbation_id="pair-1",
@@ -526,6 +569,16 @@ class S3VerifierReportTests(unittest.TestCase):
         self.assertFalse(report["aggregate"]["passed"])
         self.assertEqual(report["claim_tier"], "ran-toy")
         self.assertEqual(len(report["insensitivity_flags"]), 1)
+
+    def _passing_perturbation_outcome(self) -> PerturbationPairOutcome:
+        return run_perturbation_pair(
+            perturbation_id="pair-1",
+            must_react_expected=1.0,
+            must_react_observed=1.0,
+            must_not_react_observed=0.0,
+            unperturbed_headline=1.0,
+            perturbed_headline=0.2,
+        )
 
     def test_detected_insensitivity_blocks_c3_and_challenge_verdict(self) -> None:
         insensitivity_report = detect_insensitivity(

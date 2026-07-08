@@ -7,7 +7,7 @@ from decimal import Decimal
 from typing import Any
 
 from argusverify import C3SignatureVerification
-from .s3 import attest_challenger_independence
+from .s3 import RefereePolicyError, attest_challenger_independence, enforce_non_gameable_referee
 from .s6 import CapabilityDescriptor, IndependenceAttestation
 from .s8 import ArtifactRecord, InMemoryArtifactStore, Lineage, Producer
 
@@ -302,10 +302,11 @@ def challenge_verdict_from_report(
     verification: C3SignatureVerification,
     proponent_id: str,
 ) -> ChallengeVerdict:
-    referee = report.get("referee")
-    if not isinstance(referee, dict):
+    if not isinstance(report.get("referee"), dict):
         return ChallengeVerdict(False, False, False, "FAIL", "REFEREE_MISSING")
-    if referee.get("referee_id") == proponent_id or referee.get("distinct_from_proponent") is not True:
+    try:
+        enforce_non_gameable_referee(report, proponent_id=proponent_id)
+    except RefereePolicyError:
         return ChallengeVerdict(False, False, False, "FAIL", "REFEREE_TAMPERED")
     if not verification.valid:
         return ChallengeVerdict(False, False, False, "FAIL", "SIGNATURE")

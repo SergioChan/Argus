@@ -6863,7 +6863,9 @@ class S3Verifier:
             "debate_ref": debate_ref,
         }
         report.update(tier_decision.as_report_fields())
-        return self.signer.sign(report)
+        signed_report = self.signer.sign(report)
+        enforce_non_gameable_referee(signed_report, proponent_id=proponent_id)
+        return signed_report
 
 
 class S3ReportBuilder:
@@ -7642,6 +7644,9 @@ def _s3_perturbation_error(code: str, message: str) -> None:
 
 
 def build_referee_block(*, referee_id: str, signer_key_id: str, proponent_id: str) -> dict[str, Any]:
+    referee_id = _referee_policy_string(referee_id, "referee_id")
+    signer_key_id = _referee_policy_string(signer_key_id, "signer_key_id")
+    proponent_id = _referee_policy_string(proponent_id, "proponent_id")
     if referee_id == proponent_id:
         raise RefereePolicyError("referee must be distinct from proponent")
     return {
@@ -7650,6 +7655,40 @@ def build_referee_block(*, referee_id: str, signer_key_id: str, proponent_id: st
         "signed_by": signer_key_id,
         "distinct_from_proponent": True,
     }
+
+
+def enforce_non_gameable_referee(report: Mapping[str, Any], *, proponent_id: str) -> None:
+    """Fail closed unless the C3 report names a signed S3 referee distinct from the proponent."""
+    proponent_id = _referee_policy_string(proponent_id, "proponent_id")
+    if not isinstance(report, Mapping):
+        raise RefereePolicyError("validation report must be a mapping")
+
+    referee = report.get("referee")
+    if not isinstance(referee, Mapping):
+        raise RefereePolicyError("referee block is required")
+    referee_id = _referee_policy_string(referee.get("referee_id"), "referee.referee_id")
+    signed_by = _referee_policy_string(referee.get("signed_by"), "referee.signed_by")
+    if referee_id == proponent_id:
+        raise RefereePolicyError("referee must be distinct from proponent")
+    if referee.get("distinct_from_proponent") is not True:
+        raise RefereePolicyError("referee.distinct_from_proponent must be true")
+    if referee.get("non_gameable") is not True:
+        raise RefereePolicyError("referee.non_gameable must be true")
+
+    signature = report.get("signature")
+    if not isinstance(signature, Mapping):
+        raise RefereePolicyError("referee requires a C3 signature block")
+    signature_key_id = _referee_policy_string(signature.get("key_id"), "signature.key_id")
+    if signed_by != signature_key_id:
+        raise RefereePolicyError("referee.signed_by must match signature.key_id")
+
+
+def _referee_policy_string(value: Any, field_name: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise RefereePolicyError(f"{field_name} must be a non-empty string")
+    if value != value.strip():
+        raise RefereePolicyError(f"{field_name} must not contain surrounding whitespace")
+    return value
 
 
 def _build_verifier_profile_revision(
