@@ -1428,6 +1428,8 @@ class ForwardModelFeatureInjector:
             "uncertainty_propagated": True,
             "unit_registry_version": adapter_result.unit_registry_version,
             "unit_registry_hash": adapter_result.unit_registry_hash,
+            "uncertainty_engine_version": adapter_result.uncertainty_engine_version,
+            "uncertainty_engine_hash": adapter_result.uncertainty_engine_hash,
         }
         if adapter_result.extrapolation_flag and request.out_of_domain_policy == "drop":
             return ForwardModelFeatureResult(

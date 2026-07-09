@@ -14,6 +14,8 @@ from argus_core import (
     NormalizedQuantity,
     Quantity,
     SimpleAdapter,
+    UNCERTAINTY_ENGINE_HASH,
+    UNCERTAINTY_ENGINE_VERSION,
     UNIT_REGISTRY_HASH,
     UNIT_REGISTRY_VERSION,
 )
@@ -45,16 +47,23 @@ class S2ForwardModelFeatureInjectorTests(unittest.TestCase):
 
         self.assertEqual(result.status, "PASS")
         self.assertEqual(result.value, 0.02)
-        self.assertEqual(result.uncertainty, {"kind": "interval", "radius": 0.01})
+        self.assertEqual(result.uncertainty["kind"], "interval")
+        self.assertEqual(result.uncertainty["source"], "adapter:omega")
+        self.assertAlmostEqual(result.uncertainty["radius"], 0.01)
+        self.assertEqual(result.uncertainty["uncertainty_engine_version"], UNCERTAINTY_ENGINE_VERSION)
+        self.assertEqual(result.uncertainty["uncertainty_engine_hash"], UNCERTAINTY_ENGINE_HASH)
         self.assertEqual(result.feature_node.node_id, "omega_forward")
         self.assertTrue(result.feature_node.uncertainty_propagated)
-        self.assertEqual(result.feature_node.uncertainty, {"kind": "interval", "radius": 0.01})
+        self.assertEqual(result.feature_node.uncertainty["kind"], "interval")
+        self.assertAlmostEqual(result.feature_node.uncertainty["radius"], 0.01)
         self.assertFalse(result.feature_node.extrapolation_flag)
         self.assertFalse(result.diagnostics["extrapolation_flag"])
         self.assertEqual(result.diagnostics["adapter_id"], "gw_spectrum_surrogate")
         self.assertEqual(result.diagnostics["adapter_provenance_ref"], result.adapter_provenance_ref)
         self.assertEqual(result.diagnostics["unit_registry_version"], UNIT_REGISTRY_VERSION)
         self.assertEqual(result.diagnostics["unit_registry_hash"], UNIT_REGISTRY_HASH)
+        self.assertEqual(result.diagnostics["uncertainty_engine_version"], UNCERTAINTY_ENGINE_VERSION)
+        self.assertEqual(result.diagnostics["uncertainty_engine_hash"], UNCERTAINTY_ENGINE_HASH)
         self.assertEqual(self.store.get_record(result.adapter_provenance_ref).kind, "log")
 
     def test_out_of_domain_adapter_result_is_flagged_not_silent(self) -> None:

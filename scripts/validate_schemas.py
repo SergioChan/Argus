@@ -30,7 +30,7 @@ EXPECTED_CONTRACT_VERSIONS = {
     "C3": "2.0.0",
     "C4": "1.0.0",
     "C5": "1.0.0",
-    "C6": "1.1.0",
+    "C6": "1.2.0",
     "C10": "4.0.0",
 }
 
@@ -241,7 +241,12 @@ def validate_contract_schema(entry: dict) -> None:
             fail("C6 EvalResult.outputs must reference OutputQuantity")
         eval_result = definitions.get("EvalResult", {})
         eval_required = set(eval_result.get("required", []))
-        for field in ("unit_registry_version", "unit_registry_hash"):
+        for field in (
+            "unit_registry_version",
+            "unit_registry_hash",
+            "uncertainty_engine_version",
+            "uncertainty_engine_hash",
+        ):
             if field not in eval_required:
                 fail(f"C6 EvalResult must require {field}")
             if "default" not in eval_result.get("properties", {}).get(field, {}):

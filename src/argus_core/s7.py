@@ -30,6 +30,15 @@ UNIT_DEFINITIONS = {
     symbol: (next(iter(spec["dimensions"]), "dimensionless"), spec["scale_to_canonical"])
     for symbol, spec in _UNIT_DEFINITION_SPECS.items()
 }
+UNCERTAINTY_ENGINE_VERSION = "argus-uncertainty-1.0.0"
+_SUPPORTED_UNCERTAINTY_KINDS = ("interval", "covariance", "samples", "quantiles", "conformal", "ensemble")
+_UNCERTAINTY_ENGINE_SPEC = {
+    "version": UNCERTAINTY_ENGINE_VERSION,
+    "supported_kinds": _SUPPORTED_UNCERTAINTY_KINDS,
+    "interval_requires": "finite non-negative radius or finite ordered lower/upper bounds",
+    "bare_point_estimates": "rejected",
+}
+UNCERTAINTY_ENGINE_HASH = hash_json(_UNCERTAINTY_ENGINE_SPEC)
 
 
 class S7Error(Exception):
@@ -93,6 +102,194 @@ class S7UnitFieldSpec:
 class S7ParsedUnitExpression:
     dimensions: tuple[int, ...]
     scale_to_canonical: float
+
+
+class S7UncertaintyEngine:
+    """Validates and normalizes C6 output uncertainty objects."""
+
+    def __init__(
+        self,
+        *,
+        version: str = UNCERTAINTY_ENGINE_VERSION,
+        engine_hash: str = UNCERTAINTY_ENGINE_HASH,
+    ) -> None:
+        self.version = version
+        self.engine_hash = engine_hash
+
+    @classmethod
+    def default(cls) -> "S7UncertaintyEngine":
+        return cls()
+
+    def normalize_output_uncertainty(
+        self,
+        uncertainty: Mapping[str, Any],
+        *,
+        field: str,
+        value: float,
+        scale: float,
+        default_source: str,
+    ) -> dict[str, Any]:
+        if not isinstance(uncertainty, Mapping) or not uncertainty:
+            raise AdapterConformanceError(f"missing uncertainty representation for output field: {field}")
+        raw_kind = uncertainty.get("kind", uncertainty.get("representation"))
+        if not isinstance(raw_kind, str) or not raw_kind.strip():
+            raise AdapterConformanceError(f"uncertainty for output field {field} must declare kind")
+        kind = raw_kind.strip().lower().replace("-", "_")
+        if kind in {"none", "point_estimate", "pointestimate"}:
+            raise AdapterConformanceError(f"bare point-estimate uncertainty is not allowed for output field: {field}")
+        if kind not in _SUPPORTED_UNCERTAINTY_KINDS:
+            raise AdapterConformanceError(f"unsupported uncertainty kind for output field {field}: {kind}")
+
+        source = uncertainty.get("source") or default_source
+        if not isinstance(source, str) or not source.strip():
+            raise AdapterConformanceError(f"uncertainty for output field {field} must declare source")
+
+        normalized: dict[str, Any] = {
+            "kind": kind,
+            "source": source.strip(),
+            "uncertainty_engine_version": self.version,
+            "uncertainty_engine_hash": self.engine_hash,
+        }
+        if kind in {"interval", "conformal"}:
+            normalized.update(self._normalize_interval(uncertainty, field=field, value=value, scale=scale))
+        elif kind == "covariance":
+            normalized.update(self._normalize_covariance(uncertainty, field=field, scale=scale))
+        elif kind == "samples":
+            normalized.update(self._normalize_samples(uncertainty, field=field, scale=scale))
+        elif kind == "quantiles":
+            normalized.update(self._normalize_quantiles(uncertainty, field=field, scale=scale))
+        elif kind == "ensemble":
+            normalized.update(self._normalize_ensemble(uncertainty, field=field, scale=scale))
+
+        for key in ("confidence", "coverage"):
+            if key in uncertainty:
+                normalized[key] = _finite_probability(uncertainty[key], f"uncertainty.{field}.{key}")
+        if "calibration_ref" in uncertainty:
+            calibration_ref = uncertainty["calibration_ref"]
+            if not isinstance(calibration_ref, str) or not calibration_ref.strip():
+                raise AdapterConformanceError(f"uncertainty calibration_ref for output field {field} must be a string")
+            normalized["calibration_ref"] = calibration_ref.strip()
+        return normalized
+
+    def summarize(self, uncertainty: Mapping[str, Any]) -> dict[str, Any]:
+        summary = {
+            "kind": str(uncertainty["kind"]),
+            "source": str(uncertainty["source"]),
+        }
+        for key in ("confidence", "coverage", "calibration_ref", "sample_count"):
+            if key in uncertainty:
+                summary[key] = uncertainty[key]
+        return summary
+
+    @staticmethod
+    def _normalize_interval(
+        uncertainty: Mapping[str, Any],
+        *,
+        field: str,
+        value: float,
+        scale: float,
+    ) -> dict[str, Any]:
+        has_radius = "radius" in uncertainty
+        has_bounds = "lower" in uncertainty or "upper" in uncertainty
+        if not has_radius and not has_bounds:
+            raise AdapterConformanceError(f"interval uncertainty for output field {field} requires radius or bounds")
+        radius: float | None = None
+        lower: float | None = None
+        upper: float | None = None
+        if has_radius:
+            radius = _finite_non_negative_uncertainty(
+                uncertainty["radius"],
+                f"uncertainty.{field}.radius",
+            ) * abs(scale)
+        if has_bounds:
+            if "lower" not in uncertainty or "upper" not in uncertainty:
+                raise AdapterConformanceError(f"interval uncertainty for output field {field} requires both bounds")
+            lower = _finite_uncertainty_number(uncertainty["lower"], f"uncertainty.{field}.lower") * scale
+            upper = _finite_uncertainty_number(uncertainty["upper"], f"uncertainty.{field}.upper") * scale
+            if lower > upper:
+                raise AdapterConformanceError(f"interval uncertainty lower bound exceeds upper bound for {field}")
+            if value < lower or value > upper:
+                raise AdapterConformanceError(f"interval uncertainty for output field {field} must contain value")
+        if radius is None:
+            assert lower is not None and upper is not None
+            radius = max(abs(value - lower), abs(upper - value))
+        if lower is None or upper is None:
+            lower = value - radius
+            upper = value + radius
+        return {
+            "radius": radius,
+            "lower": lower,
+            "upper": upper,
+        }
+
+    @staticmethod
+    def _normalize_covariance(uncertainty: Mapping[str, Any], *, field: str, scale: float) -> dict[str, Any]:
+        scale2 = scale * scale
+        if "variance" in uncertainty:
+            variance = _finite_non_negative_uncertainty(
+                uncertainty["variance"],
+                f"uncertainty.{field}.variance",
+            ) * scale2
+            return {"variance": variance}
+        raw_matrix = uncertainty.get("covariance", uncertainty.get("matrix"))
+        if not isinstance(raw_matrix, list) or not raw_matrix:
+            raise AdapterConformanceError(f"covariance uncertainty for output field {field} requires matrix")
+        width = None
+        matrix = []
+        for row_index, raw_row in enumerate(raw_matrix):
+            if not isinstance(raw_row, list) or not raw_row:
+                raise AdapterConformanceError(f"covariance uncertainty row {row_index} for {field} must be non-empty")
+            width = len(raw_row) if width is None else width
+            if len(raw_row) != width:
+                raise AdapterConformanceError(f"covariance uncertainty for output field {field} must be rectangular")
+            matrix.append(
+                [
+                    _finite_uncertainty_number(value, f"uncertainty.{field}.covariance") * scale2
+                    for value in raw_row
+                ]
+            )
+        if width != len(matrix):
+            raise AdapterConformanceError(f"covariance uncertainty for output field {field} must be square")
+        return {"covariance": matrix}
+
+    @staticmethod
+    def _normalize_samples(uncertainty: Mapping[str, Any], *, field: str, scale: float) -> dict[str, Any]:
+        samples = uncertainty.get("samples")
+        if not isinstance(samples, list) or not samples:
+            raise AdapterConformanceError(f"samples uncertainty for output field {field} requires samples")
+        normalized_samples = [
+            _finite_uncertainty_number(value, f"uncertainty.{field}.samples") * scale for value in samples
+        ]
+        return {"samples": normalized_samples, "sample_count": len(normalized_samples)}
+
+    @staticmethod
+    def _normalize_quantiles(uncertainty: Mapping[str, Any], *, field: str, scale: float) -> dict[str, Any]:
+        quantiles = uncertainty.get("quantiles")
+        if not isinstance(quantiles, Mapping) or not quantiles:
+            raise AdapterConformanceError(f"quantile uncertainty for output field {field} requires quantiles")
+        normalized = {}
+        for raw_probability, raw_value in quantiles.items():
+            probability = _finite_probability(raw_probability, f"uncertainty.{field}.quantile")
+            normalized[f"{probability:.12g}"] = _finite_uncertainty_number(
+                raw_value,
+                f"uncertainty.{field}.quantile_value",
+            ) * scale
+        return {"quantiles": normalized}
+
+    @staticmethod
+    def _normalize_ensemble(uncertainty: Mapping[str, Any], *, field: str, scale: float) -> dict[str, Any]:
+        if "members" in uncertainty:
+            members = uncertainty["members"]
+            if not isinstance(members, list) or not members:
+                raise AdapterConformanceError(f"ensemble uncertainty for output field {field} requires members")
+            normalized_members = [
+                _finite_uncertainty_number(value, f"uncertainty.{field}.members") * scale for value in members
+            ]
+            return {"members": normalized_members, "sample_count": len(normalized_members)}
+        if "spread" in uncertainty:
+            spread = _finite_non_negative_uncertainty(uncertainty["spread"], f"uncertainty.{field}.spread") * abs(scale)
+            return {"spread": spread}
+        raise AdapterConformanceError(f"ensemble uncertainty for output field {field} requires members or spread")
 
 
 class S7UnitRegistry:
@@ -198,6 +395,8 @@ class EvalResult:
     cache_hit: bool = False
     unit_registry_version: str = UNIT_REGISTRY_VERSION
     unit_registry_hash: str = UNIT_REGISTRY_HASH
+    uncertainty_engine_version: str = UNCERTAINTY_ENGINE_VERSION
+    uncertainty_engine_hash: str = UNCERTAINTY_ENGINE_HASH
 
 
 @dataclass(frozen=True)
@@ -225,9 +424,16 @@ class SimpleAdapter:
 class AdapterBroker:
     """C6 broker that enforces units, domain flags, uncertainty, and provenance."""
 
-    def __init__(self, *, artifact_store: InMemoryArtifactStore | None, unit_registry: S7UnitRegistry | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        artifact_store: InMemoryArtifactStore | None,
+        unit_registry: S7UnitRegistry | None = None,
+        uncertainty_engine: S7UncertaintyEngine | None = None,
+    ) -> None:
         self._artifact_store = artifact_store
         self._unit_registry = unit_registry or S7UnitRegistry.default()
+        self._uncertainty_engine = uncertainty_engine or S7UncertaintyEngine.default()
         self._adapters: dict[str, SimpleAdapter] = {}
 
     def register(self, adapter: SimpleAdapter) -> None:
@@ -253,6 +459,8 @@ class AdapterBroker:
             violated_fields=violated_fields,
             unit_registry_version=self._unit_registry.version,
             unit_registry_hash=self._unit_registry.registry_hash,
+            uncertainty_engine_version=self._uncertainty_engine.version,
+            uncertainty_engine_hash=self._uncertainty_engine.engine_hash,
         )
 
     def _write_provenance(
@@ -272,6 +480,12 @@ class AdapterBroker:
             "seed": request.seed,
             "unit_registry_version": self._unit_registry.version,
             "unit_registry_hash": self._unit_registry.registry_hash,
+            "uncertainty_engine_version": self._uncertainty_engine.version,
+            "uncertainty_engine_hash": self._uncertainty_engine.engine_hash,
+            "uncertainty_hash": hash_json({key: value.uncertainty for key, value in outputs.items()}),
+            "uncertainty_summary": {
+                key: self._uncertainty_engine.summarize(value.uncertainty or {}) for key, value in outputs.items()
+            },
         }
         record = self._artifact_store.create_artifact(
             kind="log",
@@ -302,10 +516,17 @@ class AdapterBroker:
                 raise AdapterConformanceError(f"output field {field} cannot declare log-space units")
             scale = self._unit_registry.conversion_factor(quantity.units, spec.units)
             normalized = normalize_quantity(quantity, expected_unit, registry=self._unit_registry)
+            uncertainty = self._uncertainty_engine.normalize_output_uncertainty(
+                quantity.uncertainty,
+                field=field,
+                value=normalized.value,
+                scale=scale,
+                default_source=f"adapter:{field}",
+            )
             normalized_outputs[field] = Quantity(
                 value=normalized.value,
                 units=normalized.units,
-                uncertainty=_scale_uncertainty(quantity.uncertainty, scale),
+                uncertainty=uncertainty,
             )
         return normalized_outputs
 
@@ -444,6 +665,29 @@ def _unit_field_spec(value: Any) -> S7UnitFieldSpec:
     raise UnitsMismatchError("unit field spec must be a string or mapping")
 
 
+def _finite_uncertainty_number(value: Any, field_name: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise AdapterConformanceError(f"{field_name} must be a finite number")
+    numeric = float(value)
+    if not math.isfinite(numeric):
+        raise AdapterConformanceError(f"{field_name} must be finite")
+    return numeric
+
+
+def _finite_non_negative_uncertainty(value: Any, field_name: str) -> float:
+    numeric = _finite_uncertainty_number(value, field_name)
+    if numeric < 0:
+        raise AdapterConformanceError(f"{field_name} must be non-negative")
+    return numeric
+
+
+def _finite_probability(value: Any, field_name: str) -> float:
+    numeric = _finite_uncertainty_number(value, field_name)
+    if numeric <= 0.0 or numeric > 1.0:
+        raise AdapterConformanceError(f"{field_name} must be in (0, 1]")
+    return numeric
+
+
 def _finite_quantity_value(value: Any, field_name: str) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise UnitsMismatchError(f"{field_name} must be a finite number")
@@ -497,7 +741,7 @@ def adapter_capability_descriptor(
         revision=revision,
         kind="adapter",
         owner_subsystem="S7",
-        contract_versions={"C5": "1.0.0", "C6": "1.1.0"},
+        contract_versions={"C5": "1.0.0", "C6": "1.2.0"},
         trust_class=trust_class,
         capability_scopes=tuple(scopes),
         provenance_ref=descriptor.provenance_ref,

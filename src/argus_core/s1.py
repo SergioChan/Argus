@@ -1440,6 +1440,8 @@ def _eval_result_payload(result: EvalResult) -> dict[str, Any]:
         "cache_hit": result.cache_hit,
         "unit_registry_version": result.unit_registry_version,
         "unit_registry_hash": result.unit_registry_hash,
+        "uncertainty_engine_version": result.uncertainty_engine_version,
+        "uncertainty_engine_hash": result.uncertainty_engine_hash,
     }
 
 

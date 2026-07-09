@@ -6,7 +6,7 @@
   "x-argus-contract": {
     "id": "C6",
     "owner": "S7",
-    "version": "1.1.0"
+    "version": "1.2.0"
   },
   "oneOf": [
     { "$ref": "#/$defs/AdapterDescriptor" },
@@ -86,7 +86,9 @@
         "extrapolation_flag",
         "provenance_ref",
         "unit_registry_version",
-        "unit_registry_hash"
+        "unit_registry_hash",
+        "uncertainty_engine_version",
+        "uncertainty_engine_hash"
       ],
       "additionalProperties": false,
       "properties": {
@@ -107,6 +109,16 @@
           "type": "string",
           "pattern": "^blake3:[0-9a-f]{64}$",
           "default": "blake3:d051549f426fb54fa67a0ef96611db2aebd0158c6b541e964c380d6cc58e06e5"
+        },
+        "uncertainty_engine_version": {
+          "type": "string",
+          "minLength": 1,
+          "default": "argus-uncertainty-1.0.0"
+        },
+        "uncertainty_engine_hash": {
+          "type": "string",
+          "pattern": "^blake3:[0-9a-f]{64}$",
+          "default": "blake3:04c6c2c24fb730865ec58cc636250e709f73d54f27ac809afefe7fad360aff58"
         },
         "error": {
           "type": "object",

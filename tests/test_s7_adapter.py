@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import unittest
 
 from argus_core import (
@@ -16,6 +17,8 @@ from argus_core import (
     Quantity,
     S7UnitRegistry,
     SimpleAdapter,
+    UNCERTAINTY_ENGINE_HASH,
+    UNCERTAINTY_ENGINE_VERSION,
     UNIT_REGISTRY_HASH,
     UNIT_REGISTRY_VERSION,
     UnitsMismatchError,
@@ -130,7 +133,12 @@ class S7UnitsAndAdapterTests(unittest.TestCase):
 
         self.assertEqual(result.outputs["peak_frequency"].units, "Hz")
         self.assertAlmostEqual(result.outputs["peak_frequency"].value, 0.002)
-        self.assertEqual(result.outputs["peak_frequency"].uncertainty, {"kind": "interval", "radius": 0.0005})
+        uncertainty = result.outputs["peak_frequency"].uncertainty
+        self.assertEqual(uncertainty["kind"], "interval")
+        self.assertEqual(uncertainty["source"], "adapter:peak_frequency")
+        self.assertAlmostEqual(uncertainty["radius"], 0.0005)
+        self.assertAlmostEqual(uncertainty["lower"], 0.0015)
+        self.assertAlmostEqual(uncertainty["upper"], 0.0025)
 
     def test_evaluate_writes_provenance_and_flags_extrapolation(self) -> None:
         store = InMemoryArtifactStore()
@@ -152,7 +160,10 @@ class S7UnitsAndAdapterTests(unittest.TestCase):
         self.assertFalse(result.in_validity_domain)
         self.assertTrue(result.extrapolation_flag)
         self.assertEqual(result.violated_fields, ("v_w",))
-        self.assertEqual(result.outputs["omega"].uncertainty, {"kind": "interval", "radius": 0.01})
+        self.assertEqual(result.outputs["omega"].uncertainty["kind"], "interval")
+        self.assertEqual(result.outputs["omega"].uncertainty["source"], "adapter:omega")
+        self.assertAlmostEqual(result.outputs["omega"].uncertainty["radius"], 0.01)
+        self.assertEqual(result.outputs["omega"].uncertainty["uncertainty_engine_version"], UNCERTAINTY_ENGINE_VERSION)
         self.assertEqual(store.get_record(result.provenance_ref).kind, "log")
 
     def test_refuse_policy_rejects_out_of_domain(self) -> None:
@@ -196,6 +207,108 @@ class S7UnitsAndAdapterTests(unittest.TestCase):
             )
 
         self.assertEqual(raised.exception.category, "ADAPTER_ERROR")
+
+    def test_malformed_uncertainty_is_conformance_error(self) -> None:
+        invalid_uncertainties = (
+            {},
+            {"kind": "none", "source": "adapter"},
+            {"kind": "point_estimate", "source": "adapter"},
+            {"kind": "interval", "radius": float("nan"), "source": "adapter"},
+            {"kind": "interval", "lower": 2.0, "upper": 1.0, "source": "adapter"},
+            {"kind": "samples", "samples": [0.1, float("inf")], "source": "adapter"},
+        )
+        for uncertainty in invalid_uncertainties:
+            with self.subTest(uncertainty=uncertainty):
+                descriptor = self._descriptor(domain_policy="flag")
+                broker = AdapterBroker(artifact_store=InMemoryArtifactStore())
+                broker.register(
+                    SimpleAdapter(
+                        descriptor,
+                        lambda _inputs, _seed, uncertainty=uncertainty: {
+                            "omega": Quantity(
+                                value=1.0,
+                                units="dimensionless",
+                                uncertainty=dict(uncertainty),
+                            )
+                        },
+                    )
+                )
+
+                with self.assertRaises(AdapterConformanceError) as raised:
+                    broker.evaluate(
+                        EvalRequest(
+                            adapter_id="gw_spectrum_surrogate",
+                            inputs={
+                                "T_n": Quantity(value=100, units="GeV"),
+                                "alpha": Quantity(value=0.2, units="dimensionless"),
+                                "v_w": Quantity(value=0.7, units="dimensionless"),
+                            },
+                        )
+                    )
+
+                self.assertEqual(raised.exception.category, "ADAPTER_ERROR")
+
+    def test_uncertainty_engine_normalizes_outputs_and_provenance_summary(self) -> None:
+        store = InMemoryArtifactStore()
+        descriptor = AdapterDescriptor(
+            adapter_id="frequency_adapter",
+            version="1.0.0",
+            input_units={"alpha": "dimensionless"},
+            output_units={"peak_frequency": "Hz"},
+            validity_domain={},
+            determinism="deterministic",
+            provenance_ref="c4://adapter/frequency_adapter/v1",
+        )
+        broker = AdapterBroker(artifact_store=store)
+        broker.register(
+            SimpleAdapter(
+                descriptor,
+                lambda _inputs, _seed: {
+                    "peak_frequency": Quantity(
+                        value=2.0,
+                        units="mHz",
+                        uncertainty={
+                            "kind": "interval",
+                            "radius": 0.5,
+                            "confidence": 0.9,
+                            "source": "native-solver",
+                        },
+                    )
+                },
+            )
+        )
+
+        result = broker.evaluate(
+            EvalRequest(
+                adapter_id="frequency_adapter",
+                inputs={"alpha": Quantity(value=0.2, units="dimensionless")},
+                seed=123,
+            )
+        )
+
+        self.assertEqual(result.uncertainty_engine_version, UNCERTAINTY_ENGINE_VERSION)
+        self.assertEqual(result.uncertainty_engine_hash, UNCERTAINTY_ENGINE_HASH)
+        uncertainty = result.outputs["peak_frequency"].uncertainty
+        self.assertIsNotNone(uncertainty)
+        self.assertEqual(uncertainty["kind"], "interval")
+        self.assertEqual(uncertainty["source"], "native-solver")
+        self.assertEqual(uncertainty["uncertainty_engine_version"], UNCERTAINTY_ENGINE_VERSION)
+        self.assertEqual(uncertainty["uncertainty_engine_hash"], UNCERTAINTY_ENGINE_HASH)
+        self.assertAlmostEqual(uncertainty["radius"], 0.0005)
+        self.assertAlmostEqual(uncertainty["lower"], 0.0015)
+        self.assertAlmostEqual(uncertainty["upper"], 0.0025)
+        self.assertAlmostEqual(uncertainty["confidence"], 0.9)
+        provenance = json.loads(store.get_artifact(result.provenance_ref))
+        self.assertEqual(provenance["uncertainty_engine_version"], UNCERTAINTY_ENGINE_VERSION)
+        self.assertEqual(provenance["uncertainty_engine_hash"], UNCERTAINTY_ENGINE_HASH)
+        self.assertEqual(
+            provenance["uncertainty_summary"]["peak_frequency"],
+            {
+                "kind": "interval",
+                "source": "native-solver",
+                "confidence": 0.9,
+            },
+        )
 
     def test_provenance_unavailable_fails_closed(self) -> None:
         broker = AdapterBroker(artifact_store=None)

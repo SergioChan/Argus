@@ -29,15 +29,17 @@ class C6ContractSchemaTests(unittest.TestCase):
         Draft202012Validator.check_schema(cls.schema)
         cls.validator = Draft202012Validator(cls.schema)
 
-    def test_schema_is_canonical_c6_v1_1(self) -> None:
+    def test_schema_is_canonical_c6_v1_2(self) -> None:
         definitions = self.schema["$defs"]
 
-        self.assertEqual(self.schema["x-argus-contract"], {"id": "C6", "owner": "S7", "version": "1.1.0"})
+        self.assertEqual(self.schema["x-argus-contract"], {"id": "C6", "owner": "S7", "version": "1.2.0"})
         for name in ("AdapterDescriptor", "EvalRequest", "EvalResult", "Quantity", "OutputQuantity"):
             self.assertIn(name, definitions)
         self.assertIn("uncertainty", definitions["OutputQuantity"]["required"])
         self.assertIn("unit_registry_version", definitions["EvalResult"]["required"])
         self.assertIn("unit_registry_hash", definitions["EvalResult"]["required"])
+        self.assertIn("uncertainty_engine_version", definitions["EvalResult"]["required"])
+        self.assertIn("uncertainty_engine_hash", definitions["EvalResult"]["required"])
         self.assertEqual(
             definitions["EvalResult"]["properties"]["outputs"]["additionalProperties"]["$ref"],
             "#/$defs/OutputQuantity",
@@ -80,7 +82,7 @@ class C6ContractSchemaTests(unittest.TestCase):
     def test_generated_python_binding_points_to_exact_c6_schema_digest(self) -> None:
         contract = CONTRACT_BY_ID["C6"]
 
-        self.assertEqual(contract.version, "1.1.0")
+        self.assertEqual(contract.version, "1.2.0")
         self.assertEqual(contract.schema, "c6.compute-adapter.schema.json")
         self.assertEqual(contract.schema_sha256, self._schema_sha256(self.schema))
 

@@ -47,6 +47,8 @@ from argus_core import (
     SubagentSDKRunner,
     SubagentRuntime,
     TraceAssembler,
+    UNCERTAINTY_ENGINE_HASH,
+    UNCERTAINTY_ENGINE_VERSION,
     UNIT_REGISTRY_HASH,
     UNIT_REGISTRY_VERSION,
     build_error_envelope,
@@ -569,9 +571,16 @@ class S1SDKBaseClassTests(unittest.TestCase):
         self.assertEqual(result["result"]["adapter_id"], "adapter:bounce")
         self.assertEqual(result["result"]["outputs"]["y"]["value"], 4.0)
         self.assertEqual(result["result"]["outputs"]["y"]["units"], "dimensionless")
-        self.assertEqual(result["result"]["outputs"]["y"]["uncertainty"], {"kind": "interval", "radius": 0.1})
+        uncertainty = result["result"]["outputs"]["y"]["uncertainty"]
+        self.assertEqual(uncertainty["kind"], "interval")
+        self.assertEqual(uncertainty["source"], "adapter:y")
+        self.assertAlmostEqual(uncertainty["radius"], 0.1)
+        self.assertEqual(uncertainty["uncertainty_engine_version"], UNCERTAINTY_ENGINE_VERSION)
+        self.assertEqual(uncertainty["uncertainty_engine_hash"], UNCERTAINTY_ENGINE_HASH)
         self.assertEqual(result["result"]["unit_registry_version"], UNIT_REGISTRY_VERSION)
         self.assertEqual(result["result"]["unit_registry_hash"], UNIT_REGISTRY_HASH)
+        self.assertEqual(result["result"]["uncertainty_engine_version"], UNCERTAINTY_ENGINE_VERSION)
+        self.assertEqual(result["result"]["uncertainty_engine_hash"], UNCERTAINTY_ENGINE_HASH)
         self.assertEqual(artifacts.get_record(str(result["provenance_ref"])).kind, "log")
         self.assertEqual(audit.events()[-1].event_type, "adapter.evaluate")
         self.assertEqual(audit.events()[-1].payload["adapter_id"], "adapter:bounce")
