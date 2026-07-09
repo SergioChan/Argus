@@ -14,6 +14,8 @@ from argus_core import (
     NormalizedQuantity,
     Quantity,
     SimpleAdapter,
+    UNIT_REGISTRY_HASH,
+    UNIT_REGISTRY_VERSION,
 )
 
 
@@ -51,6 +53,8 @@ class S2ForwardModelFeatureInjectorTests(unittest.TestCase):
         self.assertFalse(result.diagnostics["extrapolation_flag"])
         self.assertEqual(result.diagnostics["adapter_id"], "gw_spectrum_surrogate")
         self.assertEqual(result.diagnostics["adapter_provenance_ref"], result.adapter_provenance_ref)
+        self.assertEqual(result.diagnostics["unit_registry_version"], UNIT_REGISTRY_VERSION)
+        self.assertEqual(result.diagnostics["unit_registry_hash"], UNIT_REGISTRY_HASH)
         self.assertEqual(self.store.get_record(result.adapter_provenance_ref).kind, "log")
 
     def test_out_of_domain_adapter_result_is_flagged_not_silent(self) -> None:

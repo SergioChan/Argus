@@ -47,6 +47,8 @@ from argus_core import (
     SubagentSDKRunner,
     SubagentRuntime,
     TraceAssembler,
+    UNIT_REGISTRY_HASH,
+    UNIT_REGISTRY_VERSION,
     build_error_envelope,
     build_frozen_pipeline_entrypoint_request,
     hash_bytes,
@@ -568,6 +570,8 @@ class S1SDKBaseClassTests(unittest.TestCase):
         self.assertEqual(result["result"]["outputs"]["y"]["value"], 4.0)
         self.assertEqual(result["result"]["outputs"]["y"]["units"], "dimensionless")
         self.assertEqual(result["result"]["outputs"]["y"]["uncertainty"], {"kind": "interval", "radius": 0.1})
+        self.assertEqual(result["result"]["unit_registry_version"], UNIT_REGISTRY_VERSION)
+        self.assertEqual(result["result"]["unit_registry_hash"], UNIT_REGISTRY_HASH)
         self.assertEqual(artifacts.get_record(str(result["provenance_ref"])).kind, "log")
         self.assertEqual(audit.events()[-1].event_type, "adapter.evaluate")
         self.assertEqual(audit.events()[-1].payload["adapter_id"], "adapter:bounce")

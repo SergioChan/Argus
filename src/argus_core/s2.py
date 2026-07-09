@@ -1426,6 +1426,8 @@ class ForwardModelFeatureInjector:
             "violated_fields": adapter_result.violated_fields,
             "out_of_domain_policy": request.out_of_domain_policy,
             "uncertainty_propagated": True,
+            "unit_registry_version": adapter_result.unit_registry_version,
+            "unit_registry_hash": adapter_result.unit_registry_hash,
         }
         if adapter_result.extrapolation_flag and request.out_of_domain_policy == "drop":
             return ForwardModelFeatureResult(

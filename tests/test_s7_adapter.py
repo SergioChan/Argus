@@ -14,7 +14,9 @@ from argus_core import (
     OutOfDomainError,
     ProvenanceUnavailableError,
     Quantity,
+    S7UnitRegistry,
     SimpleAdapter,
+    UNIT_REGISTRY_HASH,
     UNIT_REGISTRY_VERSION,
     UnitsMismatchError,
     publish_adapter_capability,
@@ -26,6 +28,26 @@ from argus_core import (
 
 
 class S7UnitsAndAdapterTests(unittest.TestCase):
+    def test_frozen_unit_registry_digest_is_pinned_into_normalized_quantities_and_results(self) -> None:
+        registry = S7UnitRegistry.default()
+
+        normalized = normalize_quantity(Quantity(value=0.1, units="TeV"), "GeV", registry=registry)
+        result = self._evaluate_with_broker(
+            self._adapter(domain_policy="flag"),
+            {
+                "T_n": Quantity(value=0.1, units="TeV"),
+                "alpha": Quantity(value=0.2, units="dimensionless"),
+                "v_w": Quantity(value=0.7, units="dimensionless"),
+            },
+        )
+
+        self.assertEqual(registry.version, UNIT_REGISTRY_VERSION)
+        self.assertEqual(registry.registry_hash, UNIT_REGISTRY_HASH)
+        self.assertEqual(normalized.unit_registry_version, UNIT_REGISTRY_VERSION)
+        self.assertEqual(normalized.unit_registry_hash, UNIT_REGISTRY_HASH)
+        self.assertEqual(result.unit_registry_version, UNIT_REGISTRY_VERSION)
+        self.assertEqual(result.unit_registry_hash, UNIT_REGISTRY_HASH)
+
     def test_units_normalized_not_silently_coerced(self) -> None:
         normalized = normalize_quantity(Quantity(value=0.1, units="TeV"), "GeV")
 
@@ -39,6 +61,76 @@ class S7UnitsAndAdapterTests(unittest.TestCase):
             normalize_quantity(Quantity(value=1.0, units="s"), "GeV")
 
         self.assertEqual(raised.exception.category, "UNITS_MISMATCH")
+
+    def test_compound_units_normalize_and_reject_dimension_mismatch(self) -> None:
+        normalized = normalize_quantity(Quantity(value=2.0, units="TeV/Hz"), "GeV/Hz")
+
+        self.assertEqual(normalized.units, "GeV/Hz")
+        self.assertEqual(normalized.original_units, "TeV/Hz")
+        self.assertAlmostEqual(normalized.value, 2000.0)
+        with self.assertRaises(UnitsMismatchError):
+            normalize_quantity(Quantity(value=1.0, units="GeV/Hz"), "GeV")
+
+    def test_log_space_inputs_are_delinearized_before_backend(self) -> None:
+        captured: dict[str, float] = {}
+        descriptor = AdapterDescriptor(
+            adapter_id="log_adapter",
+            version="1.0.0",
+            input_units={
+                "log10_beta_over_H": {"units": "dimensionless", "log_space": "log10"},
+            },
+            output_units={"omega": "dimensionless"},
+            validity_domain={"log10_beta_over_H": (1.0, 3.0)},
+            determinism="deterministic",
+            provenance_ref="c4://adapter/log_adapter/v1",
+        )
+
+        def evaluate(inputs: dict[str, NormalizedQuantity], _seed: int | None) -> dict[str, Quantity]:
+            captured["beta_over_H"] = inputs["log10_beta_over_H"].value
+            return {
+                "omega": Quantity(
+                    value=inputs["log10_beta_over_H"].value,
+                    units="dimensionless",
+                    uncertainty={"kind": "interval", "radius": 0.01},
+                )
+            }
+
+        result = self._evaluate_with_broker(
+            SimpleAdapter(descriptor, evaluate),
+            {"log10_beta_over_H": Quantity(value=2.0, units="dimensionless")},
+        )
+
+        self.assertAlmostEqual(captured["beta_over_H"], 100.0)
+        self.assertEqual(result.outputs["omega"].value, 100.0)
+        self.assertEqual(result.unit_registry_version, UNIT_REGISTRY_VERSION)
+
+    def test_outputs_are_normalized_to_declared_units(self) -> None:
+        descriptor = AdapterDescriptor(
+            adapter_id="frequency_adapter",
+            version="1.0.0",
+            input_units={"alpha": "dimensionless"},
+            output_units={"peak_frequency": "Hz"},
+            validity_domain={},
+            determinism="deterministic",
+            provenance_ref="c4://adapter/frequency_adapter/v1",
+        )
+        result = self._evaluate_with_broker(
+            SimpleAdapter(
+                descriptor,
+                lambda _inputs, _seed: {
+                    "peak_frequency": Quantity(
+                        value=2.0,
+                        units="mHz",
+                        uncertainty={"kind": "interval", "radius": 0.5},
+                    )
+                },
+            ),
+            {"alpha": Quantity(value=0.2, units="dimensionless")},
+        )
+
+        self.assertEqual(result.outputs["peak_frequency"].units, "Hz")
+        self.assertAlmostEqual(result.outputs["peak_frequency"].value, 0.002)
+        self.assertEqual(result.outputs["peak_frequency"].uncertainty, {"kind": "interval", "radius": 0.0005})
 
     def test_evaluate_writes_provenance_and_flags_extrapolation(self) -> None:
         store = InMemoryArtifactStore()
@@ -210,6 +302,12 @@ class S7UnitsAndAdapterTests(unittest.TestCase):
                 uncertainty={"kind": "interval", "radius": 0.01},
             )
         }
+
+    @staticmethod
+    def _evaluate_with_broker(adapter: SimpleAdapter, inputs: dict[str, Quantity]):
+        broker = AdapterBroker(artifact_store=InMemoryArtifactStore())
+        broker.register(adapter)
+        return broker.evaluate(EvalRequest(adapter_id=adapter.descriptor.adapter_id, inputs=inputs, seed=123))
 
 
 if __name__ == "__main__":

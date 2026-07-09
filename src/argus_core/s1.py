@@ -1438,6 +1438,8 @@ def _eval_result_payload(result: EvalResult) -> dict[str, Any]:
         "provenance_ref": result.provenance_ref,
         "violated_fields": list(result.violated_fields),
         "cache_hit": result.cache_hit,
+        "unit_registry_version": result.unit_registry_version,
+        "unit_registry_hash": result.unit_registry_hash,
     }
 
 

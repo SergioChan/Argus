@@ -11,5 +11,7 @@
   },
   "in_validity_domain": true,
   "extrapolation_flag": false,
-  "provenance_ref": "c4://adapter-call/toy-bounce/example"
+  "provenance_ref": "c4://adapter-call/toy-bounce/example",
+  "unit_registry_version": "argus-units-1.0.0",
+  "unit_registry_hash": "blake3:d051549f426fb54fa67a0ef96611db2aebd0158c6b541e964c380d6cc58e06e5"
 }
