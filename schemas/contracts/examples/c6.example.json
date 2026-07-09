@@ -18,6 +18,16 @@
   },
   "in_validity_domain": true,
   "extrapolation_flag": false,
+  "seed_used": 7,
+  "seed_source": "explicit",
+  "seed_derivation": {
+    "algorithm": "explicit",
+    "seed_manager_version": "argus-seed-1.0.0",
+    "seed_manager_hash": "blake3:139c32ecf38beef7cca4a9d72338af65843428033330bd6d4516e58e9dc90267",
+    "adapter_id": "adapter:toy-bounce",
+    "seed_used": 7,
+    "seed_source": "explicit"
+  },
   "domain_diagnostics": {
     "kind": "box",
     "policy": "flag",
@@ -34,5 +44,7 @@
   "uncertainty_engine_version": "argus-uncertainty-1.0.0",
   "uncertainty_engine_hash": "blake3:04c6c2c24fb730865ec58cc636250e709f73d54f27ac809afefe7fad360aff58",
   "validity_domain_guard_version": "argus-domain-1.0.0",
-  "validity_domain_guard_hash": "blake3:353cb32c3b4d50a2f1a3626946cd23b7407b6a64240e405c32398e936f387bc5"
+  "validity_domain_guard_hash": "blake3:353cb32c3b4d50a2f1a3626946cd23b7407b6a64240e405c32398e936f387bc5",
+  "seed_manager_version": "argus-seed-1.0.0",
+  "seed_manager_hash": "blake3:139c32ecf38beef7cca4a9d72338af65843428033330bd6d4516e58e9dc90267"
 }

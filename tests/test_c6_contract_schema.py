@@ -29,13 +29,19 @@ class C6ContractSchemaTests(unittest.TestCase):
         Draft202012Validator.check_schema(cls.schema)
         cls.validator = Draft202012Validator(cls.schema)
 
-    def test_schema_is_canonical_c6_v1_3(self) -> None:
+    def test_schema_is_canonical_c6_v2_0(self) -> None:
         definitions = self.schema["$defs"]
 
-        self.assertEqual(self.schema["x-argus-contract"], {"id": "C6", "owner": "S7", "version": "1.3.0"})
+        self.assertEqual(self.schema["x-argus-contract"], {"id": "C6", "owner": "S7", "version": "2.0.0"})
         for name in ("AdapterDescriptor", "EvalRequest", "EvalResult", "Quantity", "OutputQuantity"):
             self.assertIn(name, definitions)
         self.assertIn("uncertainty", definitions["OutputQuantity"]["required"])
+        self.assertIn("job_seed", definitions["EvalRequest"]["properties"])
+        self.assertIn("dag_node_id", definitions["EvalRequest"]["properties"])
+        self.assertIn("call_index", definitions["EvalRequest"]["properties"])
+        self.assertIn("seed_used", definitions["EvalResult"]["required"])
+        self.assertIn("seed_source", definitions["EvalResult"]["required"])
+        self.assertIn("seed_derivation", definitions["EvalResult"]["required"])
         self.assertIn("unit_registry_version", definitions["EvalResult"]["required"])
         self.assertIn("unit_registry_hash", definitions["EvalResult"]["required"])
         self.assertIn("uncertainty_engine_version", definitions["EvalResult"]["required"])
@@ -77,6 +83,9 @@ class C6ContractSchemaTests(unittest.TestCase):
                 "alpha": {"value": 0.1, "units": "dimensionless"},
             },
             "seed": 7,
+            "job_seed": 3,
+            "dag_node_id": "node-a",
+            "call_index": 0,
         }
 
         self._assert_valid(descriptor)
@@ -85,7 +94,7 @@ class C6ContractSchemaTests(unittest.TestCase):
     def test_generated_python_binding_points_to_exact_c6_schema_digest(self) -> None:
         contract = CONTRACT_BY_ID["C6"]
 
-        self.assertEqual(contract.version, "1.3.0")
+        self.assertEqual(contract.version, "2.0.0")
         self.assertEqual(contract.schema, "c6.compute-adapter.schema.json")
         self.assertEqual(contract.schema_sha256, self._schema_sha256(self.schema))
 

@@ -610,6 +610,140 @@ class S7UnitsAndAdapterTests(unittest.TestCase):
         self.assertEqual(first, second)
         self.assertNotEqual(first, other)
 
+    def test_seed_manager_derives_seed_and_records_replayable_provenance(self) -> None:
+        store = InMemoryArtifactStore()
+        captured: list[int | None] = []
+        descriptor = AdapterDescriptor(
+            adapter_id="seeded_adapter",
+            version="1.0.0",
+            input_units={"alpha": "dimensionless"},
+            output_units={"omega": "dimensionless"},
+            validity_domain={"alpha": (0.0, 1.0)},
+            determinism="deterministic",
+            provenance_ref="c4://adapter/seeded_adapter/v1",
+        )
+
+        def evaluate(_inputs: dict[str, NormalizedQuantity], seed: int | None) -> dict[str, Quantity]:
+            captured.append(seed)
+            return {
+                "omega": Quantity(
+                    value=float((seed or 0) % 1000),
+                    units="dimensionless",
+                    uncertainty={"kind": "interval", "radius": 0.01},
+                )
+            }
+
+        broker = AdapterBroker(artifact_store=store)
+        broker.register(SimpleAdapter(descriptor, evaluate))
+        request = EvalRequest(
+            adapter_id="seeded_adapter",
+            inputs={"alpha": Quantity(value=0.2, units="dimensionless")},
+            job_seed=7,
+            dag_node_id="node-a",
+            call_index=1,
+        )
+        expected_seed = derive_seed(job_seed=7, dag_node_id="node-a", call_index=1, adapter_id="seeded_adapter")
+
+        first = broker.evaluate(request)
+        second = broker.evaluate(request)
+
+        self.assertEqual(captured, [expected_seed, expected_seed])
+        self.assertEqual(first.seed_used, expected_seed)
+        self.assertEqual(first.seed_source, "derived")
+        self.assertEqual(first.seed_derivation["job_seed"], 7)
+        self.assertEqual(first.seed_derivation["dag_node_id"], "node-a")
+        self.assertEqual(first.seed_derivation["call_index"], 1)
+        self.assertEqual(first.seed_derivation["adapter_id"], "seeded_adapter")
+        self.assertEqual(first.seed_derivation["algorithm"], "blake3-kdf-v1")
+        self.assertEqual(first.outputs, second.outputs)
+
+        first_provenance = json.loads(store.get_artifact(first.provenance_ref))
+        second_provenance = json.loads(store.get_artifact(second.provenance_ref))
+        self.assertEqual(first_provenance["seed"], expected_seed)
+        self.assertEqual(first_provenance["seed_used"], expected_seed)
+        self.assertEqual(first_provenance["seed_source"], "derived")
+        self.assertEqual(first_provenance["seed_derivation"], first.seed_derivation)
+        self.assertEqual(first_provenance["output_hash"], second_provenance["output_hash"])
+        self.assertEqual(store.get_record(first.provenance_ref).lineage.seeds, (str(expected_seed),))
+
+    def test_explicit_seed_overrides_derivation_but_keeps_context(self) -> None:
+        store = InMemoryArtifactStore()
+        captured: list[int | None] = []
+        descriptor = AdapterDescriptor(
+            adapter_id="explicit_seed_adapter",
+            version="1.0.0",
+            input_units={"alpha": "dimensionless"},
+            output_units={"omega": "dimensionless"},
+            validity_domain={"alpha": (0.0, 1.0)},
+            determinism="seeded",
+            provenance_ref="c4://adapter/explicit_seed_adapter/v1",
+        )
+        broker = AdapterBroker(artifact_store=store)
+        broker.register(
+            SimpleAdapter(
+                descriptor,
+                lambda _inputs, seed: captured.append(seed)
+                or {
+                    "omega": Quantity(
+                        value=float(seed or 0),
+                        units="dimensionless",
+                        uncertainty={"kind": "interval", "radius": 0.01},
+                    )
+                },
+            )
+        )
+
+        result = broker.evaluate(
+            EvalRequest(
+                adapter_id="explicit_seed_adapter",
+                inputs={"alpha": Quantity(value=0.2, units="dimensionless")},
+                seed=555,
+                job_seed=7,
+                dag_node_id="node-a",
+                call_index=1,
+            )
+        )
+
+        self.assertEqual(captured, [555])
+        self.assertEqual(result.seed_used, 555)
+        self.assertEqual(result.seed_source, "explicit")
+        self.assertEqual(result.seed_derivation["job_seed"], 7)
+        self.assertEqual(result.seed_derivation["adapter_id"], "explicit_seed_adapter")
+        provenance = json.loads(store.get_artifact(result.provenance_ref))
+        self.assertEqual(provenance["seed"], 555)
+        self.assertEqual(provenance["seed_source"], "explicit")
+
+    def test_seed_manager_rejects_partial_or_invalid_derivation_context(self) -> None:
+        broker = AdapterBroker(artifact_store=InMemoryArtifactStore())
+        broker.register(self._adapter(domain_policy="flag"))
+        base_inputs = {
+            "T_n": Quantity(value=100, units="GeV"),
+            "alpha": Quantity(value=0.2, units="dimensionless"),
+            "v_w": Quantity(value=0.7, units="dimensionless"),
+        }
+        invalid_requests = (
+            EvalRequest(
+                adapter_id="gw_spectrum_surrogate",
+                inputs=base_inputs,
+                job_seed=7,
+                dag_node_id="node-a",
+            ),
+            EvalRequest(
+                adapter_id="gw_spectrum_surrogate",
+                inputs=base_inputs,
+                job_seed=7,
+                dag_node_id="node-a",
+                call_index=-1,
+            ),
+        )
+
+        for request in invalid_requests:
+            with self.subTest(request=request):
+                with self.assertRaises(AdapterConformanceError) as raised:
+                    broker.evaluate(request)
+
+                self.assertEqual(raised.exception.category, "ADAPTER_ERROR")
+
     def test_adapter_capability_publishes_to_c5_registry(self) -> None:
         registry = InMemoryRegistry()
 

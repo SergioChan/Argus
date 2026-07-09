@@ -1433,6 +1433,11 @@ class ForwardModelFeatureInjector:
             "uncertainty_engine_hash": adapter_result.uncertainty_engine_hash,
             "validity_domain_guard_version": adapter_result.validity_domain_guard_version,
             "validity_domain_guard_hash": adapter_result.validity_domain_guard_hash,
+            "seed_used": adapter_result.seed_used,
+            "seed_source": adapter_result.seed_source,
+            "seed_derivation": adapter_result.seed_derivation,
+            "seed_manager_version": adapter_result.seed_manager_version,
+            "seed_manager_hash": adapter_result.seed_manager_hash,
         }
         if adapter_result.extrapolation_flag and request.out_of_domain_policy == "drop":
             return ForwardModelFeatureResult(

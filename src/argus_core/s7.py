@@ -49,6 +49,16 @@ _VALIDITY_DOMAIN_GUARD_SPEC = {
     "malformed_domains": "fail_closed",
 }
 VALIDITY_DOMAIN_GUARD_HASH = hash_json(_VALIDITY_DOMAIN_GUARD_SPEC)
+SEED_MANAGER_VERSION = "argus-seed-1.0.0"
+SEED_MANAGER_ALGORITHM = "blake3-kdf-v1"
+SEED_MANAGER_HASH = hash_json(
+    {
+        "version": SEED_MANAGER_VERSION,
+        "algorithm": SEED_MANAGER_ALGORITHM,
+        "inputs": ("job_seed", "dag_node_id", "call_index", "adapter_id"),
+        "explicit_seed_policy": "caller seed overrides derived seed while retaining context",
+    }
+)
 
 
 class S7Error(Exception):
@@ -382,6 +392,97 @@ class S7DomainClassification:
     diagnostics: dict[str, Any] = field(default_factory=dict)
 
 
+@dataclass(frozen=True)
+class S7SeedDecision:
+    seed_used: int | None
+    seed_source: str
+    seed_derivation: dict[str, Any]
+
+
+class S7SeedManager:
+    """Derives replayable per-call adapter seeds from C2/DAG context."""
+
+    def __init__(
+        self,
+        *,
+        version: str = SEED_MANAGER_VERSION,
+        algorithm: str = SEED_MANAGER_ALGORITHM,
+        manager_hash: str = SEED_MANAGER_HASH,
+    ) -> None:
+        self.version = version
+        self.algorithm = algorithm
+        self.manager_hash = manager_hash
+
+    @classmethod
+    def default(cls) -> "S7SeedManager":
+        return cls()
+
+    def resolve(
+        self,
+        *,
+        adapter_id: str,
+        explicit_seed: int | None,
+        job_seed: int | None,
+        dag_node_id: str | None,
+        call_index: int | None,
+    ) -> S7SeedDecision:
+        normalized_explicit_seed = _optional_seed_int(explicit_seed, "seed")
+        context_present = job_seed is not None or dag_node_id is not None or call_index is not None
+        if context_present:
+            normalized_job_seed = _required_seed_int(job_seed, "job_seed")
+            normalized_dag_node_id = _required_seed_string(dag_node_id, "dag_node_id")
+            normalized_call_index = _required_call_index(call_index)
+            derived_seed = derive_seed(
+                job_seed=normalized_job_seed,
+                dag_node_id=normalized_dag_node_id,
+                call_index=normalized_call_index,
+                adapter_id=adapter_id,
+            )
+            seed_used = normalized_explicit_seed if normalized_explicit_seed is not None else derived_seed
+            seed_source = "explicit" if normalized_explicit_seed is not None else "derived"
+            return S7SeedDecision(
+                seed_used=seed_used,
+                seed_source=seed_source,
+                seed_derivation={
+                    "algorithm": self.algorithm,
+                    "seed_manager_version": self.version,
+                    "seed_manager_hash": self.manager_hash,
+                    "adapter_id": adapter_id,
+                    "job_seed": normalized_job_seed,
+                    "dag_node_id": normalized_dag_node_id,
+                    "call_index": normalized_call_index,
+                    "derived_seed": derived_seed,
+                    "seed_used": seed_used,
+                    "seed_source": seed_source,
+                },
+            )
+        if normalized_explicit_seed is not None:
+            return S7SeedDecision(
+                seed_used=normalized_explicit_seed,
+                seed_source="explicit",
+                seed_derivation={
+                    "algorithm": "explicit",
+                    "seed_manager_version": self.version,
+                    "seed_manager_hash": self.manager_hash,
+                    "adapter_id": adapter_id,
+                    "seed_used": normalized_explicit_seed,
+                    "seed_source": "explicit",
+                },
+            )
+        return S7SeedDecision(
+            seed_used=None,
+            seed_source="unseeded",
+            seed_derivation={
+                "algorithm": "unseeded",
+                "seed_manager_version": self.version,
+                "seed_manager_hash": self.manager_hash,
+                "adapter_id": adapter_id,
+                "seed_used": None,
+                "seed_source": "unseeded",
+            },
+        )
+
+
 class S7ValidityDomainGuard:
     """Classifies and applies C6 adapter validity-domain policy."""
 
@@ -479,6 +580,9 @@ class EvalRequest:
     adapter_id: str
     inputs: dict[str, Quantity]
     seed: int | None = None
+    job_seed: int | None = None
+    dag_node_id: str | None = None
+    call_index: int | None = None
 
 
 @dataclass(frozen=True)
@@ -488,6 +592,9 @@ class EvalResult:
     in_validity_domain: bool
     extrapolation_flag: bool
     provenance_ref: str
+    seed_used: int | None = None
+    seed_source: str = "unseeded"
+    seed_derivation: dict[str, Any] = field(default_factory=dict)
     violated_fields: tuple[str, ...] = ()
     domain_diagnostics: dict[str, Any] = field(default_factory=dict)
     cache_hit: bool = False
@@ -497,6 +604,8 @@ class EvalResult:
     uncertainty_engine_hash: str = UNCERTAINTY_ENGINE_HASH
     validity_domain_guard_version: str = VALIDITY_DOMAIN_GUARD_VERSION
     validity_domain_guard_hash: str = VALIDITY_DOMAIN_GUARD_HASH
+    seed_manager_version: str = SEED_MANAGER_VERSION
+    seed_manager_hash: str = SEED_MANAGER_HASH
 
 
 @dataclass(frozen=True)
@@ -769,6 +878,9 @@ def validate_adapter_locally(
             "unit_registry_version": result.unit_registry_version,
             "uncertainty_engine_version": result.uncertainty_engine_version,
             "validity_domain_guard_version": result.validity_domain_guard_version,
+            "seed_manager_version": result.seed_manager_version,
+            "seed_used": result.seed_used,
+            "seed_source": result.seed_source,
             "sdk_uncertainty": _sdk_attr(adapter, "_s7_uncertainty", {}),
             "sdk_backend": _sdk_attr(adapter, "_s7_backend", None),
         },
@@ -807,11 +919,13 @@ class AdapterBroker:
         unit_registry: S7UnitRegistry | None = None,
         uncertainty_engine: S7UncertaintyEngine | None = None,
         validity_domain_guard: S7ValidityDomainGuard | None = None,
+        seed_manager: S7SeedManager | None = None,
     ) -> None:
         self._artifact_store = artifact_store
         self._unit_registry = unit_registry or S7UnitRegistry.default()
         self._uncertainty_engine = uncertainty_engine or S7UncertaintyEngine.default()
         self._validity_domain_guard = validity_domain_guard or S7ValidityDomainGuard(unit_registry=self._unit_registry)
+        self._seed_manager = seed_manager or S7SeedManager.default()
         self._adapters: dict[str, SimpleAdapter] = {}
 
     def register(self, adapter: SimpleAdapter) -> None:
@@ -832,11 +946,19 @@ class AdapterBroker:
                 diagnostics=domain_classification.diagnostics,
             )
 
-        raw_outputs = adapter.evaluate(domain_classification.normalized_inputs, request.seed)
+        seed_decision = self._seed_manager.resolve(
+            adapter_id=descriptor.adapter_id,
+            explicit_seed=request.seed,
+            job_seed=request.job_seed,
+            dag_node_id=request.dag_node_id,
+            call_index=request.call_index,
+        )
+        raw_outputs = adapter.evaluate(domain_classification.normalized_inputs, seed_decision.seed_used)
         outputs = self._normalize_outputs_conform(raw_outputs, descriptor.output_units)
         provenance_ref = self._write_provenance(
             descriptor,
             request,
+            seed_decision,
             domain_classification.normalized_inputs,
             outputs,
             domain_classification.diagnostics,
@@ -847,6 +969,9 @@ class AdapterBroker:
             in_validity_domain=domain_classification.in_validity_domain,
             extrapolation_flag=domain_classification.extrapolation_flag,
             provenance_ref=provenance_ref,
+            seed_used=seed_decision.seed_used,
+            seed_source=seed_decision.seed_source,
+            seed_derivation=seed_decision.seed_derivation,
             violated_fields=domain_classification.violated_fields,
             domain_diagnostics=domain_classification.diagnostics,
             unit_registry_version=self._unit_registry.version,
@@ -855,12 +980,15 @@ class AdapterBroker:
             uncertainty_engine_hash=self._uncertainty_engine.engine_hash,
             validity_domain_guard_version=self._validity_domain_guard.version,
             validity_domain_guard_hash=self._validity_domain_guard.guard_hash,
+            seed_manager_version=self._seed_manager.version,
+            seed_manager_hash=self._seed_manager.manager_hash,
         )
 
     def _write_provenance(
         self,
         descriptor: AdapterDescriptor,
         request: EvalRequest,
+        seed_decision: S7SeedDecision,
         normalized_inputs: dict[str, NormalizedQuantity],
         outputs: dict[str, Quantity],
         domain_diagnostics: Mapping[str, Any],
@@ -872,7 +1000,12 @@ class AdapterBroker:
             "adapter_version": descriptor.version,
             "input_hash": hash_json({key: asdict(value) for key, value in normalized_inputs.items()}),
             "output_hash": hash_json({key: asdict(value) for key, value in outputs.items()}),
-            "seed": request.seed,
+            "seed": seed_decision.seed_used,
+            "seed_used": seed_decision.seed_used,
+            "seed_source": seed_decision.seed_source,
+            "seed_derivation": seed_decision.seed_derivation,
+            "seed_manager_version": self._seed_manager.version,
+            "seed_manager_hash": self._seed_manager.manager_hash,
             "unit_registry_version": self._unit_registry.version,
             "unit_registry_hash": self._unit_registry.registry_hash,
             "uncertainty_engine_version": self._uncertainty_engine.version,
@@ -894,7 +1027,7 @@ class AdapterBroker:
                 input_refs=(descriptor.provenance_ref,),
                 code_ref=f"adapter:{descriptor.adapter_id}@{descriptor.version}",
                 environment_digest=hash_json({"adapter": descriptor.adapter_id, "version": descriptor.version}),
-                seeds=(str(request.seed),) if request.seed is not None else (),
+                seeds=(str(seed_decision.seed_used),) if seed_decision.seed_used is not None else (),
             ),
         )
         return record.artifact_ref
@@ -1219,6 +1352,31 @@ def _scale_uncertainty(uncertainty: dict[str, Any], scale: float) -> dict[str, A
     return scaled
 
 
+def _optional_seed_int(value: int | None, field_name: str) -> int | None:
+    if value is None:
+        return None
+    return _required_seed_int(value, field_name)
+
+
+def _required_seed_int(value: Any, field_name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise AdapterConformanceError(f"{field_name} must be an integer")
+    return value
+
+
+def _required_call_index(value: Any) -> int:
+    call_index = _required_seed_int(value, "call_index")
+    if call_index < 0:
+        raise AdapterConformanceError("call_index must be non-negative")
+    return call_index
+
+
+def _required_seed_string(value: Any, field_name: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise AdapterConformanceError(f"{field_name} must be a non-empty string")
+    return value.strip()
+
+
 def derive_seed(*, job_seed: int, dag_node_id: str, call_index: int, adapter_id: str) -> int:
     digest = hash_json(
         {
@@ -1247,7 +1405,7 @@ def adapter_capability_descriptor(
         revision=revision,
         kind="adapter",
         owner_subsystem="S7",
-        contract_versions={"C5": "1.0.0", "C6": "1.3.0"},
+        contract_versions={"C5": "1.0.0", "C6": "2.0.0"},
         trust_class=trust_class,
         capability_scopes=tuple(scopes),
         provenance_ref=descriptor.provenance_ref,

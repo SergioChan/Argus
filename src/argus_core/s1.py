@@ -1394,7 +1394,17 @@ def _eval_request_from_mapping(request: Mapping[str, Any], *, default_adapter_re
                     message="adapter request seed must be an integer",
                 )
             ) from exc
-    return EvalRequest(adapter_id=adapter_id, inputs=inputs, seed=seed)
+    job_seed = _optional_adapter_request_int(request.get("job_seed"), "job_seed")
+    call_index = _optional_adapter_request_int(request.get("call_index"), "call_index")
+    dag_node_id = _optional_adapter_request_string(request.get("dag_node_id"), "dag_node_id")
+    return EvalRequest(
+        adapter_id=adapter_id,
+        inputs=inputs,
+        seed=seed,
+        job_seed=job_seed,
+        dag_node_id=dag_node_id,
+        call_index=call_index,
+    )
 
 
 def _quantity_from_value(value: Any) -> Quantity:
@@ -1421,11 +1431,41 @@ def _quantity_from_value(value: Any) -> Quantity:
     )
 
 
+def _optional_adapter_request_int(value: Any, field_name: str) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        _raise_adapter_request_error("S1_ADAPTER_REQUEST_INVALID", f"adapter request {field_name} must be an integer")
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise LifecyclePolicyError(
+            build_error_envelope(
+                category="POLICY",
+                code="S1_ADAPTER_REQUEST_INVALID",
+                message=f"adapter request {field_name} must be an integer",
+            )
+        ) from exc
+    return parsed
+
+
+def _optional_adapter_request_string(value: Any, field_name: str) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        _raise_adapter_request_error("S1_ADAPTER_REQUEST_INVALID", f"adapter request {field_name} must be non-empty")
+    return text
+
+
 def _eval_request_payload(request: EvalRequest) -> dict[str, Any]:
     return {
         "adapter_id": request.adapter_id,
         "inputs": {field: asdict(quantity) for field, quantity in sorted(request.inputs.items())},
         "seed": request.seed,
+        "job_seed": request.job_seed,
+        "dag_node_id": request.dag_node_id,
+        "call_index": request.call_index,
     }
 
 
@@ -1436,6 +1476,9 @@ def _eval_result_payload(result: EvalResult) -> dict[str, Any]:
         "in_validity_domain": result.in_validity_domain,
         "extrapolation_flag": result.extrapolation_flag,
         "provenance_ref": result.provenance_ref,
+        "seed_used": result.seed_used,
+        "seed_source": result.seed_source,
+        "seed_derivation": result.seed_derivation,
         "violated_fields": list(result.violated_fields),
         "domain_diagnostics": _json_safe_domain_diagnostics(result.domain_diagnostics),
         "cache_hit": result.cache_hit,
@@ -1445,6 +1488,8 @@ def _eval_result_payload(result: EvalResult) -> dict[str, Any]:
         "uncertainty_engine_hash": result.uncertainty_engine_hash,
         "validity_domain_guard_version": result.validity_domain_guard_version,
         "validity_domain_guard_hash": result.validity_domain_guard_hash,
+        "seed_manager_version": result.seed_manager_version,
+        "seed_manager_hash": result.seed_manager_hash,
     }
 
 

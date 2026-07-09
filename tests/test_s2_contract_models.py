@@ -39,7 +39,7 @@ class S2ContractModelTests(unittest.TestCase):
         self.assertEqual(model_set.by_id("C1").version, "1.0.0")
         self.assertEqual(model_set.by_id("C2").schema, "c2.job-envelope.schema.json")
         self.assertEqual(model_set.by_id("C4").version, "1.0.0")
-        self.assertEqual(model_set.by_id("C6").version, "1.3.0")
+        self.assertEqual(model_set.by_id("C6").version, "2.0.0")
 
     def test_stale_generated_binding_digest_fails_closed(self) -> None:
         stale = dict(CONTRACT_BY_ID)
