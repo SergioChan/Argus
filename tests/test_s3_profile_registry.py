@@ -318,13 +318,10 @@ class S3PostgresProfileRegistryTests(unittest.TestCase):
             "-q",
             "-h",
             self.pg_host,
-            "-d",
-            self.pg_database,
-            "-c",
-            sql,
         ]
         if self.pg_port is not None:
-            command[8:8] = ["-p", str(self.pg_port)]
+            command.extend(["-p", str(self.pg_port)])
+        command.extend(["-d", self.pg_database, "-c", sql])
         result = subprocess.run(command, check=False, text=True, capture_output=True)
         if check and result.returncode != 0:
             raise RuntimeError(
