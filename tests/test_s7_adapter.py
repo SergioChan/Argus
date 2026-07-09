@@ -11,12 +11,16 @@ from argus_core import (
     AdapterVersionError,
     EvalContext,
     EvalRequest,
+    GradRequest,
     InMemoryArtifactStore,
     InMemoryRegistry,
+    NotDifferentiableError,
     NormalizedQuantity,
     OutOfDomainError,
     ProvenanceUnavailableError,
     Quantity,
+    S7JaxBackend,
+    S7NativePythonBackend,
     S7ValidityDomainGuard,
     S7AdapterValidationResult,
     S7UnitRegistry,
@@ -46,6 +50,128 @@ from argus_core import (
 
 
 class S7UnitsAndAdapterTests(unittest.TestCase):
+    def test_native_python_backend_records_backend_provenance(self) -> None:
+        store = InMemoryArtifactStore()
+        descriptor = AdapterDescriptor(
+            adapter_id="native_backend_adapter",
+            version="1.0.0",
+            input_units={"alpha": "dimensionless"},
+            output_units={"omega": "dimensionless"},
+            validity_domain={"alpha": (0.0, 1.0)},
+            determinism="deterministic",
+            provenance_ref="c4://adapter/native-backend/v1",
+        )
+        backend = S7NativePythonBackend(
+            evaluate=lambda inputs, ctx: {
+                "omega": Quantity(
+                    value=inputs["alpha"].value + float(ctx.seed or 0) / 1000.0,
+                    units="dimensionless",
+                    uncertainty={"kind": "interval", "radius": 0.01},
+                )
+            },
+            underlying_code_version="native-test@1",
+        )
+        broker = AdapterBroker(artifact_store=store)
+        broker.register(SimpleAdapter(descriptor, backend=backend))
+
+        result = broker.evaluate(
+            EvalRequest(
+                adapter_id="native_backend_adapter",
+                inputs={"alpha": Quantity(value=0.2, units="dimensionless")},
+                seed=5,
+            )
+        )
+
+        self.assertAlmostEqual(result.outputs["omega"].value, 0.205)
+        self.assertEqual(result.backend_name, "native_python")
+        self.assertEqual(result.underlying_code_version, "native-test@1")
+        provenance = json.loads(store.get_artifact(result.provenance_ref))
+        self.assertEqual(provenance["method"], "evaluate")
+        self.assertEqual(provenance["backend_name"], "native_python")
+        self.assertEqual(provenance["underlying_code_version"], "native-test@1")
+
+    def test_jax_backend_evaluates_and_returns_jacobian_with_units(self) -> None:
+        store = InMemoryArtifactStore()
+        descriptor = AdapterDescriptor(
+            adapter_id="jax_gw_surrogate",
+            version="1.0.0",
+            input_units={"T_n": "GeV", "alpha": "dimensionless", "v_w": "dimensionless"},
+            output_units={"omega": "Omega_h2"},
+            validity_domain={"v_w": (0.4, 0.95)},
+            determinism="deterministic",
+            provenance_ref="c4://adapter/jax-gw/v1",
+            differentiable=True,
+        )
+        backend = S7JaxBackend(
+            function=lambda values: {
+                "omega": values["alpha"] * values["T_n"] / 1000.0 + values["v_w"] ** 2,
+            },
+            output_uncertainties={"omega": {"kind": "interval", "radius": 0.01, "source": "jax-surrogate"}},
+            underlying_code_version="jax-test@1",
+        )
+        broker = AdapterBroker(artifact_store=store)
+        broker.register(SimpleAdapter(descriptor, backend=backend))
+        inputs = {
+            "T_n": Quantity(value=100.0, units="GeV"),
+            "alpha": Quantity(value=0.2, units="dimensionless"),
+            "v_w": Quantity(value=0.7, units="dimensionless"),
+        }
+
+        eval_result = broker.evaluate(EvalRequest(adapter_id="jax_gw_surrogate", inputs=inputs, seed=11))
+        grad_result = broker.grad(GradRequest(adapter_id="jax_gw_surrogate", inputs=inputs, seed=11))
+
+        self.assertAlmostEqual(eval_result.outputs["omega"].value, 0.51, places=7)
+        self.assertEqual(eval_result.outputs["omega"].units, "Omega_h2")
+        self.assertEqual(eval_result.backend_name, "jax")
+        self.assertAlmostEqual(grad_result.jacobian["omega"]["T_n"].value, 0.0002, places=9)
+        self.assertEqual(grad_result.jacobian["omega"]["T_n"].units, "1/GeV")
+        self.assertAlmostEqual(grad_result.jacobian["omega"]["alpha"].value, 0.1, places=9)
+        self.assertEqual(grad_result.jacobian["omega"]["alpha"].units, "1")
+        self.assertAlmostEqual(grad_result.jacobian["omega"]["v_w"].value, 1.4, places=7)
+        self.assertEqual(grad_result.backend_name, "jax")
+        self.assertEqual(grad_result.underlying_code_version, "jax-test@1")
+
+        provenance = json.loads(store.get_artifact(grad_result.provenance_ref))
+        self.assertEqual(provenance["method"], "grad")
+        self.assertEqual(provenance["backend_name"], "jax")
+        self.assertEqual(provenance["jacobian"]["omega"]["T_n"]["units"], "1/GeV")
+        self.assertEqual(provenance["input_hash"], json.loads(store.get_artifact(eval_result.provenance_ref))["input_hash"])
+
+    def test_grad_on_non_differentiable_adapter_fails_closed(self) -> None:
+        broker = AdapterBroker(artifact_store=InMemoryArtifactStore())
+        descriptor = AdapterDescriptor(
+            adapter_id="non_diff_adapter",
+            version="1.0.0",
+            input_units={"alpha": "dimensionless"},
+            output_units={"omega": "dimensionless"},
+            validity_domain={"alpha": (0.0, 1.0)},
+            determinism="deterministic",
+            provenance_ref="c4://adapter/non-diff/v1",
+            differentiable=False,
+        )
+        broker.register(
+            SimpleAdapter(
+                descriptor,
+                lambda inputs, _seed: {
+                    "omega": Quantity(
+                        value=inputs["alpha"].value,
+                        units="dimensionless",
+                        uncertainty={"kind": "interval", "radius": 0.01},
+                    )
+                },
+            )
+        )
+
+        with self.assertRaises(NotDifferentiableError) as raised:
+            broker.grad(
+                GradRequest(
+                    adapter_id="non_diff_adapter",
+                    inputs={"alpha": Quantity(value=0.2, units="dimensionless")},
+                )
+            )
+
+        self.assertEqual(raised.exception.category, "NOT_DIFFERENTIABLE")
+
     def test_adapter_sdk_core_auto_generates_descriptor_and_passes_local_validate(self) -> None:
         @adapter_metadata(
             adapter_id="sdk_gw_example",
@@ -752,6 +878,7 @@ class S7UnitsAndAdapterTests(unittest.TestCase):
 
         self.assertEqual(published.kind, "adapter")
         self.assertEqual(published.owner_subsystem, "S7")
+        self.assertEqual(published.contract_versions["C6"], "2.1.0")
         self.assertIn("gw-surrogate-a", published.independence_tags)
         self.assertEqual([descriptor.entity_id for descriptor in resolution.descriptors], ["gw_spectrum_surrogate"])
 

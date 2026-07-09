@@ -30,7 +30,7 @@ EXPECTED_CONTRACT_VERSIONS = {
     "C3": "2.0.0",
     "C4": "1.0.0",
     "C5": "1.0.0",
-    "C6": "2.0.0",
+    "C6": "2.1.0",
     "C10": "4.0.0",
 }
 
@@ -75,6 +75,9 @@ C6_REQUIRED_DEFS = {
     "AdapterDescriptor",
     "EvalRequest",
     "EvalResult",
+    "GradRequest",
+    "GradResult",
+    "JacobianEntry",
     "OutputQuantity",
     "Quantity",
 }
@@ -255,6 +258,26 @@ def validate_contract_schema(entry: dict) -> None:
                 fail(f"C6 EvalResult {field} must declare an additive default")
         if "domain_diagnostics" not in eval_required:
             fail("C6 EvalResult must require domain_diagnostics")
+        grad_request = definitions.get("GradRequest", {})
+        grad_request_required = set(grad_request.get("required", []))
+        if not {"method", "adapter_id", "inputs"}.issubset(grad_request_required):
+            fail("C6 GradRequest must require method, adapter_id, and inputs")
+        if grad_request.get("properties", {}).get("method", {}).get("const") != "grad":
+            fail("C6 GradRequest.method must be const grad")
+        grad_result = definitions.get("GradResult", {})
+        grad_required = set(grad_result.get("required", []))
+        for field in ("jacobian", "backend_name", "backend_version", "backend_hash", "underlying_code_version"):
+            if field not in grad_required:
+                fail(f"C6 GradResult must require {field}")
+        jacobian_ref = (
+            grad_result.get("properties", {})
+            .get("jacobian", {})
+            .get("additionalProperties", {})
+            .get("additionalProperties", {})
+            .get("$ref")
+        )
+        if jacobian_ref != "#/$defs/JacobianEntry":
+            fail("C6 GradResult.jacobian entries must reference JacobianEntry")
 
     if contract_id == "C10":
         definitions = schema.get("$defs", {})

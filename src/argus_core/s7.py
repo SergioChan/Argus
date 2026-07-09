@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 from dataclasses import asdict, dataclass, field, replace
 import json
 import math
@@ -59,6 +60,24 @@ SEED_MANAGER_HASH = hash_json(
         "explicit_seed_policy": "caller seed overrides derived seed while retaining context",
     }
 )
+NATIVE_PYTHON_BACKEND_VERSION = "argus-backend-native-python-1.0.0"
+NATIVE_PYTHON_BACKEND_HASH = hash_json(
+    {
+        "backend": "native_python",
+        "version": NATIVE_PYTHON_BACKEND_VERSION,
+        "invoke": "in-process callable over normalized C6 quantities",
+        "grad": "optional callable over normalized C6 quantities",
+    }
+)
+JAX_BACKEND_VERSION = "argus-backend-jax-1.0.0"
+JAX_BACKEND_HASH = hash_json(
+    {
+        "backend": "jax",
+        "version": JAX_BACKEND_VERSION,
+        "invoke": "JAX pure function over normalized scalar inputs",
+        "grad": "jax.jacfwd over output/input pytrees",
+    }
+)
 
 
 class S7Error(Exception):
@@ -104,6 +123,13 @@ class AdapterVersionError(S7Error):
 
     def __init__(self, message: str) -> None:
         super().__init__("VERSION_UNSUPPORTED", message)
+
+
+class NotDifferentiableError(S7Error):
+    """Raised when a caller requests gradients from a non-differentiable adapter."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__("NOT_DIFFERENTIABLE", message)
 
 
 @dataclass(frozen=True)
@@ -586,6 +612,17 @@ class EvalRequest:
 
 
 @dataclass(frozen=True)
+class GradRequest:
+    adapter_id: str
+    inputs: dict[str, Quantity]
+    seed: int | None = None
+    job_seed: int | None = None
+    dag_node_id: str | None = None
+    call_index: int | None = None
+    method: str = "grad"
+
+
+@dataclass(frozen=True)
 class EvalResult:
     adapter_id: str
     outputs: dict[str, Quantity]
@@ -606,6 +643,42 @@ class EvalResult:
     validity_domain_guard_hash: str = VALIDITY_DOMAIN_GUARD_HASH
     seed_manager_version: str = SEED_MANAGER_VERSION
     seed_manager_hash: str = SEED_MANAGER_HASH
+    backend_name: str = "native_python"
+    backend_version: str = NATIVE_PYTHON_BACKEND_VERSION
+    backend_hash: str = NATIVE_PYTHON_BACKEND_HASH
+    underlying_code_version: str = "native-python:callable"
+
+
+@dataclass(frozen=True)
+class JacobianEntry:
+    value: float
+    units: str
+    output_units: str
+    input_units: str
+
+
+@dataclass(frozen=True)
+class GradResult:
+    adapter_id: str
+    jacobian: dict[str, dict[str, JacobianEntry]]
+    in_validity_domain: bool
+    extrapolation_flag: bool
+    provenance_ref: str
+    seed_used: int | None = None
+    seed_source: str = "unseeded"
+    seed_derivation: dict[str, Any] = field(default_factory=dict)
+    violated_fields: tuple[str, ...] = ()
+    domain_diagnostics: dict[str, Any] = field(default_factory=dict)
+    unit_registry_version: str = UNIT_REGISTRY_VERSION
+    unit_registry_hash: str = UNIT_REGISTRY_HASH
+    validity_domain_guard_version: str = VALIDITY_DOMAIN_GUARD_VERSION
+    validity_domain_guard_hash: str = VALIDITY_DOMAIN_GUARD_HASH
+    seed_manager_version: str = SEED_MANAGER_VERSION
+    seed_manager_hash: str = SEED_MANAGER_HASH
+    backend_name: str = "native_python"
+    backend_version: str = NATIVE_PYTHON_BACKEND_VERSION
+    backend_hash: str = NATIVE_PYTHON_BACKEND_HASH
+    underlying_code_version: str = "native-python:callable"
 
 
 @dataclass(frozen=True)
@@ -623,6 +696,184 @@ class S7AdapterValidationResult:
     eval_result: EvalResult | None
     passed: bool
     diagnostics: dict[str, Any] = field(default_factory=dict)
+
+
+class S7Backend:
+    """Backend protocol for C6 adapter execution plugins."""
+
+    backend_name: str = "unknown"
+    backend_version: str = "unknown"
+    backend_hash: str = "blake3:" + ("0" * 64)
+    underlying_code_version: str = "unknown"
+
+    def invoke(
+        self,
+        normalized_inputs: dict[str, NormalizedQuantity],
+        ctx: EvalContext,
+        descriptor: AdapterDescriptor,
+    ) -> dict[str, Quantity]:
+        raise NotImplementedError
+
+    def invoke_grad(
+        self,
+        normalized_inputs: dict[str, NormalizedQuantity],
+        ctx: EvalContext,
+        descriptor: AdapterDescriptor,
+    ) -> dict[str, dict[str, Any]]:
+        raise NotDifferentiableError(f"backend {self.backend_name} does not implement grad")
+
+
+class S7NativePythonBackend(S7Backend):
+    """Native Python backend over normalized C6 quantities."""
+
+    def __init__(
+        self,
+        *,
+        evaluate: Callable[[dict[str, NormalizedQuantity], EvalContext], dict[str, Quantity]],
+        grad: Callable[[dict[str, NormalizedQuantity], EvalContext], dict[str, dict[str, Any]]] | None = None,
+        underlying_code_version: str = "native-python:callable",
+    ) -> None:
+        if not callable(evaluate):
+            raise AdapterConformanceError("native_python backend evaluate must be callable")
+        if grad is not None and not callable(grad):
+            raise AdapterConformanceError("native_python backend grad must be callable when provided")
+        self._evaluate = evaluate
+        self._grad = grad
+        self.backend_name = "native_python"
+        self.backend_version = NATIVE_PYTHON_BACKEND_VERSION
+        self.backend_hash = NATIVE_PYTHON_BACKEND_HASH
+        self.underlying_code_version = _required_backend_string(
+            underlying_code_version,
+            "underlying_code_version",
+        )
+
+    @classmethod
+    def from_seed_callable(
+        cls,
+        evaluate_fn: Callable[[dict[str, NormalizedQuantity], int | None], dict[str, Quantity]],
+    ) -> "S7NativePythonBackend":
+        if not callable(evaluate_fn):
+            raise AdapterConformanceError("adapter evaluate_fn must be callable")
+        return cls(evaluate=lambda inputs, ctx: evaluate_fn(inputs, ctx.seed))
+
+    def invoke(
+        self,
+        normalized_inputs: dict[str, NormalizedQuantity],
+        ctx: EvalContext,
+        descriptor: AdapterDescriptor,
+    ) -> dict[str, Quantity]:
+        return self._evaluate(normalized_inputs, ctx)
+
+    def invoke_grad(
+        self,
+        normalized_inputs: dict[str, NormalizedQuantity],
+        ctx: EvalContext,
+        descriptor: AdapterDescriptor,
+    ) -> dict[str, dict[str, Any]]:
+        if self._grad is None:
+            raise NotDifferentiableError(f"native_python backend for {descriptor.adapter_id} does not implement grad")
+        return self._grad(normalized_inputs, ctx)
+
+
+class S7JaxBackend(S7Backend):
+    """JAX backend for differentiable scalar surrogate adapters."""
+
+    def __init__(
+        self,
+        *,
+        function: Callable[[Mapping[str, Any]], Mapping[str, Any]],
+        output_uncertainties: Mapping[str, Mapping[str, Any]],
+        underlying_code_version: str | None = None,
+    ) -> None:
+        if not callable(function):
+            raise AdapterConformanceError("jax backend function must be callable")
+        if not isinstance(output_uncertainties, Mapping) or not output_uncertainties:
+            raise AdapterConformanceError("jax backend must declare output uncertainties")
+        try:
+            import jax  # type: ignore
+            import jax.numpy as jnp  # type: ignore
+        except Exception as exc:  # pragma: no cover - exercised only in environments missing jax
+            raise AdapterConformanceError("jax backend requires the jax package") from exc
+        try:
+            jax.config.update("jax_enable_x64", True)
+        except Exception:
+            pass
+        self._jax = jax
+        self._jnp = jnp
+        self._function = function
+        self._output_uncertainties = {
+            str(field): dict(value) for field, value in output_uncertainties.items()
+        }
+        self.backend_name = "jax"
+        self.backend_version = JAX_BACKEND_VERSION
+        self.backend_hash = JAX_BACKEND_HASH
+        self.underlying_code_version = _required_backend_string(
+            underlying_code_version or f"jax:{getattr(jax, '__version__', 'unknown')}",
+            "underlying_code_version",
+        )
+
+    def invoke(
+        self,
+        normalized_inputs: dict[str, NormalizedQuantity],
+        ctx: EvalContext,
+        descriptor: AdapterDescriptor,
+    ) -> dict[str, Quantity]:
+        raw_outputs = self._call_function(normalized_inputs)
+        outputs: dict[str, Quantity] = {}
+        for field, expected_unit in descriptor.output_units.items():
+            if field not in raw_outputs:
+                raise AdapterConformanceError(f"jax backend missing output field: {field}")
+            if field not in self._output_uncertainties:
+                raise AdapterConformanceError(f"jax backend missing uncertainty for output field: {field}")
+            spec = _unit_field_spec(expected_unit)
+            outputs[field] = Quantity(
+                value=_finite_backend_number(raw_outputs[field], f"jax output {field}"),
+                units=spec.units,
+                uncertainty=copy.deepcopy(self._output_uncertainties[field]),
+            )
+        extra_outputs = set(raw_outputs) - set(descriptor.output_units)
+        if extra_outputs:
+            raise AdapterConformanceError(f"jax backend returned unexpected output fields: {sorted(extra_outputs)}")
+        return outputs
+
+    def invoke_grad(
+        self,
+        normalized_inputs: dict[str, NormalizedQuantity],
+        ctx: EvalContext,
+        descriptor: AdapterDescriptor,
+    ) -> dict[str, dict[str, Any]]:
+        values = self._jax_values(normalized_inputs)
+        jacobian_tree = self._jax.jacfwd(self._function)(values)
+        if not isinstance(jacobian_tree, Mapping):
+            raise AdapterConformanceError("jax grad function must return a mapping output pytree")
+        jacobian: dict[str, dict[str, Any]] = {}
+        for output_field in descriptor.output_units:
+            raw_output_grad = jacobian_tree.get(output_field)
+            if not isinstance(raw_output_grad, Mapping):
+                raise AdapterConformanceError(f"jax grad missing output field: {output_field}")
+            jacobian[output_field] = {}
+            for input_field in descriptor.input_units:
+                if input_field not in raw_output_grad:
+                    raise AdapterConformanceError(
+                        f"jax grad missing derivative for {output_field} wrt {input_field}"
+                    )
+                jacobian[output_field][input_field] = _finite_backend_number(
+                    raw_output_grad[input_field],
+                    f"jax grad {output_field}.{input_field}",
+                )
+        return jacobian
+
+    def _call_function(self, normalized_inputs: dict[str, NormalizedQuantity]) -> Mapping[str, Any]:
+        raw_outputs = self._function(self._jax_values(normalized_inputs))
+        if not isinstance(raw_outputs, Mapping):
+            raise AdapterConformanceError("jax backend function must return a mapping of output fields")
+        return raw_outputs
+
+    def _jax_values(self, normalized_inputs: dict[str, NormalizedQuantity]) -> dict[str, Any]:
+        return {
+            field: self._jnp.asarray(quantity.value, dtype=self._jnp.float64)
+            for field, quantity in normalized_inputs.items()
+        }
 
 
 class Adapter:
@@ -646,10 +897,17 @@ class Adapter:
     def as_simple_adapter(self, *, unit_registry: S7UnitRegistry | None = None) -> "SimpleAdapter":
         registry = unit_registry or S7UnitRegistry.default()
 
-        def evaluate_fn(normalized_inputs: dict[str, NormalizedQuantity], seed: int | None) -> dict[str, Quantity]:
-            return self.evaluate(normalized_inputs, EvalContext(seed=seed, unit_registry=registry))
+        def evaluate_fn(normalized_inputs: dict[str, NormalizedQuantity], ctx: EvalContext) -> dict[str, Quantity]:
+            return self.evaluate(normalized_inputs, ctx)
 
-        return SimpleAdapter(self.describe(), evaluate_fn)
+        grad_fn = None
+        if type(self).grad is not Adapter.grad:
+            grad_fn = lambda normalized_inputs, ctx: self.grad(normalized_inputs, ctx)
+
+        return SimpleAdapter(
+            self.describe(),
+            backend=S7NativePythonBackend(evaluate=evaluate_fn, grad=grad_fn),
+        )
 
     def evaluate(self, inputs: dict[str, NormalizedQuantity], ctx: EvalContext) -> dict[str, Quantity]:
         raise NotImplementedError("adapter SDK subclasses must implement evaluate")
@@ -900,13 +1158,33 @@ class SimpleAdapter:
     def __init__(
         self,
         descriptor: AdapterDescriptor,
-        evaluate_fn: Callable[[dict[str, NormalizedQuantity], int | None], dict[str, Quantity]],
+        evaluate_fn: Callable[[dict[str, NormalizedQuantity], int | None], dict[str, Quantity]] | None = None,
+        *,
+        backend: S7Backend | None = None,
     ) -> None:
+        if evaluate_fn is None and backend is None:
+            raise AdapterConformanceError("SimpleAdapter requires evaluate_fn or backend")
+        if evaluate_fn is not None and backend is not None:
+            raise AdapterConformanceError("SimpleAdapter accepts either evaluate_fn or backend, not both")
         self.descriptor = descriptor
-        self._evaluate_fn = evaluate_fn
+        self._backend = backend or S7NativePythonBackend.from_seed_callable(evaluate_fn)  # type: ignore[arg-type]
+
+    @property
+    def backend(self) -> S7Backend:
+        return self._backend
 
     def evaluate(self, normalized_inputs: dict[str, NormalizedQuantity], seed: int | None = None) -> dict[str, Quantity]:
-        return self._evaluate_fn(normalized_inputs, seed)
+        return self._backend.invoke(
+            normalized_inputs,
+            EvalContext(seed=seed),
+            self.descriptor,
+        )
+
+    def invoke(self, normalized_inputs: dict[str, NormalizedQuantity], ctx: EvalContext) -> dict[str, Quantity]:
+        return self._backend.invoke(normalized_inputs, ctx, self.descriptor)
+
+    def grad(self, normalized_inputs: dict[str, NormalizedQuantity], ctx: EvalContext) -> dict[str, dict[str, Any]]:
+        return self._backend.invoke_grad(normalized_inputs, ctx, self.descriptor)
 
 
 class AdapterBroker:
@@ -953,15 +1231,19 @@ class AdapterBroker:
             dag_node_id=request.dag_node_id,
             call_index=request.call_index,
         )
-        raw_outputs = adapter.evaluate(domain_classification.normalized_inputs, seed_decision.seed_used)
+        ctx = EvalContext(seed=seed_decision.seed_used, unit_registry=self._unit_registry)
+        raw_outputs = adapter.invoke(domain_classification.normalized_inputs, ctx)
         outputs = self._normalize_outputs_conform(raw_outputs, descriptor.output_units)
         provenance_ref = self._write_provenance(
-            descriptor,
-            request,
-            seed_decision,
-            domain_classification.normalized_inputs,
-            outputs,
-            domain_classification.diagnostics,
+            descriptor=descriptor,
+            request=request,
+            seed_decision=seed_decision,
+            normalized_inputs=domain_classification.normalized_inputs,
+            outputs=outputs,
+            jacobian=None,
+            domain_diagnostics=domain_classification.diagnostics,
+            method="evaluate",
+            backend=adapter.backend,
         )
         return EvalResult(
             adapter_id=descriptor.adapter_id,
@@ -982,24 +1264,101 @@ class AdapterBroker:
             validity_domain_guard_hash=self._validity_domain_guard.guard_hash,
             seed_manager_version=self._seed_manager.version,
             seed_manager_hash=self._seed_manager.manager_hash,
+            backend_name=adapter.backend.backend_name,
+            backend_version=adapter.backend.backend_version,
+            backend_hash=adapter.backend.backend_hash,
+            underlying_code_version=adapter.backend.underlying_code_version,
+        )
+
+    def grad(self, request: GradRequest) -> GradResult:
+        adapter = self._adapters[request.adapter_id]
+        descriptor = adapter.descriptor
+        if not descriptor.differentiable:
+            raise NotDifferentiableError(f"adapter {descriptor.adapter_id} is not differentiable")
+        normalized_inputs = normalize_inputs(request.inputs, descriptor.input_units, registry=self._unit_registry)
+        domain_classification = self._validity_domain_guard.classify(
+            normalized_inputs,
+            descriptor.validity_domain,
+            policy=descriptor.domain_policy,
+        )
+        if domain_classification.violated_fields and _normalize_domain_policy(descriptor.domain_policy) == "refuse":
+            raise OutOfDomainError(
+                f"out-of-domain fields: {', '.join(domain_classification.violated_fields)}",
+                diagnostics=domain_classification.diagnostics,
+            )
+        seed_decision = self._seed_manager.resolve(
+            adapter_id=descriptor.adapter_id,
+            explicit_seed=request.seed,
+            job_seed=request.job_seed,
+            dag_node_id=request.dag_node_id,
+            call_index=request.call_index,
+        )
+        ctx = EvalContext(seed=seed_decision.seed_used, unit_registry=self._unit_registry)
+        raw_jacobian = adapter.grad(domain_classification.normalized_inputs, ctx)
+        jacobian = self._normalize_jacobian_conform(
+            raw_jacobian,
+            descriptor.output_units,
+            descriptor.input_units,
+        )
+        provenance_ref = self._write_provenance(
+            descriptor=descriptor,
+            request=request,
+            seed_decision=seed_decision,
+            normalized_inputs=domain_classification.normalized_inputs,
+            outputs=None,
+            jacobian=jacobian,
+            domain_diagnostics=domain_classification.diagnostics,
+            method="grad",
+            backend=adapter.backend,
+        )
+        return GradResult(
+            adapter_id=descriptor.adapter_id,
+            jacobian=jacobian,
+            in_validity_domain=domain_classification.in_validity_domain,
+            extrapolation_flag=domain_classification.extrapolation_flag,
+            provenance_ref=provenance_ref,
+            seed_used=seed_decision.seed_used,
+            seed_source=seed_decision.seed_source,
+            seed_derivation=seed_decision.seed_derivation,
+            violated_fields=domain_classification.violated_fields,
+            domain_diagnostics=domain_classification.diagnostics,
+            unit_registry_version=self._unit_registry.version,
+            unit_registry_hash=self._unit_registry.registry_hash,
+            validity_domain_guard_version=self._validity_domain_guard.version,
+            validity_domain_guard_hash=self._validity_domain_guard.guard_hash,
+            seed_manager_version=self._seed_manager.version,
+            seed_manager_hash=self._seed_manager.manager_hash,
+            backend_name=adapter.backend.backend_name,
+            backend_version=adapter.backend.backend_version,
+            backend_hash=adapter.backend.backend_hash,
+            underlying_code_version=adapter.backend.underlying_code_version,
         )
 
     def _write_provenance(
         self,
+        *,
         descriptor: AdapterDescriptor,
-        request: EvalRequest,
+        request: EvalRequest | GradRequest,
         seed_decision: S7SeedDecision,
         normalized_inputs: dict[str, NormalizedQuantity],
-        outputs: dict[str, Quantity],
+        outputs: dict[str, Quantity] | None,
+        jacobian: dict[str, dict[str, JacobianEntry]] | None,
         domain_diagnostics: Mapping[str, Any],
+        method: str,
+        backend: S7Backend,
     ) -> str:
         if self._artifact_store is None:
             raise ProvenanceUnavailableError("S8 artifact store unavailable")
+        input_hash = hash_json({key: asdict(value) for key, value in normalized_inputs.items()})
         payload = {
+            "method": method,
             "adapter_id": descriptor.adapter_id,
             "adapter_version": descriptor.version,
-            "input_hash": hash_json({key: asdict(value) for key, value in normalized_inputs.items()}),
-            "output_hash": hash_json({key: asdict(value) for key, value in outputs.items()}),
+            "backend_name": backend.backend_name,
+            "backend_version": backend.backend_version,
+            "backend_hash": backend.backend_hash,
+            "underlying_code_version": backend.underlying_code_version,
+            "input_hash": input_hash,
             "seed": seed_decision.seed_used,
             "seed_used": seed_decision.seed_used,
             "seed_source": seed_decision.seed_source,
@@ -1008,25 +1367,50 @@ class AdapterBroker:
             "seed_manager_hash": self._seed_manager.manager_hash,
             "unit_registry_version": self._unit_registry.version,
             "unit_registry_hash": self._unit_registry.registry_hash,
-            "uncertainty_engine_version": self._uncertainty_engine.version,
-            "uncertainty_engine_hash": self._uncertainty_engine.engine_hash,
-            "uncertainty_hash": hash_json({key: value.uncertainty for key, value in outputs.items()}),
-            "uncertainty_summary": {
-                key: self._uncertainty_engine.summarize(value.uncertainty or {}) for key, value in outputs.items()
-            },
             "validity_domain_guard_version": self._validity_domain_guard.version,
             "validity_domain_guard_hash": self._validity_domain_guard.guard_hash,
             "domain_diagnostics": dict(domain_diagnostics),
             "domain_diagnostics_hash": hash_json(domain_diagnostics),
         }
+        if outputs is not None:
+            payload.update(
+                {
+                    "output_hash": hash_json({key: asdict(value) for key, value in outputs.items()}),
+                    "uncertainty_engine_version": self._uncertainty_engine.version,
+                    "uncertainty_engine_hash": self._uncertainty_engine.engine_hash,
+                    "uncertainty_hash": hash_json({key: value.uncertainty for key, value in outputs.items()}),
+                    "uncertainty_summary": {
+                        key: self._uncertainty_engine.summarize(value.uncertainty or {})
+                        for key, value in outputs.items()
+                    },
+                }
+            )
+        if jacobian is not None:
+            jacobian_payload = _jacobian_payload(jacobian)
+            payload.update(
+                {
+                    "jacobian": jacobian_payload,
+                    "jacobian_hash": hash_json(jacobian_payload),
+                }
+            )
         record = self._artifact_store.create_artifact(
             kind="log",
             payload=payload,
             producer=Producer(subsystem="S7", version=descriptor.version),
             lineage=Lineage(
                 input_refs=(descriptor.provenance_ref,),
-                code_ref=f"adapter:{descriptor.adapter_id}@{descriptor.version}",
-                environment_digest=hash_json({"adapter": descriptor.adapter_id, "version": descriptor.version}),
+                code_ref=f"adapter:{descriptor.adapter_id}@{descriptor.version}"
+                if method == "evaluate"
+                else f"adapter:{descriptor.adapter_id}@{descriptor.version}#{method}",
+                environment_digest=hash_json(
+                    {
+                        "adapter": descriptor.adapter_id,
+                        "version": descriptor.version,
+                        "backend_name": backend.backend_name,
+                        "backend_hash": backend.backend_hash,
+                        "underlying_code_version": backend.underlying_code_version,
+                    }
+                ),
                 seeds=(str(seed_decision.seed_used),) if seed_decision.seed_used is not None else (),
             ),
         )
@@ -1061,6 +1445,41 @@ class AdapterBroker:
                 uncertainty=uncertainty,
             )
         return normalized_outputs
+
+    def _normalize_jacobian_conform(
+        self,
+        jacobian: Mapping[str, Mapping[str, Any]],
+        output_units: Mapping[str, Any],
+        input_units: Mapping[str, Any],
+    ) -> dict[str, dict[str, JacobianEntry]]:
+        if not isinstance(jacobian, Mapping) or not jacobian:
+            raise AdapterConformanceError("grad must return a non-empty jacobian mapping")
+        extra_outputs = set(jacobian) - set(output_units)
+        if extra_outputs:
+            raise AdapterConformanceError(f"unexpected jacobian output fields: {', '.join(sorted(extra_outputs))}")
+        normalized: dict[str, dict[str, JacobianEntry]] = {}
+        for output_field, output_unit in output_units.items():
+            raw_output = jacobian.get(output_field)
+            if not isinstance(raw_output, Mapping):
+                raise AdapterConformanceError(f"missing jacobian output field: {output_field}")
+            extra_inputs = set(raw_output) - set(input_units)
+            if extra_inputs:
+                raise AdapterConformanceError(
+                    f"unexpected jacobian input fields for {output_field}: {', '.join(sorted(extra_inputs))}"
+                )
+            normalized[output_field] = {}
+            for input_field, input_unit in input_units.items():
+                if input_field not in raw_output:
+                    raise AdapterConformanceError(f"missing jacobian entry {output_field}.{input_field}")
+                output_spec = _unit_field_spec(output_unit)
+                input_spec = _unit_field_spec(input_unit)
+                normalized[output_field][input_field] = JacobianEntry(
+                    value=_finite_jacobian_value(raw_output[input_field], f"jacobian.{output_field}.{input_field}"),
+                    units=_jacobian_entry_units(output_spec.units, input_spec.units, registry=self._unit_registry),
+                    output_units=output_spec.units,
+                    input_units=input_spec.units,
+                )
+        return normalized
 
 
 def normalize_inputs(
@@ -1405,7 +1824,7 @@ def adapter_capability_descriptor(
         revision=revision,
         kind="adapter",
         owner_subsystem="S7",
-        contract_versions={"C5": "1.0.0", "C6": "2.0.0"},
+        contract_versions={"C5": "1.0.0", "C6": "2.1.0"},
         trust_class=trust_class,
         capability_scopes=tuple(scopes),
         provenance_ref=descriptor.provenance_ref,
@@ -1465,6 +1884,56 @@ def select_adapter_version(
         selected_adapter_id=selected.adapter_id,
         selected_version=selected.version,
     )
+
+
+def _required_backend_string(value: Any, field_name: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise AdapterConformanceError(f"{field_name} must be a non-empty string")
+    return value.strip()
+
+
+def _finite_backend_number(value: Any, field_name: str) -> float:
+    try:
+        if hasattr(value, "item"):
+            value = value.item()
+    except Exception as exc:
+        raise AdapterConformanceError(f"{field_name} must be convertible to a finite scalar") from exc
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise AdapterConformanceError(f"{field_name} must be a finite scalar")
+    numeric = float(value)
+    if not math.isfinite(numeric):
+        raise AdapterConformanceError(f"{field_name} must be finite")
+    return numeric
+
+
+def _finite_jacobian_value(value: Any, field_name: str) -> float:
+    return _finite_backend_number(value, field_name)
+
+
+def _jacobian_payload(jacobian: Mapping[str, Mapping[str, JacobianEntry]]) -> dict[str, dict[str, dict[str, Any]]]:
+    return {
+        output_field: {
+            input_field: asdict(entry)
+            for input_field, entry in sorted(input_entries.items())
+        }
+        for output_field, input_entries in sorted(jacobian.items())
+    }
+
+
+def _jacobian_entry_units(output_units: str, input_units: str, *, registry: S7UnitRegistry) -> str:
+    output_dimensionless = _is_dimensionless_unit(output_units, registry=registry)
+    input_dimensionless = _is_dimensionless_unit(input_units, registry=registry)
+    if output_dimensionless and input_dimensionless:
+        return "1"
+    if output_dimensionless:
+        return f"1/{input_units}"
+    if input_dimensionless:
+        return output_units
+    return f"{output_units}/{input_units}"
+
+
+def _is_dimensionless_unit(units: str, *, registry: S7UnitRegistry) -> bool:
+    return registry.parse(units).dimensions == registry.parse("dimensionless").dimensions
 
 
 def _parse_semver(version: str) -> tuple[int, int, int]:

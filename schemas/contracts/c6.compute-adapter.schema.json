@@ -6,12 +6,14 @@
   "x-argus-contract": {
     "id": "C6",
     "owner": "S7",
-    "version": "2.0.0"
+    "version": "2.1.0"
   },
   "oneOf": [
     { "$ref": "#/$defs/AdapterDescriptor" },
     { "$ref": "#/$defs/EvalRequest" },
-    { "$ref": "#/$defs/EvalResult" }
+    { "$ref": "#/$defs/EvalResult" },
+    { "$ref": "#/$defs/GradRequest" },
+    { "$ref": "#/$defs/GradResult" }
   ],
   "$defs": {
     "ArtifactRef": {
@@ -36,6 +38,17 @@
         "value": { "type": ["number", "array"] },
         "units": { "type": "string", "minLength": 1 },
         "uncertainty": { "type": "object" }
+      }
+    },
+    "JacobianEntry": {
+      "type": "object",
+      "required": ["value", "units", "output_units", "input_units"],
+      "additionalProperties": false,
+      "properties": {
+        "value": { "type": "number" },
+        "units": { "type": "string", "minLength": 1 },
+        "output_units": { "type": "string", "minLength": 1 },
+        "input_units": { "type": "string", "minLength": 1 }
       }
     },
     "DomainDiagnostics": {
@@ -235,15 +248,137 @@
           "type": "string",
           "pattern": "^blake3:[0-9a-f]{64}$"
         },
+        "backend_name": {
+          "type": "string",
+          "enum": ["native_python", "jax", "pytorch", "subprocess_binary", "emulator_gp", "emulator_nn", "surrogate_diff"]
+        },
+        "backend_version": { "type": "string", "minLength": 1 },
+        "backend_hash": { "type": "string", "pattern": "^blake3:[0-9a-f]{64}$" },
+        "underlying_code_version": { "type": "string", "minLength": 1 },
         "error": {
           "type": "object",
           "properties": {
             "category": {
               "type": "string",
-              "enum": ["UNITS_MISMATCH", "OUT_OF_DOMAIN", "PROVENANCE_UNAVAILABLE", "BUDGET", "ADAPTER_ERROR"]
+              "enum": [
+                "UNITS_MISMATCH",
+                "OUT_OF_DOMAIN",
+                "PROVENANCE_UNAVAILABLE",
+                "BUDGET",
+                "ADAPTER_ERROR",
+                "NOT_DIFFERENTIABLE"
+              ]
             },
             "message": { "type": "string" }
           }
+        }
+      }
+    },
+    "GradRequest": {
+      "type": "object",
+      "required": ["method", "adapter_id", "inputs"],
+      "additionalProperties": false,
+      "properties": {
+        "method": { "type": "string", "const": "grad" },
+        "adapter_id": { "type": "string", "minLength": 1 },
+        "inputs": {
+          "type": "object",
+          "additionalProperties": { "$ref": "#/$defs/Quantity" }
+        },
+        "seed": { "type": "integer" },
+        "job_seed": { "type": "integer" },
+        "dag_node_id": { "type": "string", "minLength": 1 },
+        "call_index": { "type": "integer", "minimum": 0 },
+        "budget_token_ref": { "type": "string" }
+      }
+    },
+    "GradResult": {
+      "type": "object",
+      "required": [
+        "adapter_id",
+        "jacobian",
+        "in_validity_domain",
+        "extrapolation_flag",
+        "provenance_ref",
+        "seed_used",
+        "seed_source",
+        "seed_derivation",
+        "unit_registry_version",
+        "unit_registry_hash",
+        "validity_domain_guard_version",
+        "validity_domain_guard_hash",
+        "seed_manager_version",
+        "seed_manager_hash",
+        "domain_diagnostics",
+        "backend_name",
+        "backend_version",
+        "backend_hash",
+        "underlying_code_version"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "adapter_id": { "type": "string", "minLength": 1 },
+        "jacobian": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "object",
+            "additionalProperties": { "$ref": "#/$defs/JacobianEntry" }
+          }
+        },
+        "in_validity_domain": { "type": "boolean" },
+        "extrapolation_flag": { "type": "boolean" },
+        "seed_used": { "type": ["integer", "null"] },
+        "seed_source": { "type": "string", "enum": ["derived", "explicit", "unseeded"] },
+        "seed_derivation": { "$ref": "#/$defs/SeedDerivation" },
+        "domain_diagnostics": {
+          "$ref": "#/$defs/DomainDiagnostics",
+          "default": {
+            "kind": "box",
+            "policy": "flag",
+            "violated_fields": [],
+            "clamped_fields": [],
+            "distance": 0,
+            "fields": {},
+            "validity_domain_guard_version": "argus-domain-1.0.0",
+            "validity_domain_guard_hash": "blake3:353cb32c3b4d50a2f1a3626946cd23b7407b6a64240e405c32398e936f387bc5"
+          }
+        },
+        "backend_name": {
+          "type": "string",
+          "enum": ["native_python", "jax", "pytorch", "subprocess_binary", "emulator_gp", "emulator_nn", "surrogate_diff"]
+        },
+        "backend_version": { "type": "string", "minLength": 1 },
+        "backend_hash": { "type": "string", "pattern": "^blake3:[0-9a-f]{64}$" },
+        "underlying_code_version": { "type": "string", "minLength": 1 },
+        "provenance_ref": { "$ref": "#/$defs/ArtifactRef" },
+        "unit_registry_version": {
+          "type": "string",
+          "minLength": 1,
+          "default": "argus-units-1.0.0"
+        },
+        "unit_registry_hash": {
+          "type": "string",
+          "pattern": "^blake3:[0-9a-f]{64}$",
+          "default": "blake3:d051549f426fb54fa67a0ef96611db2aebd0158c6b541e964c380d6cc58e06e5"
+        },
+        "validity_domain_guard_version": {
+          "type": "string",
+          "minLength": 1,
+          "default": "argus-domain-1.0.0"
+        },
+        "validity_domain_guard_hash": {
+          "type": "string",
+          "pattern": "^blake3:[0-9a-f]{64}$",
+          "default": "blake3:353cb32c3b4d50a2f1a3626946cd23b7407b6a64240e405c32398e936f387bc5"
+        },
+        "seed_manager_version": {
+          "type": "string",
+          "minLength": 1,
+          "default": "argus-seed-1.0.0"
+        },
+        "seed_manager_hash": {
+          "type": "string",
+          "pattern": "^blake3:[0-9a-f]{64}$"
         }
       }
     }

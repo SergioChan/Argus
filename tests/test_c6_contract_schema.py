@@ -29,11 +29,20 @@ class C6ContractSchemaTests(unittest.TestCase):
         Draft202012Validator.check_schema(cls.schema)
         cls.validator = Draft202012Validator(cls.schema)
 
-    def test_schema_is_canonical_c6_v2_0(self) -> None:
+    def test_schema_is_canonical_c6_v2_1(self) -> None:
         definitions = self.schema["$defs"]
 
-        self.assertEqual(self.schema["x-argus-contract"], {"id": "C6", "owner": "S7", "version": "2.0.0"})
-        for name in ("AdapterDescriptor", "EvalRequest", "EvalResult", "Quantity", "OutputQuantity"):
+        self.assertEqual(self.schema["x-argus-contract"], {"id": "C6", "owner": "S7", "version": "2.1.0"})
+        for name in (
+            "AdapterDescriptor",
+            "EvalRequest",
+            "EvalResult",
+            "GradRequest",
+            "GradResult",
+            "JacobianEntry",
+            "Quantity",
+            "OutputQuantity",
+        ):
             self.assertIn(name, definitions)
         self.assertIn("uncertainty", definitions["OutputQuantity"]["required"])
         self.assertIn("job_seed", definitions["EvalRequest"]["properties"])
@@ -52,6 +61,10 @@ class C6ContractSchemaTests(unittest.TestCase):
         self.assertEqual(
             definitions["EvalResult"]["properties"]["outputs"]["additionalProperties"]["$ref"],
             "#/$defs/OutputQuantity",
+        )
+        self.assertEqual(
+            definitions["GradResult"]["properties"]["jacobian"]["additionalProperties"]["additionalProperties"]["$ref"],
+            "#/$defs/JacobianEntry",
         )
 
     def test_example_eval_result_validates(self) -> None:
@@ -91,10 +104,70 @@ class C6ContractSchemaTests(unittest.TestCase):
         self._assert_valid(descriptor)
         self._assert_valid(request)
 
+    def test_grad_request_and_result_validate(self) -> None:
+        request = {
+            "method": "grad",
+            "adapter_id": "adapter:jax-gw",
+            "inputs": {
+                "T_n": {"value": 100.0, "units": "GeV"},
+                "alpha": {"value": 0.2, "units": "dimensionless"},
+            },
+            "seed": 11,
+        }
+        result = {
+            "adapter_id": "adapter:jax-gw",
+            "jacobian": {
+                "omega": {
+                    "T_n": {
+                        "value": 0.0002,
+                        "units": "1/GeV",
+                        "output_units": "Omega_h2",
+                        "input_units": "GeV",
+                    }
+                }
+            },
+            "in_validity_domain": True,
+            "extrapolation_flag": False,
+            "seed_used": 11,
+            "seed_source": "explicit",
+            "seed_derivation": {
+                "algorithm": "explicit",
+                "seed_manager_version": "argus-seed-1.0.0",
+                "seed_manager_hash": "blake3:139c32ecf38beef7cca4a9d72338af65843428033330bd6d4516e58e9dc90267",
+                "adapter_id": "adapter:jax-gw",
+                "seed_used": 11,
+                "seed_source": "explicit",
+            },
+            "domain_diagnostics": {
+                "kind": "box",
+                "policy": "flag",
+                "violated_fields": [],
+                "clamped_fields": [],
+                "distance": 0.0,
+                "fields": {},
+                "validity_domain_guard_version": "argus-domain-1.0.0",
+                "validity_domain_guard_hash": "blake3:353cb32c3b4d50a2f1a3626946cd23b7407b6a64240e405c32398e936f387bc5",
+            },
+            "backend_name": "jax",
+            "backend_version": "argus-backend-jax-1.0.0",
+            "backend_hash": "blake3:1111111111111111111111111111111111111111111111111111111111111111",
+            "underlying_code_version": "jax-test@1",
+            "provenance_ref": "c4://adapter-call/jax-gw/grad-example",
+            "unit_registry_version": "argus-units-1.0.0",
+            "unit_registry_hash": "blake3:d051549f426fb54fa67a0ef96611db2aebd0158c6b541e964c380d6cc58e06e5",
+            "validity_domain_guard_version": "argus-domain-1.0.0",
+            "validity_domain_guard_hash": "blake3:353cb32c3b4d50a2f1a3626946cd23b7407b6a64240e405c32398e936f387bc5",
+            "seed_manager_version": "argus-seed-1.0.0",
+            "seed_manager_hash": "blake3:139c32ecf38beef7cca4a9d72338af65843428033330bd6d4516e58e9dc90267",
+        }
+
+        self._assert_valid(request)
+        self._assert_valid(result)
+
     def test_generated_python_binding_points_to_exact_c6_schema_digest(self) -> None:
         contract = CONTRACT_BY_ID["C6"]
 
-        self.assertEqual(contract.version, "2.0.0")
+        self.assertEqual(contract.version, "2.1.0")
         self.assertEqual(contract.schema, "c6.compute-adapter.schema.json")
         self.assertEqual(contract.schema_sha256, self._schema_sha256(self.schema))
 
