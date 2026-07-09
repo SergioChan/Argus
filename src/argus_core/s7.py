@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field, replace
 import math
 from typing import Any, Callable, Mapping
 
@@ -39,15 +39,25 @@ _UNCERTAINTY_ENGINE_SPEC = {
     "bare_point_estimates": "rejected",
 }
 UNCERTAINTY_ENGINE_HASH = hash_json(_UNCERTAINTY_ENGINE_SPEC)
+VALIDITY_DOMAIN_GUARD_VERSION = "argus-domain-1.0.0"
+_VALIDITY_DOMAIN_GUARD_SPEC = {
+    "version": VALIDITY_DOMAIN_GUARD_VERSION,
+    "supported_kinds": ("box",),
+    "policies": ("flag", "refuse", "clamp_with_flag"),
+    "distance": "nearest finite normalized bound excess",
+    "malformed_domains": "fail_closed",
+}
+VALIDITY_DOMAIN_GUARD_HASH = hash_json(_VALIDITY_DOMAIN_GUARD_SPEC)
 
 
 class S7Error(Exception):
     """Base class for S7 adapter failures."""
 
-    def __init__(self, category: str, message: str) -> None:
+    def __init__(self, category: str, message: str, *, diagnostics: Mapping[str, Any] | None = None) -> None:
         super().__init__(message)
         self.category = category
         self.message = message
+        self.diagnostics = dict(diagnostics or {})
 
 
 class UnitsMismatchError(S7Error):
@@ -60,8 +70,8 @@ class UnitsMismatchError(S7Error):
 class OutOfDomainError(S7Error):
     """Raised when an adapter refuses out-of-domain input."""
 
-    def __init__(self, message: str) -> None:
-        super().__init__("OUT_OF_DOMAIN", message)
+    def __init__(self, message: str, *, diagnostics: Mapping[str, Any] | None = None) -> None:
+        super().__init__("OUT_OF_DOMAIN", message, diagnostics=diagnostics)
 
 
 class ProvenanceUnavailableError(S7Error):
@@ -363,6 +373,92 @@ class NormalizedQuantity:
 
 
 @dataclass(frozen=True)
+class S7DomainClassification:
+    normalized_inputs: dict[str, NormalizedQuantity]
+    in_validity_domain: bool
+    extrapolation_flag: bool
+    violated_fields: tuple[str, ...]
+    diagnostics: dict[str, Any] = field(default_factory=dict)
+
+
+class S7ValidityDomainGuard:
+    """Classifies and applies C6 adapter validity-domain policy."""
+
+    def __init__(
+        self,
+        *,
+        version: str = VALIDITY_DOMAIN_GUARD_VERSION,
+        guard_hash: str = VALIDITY_DOMAIN_GUARD_HASH,
+        unit_registry: S7UnitRegistry | None = None,
+    ) -> None:
+        self.version = version
+        self.guard_hash = guard_hash
+        self._unit_registry = unit_registry or S7UnitRegistry.default()
+
+    @classmethod
+    def default(cls) -> "S7ValidityDomainGuard":
+        return cls()
+
+    def classify(
+        self,
+        normalized_inputs: dict[str, NormalizedQuantity],
+        validity_domain: Mapping[str, Any],
+        *,
+        policy: str,
+    ) -> S7DomainClassification:
+        normalized_policy = _normalize_domain_policy(policy)
+        domain = _normalize_validity_domain(validity_domain, normalized_inputs, registry=self._unit_registry)
+        field_diagnostics: dict[str, Any] = {}
+        violated: list[str] = []
+        clamped: list[str] = []
+        effective_inputs = dict(normalized_inputs)
+        max_distance = 0.0
+
+        for field, bounds in domain["bounds"].items():
+            quantity = normalized_inputs[field]
+            value = quantity.domain_value if quantity.domain_value is not None else quantity.value
+            lower = bounds["lower"]
+            upper = bounds["upper"]
+            distance = _domain_distance(value, lower, upper)
+            in_domain = distance == 0.0
+            if not in_domain:
+                violated.append(field)
+            max_distance = max(max_distance, distance)
+            effective_value = value
+            if not in_domain and normalized_policy == "clamp_with_flag":
+                effective_value = min(max(value, lower), upper)
+                clamped.append(field)
+                effective_inputs[field] = _clamped_normalized_quantity(quantity, effective_value)
+            field_diagnostics[field] = {
+                "value": value,
+                "lower": lower,
+                "upper": upper,
+                "distance": distance,
+                "in_domain": in_domain,
+                "original_value": value,
+                "effective_value": effective_value,
+            }
+
+        diagnostics = {
+            "kind": domain["kind"],
+            "policy": normalized_policy,
+            "violated_fields": tuple(violated),
+            "clamped_fields": tuple(clamped),
+            "distance": max_distance,
+            "fields": field_diagnostics,
+            "validity_domain_guard_version": self.version,
+            "validity_domain_guard_hash": self.guard_hash,
+        }
+        return S7DomainClassification(
+            normalized_inputs=effective_inputs,
+            in_validity_domain=not violated,
+            extrapolation_flag=bool(violated),
+            violated_fields=tuple(violated),
+            diagnostics=diagnostics,
+        )
+
+
+@dataclass(frozen=True)
 class AdapterDescriptor:
     adapter_id: str
     version: str
@@ -392,11 +488,14 @@ class EvalResult:
     extrapolation_flag: bool
     provenance_ref: str
     violated_fields: tuple[str, ...] = ()
+    domain_diagnostics: dict[str, Any] = field(default_factory=dict)
     cache_hit: bool = False
     unit_registry_version: str = UNIT_REGISTRY_VERSION
     unit_registry_hash: str = UNIT_REGISTRY_HASH
     uncertainty_engine_version: str = UNCERTAINTY_ENGINE_VERSION
     uncertainty_engine_hash: str = UNCERTAINTY_ENGINE_HASH
+    validity_domain_guard_version: str = VALIDITY_DOMAIN_GUARD_VERSION
+    validity_domain_guard_hash: str = VALIDITY_DOMAIN_GUARD_HASH
 
 
 @dataclass(frozen=True)
@@ -430,10 +529,12 @@ class AdapterBroker:
         artifact_store: InMemoryArtifactStore | None,
         unit_registry: S7UnitRegistry | None = None,
         uncertainty_engine: S7UncertaintyEngine | None = None,
+        validity_domain_guard: S7ValidityDomainGuard | None = None,
     ) -> None:
         self._artifact_store = artifact_store
         self._unit_registry = unit_registry or S7UnitRegistry.default()
         self._uncertainty_engine = uncertainty_engine or S7UncertaintyEngine.default()
+        self._validity_domain_guard = validity_domain_guard or S7ValidityDomainGuard(unit_registry=self._unit_registry)
         self._adapters: dict[str, SimpleAdapter] = {}
 
     def register(self, adapter: SimpleAdapter) -> None:
@@ -443,24 +544,40 @@ class AdapterBroker:
         adapter = self._adapters[request.adapter_id]
         descriptor = adapter.descriptor
         normalized_inputs = normalize_inputs(request.inputs, descriptor.input_units, registry=self._unit_registry)
-        violated_fields = classify_validity(normalized_inputs, descriptor.validity_domain)
-        if violated_fields and descriptor.domain_policy == "refuse":
-            raise OutOfDomainError(f"out-of-domain fields: {', '.join(violated_fields)}")
+        domain_classification = self._validity_domain_guard.classify(
+            normalized_inputs,
+            descriptor.validity_domain,
+            policy=descriptor.domain_policy,
+        )
+        if domain_classification.violated_fields and _normalize_domain_policy(descriptor.domain_policy) == "refuse":
+            raise OutOfDomainError(
+                f"out-of-domain fields: {', '.join(domain_classification.violated_fields)}",
+                diagnostics=domain_classification.diagnostics,
+            )
 
-        raw_outputs = adapter.evaluate(normalized_inputs, request.seed)
+        raw_outputs = adapter.evaluate(domain_classification.normalized_inputs, request.seed)
         outputs = self._normalize_outputs_conform(raw_outputs, descriptor.output_units)
-        provenance_ref = self._write_provenance(descriptor, request, normalized_inputs, outputs)
+        provenance_ref = self._write_provenance(
+            descriptor,
+            request,
+            domain_classification.normalized_inputs,
+            outputs,
+            domain_classification.diagnostics,
+        )
         return EvalResult(
             adapter_id=descriptor.adapter_id,
             outputs=outputs,
-            in_validity_domain=not violated_fields,
-            extrapolation_flag=bool(violated_fields),
+            in_validity_domain=domain_classification.in_validity_domain,
+            extrapolation_flag=domain_classification.extrapolation_flag,
             provenance_ref=provenance_ref,
-            violated_fields=violated_fields,
+            violated_fields=domain_classification.violated_fields,
+            domain_diagnostics=domain_classification.diagnostics,
             unit_registry_version=self._unit_registry.version,
             unit_registry_hash=self._unit_registry.registry_hash,
             uncertainty_engine_version=self._uncertainty_engine.version,
             uncertainty_engine_hash=self._uncertainty_engine.engine_hash,
+            validity_domain_guard_version=self._validity_domain_guard.version,
+            validity_domain_guard_hash=self._validity_domain_guard.guard_hash,
         )
 
     def _write_provenance(
@@ -469,6 +586,7 @@ class AdapterBroker:
         request: EvalRequest,
         normalized_inputs: dict[str, NormalizedQuantity],
         outputs: dict[str, Quantity],
+        domain_diagnostics: Mapping[str, Any],
     ) -> str:
         if self._artifact_store is None:
             raise ProvenanceUnavailableError("S8 artifact store unavailable")
@@ -486,6 +604,10 @@ class AdapterBroker:
             "uncertainty_summary": {
                 key: self._uncertainty_engine.summarize(value.uncertainty or {}) for key, value in outputs.items()
             },
+            "validity_domain_guard_version": self._validity_domain_guard.version,
+            "validity_domain_guard_hash": self._validity_domain_guard.guard_hash,
+            "domain_diagnostics": dict(domain_diagnostics),
+            "domain_diagnostics_hash": hash_json(domain_diagnostics),
         }
         record = self._artifact_store.create_artifact(
             kind="log",
@@ -579,14 +701,112 @@ def classify_validity(
     normalized_inputs: dict[str, NormalizedQuantity],
     validity_domain: dict[str, tuple[float, float]],
 ) -> tuple[str, ...]:
-    violated = []
-    for field, (lower, upper) in validity_domain.items():
-        value = normalized_inputs[field].domain_value
-        if value is None:
-            value = normalized_inputs[field].value
-        if value < lower or value > upper:
-            violated.append(field)
-    return tuple(violated)
+    return S7ValidityDomainGuard.default().classify(normalized_inputs, validity_domain, policy="flag").violated_fields
+
+
+def _normalize_domain_policy(policy: str) -> str:
+    if not isinstance(policy, str) or not policy.strip():
+        raise AdapterConformanceError("validity domain policy must be a non-empty string")
+    normalized = policy.strip().lower().replace("-", "_")
+    if normalized not in {"flag", "refuse", "clamp_with_flag"}:
+        raise AdapterConformanceError(f"unsupported validity domain policy: {policy}")
+    return normalized
+
+
+def _normalize_validity_domain(
+    validity_domain: Mapping[str, Any],
+    normalized_inputs: Mapping[str, NormalizedQuantity],
+    *,
+    registry: S7UnitRegistry,
+) -> dict[str, Any]:
+    if not isinstance(validity_domain, Mapping):
+        raise AdapterConformanceError("validity domain must be a mapping")
+    if not validity_domain:
+        return {"kind": "box", "bounds": {}}
+    if "kind" in validity_domain:
+        return _normalize_structured_validity_domain(validity_domain, normalized_inputs, registry=registry)
+    bounds = {
+        field: _normalize_domain_bounds(field, raw_bounds, normalized_inputs, registry=registry)
+        for field, raw_bounds in validity_domain.items()
+    }
+    return {"kind": "box", "bounds": bounds}
+
+
+def _normalize_structured_validity_domain(
+    validity_domain: Mapping[str, Any],
+    normalized_inputs: Mapping[str, NormalizedQuantity],
+    *,
+    registry: S7UnitRegistry,
+) -> dict[str, Any]:
+    raw_kind = validity_domain.get("kind")
+    if not isinstance(raw_kind, str) or not raw_kind.strip():
+        raise AdapterConformanceError("validity domain kind must be a non-empty string")
+    kind = raw_kind.strip().lower().replace("-", "_")
+    if kind != "box":
+        raise AdapterConformanceError(f"unsupported validity domain kind: {kind}")
+    raw_box = validity_domain.get("box")
+    if not isinstance(raw_box, Mapping):
+        raise AdapterConformanceError("box validity domain must declare a box mapping")
+    bounds = {
+        field: _normalize_domain_bounds(field, raw_bounds, normalized_inputs, registry=registry)
+        for field, raw_bounds in raw_box.items()
+    }
+    return {"kind": "box", "bounds": bounds}
+
+
+def _normalize_domain_bounds(
+    field: str,
+    raw_bounds: Any,
+    normalized_inputs: Mapping[str, NormalizedQuantity],
+    *,
+    registry: S7UnitRegistry,
+) -> dict[str, float]:
+    if field not in normalized_inputs:
+        raise AdapterConformanceError(f"validity domain references unknown input field: {field}")
+    quantity = normalized_inputs[field]
+    raw_unit: str | None = None
+    if isinstance(raw_bounds, Mapping):
+        if "min" not in raw_bounds or "max" not in raw_bounds:
+            raise AdapterConformanceError(f"validity domain for {field} requires min and max")
+        lower = _finite_domain_number(raw_bounds["min"], f"validity_domain.{field}.min")
+        upper = _finite_domain_number(raw_bounds["max"], f"validity_domain.{field}.max")
+        raw_unit_value = raw_bounds.get("unit", raw_bounds.get("units"))
+        if raw_unit_value is not None:
+            if not isinstance(raw_unit_value, str) or not raw_unit_value.strip():
+                raise AdapterConformanceError(f"validity domain unit for {field} must be a string")
+            raw_unit = raw_unit_value.strip()
+    elif isinstance(raw_bounds, (list, tuple)) and len(raw_bounds) == 2:
+        lower = _finite_domain_number(raw_bounds[0], f"validity_domain.{field}.min")
+        upper = _finite_domain_number(raw_bounds[1], f"validity_domain.{field}.max")
+    else:
+        raise AdapterConformanceError(f"validity domain for {field} must be bounds or mapping")
+    if lower > upper:
+        raise AdapterConformanceError(f"validity domain lower bound exceeds upper bound for {field}")
+    if raw_unit and quantity.log_space is None:
+        scale = registry.conversion_factor(raw_unit, quantity.units)
+        lower *= scale
+        upper *= scale
+    elif raw_unit:
+        registry.conversion_factor(raw_unit, "dimensionless")
+    return {"lower": lower, "upper": upper}
+
+
+def _domain_distance(value: float, lower: float, upper: float) -> float:
+    if value < lower:
+        return lower - value
+    if value > upper:
+        return value - upper
+    return 0.0
+
+
+def _clamped_normalized_quantity(quantity: NormalizedQuantity, effective_domain_value: float) -> NormalizedQuantity:
+    if quantity.log_space is None:
+        return replace(quantity, value=effective_domain_value, domain_value=effective_domain_value)
+    return replace(
+        quantity,
+        value=_delinearize_log_space(effective_domain_value, quantity.log_space),
+        domain_value=effective_domain_value,
+    )
 
 
 def _default_unit_definitions() -> dict[str, S7UnitDefinition]:
@@ -674,6 +894,15 @@ def _finite_uncertainty_number(value: Any, field_name: str) -> float:
     return numeric
 
 
+def _finite_domain_number(value: Any, field_name: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise AdapterConformanceError(f"{field_name} must be a finite validity domain number")
+    numeric = float(value)
+    if not math.isfinite(numeric):
+        raise AdapterConformanceError(f"{field_name} must be finite")
+    return numeric
+
+
 def _finite_non_negative_uncertainty(value: Any, field_name: str) -> float:
     numeric = _finite_uncertainty_number(value, field_name)
     if numeric < 0:
@@ -741,7 +970,7 @@ def adapter_capability_descriptor(
         revision=revision,
         kind="adapter",
         owner_subsystem="S7",
-        contract_versions={"C5": "1.0.0", "C6": "1.2.0"},
+        contract_versions={"C5": "1.0.0", "C6": "1.3.0"},
         trust_class=trust_class,
         capability_scopes=tuple(scopes),
         provenance_ref=descriptor.provenance_ref,

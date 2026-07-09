@@ -6,7 +6,7 @@
   "x-argus-contract": {
     "id": "C6",
     "owner": "S7",
-    "version": "1.2.0"
+    "version": "1.3.0"
   },
   "oneOf": [
     { "$ref": "#/$defs/AdapterDescriptor" },
@@ -36,6 +36,44 @@
         "value": { "type": ["number", "array"] },
         "units": { "type": "string", "minLength": 1 },
         "uncertainty": { "type": "object" }
+      }
+    },
+    "DomainDiagnostics": {
+      "type": "object",
+      "required": [
+        "kind",
+        "policy",
+        "violated_fields",
+        "distance",
+        "validity_domain_guard_version",
+        "validity_domain_guard_hash"
+      ],
+      "additionalProperties": true,
+      "properties": {
+        "kind": { "type": "string", "minLength": 1 },
+        "policy": { "type": "string", "enum": ["flag", "refuse", "clamp_with_flag"] },
+        "violated_fields": {
+          "type": "array",
+          "items": { "type": "string" },
+          "uniqueItems": true
+        },
+        "clamped_fields": {
+          "type": "array",
+          "items": { "type": "string" },
+          "uniqueItems": true
+        },
+        "distance": { "type": "number", "minimum": 0 },
+        "fields": { "type": "object" },
+        "validity_domain_guard_version": {
+          "type": "string",
+          "minLength": 1,
+          "default": "argus-domain-1.0.0"
+        },
+        "validity_domain_guard_hash": {
+          "type": "string",
+          "pattern": "^blake3:[0-9a-f]{64}$",
+          "default": "blake3:353cb32c3b4d50a2f1a3626946cd23b7407b6a64240e405c32398e936f387bc5"
+        }
       }
     },
     "AdapterDescriptor": {
@@ -88,7 +126,10 @@
         "unit_registry_version",
         "unit_registry_hash",
         "uncertainty_engine_version",
-        "uncertainty_engine_hash"
+        "uncertainty_engine_hash",
+        "validity_domain_guard_version",
+        "validity_domain_guard_hash",
+        "domain_diagnostics"
       ],
       "additionalProperties": false,
       "properties": {
@@ -99,6 +140,19 @@
         },
         "in_validity_domain": { "type": "boolean" },
         "extrapolation_flag": { "type": "boolean" },
+        "domain_diagnostics": {
+          "$ref": "#/$defs/DomainDiagnostics",
+          "default": {
+            "kind": "box",
+            "policy": "flag",
+            "violated_fields": [],
+            "clamped_fields": [],
+            "distance": 0,
+            "fields": {},
+            "validity_domain_guard_version": "argus-domain-1.0.0",
+            "validity_domain_guard_hash": "blake3:353cb32c3b4d50a2f1a3626946cd23b7407b6a64240e405c32398e936f387bc5"
+          }
+        },
         "provenance_ref": { "$ref": "#/$defs/ArtifactRef" },
         "unit_registry_version": {
           "type": "string",
@@ -119,6 +173,16 @@
           "type": "string",
           "pattern": "^blake3:[0-9a-f]{64}$",
           "default": "blake3:04c6c2c24fb730865ec58cc636250e709f73d54f27ac809afefe7fad360aff58"
+        },
+        "validity_domain_guard_version": {
+          "type": "string",
+          "minLength": 1,
+          "default": "argus-domain-1.0.0"
+        },
+        "validity_domain_guard_hash": {
+          "type": "string",
+          "pattern": "^blake3:[0-9a-f]{64}$",
+          "default": "blake3:353cb32c3b4d50a2f1a3626946cd23b7407b6a64240e405c32398e936f387bc5"
         },
         "error": {
           "type": "object",

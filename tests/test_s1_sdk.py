@@ -51,6 +51,8 @@ from argus_core import (
     UNCERTAINTY_ENGINE_VERSION,
     UNIT_REGISTRY_HASH,
     UNIT_REGISTRY_VERSION,
+    VALIDITY_DOMAIN_GUARD_HASH,
+    VALIDITY_DOMAIN_GUARD_VERSION,
     build_error_envelope,
     build_frozen_pipeline_entrypoint_request,
     hash_bytes,
@@ -581,6 +583,9 @@ class S1SDKBaseClassTests(unittest.TestCase):
         self.assertEqual(result["result"]["unit_registry_hash"], UNIT_REGISTRY_HASH)
         self.assertEqual(result["result"]["uncertainty_engine_version"], UNCERTAINTY_ENGINE_VERSION)
         self.assertEqual(result["result"]["uncertainty_engine_hash"], UNCERTAINTY_ENGINE_HASH)
+        self.assertEqual(result["result"]["validity_domain_guard_version"], VALIDITY_DOMAIN_GUARD_VERSION)
+        self.assertEqual(result["result"]["validity_domain_guard_hash"], VALIDITY_DOMAIN_GUARD_HASH)
+        self.assertEqual(result["result"]["domain_diagnostics"]["violated_fields"], [])
         self.assertEqual(artifacts.get_record(str(result["provenance_ref"])).kind, "log")
         self.assertEqual(audit.events()[-1].event_type, "adapter.evaluate")
         self.assertEqual(audit.events()[-1].payload["adapter_id"], "adapter:bounce")

@@ -18,9 +18,21 @@
   },
   "in_validity_domain": true,
   "extrapolation_flag": false,
+  "domain_diagnostics": {
+    "kind": "box",
+    "policy": "flag",
+    "violated_fields": [],
+    "clamped_fields": [],
+    "distance": 0.0,
+    "fields": {},
+    "validity_domain_guard_version": "argus-domain-1.0.0",
+    "validity_domain_guard_hash": "blake3:353cb32c3b4d50a2f1a3626946cd23b7407b6a64240e405c32398e936f387bc5"
+  },
   "provenance_ref": "c4://adapter-call/toy-bounce/example",
   "unit_registry_version": "argus-units-1.0.0",
   "unit_registry_hash": "blake3:d051549f426fb54fa67a0ef96611db2aebd0158c6b541e964c380d6cc58e06e5",
   "uncertainty_engine_version": "argus-uncertainty-1.0.0",
-  "uncertainty_engine_hash": "blake3:04c6c2c24fb730865ec58cc636250e709f73d54f27ac809afefe7fad360aff58"
+  "uncertainty_engine_hash": "blake3:04c6c2c24fb730865ec58cc636250e709f73d54f27ac809afefe7fad360aff58",
+  "validity_domain_guard_version": "argus-domain-1.0.0",
+  "validity_domain_guard_hash": "blake3:353cb32c3b4d50a2f1a3626946cd23b7407b6a64240e405c32398e936f387bc5"
 }

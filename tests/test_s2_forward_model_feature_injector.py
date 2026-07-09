@@ -18,6 +18,8 @@ from argus_core import (
     UNCERTAINTY_ENGINE_VERSION,
     UNIT_REGISTRY_HASH,
     UNIT_REGISTRY_VERSION,
+    VALIDITY_DOMAIN_GUARD_HASH,
+    VALIDITY_DOMAIN_GUARD_VERSION,
 )
 
 
@@ -64,6 +66,9 @@ class S2ForwardModelFeatureInjectorTests(unittest.TestCase):
         self.assertEqual(result.diagnostics["unit_registry_hash"], UNIT_REGISTRY_HASH)
         self.assertEqual(result.diagnostics["uncertainty_engine_version"], UNCERTAINTY_ENGINE_VERSION)
         self.assertEqual(result.diagnostics["uncertainty_engine_hash"], UNCERTAINTY_ENGINE_HASH)
+        self.assertEqual(result.diagnostics["validity_domain_guard_version"], VALIDITY_DOMAIN_GUARD_VERSION)
+        self.assertEqual(result.diagnostics["validity_domain_guard_hash"], VALIDITY_DOMAIN_GUARD_HASH)
+        self.assertEqual(result.diagnostics["domain_diagnostics"]["violated_fields"], ())
         self.assertEqual(self.store.get_record(result.adapter_provenance_ref).kind, "log")
 
     def test_out_of_domain_adapter_result_is_flagged_not_silent(self) -> None:
@@ -90,6 +95,8 @@ class S2ForwardModelFeatureInjectorTests(unittest.TestCase):
         self.assertEqual(result.violated_fields, ("v_w",))
         self.assertEqual(result.diagnostics["violated_fields"], ("v_w",))
         self.assertEqual(result.diagnostics["out_of_domain_policy"], "flag")
+        self.assertEqual(result.diagnostics["domain_diagnostics"]["violated_fields"], ("v_w",))
+        self.assertEqual(result.diagnostics["domain_diagnostics"]["policy"], "flag")
         self.assertTrue(result.feature_node.diagnostics["extrapolation_flag"])
 
     def test_out_of_domain_adapter_result_can_be_dropped_with_diagnostics(self) -> None:

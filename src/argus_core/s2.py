@@ -1424,12 +1424,15 @@ class ForwardModelFeatureInjector:
             "in_validity_domain": adapter_result.in_validity_domain,
             "extrapolation_flag": adapter_result.extrapolation_flag,
             "violated_fields": adapter_result.violated_fields,
+            "domain_diagnostics": adapter_result.domain_diagnostics,
             "out_of_domain_policy": request.out_of_domain_policy,
             "uncertainty_propagated": True,
             "unit_registry_version": adapter_result.unit_registry_version,
             "unit_registry_hash": adapter_result.unit_registry_hash,
             "uncertainty_engine_version": adapter_result.uncertainty_engine_version,
             "uncertainty_engine_hash": adapter_result.uncertainty_engine_hash,
+            "validity_domain_guard_version": adapter_result.validity_domain_guard_version,
+            "validity_domain_guard_hash": adapter_result.validity_domain_guard_hash,
         }
         if adapter_result.extrapolation_flag and request.out_of_domain_policy == "drop":
             return ForwardModelFeatureResult(

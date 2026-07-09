@@ -30,7 +30,7 @@ EXPECTED_CONTRACT_VERSIONS = {
     "C3": "2.0.0",
     "C4": "1.0.0",
     "C5": "1.0.0",
-    "C6": "1.2.0",
+    "C6": "1.3.0",
     "C10": "4.0.0",
 }
 
@@ -246,11 +246,15 @@ def validate_contract_schema(entry: dict) -> None:
             "unit_registry_hash",
             "uncertainty_engine_version",
             "uncertainty_engine_hash",
+            "validity_domain_guard_version",
+            "validity_domain_guard_hash",
         ):
             if field not in eval_required:
                 fail(f"C6 EvalResult must require {field}")
             if "default" not in eval_result.get("properties", {}).get(field, {}):
                 fail(f"C6 EvalResult {field} must declare an additive default")
+        if "domain_diagnostics" not in eval_required:
+            fail("C6 EvalResult must require domain_diagnostics")
 
     if contract_id == "C10":
         definitions = schema.get("$defs", {})

@@ -15,12 +15,15 @@ from argus_core import (
     OutOfDomainError,
     ProvenanceUnavailableError,
     Quantity,
+    S7ValidityDomainGuard,
     S7UnitRegistry,
     SimpleAdapter,
     UNCERTAINTY_ENGINE_HASH,
     UNCERTAINTY_ENGINE_VERSION,
     UNIT_REGISTRY_HASH,
     UNIT_REGISTRY_VERSION,
+    VALIDITY_DOMAIN_GUARD_HASH,
+    VALIDITY_DOMAIN_GUARD_VERSION,
     UnitsMismatchError,
     publish_adapter_capability,
     derive_seed,
@@ -164,6 +167,11 @@ class S7UnitsAndAdapterTests(unittest.TestCase):
         self.assertEqual(result.outputs["omega"].uncertainty["source"], "adapter:omega")
         self.assertAlmostEqual(result.outputs["omega"].uncertainty["radius"], 0.01)
         self.assertEqual(result.outputs["omega"].uncertainty["uncertainty_engine_version"], UNCERTAINTY_ENGINE_VERSION)
+        self.assertEqual(result.validity_domain_guard_version, VALIDITY_DOMAIN_GUARD_VERSION)
+        self.assertEqual(result.validity_domain_guard_hash, VALIDITY_DOMAIN_GUARD_HASH)
+        self.assertEqual(result.domain_diagnostics["violated_fields"], ("v_w",))
+        self.assertEqual(result.domain_diagnostics["policy"], "flag")
+        self.assertAlmostEqual(result.domain_diagnostics["distance"], 0.25)
         self.assertEqual(store.get_record(result.provenance_ref).kind, "log")
 
     def test_refuse_policy_rejects_out_of_domain(self) -> None:
@@ -183,6 +191,120 @@ class S7UnitsAndAdapterTests(unittest.TestCase):
             )
 
         self.assertEqual(raised.exception.category, "OUT_OF_DOMAIN")
+        self.assertEqual(raised.exception.diagnostics["violated_fields"], ("v_w",))
+        self.assertEqual(raised.exception.diagnostics["policy"], "refuse")
+
+    def test_clamp_with_flag_policy_clamps_backend_input_and_records_diagnostics(self) -> None:
+        captured: dict[str, float | None] = {}
+        descriptor = self._descriptor(domain_policy="clamp_with_flag")
+        broker = AdapterBroker(artifact_store=InMemoryArtifactStore())
+        broker.register(
+            SimpleAdapter(
+                descriptor,
+                lambda inputs, _seed: self._evaluate_and_capture(inputs, captured),
+            )
+        )
+
+        result = broker.evaluate(
+            EvalRequest(
+                adapter_id="gw_spectrum_surrogate",
+                inputs={
+                    "T_n": Quantity(value=100, units="GeV"),
+                    "alpha": Quantity(value=0.2, units="dimensionless"),
+                    "v_w": Quantity(value=1.2, units="dimensionless"),
+                },
+            )
+        )
+
+        self.assertTrue(result.extrapolation_flag)
+        self.assertFalse(result.in_validity_domain)
+        self.assertEqual(result.violated_fields, ("v_w",))
+        self.assertAlmostEqual(captured["v_w_value"] or 0.0, 0.95)
+        self.assertAlmostEqual(captured["v_w_domain_value"] or 0.0, 0.95)
+        self.assertEqual(result.domain_diagnostics["clamped_fields"], ("v_w",))
+        self.assertAlmostEqual(result.domain_diagnostics["fields"]["v_w"]["original_value"], 1.2)
+        self.assertAlmostEqual(result.domain_diagnostics["fields"]["v_w"]["effective_value"], 0.95)
+
+    def test_structured_box_domain_uses_log_coordinate_for_validity(self) -> None:
+        captured: dict[str, float | None] = {}
+        descriptor = AdapterDescriptor(
+            adapter_id="log_domain_adapter",
+            version="1.0.0",
+            input_units={"log10_beta_over_H": {"units": "dimensionless", "log_space": "log10"}},
+            output_units={"omega": "dimensionless"},
+            validity_domain={
+                "kind": "box",
+                "box": {"log10_beta_over_H": {"min": 1.0, "max": 3.0, "unit": "dimensionless"}},
+            },
+            determinism="deterministic",
+            provenance_ref="c4://adapter/log_domain_adapter/v1",
+        )
+        broker = AdapterBroker(artifact_store=InMemoryArtifactStore())
+        broker.register(
+            SimpleAdapter(
+                descriptor,
+                lambda inputs, _seed: self._evaluate_log_domain(inputs, captured),
+            )
+        )
+
+        result = broker.evaluate(
+            EvalRequest(
+                adapter_id="log_domain_adapter",
+                inputs={"log10_beta_over_H": Quantity(value=4.0, units="dimensionless")},
+            )
+        )
+
+        self.assertAlmostEqual(captured["backend_value"] or 0.0, 10000.0)
+        self.assertTrue(result.extrapolation_flag)
+        self.assertEqual(result.violated_fields, ("log10_beta_over_H",))
+        self.assertEqual(result.domain_diagnostics["fields"]["log10_beta_over_H"]["value"], 4.0)
+        self.assertAlmostEqual(result.domain_diagnostics["fields"]["log10_beta_over_H"]["distance"], 1.0)
+
+    def test_malformed_validity_domain_fails_closed_before_backend_call(self) -> None:
+        called = False
+        descriptor = self._descriptor(domain_policy="flag")
+        descriptor = AdapterDescriptor(
+            adapter_id=descriptor.adapter_id,
+            version=descriptor.version,
+            input_units=descriptor.input_units,
+            output_units=descriptor.output_units,
+            validity_domain={"v_w": (0.95, 0.4)},
+            determinism=descriptor.determinism,
+            provenance_ref=descriptor.provenance_ref,
+            domain_policy=descriptor.domain_policy,
+            differentiable=descriptor.differentiable,
+            independence_tags=descriptor.independence_tags,
+        )
+        broker = AdapterBroker(artifact_store=InMemoryArtifactStore())
+
+        def evaluate(_inputs: dict[str, NormalizedQuantity], _seed: int | None) -> dict[str, Quantity]:
+            nonlocal called
+            called = True
+            return self._evaluate(_inputs, _seed)
+
+        broker.register(SimpleAdapter(descriptor, evaluate))
+
+        with self.assertRaises(AdapterConformanceError) as raised:
+            broker.evaluate(
+                EvalRequest(
+                    adapter_id="gw_spectrum_surrogate",
+                    inputs={
+                        "T_n": Quantity(value=100, units="GeV"),
+                        "alpha": Quantity(value=0.2, units="dimensionless"),
+                        "v_w": Quantity(value=0.7, units="dimensionless"),
+                    },
+                )
+            )
+
+        self.assertFalse(called)
+        self.assertEqual(raised.exception.category, "ADAPTER_ERROR")
+        self.assertIn("validity domain", raised.exception.message)
+
+    def test_validity_domain_guard_digest_is_stable(self) -> None:
+        guard = S7ValidityDomainGuard.default()
+
+        self.assertEqual(guard.version, VALIDITY_DOMAIN_GUARD_VERSION)
+        self.assertEqual(guard.guard_hash, VALIDITY_DOMAIN_GUARD_HASH)
 
     def test_missing_uncertainty_is_conformance_error(self) -> None:
         descriptor = self._descriptor(domain_policy="flag")
@@ -301,6 +423,9 @@ class S7UnitsAndAdapterTests(unittest.TestCase):
         provenance = json.loads(store.get_artifact(result.provenance_ref))
         self.assertEqual(provenance["uncertainty_engine_version"], UNCERTAINTY_ENGINE_VERSION)
         self.assertEqual(provenance["uncertainty_engine_hash"], UNCERTAINTY_ENGINE_HASH)
+        self.assertEqual(provenance["validity_domain_guard_version"], VALIDITY_DOMAIN_GUARD_VERSION)
+        self.assertEqual(provenance["validity_domain_guard_hash"], VALIDITY_DOMAIN_GUARD_HASH)
+        self.assertEqual(provenance["domain_diagnostics"]["violated_fields"], [])
         self.assertEqual(
             provenance["uncertainty_summary"]["peak_frequency"],
             {
@@ -411,6 +536,29 @@ class S7UnitsAndAdapterTests(unittest.TestCase):
         return {
             "omega": Quantity(
                 value=omega,
+                units="dimensionless",
+                uncertainty={"kind": "interval", "radius": 0.01},
+            )
+        }
+
+    @staticmethod
+    def _evaluate_and_capture(
+        inputs: dict[str, NormalizedQuantity],
+        captured: dict[str, float | None],
+    ) -> dict[str, Quantity]:
+        captured["v_w_value"] = inputs["v_w"].value
+        captured["v_w_domain_value"] = inputs["v_w"].domain_value
+        return S7UnitsAndAdapterTests._evaluate(inputs, None)
+
+    @staticmethod
+    def _evaluate_log_domain(
+        inputs: dict[str, NormalizedQuantity],
+        captured: dict[str, float | None],
+    ) -> dict[str, Quantity]:
+        captured["backend_value"] = inputs["log10_beta_over_H"].value
+        return {
+            "omega": Quantity(
+                value=inputs["log10_beta_over_H"].value,
                 units="dimensionless",
                 uncertainty={"kind": "interval", "radius": 0.01},
             )

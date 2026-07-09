@@ -23,7 +23,7 @@ CONTRACTS: tuple[Contract, ...] = (
     Contract(id="C3", name="Verifier Interface and Validation Report", owner="S3", version="2.0.0", schema="c3.validation-report.schema.json", schema_sha256="sha256:cb69e705e30999d11bab218710ae45ead928be617cab2d2148b8ec01d3892ac5", consumers=["S1", "S2", "S4", "S5", "S7", "S8", "S9", "S11", "S12"]),
     Contract(id="C4", name="Artifact and Provenance Record", owner="S8", version="1.0.0", schema="c4.artifact-record.schema.json", schema_sha256="sha256:32d5caf1f5f57b4c1da2eb7dc81e31f7423c834f6945e3839ffc6356fc4d35de", consumers=["S1", "S2", "S3", "S4", "S5", "S6", "S7", "S9", "S10", "S11", "S12"]),
     Contract(id="C5", name="Registry Capability Descriptor", owner="S6/S12", version="1.0.0", schema="c5.capability-descriptor.schema.json", schema_sha256="sha256:3563a6436454fb51cdc2b76c559615176e12b0eab758ce67b5534d3313610416", consumers=["S1", "S2", "S3", "S4", "S5", "S7", "S9", "S10", "S11"]),
-    Contract(id="C6", name="Compute Adapter Tool Interface", owner="S7", version="1.2.0", schema="c6.compute-adapter.schema.json", schema_sha256="sha256:28ea5cbf98eeb61ea6179b4e6895f33346acd185d3d3e8b7373e471812768052", consumers=["S1", "S2", "S3", "S5", "S6", "S10", "S11", "S12"])
+    Contract(id="C6", name="Compute Adapter Tool Interface", owner="S7", version="1.3.0", schema="c6.compute-adapter.schema.json", schema_sha256="sha256:0fc115bbc34cee85d04e552f83c4e9871b1ee9a962204a26ed119460feac7b89", consumers=["S1", "S2", "S3", "S5", "S6", "S10", "S11", "S12"])
 )
 
 CONTRACT_BY_ID: dict[str, Contract] = {contract.id: contract for contract in CONTRACTS}
