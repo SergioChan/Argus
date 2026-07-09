@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field, replace
+import json
 import math
 from typing import Any, Callable, Mapping
 
@@ -496,6 +497,282 @@ class EvalResult:
     uncertainty_engine_hash: str = UNCERTAINTY_ENGINE_HASH
     validity_domain_guard_version: str = VALIDITY_DOMAIN_GUARD_VERSION
     validity_domain_guard_hash: str = VALIDITY_DOMAIN_GUARD_HASH
+
+
+@dataclass(frozen=True)
+class EvalContext:
+    seed: int | None = None
+    unit_registry: S7UnitRegistry = field(default_factory=S7UnitRegistry.default)
+    budget: dict[str, Any] = field(default_factory=dict)
+    trace: dict[str, Any] = field(default_factory=dict)
+    provenance_writer: Any | None = None
+
+
+@dataclass(frozen=True)
+class S7AdapterValidationResult:
+    descriptor: AdapterDescriptor
+    eval_result: EvalResult | None
+    passed: bool
+    diagnostics: dict[str, Any] = field(default_factory=dict)
+
+
+class Adapter:
+    """Author-facing SDK base class for C6 adapters."""
+
+    def describe(self) -> AdapterDescriptor:
+        return build_adapter_descriptor(self)
+
+    def conformance_test_stub(
+        self,
+        *,
+        adapter_import: str | None = None,
+        sample_inputs: Mapping[str, Quantity] | None = None,
+    ) -> str:
+        return build_adapter_conformance_test_stub(
+            self,
+            adapter_import=adapter_import,
+            sample_inputs=sample_inputs,
+        )
+
+    def as_simple_adapter(self, *, unit_registry: S7UnitRegistry | None = None) -> "SimpleAdapter":
+        registry = unit_registry or S7UnitRegistry.default()
+
+        def evaluate_fn(normalized_inputs: dict[str, NormalizedQuantity], seed: int | None) -> dict[str, Quantity]:
+            return self.evaluate(normalized_inputs, EvalContext(seed=seed, unit_registry=registry))
+
+        return SimpleAdapter(self.describe(), evaluate_fn)
+
+    def evaluate(self, inputs: dict[str, NormalizedQuantity], ctx: EvalContext) -> dict[str, Quantity]:
+        raise NotImplementedError("adapter SDK subclasses must implement evaluate")
+
+    def grad(self, inputs: dict[str, NormalizedQuantity], ctx: EvalContext) -> dict[str, Any]:
+        raise AdapterConformanceError("adapter grad is not implemented")
+
+    def batch_evaluate(
+        self,
+        requests: list[dict[str, NormalizedQuantity]],
+        ctx: EvalContext,
+    ) -> list[dict[str, Quantity]]:
+        return [self.evaluate(inputs, ctx) for inputs in requests]
+
+
+def adapter_metadata(
+    *,
+    adapter_id: str,
+    version: str = "1.0.0",
+    determinism: str = "deterministic",
+    cost_class: str = "standard",
+    independence_tags: tuple[str, ...] = (),
+    provenance_ref: str | None = None,
+):
+    def decorator(cls):
+        setattr(cls, "_s7_adapter_id", adapter_id)
+        setattr(cls, "_s7_adapter_version", version)
+        setattr(cls, "_s7_determinism", determinism)
+        setattr(cls, "_s7_cost_class", cost_class)
+        setattr(cls, "_s7_independence_tags", tuple(independence_tags))
+        if provenance_ref is not None:
+            setattr(cls, "_s7_provenance_ref", provenance_ref)
+        return cls
+
+    return decorator
+
+
+def units_in(schema: Mapping[str, Any]):
+    def decorator(cls):
+        setattr(cls, "_s7_input_units", _sdk_mapping_copy(schema, "input units"))
+        return cls
+
+    return decorator
+
+
+def units_out(schema: Mapping[str, Any]):
+    def decorator(cls):
+        setattr(cls, "_s7_output_units", _sdk_mapping_copy(schema, "output units"))
+        return cls
+
+    return decorator
+
+
+def validity_domain(spec: Mapping[str, Any] | None = None, *, kind: str | None = None, policy: str = "flag"):
+    def decorator(cls):
+        domain = spec if spec is not None else {"kind": kind or "box", "box": {}}
+        setattr(cls, "_s7_validity_domain", _sdk_mapping_copy(domain, "validity domain"))
+        setattr(cls, "_s7_domain_policy", _normalize_domain_policy(policy))
+        return cls
+
+    return decorator
+
+
+def uncertainty(*, kind: str, representation: Mapping[str, Any] | None = None):
+    def decorator(cls):
+        if not isinstance(kind, str) or not kind.strip():
+            raise AdapterConformanceError("uncertainty kind must be a non-empty string")
+        metadata = {"kind": kind.strip().lower().replace("-", "_")}
+        if representation is not None:
+            metadata["representation"] = _sdk_mapping_copy(representation, "uncertainty representation")
+        setattr(cls, "_s7_uncertainty", metadata)
+        return cls
+
+    return decorator
+
+
+def differentiable(*, backend: str | None = None):
+    def decorator(cls):
+        setattr(cls, "_s7_differentiable", True)
+        if backend is not None:
+            if not isinstance(backend, str) or not backend.strip():
+                raise AdapterConformanceError("differentiable backend must be a non-empty string")
+            setattr(cls, "_s7_backend", backend.strip())
+        return cls
+
+    return decorator
+
+
+def declare_domain_box(bounds: Mapping[str, Any]) -> dict[str, Any]:
+    if not isinstance(bounds, Mapping) or not bounds:
+        raise AdapterConformanceError("domain box must declare at least one field")
+    normalized: dict[str, Any] = {}
+    for field, raw_bounds in bounds.items():
+        if not isinstance(field, str) or not field.strip():
+            raise AdapterConformanceError("domain box field names must be non-empty strings")
+        if isinstance(raw_bounds, Mapping):
+            lower = raw_bounds.get("min", raw_bounds.get("lower"))
+            upper = raw_bounds.get("max", raw_bounds.get("upper"))
+            unit = raw_bounds.get("unit")
+        elif isinstance(raw_bounds, tuple) and len(raw_bounds) in {2, 3}:
+            lower, upper = raw_bounds[0], raw_bounds[1]
+            unit = raw_bounds[2] if len(raw_bounds) == 3 else None
+        else:
+            raise AdapterConformanceError(f"domain box for {field} must be bounds or mapping")
+        entry = {
+            "min": _finite_domain_number(lower, f"validity_domain.{field}.min"),
+            "max": _finite_domain_number(upper, f"validity_domain.{field}.max"),
+        }
+        if entry["min"] > entry["max"]:
+            raise AdapterConformanceError(f"validity domain lower bound exceeds upper bound for {field}")
+        if unit is not None:
+            if not isinstance(unit, str) or not unit.strip():
+                raise AdapterConformanceError(f"validity domain unit for {field} must be a string")
+            entry["unit"] = unit.strip()
+        normalized[field.strip()] = entry
+    return {"kind": "box", "box": normalized}
+
+
+def build_adapter_descriptor(adapter: Adapter | type[Adapter]) -> AdapterDescriptor:
+    adapter_id = _required_sdk_string(adapter, "_s7_adapter_id", "adapter_id")
+    version = _sdk_string(adapter, "_s7_adapter_version", "1.0.0", "version")
+    try:
+        _parse_semver(version)
+    except AdapterVersionError as exc:
+        raise AdapterConformanceError(str(exc)) from exc
+    determinism = _sdk_string(adapter, "_s7_determinism", "deterministic", "determinism")
+    if determinism not in {"deterministic", "seeded", "stochastic"}:
+        raise AdapterConformanceError(f"unsupported adapter determinism: {determinism}")
+    input_units = _required_sdk_mapping(adapter, "_s7_input_units", "input_units")
+    output_units = _required_sdk_mapping(adapter, "_s7_output_units", "output_units")
+    domain = _sdk_mapping(adapter, "_s7_validity_domain", {})
+    domain_policy = _sdk_string(adapter, "_s7_domain_policy", "flag", "domain_policy")
+    provenance_ref = _sdk_string(
+        adapter,
+        "_s7_provenance_ref",
+        f"c4://adapter/{adapter_id}/v{version}",
+        "provenance_ref",
+    )
+    cost_class = _sdk_string(adapter, "_s7_cost_class", "standard", "cost_class")
+    tags = _sdk_string_tuple(adapter, "_s7_independence_tags", ())
+    return AdapterDescriptor(
+        adapter_id=adapter_id,
+        version=version,
+        input_units=input_units,
+        output_units=output_units,
+        validity_domain=domain,
+        determinism=determinism,
+        provenance_ref=provenance_ref,
+        domain_policy=_normalize_domain_policy(domain_policy),
+        differentiable=bool(_sdk_attr(adapter, "_s7_differentiable", False)),
+        cost_class=cost_class,
+        independence_tags=tags,
+    )
+
+
+def build_adapter_conformance_test_stub(
+    adapter: Adapter | type[Adapter],
+    *,
+    adapter_import: str | None = None,
+    sample_inputs: Mapping[str, Quantity] | None = None,
+) -> str:
+    descriptor = build_adapter_descriptor(adapter)
+    module_name, adapter_symbol = _adapter_stub_import(adapter, adapter_import)
+    supplied_inputs = dict(sample_inputs or {})
+    unexpected_inputs = sorted(set(supplied_inputs) - set(descriptor.input_units))
+    if unexpected_inputs:
+        raise AdapterConformanceError(
+            f"adapter conformance stub sample inputs include undeclared fields: {unexpected_inputs}"
+        )
+    input_literals = []
+    for field, units in sorted(descriptor.input_units.items()):
+        quantity = supplied_inputs.get(field) or _default_stub_quantity(field, units, descriptor.validity_domain)
+        input_literals.append(f"                {_py_string(field)}: {_quantity_literal(quantity)},")
+    test_class = f"{_safe_identifier(adapter_symbol)}ConformanceTests"
+    body = [
+        f"# Generated by argus-adapter-sdk for {descriptor.adapter_id} {descriptor.version}.",
+        "import unittest",
+        "",
+        "from argus_core import Quantity, validate_adapter_locally",
+        f"from {module_name} import {adapter_symbol}",
+        "",
+        "",
+        f"class {test_class}(unittest.TestCase):",
+        "    def test_local_validate_passes(self) -> None:",
+        "        result = validate_adapter_locally(",
+        f"            {adapter_symbol}(),",
+        "            inputs={",
+        *input_literals,
+        "            },",
+        "            seed=0,",
+        "        )",
+        "",
+        "        self.assertTrue(result.passed)",
+        f"        self.assertEqual(result.descriptor.adapter_id, {_py_string(descriptor.adapter_id)})",
+        f"        self.assertEqual(result.descriptor.version, {_py_string(descriptor.version)})",
+        "",
+        "",
+        "if __name__ == \"__main__\":",
+        "    unittest.main()",
+        "",
+    ]
+    return "\n".join(body)
+
+
+def validate_adapter_locally(
+    adapter: Adapter,
+    *,
+    inputs: dict[str, Quantity],
+    seed: int | None = None,
+    artifact_store: InMemoryArtifactStore | None = None,
+    unit_registry: S7UnitRegistry | None = None,
+) -> S7AdapterValidationResult:
+    registry = unit_registry or S7UnitRegistry.default()
+    store = artifact_store or InMemoryArtifactStore()
+    descriptor = adapter.describe()
+    broker = AdapterBroker(artifact_store=store, unit_registry=registry)
+    broker.register(adapter.as_simple_adapter(unit_registry=registry))
+    result = broker.evaluate(EvalRequest(adapter_id=descriptor.adapter_id, inputs=inputs, seed=seed))
+    return S7AdapterValidationResult(
+        descriptor=descriptor,
+        eval_result=result,
+        passed=True,
+        diagnostics={
+            "descriptor_hash": hash_json(asdict(descriptor)),
+            "provenance_ref": result.provenance_ref,
+            "unit_registry_version": result.unit_registry_version,
+            "uncertainty_engine_version": result.uncertainty_engine_version,
+            "validity_domain_guard_version": result.validity_domain_guard_version,
+            "sdk_uncertainty": _sdk_attr(adapter, "_s7_uncertainty", {}),
+            "sdk_backend": _sdk_attr(adapter, "_s7_backend", None),
+        },
+    )
 
 
 @dataclass(frozen=True)
@@ -1040,3 +1317,108 @@ def _parse_semver(version: str) -> tuple[int, int, int]:
         return (int(parts[0]), int(parts[1]), int(parts[2]))
     except ValueError as exc:
         raise AdapterVersionError(f"invalid adapter semver: {version}") from exc
+
+
+_SDK_MISSING = object()
+
+
+def _sdk_attr(adapter: Any, name: str, default: Any = _SDK_MISSING) -> Any:
+    if hasattr(adapter, name):
+        return getattr(adapter, name)
+    if not isinstance(adapter, type) and hasattr(adapter.__class__, name):
+        return getattr(adapter.__class__, name)
+    if default is _SDK_MISSING:
+        raise AdapterConformanceError(f"adapter SDK metadata missing {name}")
+    return default
+
+
+def _sdk_mapping_copy(value: Mapping[str, Any], label: str) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        raise AdapterConformanceError(f"adapter SDK {label} must be a mapping")
+    return dict(value)
+
+
+def _required_sdk_mapping(adapter: Any, name: str, label: str) -> dict[str, Any]:
+    value = _sdk_attr(adapter, name, None)
+    if not isinstance(value, Mapping) or not value:
+        raise AdapterConformanceError(f"adapter SDK metadata missing {label}")
+    return dict(value)
+
+
+def _sdk_mapping(adapter: Any, name: str, default: Mapping[str, Any]) -> dict[str, Any]:
+    value = _sdk_attr(adapter, name, default)
+    if not isinstance(value, Mapping):
+        raise AdapterConformanceError(f"adapter SDK metadata {name} must be a mapping")
+    return dict(value)
+
+
+def _required_sdk_string(adapter: Any, name: str, label: str) -> str:
+    value = _sdk_attr(adapter, name, None)
+    if not isinstance(value, str) or not value.strip():
+        raise AdapterConformanceError(f"adapter SDK metadata missing {label}")
+    return value.strip()
+
+
+def _sdk_string(adapter: Any, name: str, default: str, label: str) -> str:
+    value = _sdk_attr(adapter, name, default)
+    if not isinstance(value, str) or not value.strip():
+        raise AdapterConformanceError(f"adapter SDK metadata {label} must be a non-empty string")
+    return value.strip()
+
+
+def _sdk_string_tuple(adapter: Any, name: str, default: tuple[str, ...]) -> tuple[str, ...]:
+    value = _sdk_attr(adapter, name, default)
+    if not isinstance(value, (tuple, list)):
+        raise AdapterConformanceError(f"adapter SDK metadata {name} must be a tuple of strings")
+    normalized = []
+    for item in value:
+        if not isinstance(item, str) or not item.strip():
+            raise AdapterConformanceError(f"adapter SDK metadata {name} entries must be non-empty strings")
+        normalized.append(item.strip())
+    return tuple(normalized)
+
+
+def _adapter_stub_import(adapter: Any, adapter_import: str | None) -> tuple[str, str]:
+    if adapter_import is None:
+        cls = adapter if isinstance(adapter, type) else adapter.__class__
+        module_name = cls.__module__
+        symbol = cls.__qualname__.split(".")[-1]
+    elif ":" in adapter_import:
+        module_name, symbol = adapter_import.split(":", 1)
+    else:
+        module_name, _, symbol = adapter_import.rpartition(".")
+    if not module_name or not symbol:
+        raise AdapterConformanceError("adapter_import must be 'module:ClassName' or 'module.ClassName'")
+    if not _is_import_path(module_name) or not _safe_identifier(symbol) == symbol:
+        raise AdapterConformanceError("adapter_import must reference a valid Python module and class symbol")
+    return module_name, symbol
+
+
+def _default_stub_quantity(field: str, units: str, domain: Mapping[str, Any]) -> Quantity:
+    box = domain.get("box") if isinstance(domain, Mapping) and domain.get("kind") == "box" else None
+    entry = box.get(field) if isinstance(box, Mapping) else None
+    if isinstance(entry, Mapping) and "min" in entry and "max" in entry:
+        value = (_finite_domain_number(entry["min"], f"validity_domain.{field}.min") + _finite_domain_number(
+            entry["max"], f"validity_domain.{field}.max"
+        )) / 2.0
+        return Quantity(value=value, units=str(entry.get("unit") or units))
+    return Quantity(value=0.0, units=units)
+
+
+def _quantity_literal(quantity: Quantity) -> str:
+    value = _finite_domain_number(quantity.value, "sample_input.value")
+    return f"Quantity(value={value!r}, units={_py_string(quantity.units)})"
+
+
+def _py_string(value: str) -> str:
+    return json.dumps(value)
+
+
+def _safe_identifier(value: str) -> str:
+    if not isinstance(value, str) or not value.isidentifier():
+        raise AdapterConformanceError("adapter conformance stub symbol must be a valid Python identifier")
+    return value
+
+
+def _is_import_path(value: str) -> bool:
+    return all(part.isidentifier() for part in value.split("."))
