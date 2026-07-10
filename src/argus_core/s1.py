@@ -4506,7 +4506,10 @@ def _build_validation_handoff_payload(
             job_id=job_id,
         ),
     )
-    validation_report_payload = _call_s3_validation_client(validation_client, validation_request)
+    validation_report_payload, external_validation_report_ref = _call_s3_validation_client(
+        validation_client,
+        validation_request,
+    )
     verification = report_verifier.verify(validation_report_payload)
     if not verification.valid:
         raise LifecyclePolicyError(
@@ -4516,20 +4519,28 @@ def _build_validation_handoff_payload(
                 message=f"S3 validation report was rejected: {verification.reason or 'invalid'}",
             )
         )
-    from .s3 import S3ReportBuilder
+    if external_validation_report_ref is not None:
+        report_record = _load_external_validation_report(
+            artifact_store=artifact_store,
+            artifact_ref=external_validation_report_ref,
+            expected_payload=validation_report_payload,
+            frozen_pipeline_ref=frozen_pipeline_record.artifact_ref,
+        )
+    else:
+        from .s3 import S3ReportBuilder
 
-    committed_report = S3ReportBuilder(
-        artifact_store=artifact_store,
-        producer=Producer(subsystem="S3", version="0.0.0", actor_id="s3.validate"),
-        code_ref="argus-core:s3.validate",
-        environment_digest="python:s3-validate:v1",
-    ).commit_signed_report(
-        validation_report_payload,
-        input_refs=(validation_request_record.artifact_ref, frozen_pipeline_record.artifact_ref, profile_ref, *artifact_refs),
-        job_id=job_id,
-    )
-    validation_report_payload = committed_report.report
-    report_record = committed_report.record
+        committed_report = S3ReportBuilder(
+            artifact_store=artifact_store,
+            producer=Producer(subsystem="S3", version="0.0.0", actor_id="s3.validate"),
+            code_ref="argus-core:s3.validate",
+            environment_digest="python:s3-validate:v1",
+        ).commit_signed_report(
+            validation_report_payload,
+            input_refs=(validation_request_record.artifact_ref, frozen_pipeline_record.artifact_ref, profile_ref, *artifact_refs),
+            job_id=job_id,
+        )
+        validation_report_payload = committed_report.report
+        report_record = committed_report.record
     report = build_subagent_report(
         artifact_refs=artifact_refs,
         validation_report_ref=report_record.artifact_ref,
@@ -4573,9 +4584,12 @@ def _frozen_pipeline_payload(
     return payload
 
 
-def _call_s3_validation_client(validation_client: Any, validation_request: Mapping[str, Any]) -> dict[str, Any]:
+def _call_s3_validation_client(
+    validation_client: Any,
+    validation_request: Mapping[str, Any],
+) -> tuple[dict[str, Any], str | None]:
     try:
-        raw_report = validation_client.validate(dict(validation_request))
+        raw_response = validation_client.validate(dict(validation_request))
     except LifecyclePolicyError:
         raise
     except Exception as exc:
@@ -4586,16 +4600,88 @@ def _call_s3_validation_client(validation_client: Any, validation_request: Mappi
                 message=f"S3 validation handoff failed: {exc}",
             )
         ) from exc
-    report_payload = _json_compatible_payload(raw_report)
-    if not isinstance(report_payload, dict):
-        raise LifecyclePolicyError(
-            build_error_envelope(
-                category="VALIDATION",
-                code="S1_VALIDATION_REPORT_INVALID",
-                message="S3 validation client must return a C3 report mapping",
-            )
+    if not isinstance(raw_response, Mapping):
+        _raise_external_validation_error(
+            "S1_VALIDATION_RESPONSE_INVALID",
+            "S3 validation client must return a report object or an external persisted-report envelope",
         )
-    return report_payload
+    external_fields = {"validation_report_payload", "validation_report_ref"}
+    present_external_fields = external_fields & set(raw_response)
+    if not present_external_fields:
+        report_payload = _json_compatible_payload(raw_response)
+        if not isinstance(report_payload, dict):
+            _raise_external_validation_error(
+                "S1_VALIDATION_REPORT_INVALID",
+                "S3 validation client must return a C3 report mapping",
+            )
+        return report_payload, None
+    if present_external_fields != external_fields:
+        _raise_external_validation_error(
+            "S1_EXTERNAL_VALIDATION_RESPONSE_INVALID",
+            "external S3 validation response requires both validation_report_payload and validation_report_ref",
+        )
+    report_payload = raw_response.get("validation_report_payload")
+    report_ref = raw_response.get("validation_report_ref")
+    report_payload = _json_compatible_payload(report_payload)
+    if not isinstance(report_payload, dict) or not isinstance(report_ref, str) or not report_ref:
+        _raise_external_validation_error(
+            "S1_EXTERNAL_VALIDATION_RESPONSE_INVALID",
+            "external S3 validation response contains an invalid report payload or artifact reference",
+        )
+    return report_payload, report_ref
+
+
+def _load_external_validation_report(
+    *,
+    artifact_store: Any,
+    artifact_ref: str,
+    expected_payload: Mapping[str, Any],
+    frozen_pipeline_ref: str,
+) -> Any:
+    get_record = getattr(artifact_store, "get_record", None)
+    get_artifact = getattr(artifact_store, "get_artifact", None)
+    if not callable(get_record) or not callable(get_artifact):
+        _raise_external_validation_error(
+            "S1_EXTERNAL_VALIDATION_STORE_UNSUPPORTED",
+            "external S3 validation requires C4 record and payload readback",
+        )
+    try:
+        record = get_record(artifact_ref)
+        raw_payload = get_artifact(artifact_ref)
+        stored_payload = json.loads(raw_payload.decode("utf-8"))
+    except Exception as exc:
+        _raise_external_validation_error(
+            "S1_EXTERNAL_VALIDATION_REPORT_UNAVAILABLE",
+            f"external S3 report {artifact_ref} could not be read from C4: {exc}",
+        )
+    if getattr(record, "kind", None) != "report":
+        _raise_external_validation_error(
+            "S1_EXTERNAL_VALIDATION_REPORT_KIND_INVALID",
+            "external S3 validation reference must resolve to a report artifact",
+        )
+    producer = getattr(record, "producer", None)
+    if getattr(producer, "subsystem", "").upper() != "S3":
+        _raise_external_validation_error(
+            "S1_EXTERNAL_VALIDATION_REPORT_PRODUCER_INVALID",
+            "external S3 validation reference must be produced by S3",
+        )
+    if not isinstance(stored_payload, Mapping) or dict(stored_payload) != dict(expected_payload):
+        _raise_external_validation_error(
+            "S1_EXTERNAL_VALIDATION_REPORT_MISMATCH",
+            "external S3 validation report payload does not match the C4-persisted report",
+        )
+    lineage = getattr(record, "lineage", None)
+    input_refs = tuple(getattr(lineage, "input_refs", ()) or ())
+    if frozen_pipeline_ref not in input_refs:
+        _raise_external_validation_error(
+            "S1_EXTERNAL_VALIDATION_REPORT_LINEAGE_INVALID",
+            "external S3 validation report lineage must include the frozen pipeline",
+        )
+    return record
+
+
+def _raise_external_validation_error(code: str, message: str) -> NoReturn:
+    raise LifecyclePolicyError(build_error_envelope(category="VALIDATION", code=code, message=message))
 
 
 def _subagent_report_payload(*, job_id: str, subagent_id: str, report: SubagentReport) -> dict[str, Any]:

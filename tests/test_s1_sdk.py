@@ -122,6 +122,32 @@ class ExampleSubagent(Subagent):
         }
 
 
+def _signed_recap_report(s3: S3Verifier, request: dict[str, object]) -> dict[str, object]:
+    outcome = run_perturbation_pair(
+        perturbation_id="pair-s1-external-report",
+        must_react_expected=1.0,
+        must_react_observed=1.0,
+        must_not_react_observed=0.0,
+        unperturbed_headline=1.0,
+        perturbed_headline=0.2,
+    )
+    return s3.build_report(
+        profile_ref=str(request["profile_ref"]),
+        frozen_pipeline_ref=str(request["frozen_pipeline_ref"]),
+        proponent_id="sdk-subagent",
+        checks=(
+            CheckResult("INJECTION", "PASS"),
+            CheckResult("NULL_CONTROL", "PASS"),
+            CheckResult("PHYSICAL_CONSISTENCY", "PASS"),
+            CheckResult("CALIBRATION", "PASS"),
+            CheckResult("RECAP_BENCHMARK", "PASS", metrics={"test_cases": ["S3-T24", "S3-TC32"]}),
+        ),
+        perturbation_outcome=outcome,
+        requested_tier="recapitulated-known",
+        debate_ref="c4://debate/s1-external-report",
+    )
+
+
 class S1SDKBaseClassTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
@@ -147,6 +173,45 @@ class S1SDKBaseClassTests(unittest.TestCase):
             estimated_cost=0.5,
             budget_cost=1.0,
         )
+
+    def _validation_runner(self, artifacts: InMemoryArtifactStore) -> tuple[SubagentSDKRunner, object]:
+        class ValidationBuildSubagent(Subagent):
+            def plan(self, ctx: ExecContext, envelope: JobEnvelope) -> dict[str, object]:
+                return {
+                    "steps": [{"step_id": "fit", "kind": "train", "description": "Fit external-report toy model"}],
+                    "adapters_required": list(envelope.required_adapters),
+                    "datasets_required": ["c4://dataset/ewpt-toy"],
+                    "verifier_profile_ref": envelope.verifier_profile_ref,
+                    "budget_breakdown": {"total": {"cost_usd": envelope.estimated_cost}},
+                    "risk_notes": [],
+                }
+
+            def build(self, ctx: ExecContext, _plan: dict[str, object]) -> dict[str, object]:
+                artifact = ctx.emit_artifact(
+                    {"weights": [1.0], "headline": 1.0},
+                    kind="model",
+                    lineage=Lineage(
+                        input_refs=(),
+                        code_ref="git:project-argus@s1-external-report",
+                        environment_digest="oci:s1-external-report",
+                        seeds=("seed-s1-external-report",),
+                    ),
+                )
+                return {
+                    "artifact_refs": [str(artifact["artifact_ref"])],
+                    "diagnostics": {},
+                    "self_checks": [{"type": "smoke", "status": "PASS", "advisory": True}],
+                    "uncertainty_summary": tag_uncertainty(
+                        "interval",
+                        {"radius": 0.01, "source": "external-report-build"},
+                    ),
+                }
+
+        runtime = SubagentRuntime(descriptor=self.descriptor, artifact_store=artifacts)
+        runner = SubagentSDKRunner(ValidationBuildSubagent(self.descriptor), runtime=runtime)
+        runner.accept(self.envelope)
+        plan = runner.plan(self.envelope)
+        return runner, runner.build(self.envelope.job_id, plan.payload)
 
     def test_runner_wraps_author_plan_build_in_real_lifecycle(self) -> None:
         subagent = ExampleSubagent(self.descriptor)
@@ -1050,6 +1115,102 @@ class S1SDKBaseClassTests(unittest.TestCase):
         self._assert_c1_def_valid("SubagentReport", validated.payload["subagent_report"])
         self.assertEqual(validated.payload["subagent_report"]["claim_tier"], "recapitulated-known")
         self.assertEqual(validated.payload["subagent_report"]["validation_report_ref"], validated.payload["validation_report_ref"])
+
+    def test_runner_validate_uses_externally_persisted_s3_report_without_rewriting_it(self) -> None:
+        trust_store = InMemoryVerifierTrustStore()
+        trust_store.register_key("s3-key", b"s3-secret")
+        c3_verifier = C3ReportVerifier(trust_store)
+        artifacts = InMemoryArtifactStore(report_verifier=c3_verifier)
+        runner, build = self._validation_runner(artifacts)
+
+        class ExternalS3ValidationClient:
+            def __init__(self) -> None:
+                signer = C3ReportSigner(key_id="s3-key", secret=b"s3-secret")
+                self.s3 = S3Verifier(verifier_id="s3-referee", signer_key_id="s3-key", signer=signer)
+                self.report_ref: str | None = None
+
+            def validate(self, request: dict[str, object]) -> dict[str, object]:
+                report = _signed_recap_report(self.s3, request)
+                record = artifacts.create_artifact(
+                    kind="report",
+                    payload=report,
+                    producer=Producer(subsystem="S3", version="0.0.0", actor_id="s3-referee"),
+                    lineage=Lineage(
+                        input_refs=(str(request["frozen_pipeline_ref"]),),
+                        code_ref="argus:s3.external-referee",
+                        environment_digest="oci:s3-external-referee",
+                        job_id=self_test.envelope.job_id,
+                    ),
+                )
+                self.report_ref = record.artifact_ref
+                return {
+                    "validation_report_payload": report,
+                    "validation_report_ref": record.artifact_ref,
+                }
+
+        self_test = self
+        client = ExternalS3ValidationClient()
+        validated = runner.validate(
+            self.envelope.job_id,
+            build.payload,
+            profile_ref=str(self.envelope.verifier_profile_ref),
+            blind_dataset_handle="blind://s3/labels/external-report",
+            budget_token_ref="budget://token/external-report",
+            validation_client=client,
+            report_verifier=c3_verifier,
+        )
+
+        self.assertIsNotNone(client.report_ref)
+        self.assertEqual(validated.payload["validation_report_ref"], client.report_ref)
+        report_records = artifacts.query_artifacts({"kind": "report"})
+        self.assertEqual(len(report_records), 1)
+        self.assertEqual(report_records[0].producer.subsystem, "S3")
+
+    def test_runner_validate_rejects_mismatched_external_s3_report_reference(self) -> None:
+        trust_store = InMemoryVerifierTrustStore()
+        trust_store.register_key("s3-key", b"s3-secret")
+        c3_verifier = C3ReportVerifier(trust_store)
+        artifacts = InMemoryArtifactStore(report_verifier=c3_verifier)
+        runner, build = self._validation_runner(artifacts)
+
+        class MismatchedExternalS3ValidationClient:
+            def __init__(self) -> None:
+                signer = C3ReportSigner(key_id="s3-key", secret=b"s3-secret")
+                self.s3 = S3Verifier(verifier_id="s3-referee", signer_key_id="s3-key", signer=signer)
+
+            def validate(self, request: dict[str, object]) -> dict[str, object]:
+                persisted_report = _signed_recap_report(self.s3, request)
+                record = artifacts.create_artifact(
+                    kind="report",
+                    payload=persisted_report,
+                    producer=Producer(subsystem="S3", version="0.0.0", actor_id="s3-referee"),
+                    lineage=Lineage(
+                        input_refs=(str(request["frozen_pipeline_ref"]),),
+                        code_ref="argus:s3.external-referee",
+                        environment_digest="oci:s3-external-referee",
+                        job_id=self_test.envelope.job_id,
+                    ),
+                )
+                return {
+                    "validation_report_payload": _signed_recap_report(self.s3, request),
+                    "validation_report_ref": record.artifact_ref,
+                }
+
+        self_test = self
+        with self.assertRaises(LifecyclePolicyError) as raised:
+            runner.validate(
+                self.envelope.job_id,
+                build.payload,
+                profile_ref=str(self.envelope.verifier_profile_ref),
+                blind_dataset_handle="blind://s3/labels/external-report-mismatch",
+                budget_token_ref="budget://token/external-report-mismatch",
+                validation_client=MismatchedExternalS3ValidationClient(),
+                report_verifier=c3_verifier,
+            )
+
+        self.assertEqual(raised.exception.envelope.code, "S1_EXTERNAL_VALIDATION_REPORT_MISMATCH")
+        self.assertEqual(runner.runtime.store.current(self.envelope.job_id).state, LifecycleState.BUILDING)
+        self.assertEqual(len(artifacts.query_artifacts({"kind": "report"})), 1)
 
     def test_runner_validate_fails_closed_without_s3_validation_client(self) -> None:
         class ArtifactBuildSubagent(ExampleSubagent):
