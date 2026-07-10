@@ -97,9 +97,19 @@ S7_PROVENANCE_EMITTER_HASH = hash_json(
         "failure_policy": "fail_closed_provenance_unavailable",
     }
 )
-C5_CONTRACT_VERSION = "1.1.0"
+C5_CONTRACT_VERSION = "2.0.0"
 C6_CONTRACT_VERSION = "2.3.0"
 _S7_ADAPTER_COST_CLASSES = frozenset({"toy", "standard", "heavy", "flagship_hpc_disallowed"})
+S7_DETERMINISM_SCHEMA_VERSION = "argus.s7.determinism.v1"
+S7_DETERMINISM_VERSION = "argus-s7-determinism-1.0.0"
+S7_DETERMINISM_HASH = hash_json(
+    {
+        "version": S7_DETERMINISM_VERSION,
+        "schema": S7_DETERMINISM_SCHEMA_VERSION,
+        "policy": "repeat deterministic local conformance with identical inputs and seed",
+        "violation": "write C4 evidence and quarantine C5 revision",
+    }
+)
 
 
 class S7Error(Exception):
@@ -1034,6 +1044,8 @@ class S7ArtifactStore(Protocol):
         created_at: str | None = None,
     ) -> ArtifactRecord: ...
 
+    def get_artifact(self, artifact_ref: str) -> bytes: ...
+
 
 class S7ProvenanceEmitter:
     """Writes complete, fail-closed C4 provenance for S7 broker calls."""
@@ -1505,7 +1517,7 @@ def validate_adapter_locally(
     *,
     inputs: dict[str, Quantity],
     seed: int | None = None,
-    artifact_store: InMemoryArtifactStore | None = None,
+    artifact_store: S7ArtifactStore | None = None,
     unit_registry: S7UnitRegistry | None = None,
 ) -> S7AdapterValidationResult:
     registry = unit_registry or S7UnitRegistry.default()
@@ -1558,6 +1570,139 @@ class S7RegistrationResult:
     capability: CapabilityDescriptor
     revision_ref: str
     conformance: S7AdapterValidationResult
+    determinism: "S7DeterminismResult"
+
+
+@dataclass(frozen=True)
+class S7DeterminismResult:
+    checked: bool
+    passed: bool
+    evidence_ref: str | None
+    baseline_output_hash: str | None
+    recheck_output_hash: str | None
+    baseline_provenance_hash: str | None
+    recheck_provenance_hash: str | None
+    quarantined_revision: int | None = None
+
+
+class S7DeterminismVerifier:
+    """Replays deterministic adapter conformance and emits C4 evidence."""
+
+    def __init__(self, *, artifact_store: S7ArtifactStore) -> None:
+        self._artifact_store = artifact_store
+
+    def recheck(
+        self,
+        *,
+        adapter: Adapter,
+        baseline: S7AdapterValidationResult,
+        sample_inputs: Mapping[str, Quantity],
+        seed: int | None,
+        registry_revision: int,
+    ) -> S7DeterminismResult:
+        if baseline.descriptor.determinism != "deterministic":
+            return S7DeterminismResult(
+                checked=False,
+                passed=True,
+                evidence_ref=None,
+                baseline_output_hash=None,
+                recheck_output_hash=None,
+                baseline_provenance_hash=None,
+                recheck_provenance_hash=None,
+            )
+        if baseline.eval_result is None:
+            raise AdapterConformanceError("determinism baseline lacks an evaluation result")
+
+        recheck = validate_adapter_locally(
+            adapter,
+            inputs=dict(sample_inputs),
+            seed=seed,
+            artifact_store=self._artifact_store,
+        )
+        if recheck.eval_result is None:
+            raise AdapterConformanceError("determinism recheck lacks an evaluation result")
+
+        baseline_output_hash = _s7_determinism_output_hash(baseline.eval_result)
+        recheck_output_hash = _s7_determinism_output_hash(recheck.eval_result)
+        baseline_provenance_hash = self._provenance_hash(baseline.eval_result.provenance_ref)
+        recheck_provenance_hash = self._provenance_hash(recheck.eval_result.provenance_ref)
+        passed = (
+            baseline_output_hash == recheck_output_hash
+            and baseline_provenance_hash == recheck_provenance_hash
+        )
+        evidence_record = self._artifact_store.create_artifact(
+            kind="log",
+            payload={
+                "schema": S7_DETERMINISM_SCHEMA_VERSION,
+                "verifier_version": S7_DETERMINISM_VERSION,
+                "verifier_hash": S7_DETERMINISM_HASH,
+                "adapter_id": baseline.descriptor.adapter_id,
+                "adapter_version": baseline.descriptor.version,
+                "registry_revision": registry_revision,
+                "seed": seed,
+                "input_hash": hash_json(
+                    {
+                        field: asdict(quantity)
+                        for field, quantity in sorted(sample_inputs.items())
+                    }
+                ),
+                "baseline": {
+                    "provenance_ref": baseline.eval_result.provenance_ref,
+                    "output_hash": baseline_output_hash,
+                    "provenance_hash": baseline_provenance_hash,
+                },
+                "recheck": {
+                    "provenance_ref": recheck.eval_result.provenance_ref,
+                    "output_hash": recheck_output_hash,
+                    "provenance_hash": recheck_provenance_hash,
+                },
+                "passed": passed,
+            },
+            producer=Producer(subsystem="S7", version=S7_DETERMINISM_VERSION),
+            lineage=Lineage(
+                input_refs=tuple(
+                    dict.fromkeys(
+                        (
+                            baseline.eval_result.provenance_ref,
+                            recheck.eval_result.provenance_ref,
+                        )
+                    )
+                ),
+                code_ref="argus-core:s7-determinism",
+                environment_digest=S7_DETERMINISM_HASH,
+            ),
+        )
+        return S7DeterminismResult(
+            checked=True,
+            passed=passed,
+            evidence_ref=evidence_record.artifact_ref,
+            baseline_output_hash=baseline_output_hash,
+            recheck_output_hash=recheck_output_hash,
+            baseline_provenance_hash=baseline_provenance_hash,
+            recheck_provenance_hash=recheck_provenance_hash,
+        )
+
+    def _provenance_hash(self, provenance_ref: str) -> str:
+        try:
+            payload = json.loads(self._artifact_store.get_artifact(provenance_ref).decode("utf-8"))
+        except (KeyError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ProvenanceUnavailableError(
+                f"determinism recheck cannot load provenance: {provenance_ref}"
+            ) from exc
+        if not isinstance(payload, Mapping):
+            raise ProvenanceUnavailableError(
+                f"determinism recheck provenance is not a JSON object: {provenance_ref}"
+            )
+        return hash_json(payload)
+
+
+def _s7_determinism_output_hash(result: EvalResult) -> str:
+    return hash_json(
+        {
+            field: asdict(quantity)
+            for field, quantity in sorted(result.outputs.items())
+        }
+    )
 
 
 class S7RegistrationService:
@@ -1567,12 +1712,16 @@ class S7RegistrationService:
         self,
         *,
         registry: InMemoryRegistry,
-        artifact_store: InMemoryArtifactStore,
+        artifact_store: S7ArtifactStore,
         cost_ceiling: S7CostCeiling | None = None,
+        determinism_verifier: S7DeterminismVerifier | None = None,
     ) -> None:
         self._registry = registry
         self._artifact_store = artifact_store
         self._cost_ceiling = cost_ceiling or S7CostCeiling()
+        self._determinism_verifier = determinism_verifier or S7DeterminismVerifier(
+            artifact_store=artifact_store
+        )
 
     def register(
         self,
@@ -1633,12 +1782,71 @@ class S7RegistrationService:
                 "REGISTRY_PUBLICATION_FAILED",
                 f"adapter {descriptor.adapter_id} could not be published to C5: {exc}",
             ) from exc
+        try:
+            determinism = self._determinism_verifier.recheck(
+                adapter=adapter,
+                baseline=conformance,
+                sample_inputs=sample_inputs,
+                seed=seed,
+                registry_revision=published.revision,
+            )
+        except Exception as exc:
+            quarantined = self._quarantine_after_recheck_failure(
+                entity_id=published.entity_id,
+                evidence_ref=published.provenance_ref,
+                cause=exc,
+            )
+            raise S7RegistrationError(
+                "DETERMINISM_UNAVAILABLE",
+                f"adapter {descriptor.adapter_id} determinism recheck could not complete",
+                diagnostics={
+                    "adapter_id": descriptor.adapter_id,
+                    "quarantined_revision": quarantined.revision,
+                    "evidence_ref": quarantined.provenance_ref,
+                },
+            ) from exc
+        if determinism.checked and not determinism.passed:
+            quarantined = self._quarantine_after_recheck_failure(
+                entity_id=published.entity_id,
+                evidence_ref=determinism.evidence_ref or published.provenance_ref,
+                cause=None,
+            )
+            raise S7RegistrationError(
+                "DETERMINISM_VIOLATION",
+                f"adapter {descriptor.adapter_id} produced non-identical deterministic recheck output",
+                diagnostics={
+                    "adapter_id": descriptor.adapter_id,
+                    "evidence_ref": determinism.evidence_ref,
+                    "baseline_output_hash": determinism.baseline_output_hash,
+                    "recheck_output_hash": determinism.recheck_output_hash,
+                    "baseline_provenance_hash": determinism.baseline_provenance_hash,
+                    "recheck_provenance_hash": determinism.recheck_provenance_hash,
+                    "quarantined_revision": quarantined.revision,
+                },
+            )
         return S7RegistrationResult(
             descriptor=registered_descriptor,
             capability=published,
             revision_ref=published.provenance_ref,
             conformance=conformance,
+            determinism=determinism,
         )
+
+    def _quarantine_after_recheck_failure(
+        self,
+        *,
+        entity_id: str,
+        evidence_ref: str,
+        cause: Exception | None,
+    ) -> CapabilityDescriptor:
+        try:
+            return self._registry.quarantine(entity_id, evidence_ref=evidence_ref)
+        except Exception as exc:
+            detail = f"; recheck cause: {cause}" if cause is not None else ""
+            raise S7RegistrationError(
+                "QUARANTINE_FAILED",
+                f"adapter {entity_id} could not be quarantined after determinism failure: {exc}{detail}",
+            ) from exc
 
     @staticmethod
     def _validated_subtopics(subtopics: tuple[str, ...]) -> tuple[str, ...]:

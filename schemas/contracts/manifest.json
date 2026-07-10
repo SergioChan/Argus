@@ -38,7 +38,7 @@
       "id": "C5",
       "name": "Registry Capability Descriptor",
       "owner": "S6/S12",
-      "version": "1.1.0",
+      "version": "2.0.0",
       "schema": "c5.capability-descriptor.schema.json",
       "consumers": ["S1", "S2", "S3", "S4", "S5", "S7", "S9", "S10", "S11"]
     },

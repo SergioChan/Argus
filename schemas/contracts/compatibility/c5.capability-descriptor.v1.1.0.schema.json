@@ -6,7 +6,7 @@
   "x-argus-contract": {
     "id": "C5",
     "owner": "S6/S12",
-    "version": "2.0.0"
+    "version": "1.1.0"
   },
   "$ref": "#/$defs/CapabilityDescriptor",
   "$defs": {
@@ -25,7 +25,7 @@
           "type": "string",
           "enum": ["subagent", "adapter", "verifier", "dataset", "contamination_index", "federated_subagent", "federated_adapter"]
         },
-        "owner_subsystem": { "type": "string", "pattern": "^S\\d+$" },
+        "owner_subsystem": { "type": "string", "pattern": "^S\\\\d+$" },
         "subtopics": {
           "type": "array",
           "items": { "type": "string" },
@@ -69,7 +69,7 @@
         "provenance_ref": { "$ref": "#/$defs/ArtifactRef" },
         "status": {
           "type": "string",
-          "enum": ["active", "deprecated", "revoked", "suspended", "quarantined"]
+          "enum": ["active", "deprecated", "revoked", "suspended"]
         }
       }
     }

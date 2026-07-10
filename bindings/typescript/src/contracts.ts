@@ -113,7 +113,7 @@ export const contracts = [
     "id": "C5",
     "name": "Registry Capability Descriptor",
     "owner": "S6/S12",
-    "version": "1.1.0",
+    "version": "2.0.0",
     "schema": "c5.capability-descriptor.schema.json",
     "consumers": [
       "S1",
@@ -126,7 +126,7 @@ export const contracts = [
       "S10",
       "S11"
     ],
-    "schema_sha256": "sha256:66b8d606977472a417e4e47fd9e9cbfb01f3c9fdb68a02bb95a30832c4409c48"
+    "schema_sha256": "sha256:9d7c1e1818067d0b467070533915f98d2d3440b2b4c35239c6193d15bc8a83b0"
   },
   {
     "id": "C6",

@@ -28,6 +28,7 @@ from argus_core import (
     Producer,
     Quantity,
     S7CostCeiling,
+    S7RegistrationError,
     S7NativePythonBackend,
     S7RegistrationService,
     SignatureInvalidError,
@@ -415,6 +416,86 @@ class S8PostgresSchemaTests(unittest.TestCase):
         self.assertEqual(
             {node.artifact_ref for node in lineage.nodes},
             {descriptor_record.artifact_ref, registration.revision_ref},
+        )
+
+    def test_s7_determinism_violation_quarantines_revision_with_postgres_c4_evidence(self) -> None:
+        store = self._postgres_store()
+        descriptor_record = store.create_artifact(
+            kind="adapter_descriptor",
+            payload={"adapter_id": "postgres_determinism_fixture", "version": "1.0.0"},
+            producer=Producer(subsystem="S7", version="1.0.0"),
+            lineage=Lineage(
+                input_refs=(),
+                code_ref="adapter:postgres_determinism_fixture@1.0.0",
+                environment_digest=hash_json({"fixture": "s7-determinism-parent"}),
+            ),
+        )
+
+        @adapter_metadata(
+            adapter_id="postgres_determinism_fixture",
+            version="1.0.0",
+            cost_class="standard",
+            independence_tags=("postgres-determinism-impl",),
+            provenance_ref=descriptor_record.artifact_ref,
+        )
+        @uncertainty(kind="interval")
+        @validity_domain(declare_domain_box({"alpha": (0.0, 1.0)}))
+        @units_out({"omega": "dimensionless"})
+        @units_in({"alpha": "dimensionless"})
+        class PostgresDeterminismViolatingAdapter(Adapter):
+            def __init__(self) -> None:
+                self._calls = 0
+
+            def evaluate(self, inputs, _ctx):
+                self._calls += 1
+                return {
+                    "omega": Quantity(
+                        value=inputs["alpha"].value + self._calls,
+                        units="dimensionless",
+                        uncertainty={"kind": "interval", "radius": 0.01},
+                    )
+                }
+
+        registry = InMemoryRegistry(artifact_store=store)
+        with self.assertRaises(S7RegistrationError) as raised:
+            S7RegistrationService(
+                registry=registry,
+                artifact_store=store,
+                cost_ceiling=S7CostCeiling(allowed_cost_classes=("toy", "standard")),
+            ).register(
+                adapter=PostgresDeterminismViolatingAdapter(),
+                subtopics=("ewpt",),
+                sample_inputs={"alpha": Quantity(value=0.2, units="dimensionless")},
+                seed=17,
+            )
+
+        self.assertEqual(raised.exception.category, "DETERMINISM_VIOLATION")
+        evidence_ref = raised.exception.diagnostics["evidence_ref"]
+        quarantined = registry.get("postgres_determinism_fixture")
+        record = store.get_record(evidence_ref)
+        payload = json.loads(store.get_artifact(evidence_ref))
+        lineage = store.get_lineage(evidence_ref, direction="ancestors")
+
+        self.assertEqual(quarantined.status, "quarantined")
+        self.assertEqual(quarantined.revision, 2)
+        self.assertEqual(registry.resolve(kind="adapter", subtopic="ewpt").descriptors, ())
+        self.assertEqual(record.kind, "log")
+        self.assertEqual(record.producer.subsystem, "S7")
+        self.assertEqual(record.lineage.code_ref, "argus-core:s7-determinism")
+        self.assertFalse(payload["passed"])
+        self.assertNotEqual(payload["baseline"]["output_hash"], payload["recheck"]["output_hash"])
+        self.assertEqual(
+            set(record.lineage.input_refs),
+            {payload["baseline"]["provenance_ref"], payload["recheck"]["provenance_ref"]},
+        )
+        self.assertEqual(
+            {node.artifact_ref for node in lineage.nodes},
+            {
+                descriptor_record.artifact_ref,
+                payload["baseline"]["provenance_ref"],
+                payload["recheck"]["provenance_ref"],
+                evidence_ref,
+            },
         )
 
     def test_commit_function_is_idempotent_for_identical_record(self) -> None:

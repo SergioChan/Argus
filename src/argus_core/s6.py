@@ -263,6 +263,8 @@ class InMemoryRegistry:
             raise RegistryError("first descriptor revision must be 1")
         if latest is not None and self.get(descriptor.entity_id).status == "revoked":
             raise DescriptorRevokedError("revoked descriptor cannot be republished")
+        if latest is not None and self.get(descriptor.entity_id).status == "quarantined":
+            raise RegistryError("quarantined descriptor cannot be republished")
 
         published = descriptor
         if self._artifact_store is not None and descriptor.provenance_ref == "c4://pending":
@@ -329,6 +331,32 @@ class InMemoryRegistry:
         )
         return revoked
 
+    def quarantine(self, entity_id: str, *, evidence_ref: str) -> CapabilityDescriptor:
+        current = self.get(entity_id)
+        if current.status == "quarantined":
+            return current
+        if current.status == "revoked":
+            raise DescriptorRevokedError("revoked descriptor cannot be quarantined")
+        if not isinstance(evidence_ref, str) or not evidence_ref.startswith("c4://"):
+            raise RegistryError("quarantine evidence_ref must be a C4 artifact reference")
+        quarantined = replace(
+            current,
+            revision=current.revision + 1,
+            provenance_ref=evidence_ref,
+            status="quarantined",
+        )
+        self._descriptors[(quarantined.entity_id, quarantined.revision)] = quarantined
+        self._latest_revision[quarantined.entity_id] = quarantined.revision
+        self._events.append(
+            RegistryEvent(
+                event_type="s6.registry.quarantined",
+                entity_id=quarantined.entity_id,
+                revision=quarantined.revision,
+                descriptor_ref=quarantined.provenance_ref,
+            )
+        )
+        return quarantined
+
     def attest_independence(
         self,
         *,
@@ -379,7 +407,7 @@ class InMemoryRegistry:
             raise RegistryError("descriptor capability_scopes is required")
         if "C5" not in descriptor.contract_versions:
             raise RegistryError("descriptor contract_versions must include C5")
-        if descriptor.status not in {"active", "deprecated", "revoked", "suspended"}:
+        if descriptor.status not in {"active", "deprecated", "revoked", "suspended", "quarantined"}:
             raise RegistryError("descriptor status is invalid")
         if descriptor.cost_class is not None:
             if descriptor.kind != "adapter":
