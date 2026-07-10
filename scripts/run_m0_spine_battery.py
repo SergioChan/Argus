@@ -51,6 +51,7 @@ from argusverify import C3ReportSigner, InMemoryVerifierTrustStore, verify_repor
 
 DEFAULT_IMAGE = "busybox@sha256:73aaf090f3d85aa34ee199857f03fa3a95c8ede2ffd4cc2cdb5b94e566b11662"
 M0_C3_VERIFIER_KEY_ID = "argus-m0-c3-verifier"
+M1_S3_REFERENCE_REFEREE_KEY_ID = "s3-reference-referee-key"
 HALT_LATENCY_TRIALS = 50
 HALT_LATENCY_LIMIT_S = 2.0
 TOKEN_REVOCATION_PROPAGATION_SLO_S = 2.0
@@ -84,6 +85,7 @@ def main() -> int:
         "ARGUS_M0_S8_PORT": str(_free_port()),
         "ARGUS_M0_S10_PORT": str(_free_port()),
         "ARGUS_M0_S1_DEMO_PORT": str(_free_port()),
+        "ARGUS_M0_S3_REFERENCE_REFEREE_PORT": str(_free_port()),
     }
     env = {
         **os.environ,
@@ -99,7 +101,10 @@ def main() -> int:
         "ARGUS_S10_CHECKPOINT_SIGNER_AUTH_TOKEN": runtime_secrets["s10_checkpoint_signer_auth_token"],
         "ARGUS_S10_VERIFIER_KEY_AUTH_TOKEN": runtime_secrets["s10_verifier_key_auth_token"],
         "ARGUS_S10_C3_VERIFIER_KEYS_JSON": json.dumps(
-            {M0_C3_VERIFIER_KEY_ID: runtime_secrets["c3_verifier_signing_key"]},
+            {
+                M0_C3_VERIFIER_KEY_ID: runtime_secrets["c3_verifier_signing_key"],
+                M1_S3_REFERENCE_REFEREE_KEY_ID: runtime_secrets["s3_reference_referee_signing_key"],
+            },
             separators=(",", ":"),
             sort_keys=True,
         ),
@@ -107,6 +112,7 @@ def main() -> int:
         "ARGUS_S10_PRICE_TABLE_ISSUED_AT": str(price_table_now - 60),
         "ARGUS_S10_PRICE_TABLE_EXPIRES_AT": str(price_table_now + 86_400),
         "ARGUS_S8_BROKER_WRITE_KEY": runtime_secrets["s8_broker_write_key"],
+        "ARGUS_S3_REFERENCE_REFEREE_SIGNER_SECRET": runtime_secrets["s3_reference_referee_signing_key"],
     }
     s8_url = f"http://127.0.0.1:{ports['ARGUS_M0_S8_PORT']}"
     s10_url = f"http://127.0.0.1:{ports['ARGUS_M0_S10_PORT']}"
@@ -116,6 +122,7 @@ def main() -> int:
         "s8_url": s8_url,
         "s10_url": s10_url,
         "s1_reference_demo_url": s1_reference_demo_url,
+        "s3_reference_referee_url": f"http://127.0.0.1:{ports['ARGUS_M0_S3_REFERENCE_REFEREE_PORT']}",
         "ports": ports,
         "persistence": "postgres-minio",
         "auth_callers": list(_m0_identity_requests().keys()),
@@ -534,6 +541,7 @@ def _m0_runtime_secrets() -> dict[str, str]:
         "s10_price_table_signing_key": f"argus-s10-price-table-key-{uuid4().hex}",
         "s8_broker_write_key": f"argus-s8-broker-key-{uuid4().hex}",
         "c3_verifier_signing_key": f"argus-c3-verifier-key-{uuid4().hex}",
+        "s3_reference_referee_signing_key": f"argus-s3-reference-referee-key-{uuid4().hex}",
     }
 
 
@@ -629,6 +637,28 @@ def _m0_identity_requests() -> dict[str, dict[str, Any]]:
             "caller_id": "m0-verifier",
             "job_id": "m0-verifier-job",
             "root_request_id": "m0-verifier-root",
+            "scopes": {
+                "broker_audiences": ["store"],
+                "capabilities": ["s8.read"],
+                "producer_subsystems": ["S3"],
+                "sandbox_risk_class": "standard",
+            },
+        },
+        "m1-reference-s1": {
+            "caller_id": "m1-reference-s1",
+            "job_id": "m1-reference-job",
+            "root_request_id": "m1-reference-root",
+            "scopes": {
+                "broker_audiences": ["store"],
+                "capabilities": ["s8.read"],
+                "producer_subsystems": ["S1"],
+                "sandbox_risk_class": "standard",
+            },
+        },
+        "m1-reference-s3": {
+            "caller_id": "m1-reference-s3",
+            "job_id": "m1-reference-job",
+            "root_request_id": "m1-reference-root",
             "scopes": {
                 "broker_audiences": ["store"],
                 "capabilities": ["s8.read"],

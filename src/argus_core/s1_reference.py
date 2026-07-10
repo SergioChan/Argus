@@ -614,14 +614,16 @@ class S1ReferencePhysicsSubagent(Subagent):
         }
 
 
-class _ReferenceS3ValidationClient:
+class ReferenceS3ValidationEngine:
+    """Reference EWPT validation logic reusable by an isolated S3 referee service."""
+
     def __init__(
         self,
         *,
-        artifact_store: InMemoryArtifactStore,
+        artifact_store: Any,
         verifier: S3Verifier,
-        contamination_index: ContaminationIndex,
-        contamination_snapshot: FrozenContaminationSnapshot,
+        contamination_index: ContaminationIndex | None,
+        contamination_snapshot: FrozenContaminationSnapshot | None,
         mode: str,
     ) -> None:
         self.artifact_store = artifact_store
@@ -685,6 +687,12 @@ class _ReferenceS3ValidationClient:
             if isinstance(diagnostics, Mapping) and diagnostics.get("extrapolation_flag") is True:
                 return True
         return False
+
+
+class _ReferenceS3ValidationClient(ReferenceS3ValidationEngine):
+    """Compatibility wrapper for the legacy in-process reference harness."""
+
+    pass
 
 
 def _job_envelope(*, job_id: str) -> JobEnvelope:
@@ -798,11 +806,11 @@ def _reference_physics_adapter() -> SimpleAdapter:
 
 def _reference_plugin_checks(
     *,
-    artifact_store: InMemoryArtifactStore,
+    artifact_store: Any,
     model_payload: Mapping[str, Any],
     dataset_payload: Mapping[str, Any],
-    contamination_index: ContaminationIndex,
-    contamination_snapshot: FrozenContaminationSnapshot,
+    contamination_index: ContaminationIndex | None,
+    contamination_snapshot: FrozenContaminationSnapshot | None,
     extrapolated: bool,
     include_m3_checks: bool,
     profile_ref: str,
@@ -898,6 +906,8 @@ def _reference_check_plugins(
         ),
     ]
     if include_m3_checks:
+        if contamination_index is None or contamination_snapshot is None:
+            raise ValueError("reference M3 checks require a frozen contamination snapshot")
         plugins.insert(
             2,
             S3CrossCodeCheckPlugin(

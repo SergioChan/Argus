@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 import hashlib
 import json
 from pathlib import Path
+from threading import RLock
 from typing import Any, Callable, Mapping, Protocol
 
 from .canonical import canonical_json_bytes
@@ -472,79 +473,86 @@ class FileSystemObjectStore(ObjectStoreFacade):
         self.root = Path(root)
         (self.root / WRITE_ONCE_BUCKET).mkdir(parents=True, exist_ok=True)
         (self.root / SCRATCH_BUCKET).mkdir(parents=True, exist_ok=True)
+        self._lock = RLock()
 
     def put(self, content_hash: str, payload: bytes, *, bucket_class: str) -> None:
-        _assert_known_bucket_class(bucket_class)
-        _assert_payload_matches_hash(content_hash, payload)
-        existing_path = self.object_path(content_hash)
-        if existing_path is not None:
-            existing = existing_path.read_bytes()
-            _assert_payload_matches_hash(content_hash, existing)
-            if existing != payload:
-                raise HashMismatchError(f"existing object bytes do not match {content_hash}")
-            if bucket_class == WRITE_ONCE_BUCKET and existing_path.parent.name == SCRATCH_BUCKET:
-                self.promote_to_write_once(content_hash)
-            return
+        with self._lock:
+            _assert_known_bucket_class(bucket_class)
+            _assert_payload_matches_hash(content_hash, payload)
+            existing_path = self.object_path(content_hash)
+            if existing_path is not None:
+                existing = existing_path.read_bytes()
+                _assert_payload_matches_hash(content_hash, existing)
+                if existing != payload:
+                    raise HashMismatchError(f"existing object bytes do not match {content_hash}")
+                if bucket_class == WRITE_ONCE_BUCKET and existing_path.parent.name == SCRATCH_BUCKET:
+                    self.promote_to_write_once(content_hash)
+                return
 
-        destination = self._path_for(content_hash, bucket_class)
-        try:
-            with destination.open("xb") as handle:
-                handle.write(payload)
-        except FileExistsError:
-            existing = destination.read_bytes()
-            if existing != payload:
-                raise HashMismatchError(f"existing object bytes do not match {content_hash}")
+            destination = self._path_for(content_hash, bucket_class)
+            try:
+                with destination.open("xb") as handle:
+                    handle.write(payload)
+            except FileExistsError:
+                existing = destination.read_bytes()
+                if existing != payload:
+                    raise HashMismatchError(f"existing object bytes do not match {content_hash}")
 
     def get(self, content_hash: str) -> bytes:
-        existing_path = self.object_path(content_hash)
-        if existing_path is None:
-            raise KeyError(content_hash)
-        payload = existing_path.read_bytes()
-        _assert_payload_matches_hash(content_hash, payload)
-        return payload
+        with self._lock:
+            existing_path = self.object_path(content_hash)
+            if existing_path is None:
+                raise KeyError(content_hash)
+            payload = existing_path.read_bytes()
+            _assert_payload_matches_hash(content_hash, payload)
+            return payload
 
     def promote_to_write_once(self, content_hash: str) -> None:
-        write_once_path = self._path_for(content_hash, WRITE_ONCE_BUCKET)
-        scratch_path = self._path_for(content_hash, SCRATCH_BUCKET)
-        if write_once_path.exists():
-            _assert_payload_matches_hash(content_hash, write_once_path.read_bytes())
-            if scratch_path.exists():
-                scratch_payload = scratch_path.read_bytes()
-                _assert_payload_matches_hash(content_hash, scratch_payload)
-                if scratch_payload != write_once_path.read_bytes():
-                    raise HashMismatchError(f"scratch object bytes do not match {content_hash}")
-                scratch_path.unlink()
-            return
-        if not scratch_path.exists():
-            raise KeyError(content_hash)
-        scratch_payload = scratch_path.read_bytes()
-        _assert_payload_matches_hash(content_hash, scratch_payload)
-        scratch_path.replace(write_once_path)
+        with self._lock:
+            write_once_path = self._path_for(content_hash, WRITE_ONCE_BUCKET)
+            scratch_path = self._path_for(content_hash, SCRATCH_BUCKET)
+            if write_once_path.exists():
+                _assert_payload_matches_hash(content_hash, write_once_path.read_bytes())
+                if scratch_path.exists():
+                    scratch_payload = scratch_path.read_bytes()
+                    _assert_payload_matches_hash(content_hash, scratch_payload)
+                    if scratch_payload != write_once_path.read_bytes():
+                        raise HashMismatchError(f"scratch object bytes do not match {content_hash}")
+                    scratch_path.unlink()
+                return
+            if not scratch_path.exists():
+                raise KeyError(content_hash)
+            scratch_payload = scratch_path.read_bytes()
+            _assert_payload_matches_hash(content_hash, scratch_payload)
+            scratch_path.replace(write_once_path)
 
     def bucket_class(self, content_hash: str) -> str:
-        existing_path = self.object_path(content_hash)
-        if existing_path is None:
-            raise KeyError(content_hash)
-        return existing_path.parent.name
+        with self._lock:
+            existing_path = self.object_path(content_hash)
+            if existing_path is None:
+                raise KeyError(content_hash)
+            return existing_path.parent.name
 
     @property
     def object_count(self) -> int:
-        names = {
-            path.name
-            for bucket in (WRITE_ONCE_BUCKET, SCRATCH_BUCKET)
-            for path in (self.root / bucket).iterdir()
-            if path.is_file()
-        }
-        return len(names)
+        with self._lock:
+            names = {
+                path.name
+                for bucket in (WRITE_ONCE_BUCKET, SCRATCH_BUCKET)
+                for path in (self.root / bucket).iterdir()
+                if path.is_file()
+            }
+            return len(names)
 
     def object_path(self, content_hash: str) -> Path | None:
-        write_once_path = self._path_for(content_hash, WRITE_ONCE_BUCKET)
-        if write_once_path.exists():
-            return write_once_path
-        scratch_path = self._path_for(content_hash, SCRATCH_BUCKET)
-        if scratch_path.exists():
-            return scratch_path
-        return None
+        with self._lock:
+            write_once_path = self._path_for(content_hash, WRITE_ONCE_BUCKET)
+            if write_once_path.exists():
+                return write_once_path
+            scratch_path = self._path_for(content_hash, SCRATCH_BUCKET)
+            if scratch_path.exists():
+                return scratch_path
+            return None
 
     def _path_for(self, content_hash: str, bucket_class: str) -> Path:
         return self.root / bucket_class / _object_name(content_hash)
@@ -1427,6 +1435,7 @@ class FileSystemArtifactStore(InMemoryArtifactStore):
         self.root.mkdir(parents=True, exist_ok=True)
         self._ledger_path = self.root / "artifact_ledger.jsonl"
         self._replaying_ledger = True
+        self._lock = RLock()
         super().__init__(
             report_verifier=report_verifier,
             object_store=FileSystemObjectStore(self.root / "objects"),
@@ -1446,20 +1455,21 @@ class FileSystemArtifactStore(InMemoryArtifactStore):
         validation_report_ref: str | None = None,
         created_at: str | None = None,
     ) -> ArtifactRecord:
-        previous_sequence = self._latest_checkpoint().sequence
-        record = super().create_artifact(
-            kind=kind,
-            payload=payload,
-            producer=producer,
-            lineage=lineage,
-            artifact_ref=artifact_ref,
-            claim_tier=claim_tier,
-            validation_report_ref=validation_report_ref,
-            created_at=created_at,
-        )
-        if not self._replaying_ledger and self._latest_checkpoint().sequence > previous_sequence:
-            self._append_ledger_event(record)
-        return record
+        with self._lock:
+            previous_sequence = self._latest_checkpoint().sequence
+            record = super().create_artifact(
+                kind=kind,
+                payload=payload,
+                producer=producer,
+                lineage=lineage,
+                artifact_ref=artifact_ref,
+                claim_tier=claim_tier,
+                validation_report_ref=validation_report_ref,
+                created_at=created_at,
+            )
+            if not self._replaying_ledger and self._latest_checkpoint().sequence > previous_sequence:
+                self._append_ledger_event(record)
+            return record
 
     def _replay_ledger(self) -> None:
         if not self._ledger_path.exists():

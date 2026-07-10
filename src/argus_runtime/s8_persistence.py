@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import shlex
 import subprocess
+from threading import RLock
 from typing import Any
 from urllib import error as urlerror
 from urllib import request as urlrequest
@@ -57,100 +58,108 @@ class MinioObjectStore:
 
         self.bucket = bucket
         self._client = Minio(endpoint, access_key=access_key, secret_key=secret_key, secure=secure)
+        self._lock = RLock()
         if not self._client.bucket_exists(bucket):
             self._client.make_bucket(bucket)
 
     def put(self, content_hash: str, payload: bytes, *, bucket_class: str) -> None:
-        _assert_known_bucket_class(bucket_class)
-        _assert_payload_matches_hash(content_hash, payload)
-        existing_key = self._object_key(content_hash)
-        if existing_key is not None:
-            existing = self._get_key(existing_key)
-            _assert_payload_matches_hash(content_hash, existing)
-            if existing != payload:
-                raise HashMismatchError(f"existing object bytes do not match {content_hash}")
-            if bucket_class == WRITE_ONCE_BUCKET and existing_key.split("/", 1)[0] == SCRATCH_BUCKET:
-                self.promote_to_write_once(content_hash)
-            return
+        with self._lock:
+            _assert_known_bucket_class(bucket_class)
+            _assert_payload_matches_hash(content_hash, payload)
+            existing_key = self._object_key(content_hash)
+            if existing_key is not None:
+                existing = self._get_key(existing_key)
+                _assert_payload_matches_hash(content_hash, existing)
+                if existing != payload:
+                    raise HashMismatchError(f"existing object bytes do not match {content_hash}")
+                if bucket_class == WRITE_ONCE_BUCKET and existing_key.split("/", 1)[0] == SCRATCH_BUCKET:
+                    self.promote_to_write_once(content_hash)
+                return
 
-        key = self._key_for(content_hash, bucket_class)
-        self._client.put_object(
-            self.bucket,
-            key,
-            BytesIO(payload),
-            length=len(payload),
-            content_type="application/json",
-        )
+            key = self._key_for(content_hash, bucket_class)
+            self._client.put_object(
+                self.bucket,
+                key,
+                BytesIO(payload),
+                length=len(payload),
+                content_type="application/json",
+            )
 
     def get(self, content_hash: str) -> bytes:
-        key = self._object_key(content_hash)
-        if key is None:
-            raise KeyError(content_hash)
-        payload = self._get_key(key)
-        _assert_payload_matches_hash(content_hash, payload)
-        return payload
+        with self._lock:
+            key = self._object_key(content_hash)
+            if key is None:
+                raise KeyError(content_hash)
+            payload = self._get_key(key)
+            _assert_payload_matches_hash(content_hash, payload)
+            return payload
 
     def promote_to_write_once(self, content_hash: str) -> None:
-        write_once_key = self._key_for(content_hash, WRITE_ONCE_BUCKET)
-        scratch_key = self._key_for(content_hash, SCRATCH_BUCKET)
-        if self._key_exists(write_once_key):
-            payload = self._get_key(write_once_key)
+        with self._lock:
+            write_once_key = self._key_for(content_hash, WRITE_ONCE_BUCKET)
+            scratch_key = self._key_for(content_hash, SCRATCH_BUCKET)
+            if self._key_exists(write_once_key):
+                payload = self._get_key(write_once_key)
+                _assert_payload_matches_hash(content_hash, payload)
+                if self._key_exists(scratch_key):
+                    scratch_payload = self._get_key(scratch_key)
+                    _assert_payload_matches_hash(content_hash, scratch_payload)
+                    if scratch_payload != payload:
+                        raise HashMismatchError(f"scratch object bytes do not match {content_hash}")
+                    self._client.remove_object(self.bucket, scratch_key)
+                return
+            if not self._key_exists(scratch_key):
+                raise KeyError(content_hash)
+            payload = self._get_key(scratch_key)
             _assert_payload_matches_hash(content_hash, payload)
-            if self._key_exists(scratch_key):
-                scratch_payload = self._get_key(scratch_key)
-                _assert_payload_matches_hash(content_hash, scratch_payload)
-                if scratch_payload != payload:
-                    raise HashMismatchError(f"scratch object bytes do not match {content_hash}")
-                self._client.remove_object(self.bucket, scratch_key)
-            return
-        if not self._key_exists(scratch_key):
-            raise KeyError(content_hash)
-        payload = self._get_key(scratch_key)
-        _assert_payload_matches_hash(content_hash, payload)
-        self._client.put_object(
-            self.bucket,
-            write_once_key,
-            BytesIO(payload),
-            length=len(payload),
-            content_type="application/json",
-        )
-        self._client.remove_object(self.bucket, scratch_key)
+            self._client.put_object(
+                self.bucket,
+                write_once_key,
+                BytesIO(payload),
+                length=len(payload),
+                content_type="application/json",
+            )
+            self._client.remove_object(self.bucket, scratch_key)
 
     def bucket_class(self, content_hash: str) -> str:
-        key = self._object_key(content_hash)
-        if key is None:
-            raise KeyError(content_hash)
-        return key.split("/", 1)[0]
+        with self._lock:
+            key = self._object_key(content_hash)
+            if key is None:
+                raise KeyError(content_hash)
+            return key.split("/", 1)[0]
 
     @property
     def object_count(self) -> int:
-        names = {
-            item.object_name.split("/", 1)[1]
-            for item in self._client.list_objects(self.bucket, recursive=True)
-            if item.object_name and "/" in item.object_name
-        }
-        return len(names)
+        with self._lock:
+            names = {
+                item.object_name.split("/", 1)[1]
+                for item in self._client.list_objects(self.bucket, recursive=True)
+                if item.object_name and "/" in item.object_name
+            }
+            return len(names)
 
     def overwrite_for_test(self, content_hash: str, payload: bytes) -> None:
-        key = self._object_key(content_hash)
-        if key is None:
-            raise KeyError(content_hash)
-        self._client.put_object(
-            self.bucket,
-            key,
-            BytesIO(payload),
-            length=len(payload),
-            content_type="application/json",
-        )
+        with self._lock:
+            key = self._object_key(content_hash)
+            if key is None:
+                raise KeyError(content_hash)
+            self._client.put_object(
+                self.bucket,
+                key,
+                BytesIO(payload),
+                length=len(payload),
+                content_type="application/json",
+            )
 
     def _object_key(self, content_hash: str) -> str | None:
-        write_once_key = self._key_for(content_hash, WRITE_ONCE_BUCKET)
-        if self._key_exists(write_once_key):
-            return write_once_key
-        scratch_key = self._key_for(content_hash, SCRATCH_BUCKET)
-        if self._key_exists(scratch_key):
-            return scratch_key
-        return None
+        with self._lock:
+            write_once_key = self._key_for(content_hash, WRITE_ONCE_BUCKET)
+            if self._key_exists(write_once_key):
+                return write_once_key
+            scratch_key = self._key_for(content_hash, SCRATCH_BUCKET)
+            if self._key_exists(scratch_key):
+                return scratch_key
+            return None
 
     def _key_for(self, content_hash: str, bucket_class: str) -> str:
         return f"{bucket_class}/{_object_name(content_hash)}"
@@ -340,6 +349,7 @@ class PostgresArtifactStore:
         self._db_role = db_role
         self._ledger_writer = ledger_writer
         self._report_verifier = report_verifier
+        self._lock = RLock()
         self.ledger_writer_kind = getattr(ledger_writer, "ledger_writer_kind", "rust-subprocess")
         self.checkpoint_signer_kind = getattr(ledger_writer, "checkpoint_signer_kind", "unconfigured")
         self.report_verifier_kind = "argusverify" if report_verifier is not None else "unconfigured"
@@ -350,22 +360,23 @@ class PostgresArtifactStore:
         self.refresh()
 
     def refresh(self) -> None:
-        snapshot = self._snapshot_store()
-        for row in self._fetch_records():
-            payload_bytes = self._object_store.get(str(row["content_hash"]))
-            record = _record_from_row(row, size_bytes=len(payload_bytes))
-            payload = json.loads(payload_bytes.decode("utf-8"))
-            snapshot.create_artifact(
-                artifact_ref=record.artifact_ref,
-                kind=record.kind,
-                payload=payload,
-                producer=record.producer,
-                lineage=record.lineage,
-                claim_tier=record.claim_tier,
-                validation_report_ref=record.validation_report_ref,
-                created_at=record.created_at,
-            )
-        self._snapshot = snapshot
+        with self._lock:
+            snapshot = self._snapshot_store()
+            for row in self._fetch_records():
+                payload_bytes = self._object_store.get(str(row["content_hash"]))
+                record = _record_from_row(row, size_bytes=len(payload_bytes))
+                payload = json.loads(payload_bytes.decode("utf-8"))
+                snapshot.create_artifact(
+                    artifact_ref=record.artifact_ref,
+                    kind=record.kind,
+                    payload=payload,
+                    producer=record.producer,
+                    lineage=record.lineage,
+                    claim_tier=record.claim_tier,
+                    validation_report_ref=record.validation_report_ref,
+                    created_at=record.created_at,
+                )
+            self._snapshot = snapshot
 
     def _snapshot_store(self) -> InMemoryArtifactStore:
         return InMemoryArtifactStore(
@@ -385,22 +396,23 @@ class PostgresArtifactStore:
         validation_report_ref: str | None = None,
         created_at: str | None = None,
     ) -> ArtifactRecord:
-        self.refresh()
-        before_count = self._snapshot.record_count
-        record = self._snapshot.create_artifact(
-            kind=kind,
-            payload=payload,
-            producer=producer,
-            lineage=lineage,
-            artifact_ref=artifact_ref,
-            claim_tier=claim_tier,
-            validation_report_ref=validation_report_ref,
-            created_at=created_at,
-        )
-        if self._snapshot.record_count == before_count:
-            return record
-        self._commit_record(record)
-        return self.get_artifact_record(record.artifact_ref)
+        with self._lock:
+            self.refresh()
+            before_count = self._snapshot.record_count
+            record = self._snapshot.create_artifact(
+                kind=kind,
+                payload=payload,
+                producer=producer,
+                lineage=lineage,
+                artifact_ref=artifact_ref,
+                claim_tier=claim_tier,
+                validation_report_ref=validation_report_ref,
+                created_at=created_at,
+            )
+            if self._snapshot.record_count == before_count:
+                return record
+            self._commit_record(record)
+            return self.get_artifact_record(record.artifact_ref)
 
     def get_artifact(self, ref: str) -> bytes:
         row = self._fetch_record(ref, require_unique_record=False)

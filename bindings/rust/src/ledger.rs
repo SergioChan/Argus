@@ -18,6 +18,7 @@ const LEDGER_TRANSACTION_TIMEOUT_SQL: &str = "
 SET LOCAL statement_timeout = '15s';
 SET LOCAL idle_in_transaction_session_timeout = '15s';
 ";
+const LEDGER_TIP_ADVISORY_LOCK_KEY: i64 = 5_038_300_801;
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct ArtifactRecordDraft {
@@ -167,6 +168,7 @@ impl PostgresLedgerWriter {
     ) -> Result<(), postgres::Error> {
         let mut transaction = self.client.transaction()?;
         apply_ledger_transaction_timeouts(&mut transaction)?;
+        lock_ledger_tip(&mut transaction)?;
         let existing_sequence = existing_merkle_sequence(&mut transaction, &draft.artifact_id)?;
         let (sequence, previous_root) = if let Some(sequence) = existing_sequence {
             (sequence, String::new())
@@ -203,6 +205,7 @@ impl PostgresLedgerWriter {
     {
         let mut transaction = self.client.transaction()?;
         apply_ledger_transaction_timeouts(&mut transaction)?;
+        lock_ledger_tip(&mut transaction)?;
         let existing_sequence = existing_merkle_sequence(&mut transaction, &draft.artifact_id)?;
         let (sequence, previous_root) = if let Some(sequence) = existing_sequence {
             (sequence, String::new())
@@ -254,6 +257,7 @@ impl PostgresLedgerWriter {
     ) -> Result<Option<MerkleCheckpoint>, postgres::Error> {
         let mut transaction = self.client.transaction()?;
         apply_ledger_transaction_timeouts(&mut transaction)?;
+        lock_ledger_tip(&mut transaction)?;
         let Some((sequence, root)) = latest_ledger_leaf(&mut transaction)? else {
             transaction.commit()?;
             return Ok(None);
@@ -289,6 +293,7 @@ impl PostgresLedgerWriter {
     ) -> Result<(), postgres::Error> {
         let mut transaction = self.client.transaction()?;
         apply_ledger_transaction_timeouts(&mut transaction)?;
+        lock_ledger_tip(&mut transaction)?;
         transaction.execute(
             "
             SELECT s8.append_merkle_checkpoint($1, $2, $3, $4);
@@ -313,6 +318,14 @@ fn apply_ledger_transaction_timeouts<C: GenericClient>(
     client: &mut C,
 ) -> Result<(), postgres::Error> {
     client.batch_execute(LEDGER_TRANSACTION_TIMEOUT_SQL)
+}
+
+fn lock_ledger_tip<C: GenericClient>(client: &mut C) -> Result<(), postgres::Error> {
+    client.query_one(
+        "SELECT pg_advisory_xact_lock($1);",
+        &[&LEDGER_TIP_ADVISORY_LOCK_KEY],
+    )?;
+    Ok(())
 }
 
 fn commit_artifact_record<C: GenericClient>(
@@ -484,7 +497,8 @@ mod tests {
     use std::net::TcpListener;
     use std::path::{Path, PathBuf};
     use std::process::{Command, Stdio};
-    use std::sync::{Mutex, MutexGuard};
+    use std::sync::{Arc, Barrier, Mutex, MutexGuard};
+    use std::thread;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     static POSTGRES_TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -786,6 +800,63 @@ mod tests {
             1
         );
         assert!(signer.verify(&checkpoint));
+        Ok(())
+    }
+
+    #[test]
+    fn concurrent_checkpointed_writers_serialize_the_merkle_tip() -> Result<(), Box<dyn Error>> {
+        let Some(postgres) = TestPostgres::start()? else {
+            return Ok(());
+        };
+        let dsn = postgres.connection_string();
+        let signer = CheckpointSigner::new("s8-ledger-key", b"s8-ledger-secret".to_vec());
+        let barrier = Arc::new(Barrier::new(6));
+        let handles = (1..=5)
+            .map(|sequence| {
+                let dsn = dsn.clone();
+                let signer = signer.clone();
+                let barrier = Arc::clone(&barrier);
+                let record = draft(
+                    &format!("c4://artifact/concurrent-{sequence}"),
+                    sequence,
+                    "dataset",
+                    &[],
+                    None,
+                );
+                thread::spawn(move || -> Result<MerkleCheckpoint, String> {
+                    let mut client = Client::connect(&dsn, NoTls).map_err(|error| error.to_string())?;
+                    client
+                        .batch_execute("SET ROLE argus_s8_ledger_writer;")
+                        .map_err(|error| error.to_string())?;
+                    let mut writer = PostgresLedgerWriter::from_client(client);
+                    barrier.wait();
+                    writer
+                        .commit_artifact_record_with_checkpoint(&record, |tip_sequence, root| {
+                            Ok(MerkleCheckpoint {
+                                sequence: tip_sequence,
+                                root: root.to_string(),
+                                signature: signer.sign(tip_sequence, root),
+                                signer_key_id: signer.key_id().to_string(),
+                            })
+                        })
+                        .map_err(|error| error.to_string())?
+                        .ok_or_else(|| "concurrent insert unexpectedly returned no checkpoint".to_string())
+                })
+            })
+            .collect::<Vec<_>>();
+        barrier.wait();
+        for handle in handles {
+            let checkpoint = handle
+                .join()
+                .map_err(|_| "concurrent ledger writer thread panicked")?
+                .map_err(|error| format!("concurrent ledger writer failed: {error}"))?;
+            assert!(signer.verify(&checkpoint));
+        }
+
+        let mut admin = postgres.admin_client()?;
+        assert_eq!(scalar_i64(&mut admin, "SELECT count(*) FROM s8.artifact_record;")?, 5);
+        assert_eq!(scalar_i64(&mut admin, "SELECT count(*) FROM s8.ledger_leaf;")?, 5);
+        assert_eq!(scalar_i64(&mut admin, "SELECT max(sequence) FROM s8.ledger_leaf;")?, 5);
         Ok(())
     }
 

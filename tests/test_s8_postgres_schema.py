@@ -9,6 +9,8 @@ import shutil
 import socket
 import subprocess
 from tempfile import TemporaryDirectory
+from threading import Barrier, Lock, RLock, Thread
+import time
 import unittest
 
 from argus_core import (
@@ -31,8 +33,10 @@ from argus_core import (
     S7RegistrationError,
     S7NativePythonBackend,
     S7RegistrationService,
+    SCRATCH_BUCKET,
     SignatureInvalidError,
     SimpleAdapter,
+    WRITE_ONCE_BUCKET,
     assert_lineage_complete,
     adapter_metadata,
     declare_domain_box,
@@ -43,7 +47,7 @@ from argus_core import (
     hash_bytes,
     hash_json,
 )
-from argus_runtime.s8_persistence import PostgresArtifactStore, report_verifier_from_env
+from argus_runtime.s8_persistence import MinioObjectStore, PostgresArtifactStore, report_verifier_from_env
 from argusverify import C3ReportSigner, C3ReportVerifier, InMemoryVerifierTrustStore
 
 
@@ -121,6 +125,80 @@ def _free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("127.0.0.1", 0))
         return int(sock.getsockname()[1])
+
+
+class MinioObjectStoreConcurrencyTests(unittest.TestCase):
+    def test_concurrent_scratch_promotions_are_serialized(self) -> None:
+        class SlowPromotionClient:
+            def __init__(self, *, scratch_key: str, payload: bytes) -> None:
+                self.objects = {scratch_key: payload}
+                self._lock = Lock()
+
+            def key_exists(self, key: str) -> bool:
+                time.sleep(0.001)
+                with self._lock:
+                    return key in self.objects
+
+            def get_key(self, key: str) -> bytes:
+                time.sleep(0.001)
+                with self._lock:
+                    return self.objects[key]
+
+            def put_object(
+                self,
+                bucket: str,
+                key: str,
+                data: object,
+                *,
+                length: int,
+                content_type: str,
+            ) -> None:
+                del bucket, length, content_type
+                time.sleep(0.001)
+                with self._lock:
+                    self.objects[key] = getattr(data, "read")()
+
+            def remove_object(self, bucket: str, key: str) -> None:
+                del bucket
+                time.sleep(0.001)
+                with self._lock:
+                    if key not in self.objects:
+                        raise AssertionError(f"concurrent promotion removed {key} twice")
+                    del self.objects[key]
+
+        payload = b'{"shared":true}'
+        content_hash = hash_bytes(payload)
+        for _ in range(20):
+            store = object.__new__(MinioObjectStore)
+            store.bucket = "argus-test"
+            store._lock = RLock()
+            scratch_key = store._key_for(content_hash, SCRATCH_BUCKET)
+            write_once_key = store._key_for(content_hash, WRITE_ONCE_BUCKET)
+            client = SlowPromotionClient(scratch_key=scratch_key, payload=payload)
+            store._client = client
+            store._key_exists = client.key_exists
+            store._get_key = client.get_key
+            start = Barrier(3)
+            errors: list[BaseException] = []
+            error_lock = Lock()
+
+            def promote() -> None:
+                start.wait()
+                try:
+                    store.promote_to_write_once(content_hash)
+                except BaseException as exc:
+                    with error_lock:
+                        errors.append(exc)
+
+            threads = [Thread(target=promote) for _ in range(2)]
+            for thread in threads:
+                thread.start()
+            start.wait()
+            for thread in threads:
+                thread.join()
+
+            self.assertEqual(errors, [])
+            self.assertEqual(client.objects, {write_once_key: payload})
 
 
 @unittest.skipUnless(
@@ -1242,6 +1320,46 @@ class S8PostgresSchemaTests(unittest.TestCase):
                 object_store=InMemoryObjectStore(),
                 db_role="argus_s8_ledger_writer",
             )
+
+    def test_postgres_store_serializes_concurrent_create_and_commit(self) -> None:
+        store = self._postgres_store()
+        start = Barrier(6)
+        errors: list[BaseException] = []
+        records: list[ArtifactRecord] = []
+        result_lock = Lock()
+
+        def create(index: int) -> None:
+            start.wait()
+            try:
+                record = store.create_artifact(
+                    kind="dataset",
+                    payload={"concurrent_index": index},
+                    producer=Producer(subsystem="S1", version="0.0.0"),
+                    lineage=Lineage(
+                        input_refs=(),
+                        code_ref=f"git:concurrent-{index}",
+                        environment_digest="oci:concurrent",
+                    ),
+                )
+                with result_lock:
+                    records.append(record)
+            except BaseException as exc:
+                with result_lock:
+                    errors.append(exc)
+
+        threads = [Thread(target=create, args=(index,)) for index in range(5)]
+        for thread in threads:
+            thread.start()
+        start.wait()
+        for thread in threads:
+            thread.join()
+
+        self.assertEqual(errors, [])
+        self.assertEqual(len(records), 5)
+        count = self._psql("SELECT count(*) FROM s8.artifact_record;")
+        leaves = self._psql("SELECT count(*) FROM s8.ledger_leaf;")
+        self.assertEqual(count.stdout.strip(), "5")
+        self.assertEqual(leaves.stdout.strip(), "5")
 
     def test_postgres_store_reproducibility_manifest_and_checks_use_pg_append_only(self) -> None:
         object_store = InMemoryObjectStore()

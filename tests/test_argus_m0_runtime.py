@@ -59,10 +59,14 @@ CHECKPOINT_SIGNING_KEY = "test-s10-checkpoint-signing-key"
 CHECKPOINT_SIGNER_AUTH_TOKEN = "test-checkpoint-signer-token"
 S10_VERIFIER_KEY_AUTH_TOKEN = "test-verifier-key-token"
 PRICE_TABLE_SIGNING_KEY = "test-s10-price-table-signing-key"
+S3_REFERENCE_REFEREE_SIGNING_KEY = "test-s3-reference-referee-signing-key"
 TOKEN_ED25519_PRIVATE_KEY_HEX = "1111111111111111111111111111111111111111111111111111111111111111"
 TOKEN_ED25519_PUBLIC_KEY_HEX = "d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737"
 S10_C3_VERIFIER_KEYS_JSON = json.dumps(
-    {"argus-m0-c3-verifier": "test-c3-verifier-key"},
+    {
+        "argus-m0-c3-verifier": "test-c3-verifier-key",
+        "s3-reference-referee-key": S3_REFERENCE_REFEREE_SIGNING_KEY,
+    },
     separators=(",", ":"),
     sort_keys=True,
 )
@@ -2250,6 +2254,7 @@ class ArgusM0ComposeTests(unittest.TestCase):
                 "ARGUS_S10_PRICE_TABLE_EXPIRES_AT": "4102444800",
                 "ARGUS_S10_C3_VERIFIER_KEYS_JSON": S10_C3_VERIFIER_KEYS_JSON,
                 "ARGUS_S10_VERIFIER_KEY_AUTH_TOKEN": S10_VERIFIER_KEY_AUTH_TOKEN,
+                "ARGUS_S3_REFERENCE_REFEREE_SIGNER_SECRET": S3_REFERENCE_REFEREE_SIGNING_KEY,
             },
         )
         if config.returncode != 0:
@@ -2257,7 +2262,10 @@ class ArgusM0ComposeTests(unittest.TestCase):
 
         rendered = json.loads(config.stdout)
         services = rendered["services"]
-        self.assertEqual({"postgres", "minio", "s8-writer", "s10-supervisor", "s1-reference-demo"}, set(services))
+        self.assertEqual(
+            {"postgres", "minio", "s8-writer", "s10-supervisor", "s1-reference-demo", "s3-reference-referee"},
+            set(services),
+        )
         self.assertTrue(services["postgres"]["image"].startswith("postgres@sha256:"))
         self.assertTrue(services["minio"]["image"].startswith("minio/minio@sha256:"))
         self.assertEqual(services["s8-writer"]["command"], ["python", "-m", "argus_runtime.s8_writer_service"])
@@ -2265,6 +2273,10 @@ class ArgusM0ComposeTests(unittest.TestCase):
         self.assertEqual(
             services["s1-reference-demo"]["command"],
             ["python", "-m", "argus_runtime.s1_reference_demo_service", "--serve"],
+        )
+        self.assertEqual(
+            services["s3-reference-referee"]["command"],
+            ["python", "-m", "argus_runtime.s3_reference_referee_service"],
         )
         self.assertEqual(services["s8-writer"]["environment"]["ARGUS_S8_HOST"], "0.0.0.0")
         self.assertEqual(
@@ -2312,9 +2324,28 @@ class ArgusM0ComposeTests(unittest.TestCase):
         self.assertEqual(services["s1-reference-demo"]["environment"]["ARGUS_S1_REFERENCE_DEMO_HOST"], "0.0.0.0")
         self.assertEqual(services["s1-reference-demo"]["environment"]["ARGUS_S1_REFERENCE_DEMO_PORT"], "8080")
         self.assertEqual(services["s1-reference-demo"]["environment"]["ARGUS_SCHEMA_ROOT"], "/app/schemas")
+        self.assertEqual(services["s3-reference-referee"]["environment"]["ARGUS_S3_REFERENCE_REFEREE_HOST"], "0.0.0.0")
+        self.assertEqual(services["s3-reference-referee"]["environment"]["ARGUS_S3_REFERENCE_REFEREE_PORT"], "8080")
+        self.assertEqual(
+            services["s3-reference-referee"]["environment"]["ARGUS_S3_REFERENCE_REFEREE_S10_URL"],
+            "http://s10-supervisor:8080",
+        )
+        self.assertEqual(
+            services["s3-reference-referee"]["environment"]["ARGUS_S3_REFERENCE_REFEREE_S8_URL"],
+            "http://s8-writer:8080",
+        )
+        self.assertEqual(
+            services["s3-reference-referee"]["environment"]["ARGUS_S3_REFERENCE_REFEREE_SIGNER_KEY_ID"],
+            "s3-reference-referee-key",
+        )
+        self.assertEqual(
+            services["s3-reference-referee"]["environment"]["ARGUS_S3_REFERENCE_REFEREE_SIGNER_SECRET"],
+            S3_REFERENCE_REFEREE_SIGNING_KEY,
+        )
         self.assertEqual(services["s8-writer"]["ports"][0]["host_ip"], "127.0.0.1")
         self.assertEqual(services["s10-supervisor"]["ports"][0]["host_ip"], "127.0.0.1")
         self.assertEqual(services["s1-reference-demo"]["ports"][0]["host_ip"], "127.0.0.1")
+        self.assertEqual(services["s3-reference-referee"]["ports"][0]["host_ip"], "127.0.0.1")
         self.assertNotIn("volumes", services["s8-writer"])
         self.assertIn("ARGUS_RUNTIME_BOOTSTRAP_TOKEN", services["s8-writer"]["environment"])
         self.assertIn("ARGUS_RUNTIME_IDENTITY_SIGNING_KEY", services["s8-writer"]["environment"])
@@ -2323,6 +2354,16 @@ class ArgusM0ComposeTests(unittest.TestCase):
         self.assertIn("ARGUS_RUNTIME_BOOTSTRAP_TOKEN", services["s10-supervisor"]["environment"])
         self.assertIn("ARGUS_RUNTIME_IDENTITY_SIGNING_KEY", services["s10-supervisor"]["environment"])
         self.assertIn("ARGUS_RUNTIME_IDENTITY_MINT_POLICY_JSON", services["s10-supervisor"]["environment"])
+        self.assertEqual(
+            services["s3-reference-referee"]["environment"]["ARGUS_RUNTIME_BOOTSTRAP_TOKEN"],
+            BOOTSTRAP_TOKEN,
+        )
+        self.assertEqual(
+            services["s3-reference-referee"]["environment"]["ARGUS_S10_VERIFIER_KEY_AUTH_TOKEN"],
+            S10_VERIFIER_KEY_AUTH_TOKEN,
+        )
+        self.assertNotIn("ARGUS_S3_REFERENCE_REFEREE_SIGNER_SECRET", services["s8-writer"]["environment"])
+        self.assertNotIn("ARGUS_S3_REFERENCE_REFEREE_SIGNER_SECRET", services["s10-supervisor"]["environment"])
         self.assertEqual(services["s10-supervisor"]["environment"]["ARGUS_M0_HEALTH_TOKEN"], HEALTH_TOKEN)
         self.assertNotEqual(services["s10-supervisor"]["environment"]["ARGUS_M0_HEALTH_TOKEN"], BOOTSTRAP_TOKEN)
         self.assertIn("ARGUS_S8_BROKER_WRITE_KEY", services["s8-writer"]["environment"])
@@ -2410,6 +2451,8 @@ class ArgusM0ComposeTests(unittest.TestCase):
         self.assertIn("postgres", services["s10-supervisor"]["depends_on"])
         self.assertIn("s8-writer", services["s1-reference-demo"]["depends_on"])
         self.assertIn("s10-supervisor", services["s1-reference-demo"]["depends_on"])
+        self.assertIn("s8-writer", services["s3-reference-referee"]["depends_on"])
+        self.assertIn("s10-supervisor", services["s3-reference-referee"]["depends_on"])
         self.assertNotIn("s8-data", rendered["volumes"])
         self.assertIn("postgres-data", rendered["volumes"])
         self.assertIn("minio-data", rendered["volumes"])

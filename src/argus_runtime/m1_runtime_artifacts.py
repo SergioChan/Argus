@@ -141,11 +141,14 @@ class S10S8ArtifactStore:
         artifact_ref: str | None = None,
         claim_tier: str = "ran-toy",
         validation_report_ref: str | None = None,
+        created_at: str | None = None,
     ) -> ArtifactRecord:
         if producer.job_id not in {None, self.job_id}:
             raise RuntimeArtifactStoreError("producer job_id does not match the runtime identity")
         if lineage.job_id not in {None, self.job_id}:
             raise RuntimeArtifactStoreError("lineage job_id does not match the runtime identity")
+        if created_at is not None:
+            raise RuntimeArtifactStoreError("runtime artifact timestamps are assigned by the C4 store")
         body: dict[str, Any] = {
             "scope_token": self._scope(),
             "kind": kind,

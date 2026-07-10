@@ -134,6 +134,40 @@ services:
       timeout: 3s
       retries: 20
 
+  s3-reference-referee:
+    build:
+      context: ../..
+      dockerfile: deploy/argus-m0/python-service.Dockerfile
+    command: ["python", "-m", "argus_runtime.s3_reference_referee_service"]
+    environment:
+      ARGUS_S3_REFERENCE_REFEREE_HOST: "0.0.0.0"
+      ARGUS_S3_REFERENCE_REFEREE_PORT: "8080"
+      ARGUS_S3_REFERENCE_REFEREE_S10_URL: http://s10-supervisor:8080
+      ARGUS_S3_REFERENCE_REFEREE_S8_URL: http://s8-writer:8080
+      ARGUS_S3_REFERENCE_REFEREE_VERIFIER_KEY_ENDPOINT_URL: http://s10-supervisor:8080/v1/internal/verifier-keys
+      ARGUS_S3_REFERENCE_REFEREE_ALLOW_INSECURE_VERIFIER_KEY_STORE: "1"
+      ARGUS_S3_REFERENCE_REFEREE_CALLER_ID: m1-reference-s3
+      ARGUS_S3_REFERENCE_REFEREE_JOB_ID: m1-reference-job
+      ARGUS_S3_REFERENCE_REFEREE_SIGNER_KEY_ID: s3-reference-referee-key
+      ARGUS_S3_REFERENCE_REFEREE_SIGNER_SECRET: ${ARGUS_S3_REFERENCE_REFEREE_SIGNER_SECRET:?ARGUS_S3_REFERENCE_REFEREE_SIGNER_SECRET is required}
+      ARGUS_RUNTIME_BOOTSTRAP_TOKEN: ${ARGUS_RUNTIME_BOOTSTRAP_TOKEN:?ARGUS_RUNTIME_BOOTSTRAP_TOKEN is required}
+      ARGUS_S10_VERIFIER_KEY_AUTH_TOKEN: ${ARGUS_S10_VERIFIER_KEY_AUTH_TOKEN:?ARGUS_S10_VERIFIER_KEY_AUTH_TOKEN is required}
+      ARGUS_SCHEMA_ROOT: /app/schemas
+    ports:
+      - "127.0.0.1:${ARGUS_M0_S3_REFERENCE_REFEREE_PORT:-58083}:8080"
+    depends_on:
+      s8-writer:
+        condition: service_healthy
+      s10-supervisor:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - "python -c \"import json, urllib.request; assert json.load(urllib.request.urlopen('http://127.0.0.1:8080/healthz'))['status'] == 'ok'\""
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
   s1-reference-demo:
     build:
       context: ../..
