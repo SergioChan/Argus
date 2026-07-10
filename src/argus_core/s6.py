@@ -51,6 +51,7 @@ class CapabilityDescriptor:
     provenance_ref: str
     subtopics: tuple[str, ...] = ()
     independence_tags: tuple[str, ...] = ()
+    cost_class: str | None = None
     conformance: dict[str, str] | None = None
     conformance_level: str | None = None
     status: str = "active"
@@ -70,6 +71,8 @@ class CapabilityDescriptor:
             payload["subtopics"] = list(self.subtopics)
         if self.independence_tags:
             payload["independence_tags"] = list(self.independence_tags)
+        if self.cost_class is not None:
+            payload["cost_class"] = self.cost_class
         conformance = dict(self.conformance or {})
         if self.conformance_level is not None and "level" not in conformance:
             conformance["level"] = self.conformance_level
@@ -378,6 +381,11 @@ class InMemoryRegistry:
             raise RegistryError("descriptor contract_versions must include C5")
         if descriptor.status not in {"active", "deprecated", "revoked", "suspended"}:
             raise RegistryError("descriptor status is invalid")
+        if descriptor.cost_class is not None:
+            if descriptor.kind != "adapter":
+                raise RegistryError("cost_class is only valid for adapter descriptors")
+            if descriptor.cost_class not in {"toy", "standard", "heavy", "flagship_hpc_disallowed"}:
+                raise RegistryError("descriptor cost_class is invalid")
         if descriptor.conformance is not None:
             self._validate_conformance_block(descriptor)
 

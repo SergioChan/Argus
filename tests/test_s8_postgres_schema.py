@@ -12,6 +12,7 @@ from tempfile import TemporaryDirectory
 import unittest
 
 from argus_core import (
+    Adapter,
     AdapterBroker,
     AdapterDescriptor,
     ArtifactRecord,
@@ -22,13 +23,22 @@ from argus_core import (
     IllegalTierError,
     InMemoryArtifactStore,
     InMemoryObjectStore,
+    InMemoryRegistry,
     Lineage,
     Producer,
     Quantity,
+    S7CostCeiling,
     S7NativePythonBackend,
+    S7RegistrationService,
     SignatureInvalidError,
     SimpleAdapter,
     assert_lineage_complete,
+    adapter_metadata,
+    declare_domain_box,
+    uncertainty,
+    units_in,
+    units_out,
+    validity_domain,
     hash_bytes,
     hash_json,
 )
@@ -345,6 +355,66 @@ class S8PostgresSchemaTests(unittest.TestCase):
         self.assertEqual(
             {node.artifact_ref for node in lineage.nodes},
             {descriptor_record.artifact_ref, result.provenance_ref},
+        )
+
+    def test_s7_registration_publishes_c5_revision_anchored_to_postgres_conformance(self) -> None:
+        store = self._postgres_store()
+        descriptor_record = store.create_artifact(
+            kind="adapter_descriptor",
+            payload={"adapter_id": "postgres_registration_fixture", "version": "1.0.0"},
+            producer=Producer(subsystem="S7", version="1.0.0"),
+            lineage=Lineage(
+                input_refs=(),
+                code_ref="adapter:postgres_registration_fixture@1.0.0",
+                environment_digest=hash_json({"fixture": "s7-registration-parent"}),
+            ),
+        )
+
+        @adapter_metadata(
+            adapter_id="postgres_registration_fixture",
+            version="1.0.0",
+            cost_class="standard",
+            independence_tags=("postgres-registration-impl",),
+            provenance_ref=descriptor_record.artifact_ref,
+        )
+        @uncertainty(kind="interval")
+        @validity_domain(declare_domain_box({"alpha": (0.0, 1.0)}))
+        @units_out({"omega": "dimensionless"})
+        @units_in({"alpha": "dimensionless"})
+        class PostgresRegistrationAdapter(Adapter):
+            def evaluate(self, inputs, _ctx):
+                return {
+                    "omega": Quantity(
+                        value=inputs["alpha"].value,
+                        units="dimensionless",
+                        uncertainty={"kind": "interval", "radius": 0.01},
+                    )
+                }
+
+        registry = InMemoryRegistry(artifact_store=store)
+        registration = S7RegistrationService(
+            registry=registry,
+            artifact_store=store,
+            cost_ceiling=S7CostCeiling(allowed_cost_classes=("toy", "standard")),
+        ).register(
+            adapter=PostgresRegistrationAdapter(),
+            subtopics=("ewpt",),
+            sample_inputs={"alpha": Quantity(value=0.2, units="dimensionless")},
+        )
+        resolution = registry.resolve(kind="adapter", subtopic="ewpt", required_scope="evaluate")
+        record = store.get_record(registration.revision_ref)
+        lineage = store.get_lineage(registration.revision_ref, direction="ancestors")
+
+        self.assertTrue(registration.conformance.passed)
+        self.assertEqual(registration.revision_ref, registration.conformance.eval_result.provenance_ref)
+        self.assertEqual(record.kind, "log")
+        self.assertEqual(record.lineage.input_refs, (descriptor_record.artifact_ref,))
+        self.assertEqual([descriptor.entity_id for descriptor in resolution.descriptors], ["postgres_registration_fixture"])
+        self.assertEqual(resolution.descriptors[0].cost_class, "standard")
+        self.assertEqual(resolution.descriptors[0].independence_tags, ("postgres-registration-impl",))
+        self.assertEqual(
+            {node.artifact_ref for node in lineage.nodes},
+            {descriptor_record.artifact_ref, registration.revision_ref},
         )
 
     def test_commit_function_is_idempotent_for_identical_record(self) -> None:

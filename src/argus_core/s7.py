@@ -97,7 +97,9 @@ S7_PROVENANCE_EMITTER_HASH = hash_json(
         "failure_policy": "fail_closed_provenance_unavailable",
     }
 )
+C5_CONTRACT_VERSION = "1.1.0"
 C6_CONTRACT_VERSION = "2.3.0"
+_S7_ADAPTER_COST_CLASSES = frozenset({"toy", "standard", "heavy", "flagship_hpc_disallowed"})
 
 
 class S7Error(Exception):
@@ -171,6 +173,10 @@ class S7BudgetExceededError(S7Error):
 
     def __init__(self, message: str, *, diagnostics: Mapping[str, Any] | None = None) -> None:
         super().__init__("BUDGET", message, diagnostics=diagnostics)
+
+
+class S7RegistrationError(S7Error):
+    """Raised when adapter registration cannot complete fail-closed."""
 
 
 @dataclass(frozen=True)
@@ -1503,7 +1509,7 @@ def validate_adapter_locally(
     unit_registry: S7UnitRegistry | None = None,
 ) -> S7AdapterValidationResult:
     registry = unit_registry or S7UnitRegistry.default()
-    store = artifact_store or InMemoryArtifactStore()
+    store = artifact_store if artifact_store is not None else InMemoryArtifactStore()
     descriptor = adapter.describe()
     broker = AdapterBroker(artifact_store=store, unit_registry=registry)
     broker.register(adapter.as_simple_adapter(unit_registry=registry))
@@ -1525,6 +1531,121 @@ def validate_adapter_locally(
             "sdk_backend": _sdk_attr(adapter, "_s7_backend", None),
         },
     )
+
+
+@dataclass(frozen=True)
+class S7CostCeiling:
+    """Registration policy that excludes disallowed adapter cost classes."""
+
+    allowed_cost_classes: tuple[str, ...] = ("toy", "standard")
+
+    def __post_init__(self) -> None:
+        allowed = tuple(dict.fromkeys(self.allowed_cost_classes))
+        if not allowed:
+            raise ValueError("allowed_cost_classes must not be empty")
+        invalid = sorted(set(allowed) - _S7_ADAPTER_COST_CLASSES)
+        if invalid:
+            raise ValueError(f"unsupported adapter cost classes: {invalid}")
+        object.__setattr__(self, "allowed_cost_classes", allowed)
+
+    def permits(self, cost_class: str) -> bool:
+        return cost_class in self.allowed_cost_classes
+
+
+@dataclass(frozen=True)
+class S7RegistrationResult:
+    descriptor: AdapterDescriptor
+    capability: CapabilityDescriptor
+    revision_ref: str
+    conformance: S7AdapterValidationResult
+
+
+class S7RegistrationService:
+    """Run local adapter conformance before immutable C5 publication."""
+
+    def __init__(
+        self,
+        *,
+        registry: InMemoryRegistry,
+        artifact_store: InMemoryArtifactStore,
+        cost_ceiling: S7CostCeiling | None = None,
+    ) -> None:
+        self._registry = registry
+        self._artifact_store = artifact_store
+        self._cost_ceiling = cost_ceiling or S7CostCeiling()
+
+    def register(
+        self,
+        *,
+        adapter: Adapter,
+        subtopics: tuple[str, ...],
+        sample_inputs: Mapping[str, Quantity],
+        revision: int = 1,
+        seed: int | None = 0,
+    ) -> S7RegistrationResult:
+        if revision < 1:
+            raise S7RegistrationError("SCHEMA_INVALID", "adapter revision must be positive")
+        normalized_subtopics = self._validated_subtopics(subtopics)
+        try:
+            descriptor = adapter.describe()
+        except Exception as exc:
+            diagnostics = exc.diagnostics if isinstance(exc, S7Error) else None
+            raise S7RegistrationError("SCHEMA_INVALID", f"adapter descriptor is invalid: {exc}", diagnostics=diagnostics) from exc
+        if not self._cost_ceiling.permits(descriptor.cost_class):
+            raise S7RegistrationError(
+                "COST_CLASS_EXCEEDED",
+                f"adapter {descriptor.adapter_id} cost_class {descriptor.cost_class} exceeds registration ceiling",
+                diagnostics={
+                    "adapter_id": descriptor.adapter_id,
+                    "cost_class": descriptor.cost_class,
+                    "allowed_cost_classes": self._cost_ceiling.allowed_cost_classes,
+                },
+            )
+        try:
+            conformance = validate_adapter_locally(
+                adapter,
+                inputs=dict(sample_inputs),
+                seed=seed,
+                artifact_store=self._artifact_store,
+            )
+        except Exception as exc:
+            raise S7RegistrationError(
+                "CONFORMANCE_FAILED",
+                f"adapter {descriptor.adapter_id} failed local conformance: {exc}",
+            ) from exc
+        if not conformance.passed or conformance.eval_result is None:
+            raise S7RegistrationError(
+                "CONFORMANCE_FAILED",
+                f"adapter {descriptor.adapter_id} produced no trusted local conformance result",
+            )
+        registered_descriptor = replace(descriptor, provenance_ref=conformance.eval_result.provenance_ref)
+        capability = adapter_capability_descriptor(
+            registered_descriptor,
+            subtopics=normalized_subtopics,
+            revision=revision,
+            c5_version=C5_CONTRACT_VERSION,
+            conformance_level="bronze",
+        )
+        try:
+            published = self._registry.publish(capability)
+        except Exception as exc:
+            raise S7RegistrationError(
+                "REGISTRY_PUBLICATION_FAILED",
+                f"adapter {descriptor.adapter_id} could not be published to C5: {exc}",
+            ) from exc
+        return S7RegistrationResult(
+            descriptor=registered_descriptor,
+            capability=published,
+            revision_ref=published.provenance_ref,
+            conformance=conformance,
+        )
+
+    @staticmethod
+    def _validated_subtopics(subtopics: tuple[str, ...]) -> tuple[str, ...]:
+        normalized = tuple(dict.fromkeys(item.strip() for item in subtopics if isinstance(item, str) and item.strip()))
+        if not normalized or len(normalized) != len(subtopics):
+            raise S7RegistrationError("SCHEMA_INVALID", "subtopics must be unique non-empty strings")
+        return normalized
 
 
 @dataclass(frozen=True)
@@ -2387,6 +2508,8 @@ def adapter_capability_descriptor(
     revision: int = 1,
     trust_class: str = "internal",
     status: str = "active",
+    c5_version: str = C5_CONTRACT_VERSION,
+    conformance_level: str = "gold",
 ) -> CapabilityDescriptor:
     scopes = ["describe", "evaluate", "batch_evaluate"]
     if descriptor.differentiable:
@@ -2396,13 +2519,14 @@ def adapter_capability_descriptor(
         revision=revision,
         kind="adapter",
         owner_subsystem="S7",
-        contract_versions={"C5": "1.0.0", "C6": C6_CONTRACT_VERSION},
+        contract_versions={"C5": c5_version, "C6": C6_CONTRACT_VERSION},
         trust_class=trust_class,
         capability_scopes=tuple(scopes),
         provenance_ref=descriptor.provenance_ref,
         subtopics=subtopics,
         independence_tags=descriptor.independence_tags,
-        conformance_level="gold",
+        conformance_level=conformance_level,
+        cost_class=descriptor.cost_class,
         status=status,
     )
 

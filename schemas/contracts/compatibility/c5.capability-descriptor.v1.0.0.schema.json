@@ -6,7 +6,7 @@
   "x-argus-contract": {
     "id": "C5",
     "owner": "S6/S12",
-    "version": "1.1.0"
+    "version": "1.0.0"
   },
   "$ref": "#/$defs/CapabilityDescriptor",
   "$defs": {
@@ -50,10 +50,6 @@
           "type": "array",
           "items": { "type": "string" },
           "uniqueItems": true
-        },
-        "cost_class": {
-          "type": "string",
-          "enum": ["toy", "standard", "heavy", "flagship_hpc_disallowed"]
         },
         "conformance": {
           "type": "object",
