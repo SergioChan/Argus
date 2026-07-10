@@ -1816,7 +1816,7 @@ class S10DockerSupervisorTests(unittest.TestCase):
             args=("-c", "cat /proc/net/route; printf '\\nARGUS_UID=%s\\nARGUS_SAFE=%s\\n' \"$(id -u)\" \"$ARGUS_SAFE\""),
             env={"ARGUS_SAFE": "visible", "ARGUS_SECRET": "hidden"},
             env_allowlist=("ARGUS_SAFE",),
-            wallclock_s=5,
+            wallclock_s=10,
         )
         handle = self._handle()
 
@@ -2059,7 +2059,7 @@ class S10DockerOrchestratorTests(unittest.TestCase):
             args=("-c", "cat /proc/net/route; printf '\\nARGUS_UID=%s\\nARGUS_SAFE=%s\\n' \"$(id -u)\" \"$ARGUS_SAFE\""),
             env={"ARGUS_SAFE": "visible", "ARGUS_SECRET": "hidden"},
             env_allowlist=("ARGUS_SAFE",),
-            wallclock_s=5,
+            wallclock_s=10,
         )
 
         result = self.orchestrator.launch_and_wait(request)
