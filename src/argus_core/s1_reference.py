@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+from math import isfinite
 import secrets
 from typing import Any, Callable, Mapping
 
@@ -19,6 +20,7 @@ from .s1 import (
     SubagentDescriptor,
     SubagentRuntime,
     SubagentSDKRunner,
+    build_error_envelope,
 )
 from .s3 import (
     CheckResult,
@@ -67,6 +69,7 @@ S1_REFERENCE_SHOULD_REACT_ALPHA_SCALE = 0.2
 S1_REFERENCE_MUST_NOT_REACT_VW_UNCERTAINTY_SCALE = 2.0
 
 S3ReferenceSignerFactory = Callable[[str, bytes], S3ReportSignerProtocol]
+ReferenceSandboxSpecFactory = Callable[[str, Mapping[str, Any]], Mapping[str, Any]]
 
 
 @dataclass(frozen=True)
@@ -122,6 +125,9 @@ class S1ReferencePhysicsHarness:
         *,
         artifact_store: InMemoryArtifactStore | None = None,
         s3_signer_factory: S3ReferenceSignerFactory | None = None,
+        sandbox_marshaler: Any | None = None,
+        sandbox_spec_factory: ReferenceSandboxSpecFactory | None = None,
+        adapter_egress_allowlist: Mapping[str, Any] | None = None,
     ) -> None:
         self.s3_key_manager = S3TrustStoreKeyManager(actor_id="s1-reference-s3-key-manager")
         s3_referee_key_material = secrets.token_urlsafe(32).encode("utf-8")
@@ -153,6 +159,9 @@ class S1ReferencePhysicsHarness:
             adapter_broker=self.adapter_broker,
             audit_ledger=self.audit_ledger,
         )
+        self.sandbox_marshaler = sandbox_marshaler
+        self.sandbox_spec_factory = sandbox_spec_factory
+        self.adapter_egress_allowlist = dict(adapter_egress_allowlist or {})
         self._ensure_reference_records()
 
     def run_happy_path(self, *, job_id: str) -> S1ReferencePhysicsRunResult:
@@ -317,11 +326,14 @@ class S1ReferencePhysicsHarness:
             adapter_inputs=adapter_inputs,
             variant_base_ref=variant_base_ref,
             variant_parameters=variant_parameters,
+            sandbox_spec_factory=self.sandbox_spec_factory,
         )
         runtime = SubagentRuntime(
             descriptor=descriptor,
             artifact_store=self.artifact_store,
+            sandbox_marshaler=self.sandbox_marshaler,
             adapter_client=self._adapter_client_for(job_id),
+            adapter_egress_allowlist=self.adapter_egress_allowlist,
         )
         return SubagentSDKRunner(subagent, runtime=runtime)
 
@@ -474,12 +486,14 @@ class S1ReferencePhysicsSubagent(Subagent):
         adapter_inputs: Mapping[str, Any],
         variant_base_ref: str | None = None,
         variant_parameters: Mapping[str, Any] | None = None,
+        sandbox_spec_factory: ReferenceSandboxSpecFactory | None = None,
     ) -> None:
         super().__init__(descriptor)
         self.dataset_ref = dataset_ref
         self.adapter_inputs = dict(adapter_inputs)
         self.variant_base_ref = variant_base_ref
         self.variant_parameters = dict(variant_parameters or {})
+        self.sandbox_spec_factory = sandbox_spec_factory
 
     def plan(self, ctx: ExecContext, envelope: JobEnvelope) -> Mapping[str, Any]:
         del ctx
@@ -522,6 +536,10 @@ class S1ReferencePhysicsSubagent(Subagent):
             ctx=ctx,
             adapter_inputs=self.adapter_inputs,
         )
+        sandbox_diagnostics = self._run_sandbox_compute(
+            ctx=ctx,
+            adapter_outputs=output_payloads,
+        )
         diagnostics = {
             "dataset_ref": dataset["dataset_ref"],
             "adapter_id": result["adapter_id"],
@@ -534,6 +552,8 @@ class S1ReferencePhysicsSubagent(Subagent):
             "extrapolation_flag": result["extrapolation_flag"],
             "risk_notes": [],
         }
+        if sandbox_diagnostics is not None:
+            diagnostics["sandbox"] = sandbox_diagnostics
         if result["extrapolation_flag"]:
             domain_diagnostics = result.get("domain_diagnostics")
             if not isinstance(domain_diagnostics, Mapping):
@@ -612,6 +632,134 @@ class S1ReferencePhysicsSubagent(Subagent):
                 {"radius": omega_radius, "source": omega_source},
             ),
         }
+
+    def _run_sandbox_compute(
+        self,
+        *,
+        ctx: ExecContext,
+        adapter_outputs: Mapping[str, Any],
+    ) -> dict[str, Any] | None:
+        if self.sandbox_spec_factory is None:
+            return None
+        spec = self.sandbox_spec_factory(ctx.job_id, self.adapter_inputs)
+        if not isinstance(spec, Mapping):
+            raise LifecyclePolicyError(
+                build_error_envelope(
+                    category="SANDBOX",
+                    code="S10_REFERENCE_SANDBOX_SPEC_INVALID",
+                    message="reference sandbox spec factory must return an object",
+                )
+            )
+        execution = ctx.submit_sandbox_job(dict(spec))
+        if execution.get("timed_out") is True or execution.get("exit_code") != 0:
+            raise LifecyclePolicyError(
+                build_error_envelope(
+                    category="SANDBOX",
+                    code="S10_REFERENCE_SANDBOX_FAILED",
+                    message="reference S10 sandbox did not complete successfully",
+                    provenance_ref=_optional_reference_sandbox_ref(execution),
+                )
+            )
+        if execution.get("state") != "SUCCEEDED":
+            raise LifecyclePolicyError(
+                build_error_envelope(
+                    category="SANDBOX",
+                    code="S10_REFERENCE_SANDBOX_STATE_INVALID",
+                    message="reference S10 sandbox returned a non-success state",
+                    provenance_ref=_optional_reference_sandbox_ref(execution),
+                )
+            )
+        stdout = execution.get("stdout")
+        if not isinstance(stdout, str) or not stdout.strip():
+            raise LifecyclePolicyError(
+                build_error_envelope(
+                    category="SANDBOX",
+                    code="S10_REFERENCE_SANDBOX_OUTPUT_MISSING",
+                    message="reference S10 sandbox did not return a JSON computation result",
+                    provenance_ref=_optional_reference_sandbox_ref(execution),
+                )
+            )
+        try:
+            output = json.loads(stdout)
+        except json.JSONDecodeError as exc:
+            raise LifecyclePolicyError(
+                build_error_envelope(
+                    category="SANDBOX",
+                    code="S10_REFERENCE_SANDBOX_OUTPUT_INVALID",
+                    message="reference S10 sandbox returned invalid JSON",
+                    provenance_ref=_optional_reference_sandbox_ref(execution),
+                )
+            ) from exc
+        if not isinstance(output, Mapping):
+            raise LifecyclePolicyError(
+                build_error_envelope(
+                    category="SANDBOX",
+                    code="S10_REFERENCE_SANDBOX_OUTPUT_INVALID",
+                    message="reference S10 sandbox output must be an object",
+                    provenance_ref=_optional_reference_sandbox_ref(execution),
+                )
+            )
+        normalized_output = _reference_sandbox_output(output, adapter_outputs=adapter_outputs)
+        return {
+            "sandbox_id": execution.get("sandbox_id"),
+            "state": execution.get("state"),
+            "launch_provenance_ref": _optional_reference_sandbox_ref(execution),
+            "duration_s": execution.get("duration_s"),
+            "output": normalized_output,
+        }
+
+
+def _optional_reference_sandbox_ref(execution: Mapping[str, Any]) -> str | None:
+    reference = execution.get("launch_provenance_ref")
+    return reference if isinstance(reference, str) and reference else None
+
+
+def _reference_sandbox_output(
+    output: Mapping[str, Any],
+    *,
+    adapter_outputs: Mapping[str, Any],
+) -> dict[str, float]:
+    normalized: dict[str, float] = {}
+    for field in ("omega", "peak_omega", "peak_frequency"):
+        expected_payload = adapter_outputs.get(field)
+        if not isinstance(expected_payload, Mapping):
+            raise LifecyclePolicyError(
+                build_error_envelope(
+                    category="SANDBOX",
+                    code="S10_REFERENCE_SANDBOX_ADAPTER_OUTPUT_INVALID",
+                    message=f"reference adapter output {field} is unavailable for sandbox verification",
+                )
+            )
+        try:
+            expected = float(expected_payload["value"])
+            actual = float(output[field])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise LifecyclePolicyError(
+                build_error_envelope(
+                    category="SANDBOX",
+                    code="S10_REFERENCE_SANDBOX_OUTPUT_INVALID",
+                    message=f"reference S10 sandbox output requires numeric {field}",
+                )
+            ) from exc
+        if not isfinite(actual):
+            raise LifecyclePolicyError(
+                build_error_envelope(
+                    category="SANDBOX",
+                    code="S10_REFERENCE_SANDBOX_OUTPUT_INVALID",
+                    message=f"reference S10 sandbox output {field} must be finite",
+                )
+            )
+        tolerance = max(abs(expected) * 1e-12, 1e-30)
+        if abs(actual - expected) > tolerance:
+            raise LifecyclePolicyError(
+                build_error_envelope(
+                    category="SANDBOX",
+                    code="S10_REFERENCE_SANDBOX_OUTPUT_MISMATCH",
+                    message=f"reference S10 sandbox output {field} does not match the brokered S7 result",
+                )
+            )
+        normalized[field] = actual
+    return normalized
 
 
 class ReferenceS3ValidationEngine:

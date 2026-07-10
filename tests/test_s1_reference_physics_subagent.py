@@ -4,21 +4,130 @@ import json
 import unittest
 
 from argus_core import (
+    BudgetCaps,
     CheckResult,
+    EgressRule,
     GW_SPECTRUM_ADAPTER_ID,
+    InMemoryTokenService,
     Lineage,
+    LaunchEnvelope,
+    LaunchRequest,
     LifecycleState,
+    LifecyclePolicyError,
     Producer,
+    ScopeGrant,
     S1_REFERENCE_PHYSICS_PROFILE_REF,
     S1ReferencePhysicsHarness,
     evaluate_sound_wave_spectrum,
     tier_from_checks,
 )
 import argus_core.s1_reference as s1_reference_module
-from argus_core.s1_reference import _ReferenceS3ValidationClient
+from argus_core.s1_reference import _ReferenceS3ValidationClient, _reference_sandbox_output
 
 
 class S1ReferencePhysicsSubagentTests(unittest.TestCase):
+    def test_reference_sandbox_output_mismatch_is_fail_closed(self) -> None:
+        adapter_outputs = {
+            "omega": {"value": 2.1267660025483526e-11},
+            "peak_omega": {"value": 2.1561841843479577e-11},
+            "peak_frequency": {"value": 0.0027439964271339418},
+        }
+
+        with self.assertRaises(LifecyclePolicyError) as raised:
+            _reference_sandbox_output(
+                {
+                    "omega": 1.0,
+                    "peak_omega": 2.1561841843479577e-11,
+                    "peak_frequency": 0.0027439964271339418,
+                },
+                adapter_outputs=adapter_outputs,
+            )
+        self.assertEqual(raised.exception.envelope.code, "S10_REFERENCE_SANDBOX_OUTPUT_MISMATCH")
+
+    def test_reference_build_executes_an_injected_s10_sandbox_and_records_its_output(self) -> None:
+        tokens = InMemoryTokenService(signing_key=b"reference-sandbox-test", now_fn=lambda: 1_000)
+        calls: list[dict[str, object]] = []
+
+        class SandboxMarshaler:
+            def submit_sandbox_job(self, *, job_id: str, spec: dict[str, object]) -> dict[str, object]:
+                calls.append({"job_id": job_id, "spec": spec})
+                return {
+                    "job_id": job_id,
+                    "sandbox_id": "s1-reference-sandbox",
+                    "state": "SUCCEEDED",
+                    "exit_code": 0,
+                    "timed_out": False,
+                    "duration_s": 0.05,
+                    "stdout": json.dumps(
+                        {
+                            "omega": 2.1267660025483526e-11,
+                            "peak_omega": 2.1561841843479577e-11,
+                            "peak_frequency": 0.0027439964271339418,
+                        }
+                    ),
+                    "stderr": "",
+                    "launch_provenance_ref": "c4://container/s1-reference-sandbox",
+                    "budget_usage": {"wallclock_s": 0.05},
+                }
+
+        def sandbox_spec_factory(job_id: str, adapter_inputs: dict[str, object]) -> dict[str, object]:
+            self.assertEqual(job_id, "job-s1-reference-sandbox")
+            self.assertIn("alpha", adapter_inputs)
+            return {
+                "launch_request": LaunchRequest(
+                    job_id=job_id,
+                    subagent_id="s1-reference-physics",
+                    trace_id=f"trace:{job_id}",
+                    budget_token=tokens.mint_budget(
+                        caps=BudgetCaps(max_compute_units=10, max_wallclock_s=10, max_cost_usd=1),
+                        job_id=job_id,
+                        root_request_id=f"root:{job_id}",
+                    ),
+                    scope_token=tokens.mint_scope(
+                        job_id=job_id,
+                        scopes=ScopeGrant(
+                            allowed_adapters=(GW_SPECTRUM_ADAPTER_ID,),
+                            egress_allowlist=(
+                                EgressRule("store.local", 443, "https"),
+                                EgressRule("adapter.local", 443, "https"),
+                            ),
+                            sandbox_risk_class="standard",
+                        ),
+                    ),
+                    image="busybox@sha256:" + "b" * 64,
+                    entrypoint=("awk",),
+                    args=("BEGIN { print \\\"{}\\\" }",),
+                    env={},
+                    env_allowlist=(),
+                    requested_envelope=LaunchEnvelope(
+                        cpu_m=250,
+                        mem_bytes=64 * 1024 * 1024,
+                        gpu_count=0,
+                        wallclock_s=10,
+                        scratch_bytes=1024 * 1024,
+                        pids=8,
+                        estimated_cost_usd=0.01,
+                    ),
+                )
+            }
+
+        harness = S1ReferencePhysicsHarness(
+            sandbox_marshaler=SandboxMarshaler(),
+            sandbox_spec_factory=sandbox_spec_factory,
+            adapter_egress_allowlist={
+                GW_SPECTRUM_ADAPTER_ID: (EgressRule("adapter.local", 443, "https"),),
+            },
+        )
+
+        result = harness.run_happy_path(job_id="job-s1-reference-sandbox")
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(result.final_state, LifecycleState.REPORTED)
+        sandbox = result.build_payload["diagnostics"]["sandbox"]
+        self.assertEqual(sandbox["sandbox_id"], "s1-reference-sandbox")
+        self.assertEqual(sandbox["launch_provenance_ref"], "c4://container/s1-reference-sandbox")
+        self.assertEqual(sandbox["output"]["omega"], 2.1267660025483526e-11)
+
     def test_full_reference_physics_lifecycle_reaches_reported_and_observatory_verified(self) -> None:
         harness = S1ReferencePhysicsHarness()
 
