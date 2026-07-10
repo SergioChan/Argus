@@ -9,6 +9,8 @@ from argus_core import (
     AdapterDescriptor,
     Adapter,
     AdapterVersionError,
+    BackendUnavailableError,
+    C6_CONTRACT_VERSION,
     EvalContext,
     EvalRequest,
     GradRequest,
@@ -17,6 +19,7 @@ from argus_core import (
     NotDifferentiableError,
     NormalizedQuantity,
     OutOfDomainError,
+    PermissionDeniedError,
     ProvenanceUnavailableError,
     Quantity,
     S7JaxBackend,
@@ -171,6 +174,172 @@ class S7UnitsAndAdapterTests(unittest.TestCase):
             )
 
         self.assertEqual(raised.exception.category, "NOT_DIFFERENTIABLE")
+
+    def test_broker_bulkheads_crash_looping_backend_from_healthy_adapter(self) -> None:
+        crash_calls = 0
+        healthy_calls = 0
+
+        def crash(_inputs: dict[str, NormalizedQuantity], _seed: int | None) -> dict[str, Quantity]:
+            nonlocal crash_calls
+            crash_calls += 1
+            raise RuntimeError("backend process exited")
+
+        def healthy(inputs: dict[str, NormalizedQuantity], _seed: int | None) -> dict[str, Quantity]:
+            nonlocal healthy_calls
+            healthy_calls += 1
+            return {
+                "omega": Quantity(
+                    value=inputs["alpha"].value,
+                    units="dimensionless",
+                    uncertainty={"kind": "interval", "radius": 0.01},
+                )
+            }
+
+        broker = AdapterBroker(
+            artifact_store=InMemoryArtifactStore(),
+            circuit_breaker_failure_threshold=1,
+        )
+        broker.register(
+            SimpleAdapter(
+                AdapterDescriptor(
+                    adapter_id="crashy_adapter",
+                    version="1.0.0",
+                    input_units={"alpha": "dimensionless"},
+                    output_units={"omega": "dimensionless"},
+                    validity_domain={"alpha": (0.0, 1.0)},
+                    determinism="deterministic",
+                    provenance_ref="c4://adapter/crashy/v1",
+                ),
+                crash,
+            )
+        )
+        broker.register(
+            SimpleAdapter(
+                AdapterDescriptor(
+                    adapter_id="healthy_adapter",
+                    version="1.0.0",
+                    input_units={"alpha": "dimensionless"},
+                    output_units={"omega": "dimensionless"},
+                    validity_domain={"alpha": (0.0, 1.0)},
+                    determinism="deterministic",
+                    provenance_ref="c4://adapter/healthy/v1",
+                ),
+                healthy,
+            )
+        )
+
+        with self.assertRaises(BackendUnavailableError) as first_failure:
+            broker.evaluate(
+                EvalRequest(
+                    adapter_id="crashy_adapter",
+                    inputs={"alpha": Quantity(value=0.2, units="dimensionless")},
+                )
+            )
+
+        self.assertEqual(first_failure.exception.category, "BACKEND_UNAVAILABLE")
+        self.assertEqual(broker.backend_circuit_state("crashy_adapter").state, "open")
+        for _ in range(5):
+            result = broker.evaluate(
+                EvalRequest(
+                    adapter_id="healthy_adapter",
+                    inputs={"alpha": Quantity(value=0.7, units="dimensionless")},
+                )
+            )
+            self.assertAlmostEqual(result.outputs["omega"].value, 0.7)
+
+        with self.assertRaises(BackendUnavailableError):
+            broker.evaluate(
+                EvalRequest(
+                    adapter_id="crashy_adapter",
+                    inputs={"alpha": Quantity(value=0.4, units="dimensionless")},
+                )
+            )
+
+        self.assertEqual(crash_calls, 1)
+        self.assertEqual(healthy_calls, 5)
+
+    def test_broker_accepts_current_major_minor_request_and_rejects_future_major(self) -> None:
+        broker = AdapterBroker(artifact_store=InMemoryArtifactStore(), c6_version=C6_CONTRACT_VERSION)
+        broker.register(self._adapter(domain_policy="flag"))
+        inputs = {
+            "T_n": Quantity(value=100, units="GeV"),
+            "alpha": Quantity(value=0.2, units="dimensionless"),
+            "v_w": Quantity(value=0.7, units="dimensionless"),
+        }
+
+        accepted = broker.evaluate(
+            EvalRequest(
+                adapter_id="gw_spectrum_surrogate",
+                inputs=inputs,
+                c6_version="2.0.0",
+            )
+        )
+
+        self.assertAlmostEqual(accepted.outputs["omega"].value, 0.02)
+        with self.assertRaises(AdapterVersionError) as raised:
+            broker.evaluate(
+                EvalRequest(
+                    adapter_id="gw_spectrum_surrogate",
+                    inputs=inputs,
+                    c6_version="3.0.0",
+                )
+            )
+
+        self.assertEqual(raised.exception.category, "VERSION_UNSUPPORTED")
+
+    def test_broker_scope_gate_denies_before_backend_execution(self) -> None:
+        called = False
+
+        def evaluate(inputs: dict[str, NormalizedQuantity], _seed: int | None) -> dict[str, Quantity]:
+            nonlocal called
+            called = True
+            return {
+                "omega": Quantity(
+                    value=inputs["alpha"].value,
+                    units="dimensionless",
+                    uncertainty={"kind": "interval", "radius": 0.01},
+                )
+            }
+
+        broker = AdapterBroker(
+            artifact_store=InMemoryArtifactStore(),
+            required_scopes=("adapter-invoke",),
+        )
+        broker.register(
+            SimpleAdapter(
+                AdapterDescriptor(
+                    adapter_id="scoped_adapter",
+                    version="1.0.0",
+                    input_units={"alpha": "dimensionless"},
+                    output_units={"omega": "dimensionless"},
+                    validity_domain={"alpha": (0.0, 1.0)},
+                    determinism="deterministic",
+                    provenance_ref="c4://adapter/scoped/v1",
+                ),
+                evaluate,
+            )
+        )
+
+        with self.assertRaises(PermissionDeniedError) as raised:
+            broker.evaluate(
+                EvalRequest(
+                    adapter_id="scoped_adapter",
+                    inputs={"alpha": Quantity(value=0.2, units="dimensionless")},
+                    caller_scopes=("c6.read",),
+                )
+            )
+
+        self.assertEqual(raised.exception.category, "PERMISSION_DENIED")
+        self.assertFalse(called)
+        allowed = broker.evaluate(
+            EvalRequest(
+                adapter_id="scoped_adapter",
+                inputs={"alpha": Quantity(value=0.3, units="dimensionless")},
+                caller_scopes=("adapter-invoke", "c6.read"),
+            )
+        )
+        self.assertTrue(called)
+        self.assertAlmostEqual(allowed.outputs["omega"].value, 0.3)
 
     def test_adapter_sdk_core_auto_generates_descriptor_and_passes_local_validate(self) -> None:
         @adapter_metadata(
@@ -878,7 +1047,7 @@ class S7UnitsAndAdapterTests(unittest.TestCase):
 
         self.assertEqual(published.kind, "adapter")
         self.assertEqual(published.owner_subsystem, "S7")
-        self.assertEqual(published.contract_versions["C6"], "2.1.0")
+        self.assertEqual(published.contract_versions["C6"], "2.2.0")
         self.assertIn("gw-surrogate-a", published.independence_tags)
         self.assertEqual([descriptor.entity_id for descriptor in resolution.descriptors], ["gw_spectrum_surrogate"])
 

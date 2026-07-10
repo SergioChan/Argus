@@ -29,10 +29,10 @@ class C6ContractSchemaTests(unittest.TestCase):
         Draft202012Validator.check_schema(cls.schema)
         cls.validator = Draft202012Validator(cls.schema)
 
-    def test_schema_is_canonical_c6_v2_1(self) -> None:
+    def test_schema_is_canonical_c6_v2_2(self) -> None:
         definitions = self.schema["$defs"]
 
-        self.assertEqual(self.schema["x-argus-contract"], {"id": "C6", "owner": "S7", "version": "2.1.0"})
+        self.assertEqual(self.schema["x-argus-contract"], {"id": "C6", "owner": "S7", "version": "2.2.0"})
         for name in (
             "AdapterDescriptor",
             "EvalRequest",
@@ -48,6 +48,10 @@ class C6ContractSchemaTests(unittest.TestCase):
         self.assertIn("job_seed", definitions["EvalRequest"]["properties"])
         self.assertIn("dag_node_id", definitions["EvalRequest"]["properties"])
         self.assertIn("call_index", definitions["EvalRequest"]["properties"])
+        self.assertIn("c6_version", definitions["EvalRequest"]["properties"])
+        self.assertIn("caller_scopes", definitions["EvalRequest"]["properties"])
+        self.assertIn("c6_version", definitions["GradRequest"]["properties"])
+        self.assertIn("caller_scopes", definitions["GradRequest"]["properties"])
         self.assertIn("seed_used", definitions["EvalResult"]["required"])
         self.assertIn("seed_source", definitions["EvalResult"]["required"])
         self.assertIn("seed_derivation", definitions["EvalResult"]["required"])
@@ -91,6 +95,8 @@ class C6ContractSchemaTests(unittest.TestCase):
         }
         request = {
             "adapter_id": "adapter:toy-bounce",
+            "c6_version": "2.2.0",
+            "caller_scopes": ["adapter-invoke", "c6.read"],
             "inputs": {
                 "T_n": {"value": 100.0, "units": "GeV"},
                 "alpha": {"value": 0.1, "units": "dimensionless"},
@@ -108,6 +114,8 @@ class C6ContractSchemaTests(unittest.TestCase):
         request = {
             "method": "grad",
             "adapter_id": "adapter:jax-gw",
+            "c6_version": "2.2.0",
+            "caller_scopes": ["adapter-invoke"],
             "inputs": {
                 "T_n": {"value": 100.0, "units": "GeV"},
                 "alpha": {"value": 0.2, "units": "dimensionless"},
@@ -167,7 +175,7 @@ class C6ContractSchemaTests(unittest.TestCase):
     def test_generated_python_binding_points_to_exact_c6_schema_digest(self) -> None:
         contract = CONTRACT_BY_ID["C6"]
 
-        self.assertEqual(contract.version, "2.1.0")
+        self.assertEqual(contract.version, "2.2.0")
         self.assertEqual(contract.schema, "c6.compute-adapter.schema.json")
         self.assertEqual(contract.schema_sha256, self._schema_sha256(self.schema))
 

@@ -30,7 +30,7 @@ EXPECTED_CONTRACT_VERSIONS = {
     "C3": "2.0.0",
     "C4": "1.0.0",
     "C5": "1.0.0",
-    "C6": "2.1.0",
+    "C6": "2.2.0",
     "C10": "4.0.0",
 }
 
@@ -259,6 +259,13 @@ def validate_contract_schema(entry: dict) -> None:
         if "domain_diagnostics" not in eval_required:
             fail("C6 EvalResult must require domain_diagnostics")
         grad_request = definitions.get("GradRequest", {})
+        eval_request = definitions.get("EvalRequest", {})
+        for request_name, request_def in (("EvalRequest", eval_request), ("GradRequest", grad_request)):
+            request_props = request_def.get("properties", {})
+            if "c6_version" not in request_props:
+                fail(f"C6 {request_name} must expose c6_version")
+            if "caller_scopes" not in request_props:
+                fail(f"C6 {request_name} must expose caller_scopes")
         grad_request_required = set(grad_request.get("required", []))
         if not {"method", "adapter_id", "inputs"}.issubset(grad_request_required):
             fail("C6 GradRequest must require method, adapter_id, and inputs")

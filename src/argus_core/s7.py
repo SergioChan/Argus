@@ -78,6 +78,7 @@ JAX_BACKEND_HASH = hash_json(
         "grad": "jax.jacfwd over output/input pytrees",
     }
 )
+C6_CONTRACT_VERSION = "2.2.0"
 
 
 class S7Error(Exception):
@@ -125,11 +126,25 @@ class AdapterVersionError(S7Error):
         super().__init__("VERSION_UNSUPPORTED", message)
 
 
+class BackendUnavailableError(S7Error):
+    """Raised when an adapter backend is unavailable or circuit-open."""
+
+    def __init__(self, message: str, *, diagnostics: Mapping[str, Any] | None = None) -> None:
+        super().__init__("BACKEND_UNAVAILABLE", message, diagnostics=diagnostics)
+
+
 class NotDifferentiableError(S7Error):
     """Raised when a caller requests gradients from a non-differentiable adapter."""
 
     def __init__(self, message: str) -> None:
         super().__init__("NOT_DIFFERENTIABLE", message)
+
+
+class PermissionDeniedError(S7Error):
+    """Raised when caller scopes do not authorize adapter invocation."""
+
+    def __init__(self, message: str, *, diagnostics: Mapping[str, Any] | None = None) -> None:
+        super().__init__("PERMISSION_DENIED", message, diagnostics=diagnostics)
 
 
 @dataclass(frozen=True)
@@ -605,6 +620,8 @@ class AdapterDescriptor:
 class EvalRequest:
     adapter_id: str
     inputs: dict[str, Quantity]
+    c6_version: str = C6_CONTRACT_VERSION
+    caller_scopes: tuple[str, ...] = ()
     seed: int | None = None
     job_seed: int | None = None
     dag_node_id: str | None = None
@@ -615,6 +632,8 @@ class EvalRequest:
 class GradRequest:
     adapter_id: str
     inputs: dict[str, Quantity]
+    c6_version: str = C6_CONTRACT_VERSION
+    caller_scopes: tuple[str, ...] = ()
     seed: int | None = None
     job_seed: int | None = None
     dag_node_id: str | None = None
@@ -1152,6 +1171,16 @@ class AdapterVersionSelection:
     selected_version: str
 
 
+@dataclass(frozen=True)
+class AdapterCircuitState:
+    adapter_id: str
+    state: str
+    failure_count: int
+    failure_threshold: int
+    last_error_category: str | None = None
+    last_error_message: str | None = None
+
+
 class SimpleAdapter:
     """Adapter wrapper around a pure normalized-input evaluation function."""
 
@@ -1198,18 +1227,33 @@ class AdapterBroker:
         uncertainty_engine: S7UncertaintyEngine | None = None,
         validity_domain_guard: S7ValidityDomainGuard | None = None,
         seed_manager: S7SeedManager | None = None,
+        c6_version: str = C6_CONTRACT_VERSION,
+        required_scopes: tuple[str, ...] = (),
+        circuit_breaker_failure_threshold: int = 3,
     ) -> None:
         self._artifact_store = artifact_store
         self._unit_registry = unit_registry or S7UnitRegistry.default()
         self._uncertainty_engine = uncertainty_engine or S7UncertaintyEngine.default()
         self._validity_domain_guard = validity_domain_guard or S7ValidityDomainGuard(unit_registry=self._unit_registry)
         self._seed_manager = seed_manager or S7SeedManager.default()
+        _parse_semver(c6_version)
+        if circuit_breaker_failure_threshold < 1:
+            raise AdapterConformanceError("circuit_breaker_failure_threshold must be >= 1")
+        self._c6_version = c6_version
+        self._required_scopes = tuple(_required_scope_string(scope) for scope in required_scopes)
+        self._circuit_breaker_failure_threshold = circuit_breaker_failure_threshold
         self._adapters: dict[str, SimpleAdapter] = {}
+        self._circuits: dict[str, AdapterCircuitState] = {}
 
     def register(self, adapter: SimpleAdapter) -> None:
         self._adapters[adapter.descriptor.adapter_id] = adapter
+        self._circuits.setdefault(adapter.descriptor.adapter_id, self._closed_circuit(adapter.descriptor.adapter_id))
+
+    def backend_circuit_state(self, adapter_id: str) -> AdapterCircuitState:
+        return self._circuits.get(adapter_id, self._closed_circuit(adapter_id))
 
     def evaluate(self, request: EvalRequest) -> EvalResult:
+        self._check_request_controls(request)
         adapter = self._adapters[request.adapter_id]
         descriptor = adapter.descriptor
         normalized_inputs = normalize_inputs(request.inputs, descriptor.input_units, registry=self._unit_registry)
@@ -1232,7 +1276,7 @@ class AdapterBroker:
             call_index=request.call_index,
         )
         ctx = EvalContext(seed=seed_decision.seed_used, unit_registry=self._unit_registry)
-        raw_outputs = adapter.invoke(domain_classification.normalized_inputs, ctx)
+        raw_outputs = self._invoke_evaluate(adapter, domain_classification.normalized_inputs, ctx)
         outputs = self._normalize_outputs_conform(raw_outputs, descriptor.output_units)
         provenance_ref = self._write_provenance(
             descriptor=descriptor,
@@ -1271,6 +1315,7 @@ class AdapterBroker:
         )
 
     def grad(self, request: GradRequest) -> GradResult:
+        self._check_request_controls(request)
         adapter = self._adapters[request.adapter_id]
         descriptor = adapter.descriptor
         if not descriptor.differentiable:
@@ -1294,7 +1339,7 @@ class AdapterBroker:
             call_index=request.call_index,
         )
         ctx = EvalContext(seed=seed_decision.seed_used, unit_registry=self._unit_registry)
-        raw_jacobian = adapter.grad(domain_classification.normalized_inputs, ctx)
+        raw_jacobian = self._invoke_grad(adapter, domain_classification.normalized_inputs, ctx)
         jacobian = self._normalize_jacobian_conform(
             raw_jacobian,
             descriptor.output_units,
@@ -1332,6 +1377,105 @@ class AdapterBroker:
             backend_version=adapter.backend.backend_version,
             backend_hash=adapter.backend.backend_hash,
             underlying_code_version=adapter.backend.underlying_code_version,
+        )
+
+    def _check_request_controls(self, request: EvalRequest | GradRequest) -> None:
+        self._check_c6_version(request.c6_version)
+        if not self._required_scopes:
+            return
+        caller_scopes = set(request.caller_scopes)
+        missing_scopes = tuple(scope for scope in self._required_scopes if scope not in caller_scopes)
+        if missing_scopes:
+            raise PermissionDeniedError(
+                f"caller lacks required adapter scope(s): {', '.join(missing_scopes)}",
+                diagnostics={
+                    "required_scopes": self._required_scopes,
+                    "caller_scopes": tuple(request.caller_scopes),
+                    "missing_scopes": missing_scopes,
+                },
+            )
+
+    def _check_c6_version(self, request_version: str) -> None:
+        broker_major, broker_minor, _broker_patch = _parse_semver(self._c6_version)
+        request_major, request_minor, _request_patch = _parse_semver(request_version)
+        if request_major != broker_major:
+            raise AdapterVersionError(
+                f"C6 major version {request_major} is not supported by broker {self._c6_version}"
+            )
+        if request_minor > broker_minor:
+            raise AdapterVersionError(
+                f"C6 minor version {request_version} is newer than broker {self._c6_version}"
+            )
+
+    def _invoke_evaluate(
+        self,
+        adapter: SimpleAdapter,
+        normalized_inputs: dict[str, NormalizedQuantity],
+        ctx: EvalContext,
+    ) -> dict[str, Quantity]:
+        self._ensure_circuit_closed(adapter.descriptor.adapter_id)
+        try:
+            outputs = adapter.invoke(normalized_inputs, ctx)
+        except S7Error:
+            raise
+        except Exception as exc:
+            self._record_backend_failure(adapter.descriptor.adapter_id, exc)
+        self._record_backend_success(adapter.descriptor.adapter_id)
+        return outputs
+
+    def _invoke_grad(
+        self,
+        adapter: SimpleAdapter,
+        normalized_inputs: dict[str, NormalizedQuantity],
+        ctx: EvalContext,
+    ) -> dict[str, dict[str, Any]]:
+        self._ensure_circuit_closed(adapter.descriptor.adapter_id)
+        try:
+            jacobian = adapter.grad(normalized_inputs, ctx)
+        except S7Error:
+            raise
+        except Exception as exc:
+            self._record_backend_failure(adapter.descriptor.adapter_id, exc)
+        self._record_backend_success(adapter.descriptor.adapter_id)
+        return jacobian
+
+    def _ensure_circuit_closed(self, adapter_id: str) -> None:
+        state = self.backend_circuit_state(adapter_id)
+        if state.state == "open":
+            raise BackendUnavailableError(
+                f"adapter backend circuit is open: {adapter_id}",
+                diagnostics=asdict(state),
+            )
+
+    def _record_backend_failure(self, adapter_id: str, exc: Exception) -> None:
+        previous = self.backend_circuit_state(adapter_id)
+        failure_count = previous.failure_count + 1
+        state = "open" if failure_count >= self._circuit_breaker_failure_threshold else "closed"
+        circuit = AdapterCircuitState(
+            adapter_id=adapter_id,
+            state=state,
+            failure_count=failure_count,
+            failure_threshold=self._circuit_breaker_failure_threshold,
+            last_error_category="BACKEND_UNAVAILABLE",
+            last_error_message=str(exc),
+        )
+        self._circuits[adapter_id] = circuit
+        raise BackendUnavailableError(
+            f"adapter backend unavailable: {adapter_id}",
+            diagnostics=asdict(circuit),
+        ) from exc
+
+    def _record_backend_success(self, adapter_id: str) -> None:
+        state = self.backend_circuit_state(adapter_id)
+        if state.failure_count:
+            self._circuits[adapter_id] = self._closed_circuit(adapter_id)
+
+    def _closed_circuit(self, adapter_id: str) -> AdapterCircuitState:
+        return AdapterCircuitState(
+            adapter_id=adapter_id,
+            state="closed",
+            failure_count=0,
+            failure_threshold=self._circuit_breaker_failure_threshold,
         )
 
     def _write_provenance(
@@ -1824,7 +1968,7 @@ def adapter_capability_descriptor(
         revision=revision,
         kind="adapter",
         owner_subsystem="S7",
-        contract_versions={"C5": "1.0.0", "C6": "2.1.0"},
+        contract_versions={"C5": "1.0.0", "C6": C6_CONTRACT_VERSION},
         trust_class=trust_class,
         capability_scopes=tuple(scopes),
         provenance_ref=descriptor.provenance_ref,
@@ -1889,6 +2033,12 @@ def select_adapter_version(
 def _required_backend_string(value: Any, field_name: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise AdapterConformanceError(f"{field_name} must be a non-empty string")
+    return value.strip()
+
+
+def _required_scope_string(value: Any) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise AdapterConformanceError("required scopes must be non-empty strings")
     return value.strip()
 
 

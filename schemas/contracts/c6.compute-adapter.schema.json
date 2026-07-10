@@ -6,7 +6,7 @@
   "x-argus-contract": {
     "id": "C6",
     "owner": "S7",
-    "version": "2.1.0"
+    "version": "2.2.0"
   },
   "oneOf": [
     { "$ref": "#/$defs/AdapterDescriptor" },
@@ -151,6 +151,17 @@
       "additionalProperties": false,
       "properties": {
         "adapter_id": { "type": "string", "minLength": 1 },
+        "c6_version": {
+          "type": "string",
+          "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$",
+          "default": "2.2.0"
+        },
+        "caller_scopes": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "uniqueItems": true,
+          "default": []
+        },
         "inputs": {
           "type": "object",
           "additionalProperties": { "$ref": "#/$defs/Quantity" }
@@ -266,7 +277,10 @@
                 "PROVENANCE_UNAVAILABLE",
                 "BUDGET",
                 "ADAPTER_ERROR",
-                "NOT_DIFFERENTIABLE"
+                "NOT_DIFFERENTIABLE",
+                "BACKEND_UNAVAILABLE",
+                "VERSION_UNSUPPORTED",
+                "PERMISSION_DENIED"
               ]
             },
             "message": { "type": "string" }
@@ -281,6 +295,17 @@
       "properties": {
         "method": { "type": "string", "const": "grad" },
         "adapter_id": { "type": "string", "minLength": 1 },
+        "c6_version": {
+          "type": "string",
+          "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$",
+          "default": "2.2.0"
+        },
+        "caller_scopes": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "uniqueItems": true,
+          "default": []
+        },
         "inputs": {
           "type": "object",
           "additionalProperties": { "$ref": "#/$defs/Quantity" }
