@@ -132,7 +132,7 @@ export const contracts = [
     "id": "C6",
     "name": "Compute Adapter Tool Interface",
     "owner": "S7",
-    "version": "2.2.0",
+    "version": "2.3.0",
     "schema": "c6.compute-adapter.schema.json",
     "consumers": [
       "S1",
@@ -144,7 +144,7 @@ export const contracts = [
       "S11",
       "S12"
     ],
-    "schema_sha256": "sha256:0d77c1c69bb7f4cf9c830aadb2e6d349202ca951dc5f639bea5c3751b50e5e30"
+    "schema_sha256": "sha256:d58f75e5b026101bd516486633a2de17530847de88821800ea1ff73627c8de70"
   }
 ] as const satisfies readonly Contract[];
 

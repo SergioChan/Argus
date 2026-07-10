@@ -78,7 +78,7 @@ JAX_BACKEND_HASH = hash_json(
         "grad": "jax.jacfwd over output/input pytrees",
     }
 )
-C6_CONTRACT_VERSION = "2.2.0"
+C6_CONTRACT_VERSION = "2.3.0"
 
 
 class S7Error(Exception):
@@ -145,6 +145,13 @@ class PermissionDeniedError(S7Error):
 
     def __init__(self, message: str, *, diagnostics: Mapping[str, Any] | None = None) -> None:
         super().__init__("PERMISSION_DENIED", message, diagnostics=diagnostics)
+
+
+class S7BudgetExceededError(S7Error):
+    """Raised or enveloped when a C6 batch request exhausts its budget token."""
+
+    def __init__(self, message: str, *, diagnostics: Mapping[str, Any] | None = None) -> None:
+        super().__init__("BUDGET", message, diagnostics=diagnostics)
 
 
 @dataclass(frozen=True)
@@ -626,6 +633,7 @@ class EvalRequest:
     job_seed: int | None = None
     dag_node_id: str | None = None
     call_index: int | None = None
+    budget_token_ref: str | None = None
 
 
 @dataclass(frozen=True)
@@ -638,6 +646,7 @@ class GradRequest:
     job_seed: int | None = None
     dag_node_id: str | None = None
     call_index: int | None = None
+    budget_token_ref: str | None = None
     method: str = "grad"
 
 
@@ -698,6 +707,92 @@ class GradResult:
     backend_version: str = NATIVE_PYTHON_BACKEND_VERSION
     backend_hash: str = NATIVE_PYTHON_BACKEND_HASH
     underlying_code_version: str = "native-python:callable"
+
+
+@dataclass(frozen=True)
+class S7BudgetToken:
+    token_ref: str
+    remaining_units: float
+    unit_cost: float = 1.0
+
+    def __post_init__(self) -> None:
+        token_ref = _required_budget_string(self.token_ref, "budget_token.token_ref")
+        remaining_units = _finite_non_negative_budget_number(self.remaining_units, "budget_token.remaining_units")
+        unit_cost = _finite_positive_budget_number(self.unit_cost, "budget_token.unit_cost")
+        object.__setattr__(self, "token_ref", token_ref)
+        object.__setattr__(self, "remaining_units", remaining_units)
+        object.__setattr__(self, "unit_cost", unit_cost)
+
+
+@dataclass(frozen=True)
+class S7ErrorEnvelope:
+    category: str
+    message: str
+    diagnostics: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class BatchEvaluateItemResult:
+    index: int
+    result: EvalResult | None = None
+    error: S7ErrorEnvelope | None = None
+
+    def __post_init__(self) -> None:
+        if self.index < 0:
+            raise AdapterConformanceError("batch item index must be non-negative")
+        if (self.result is None) == (self.error is None):
+            raise AdapterConformanceError("batch item must contain exactly one result or error")
+
+
+@dataclass(frozen=True)
+class BatchEvaluateRequest:
+    items: tuple[EvalRequest, ...]
+    budget_token: S7BudgetToken
+    method: str = "batch_evaluate"
+
+    def __post_init__(self) -> None:
+        if self.method != "batch_evaluate":
+            raise AdapterConformanceError("BatchEvaluateRequest.method must be batch_evaluate")
+        items = tuple(self.items)
+        if not items:
+            raise AdapterConformanceError("BatchEvaluateRequest requires at least one item")
+        for index, item in enumerate(items):
+            if not isinstance(item, EvalRequest):
+                raise AdapterConformanceError(f"batch item {index} must be an EvalRequest")
+            if item.budget_token_ref is not None and item.budget_token_ref != self.budget_token.token_ref:
+                raise AdapterConformanceError(
+                    f"batch item {index} budget_token_ref does not match request budget token"
+                )
+        object.__setattr__(self, "items", items)
+
+
+@dataclass(frozen=True)
+class BatchEvaluateResult:
+    items: tuple[BatchEvaluateItemResult, ...]
+    n_ok: int
+    halted: bool
+    budget_token_ref: str
+    budget_limit_units: float
+    budget_unit_cost: float
+    budget_spent_units: float
+    budget_remaining_units: float
+    halted_index: int | None = None
+    partial_provenance_ref: str | None = None
+    method: str = "batch_evaluate"
+
+    @property
+    def budget(self) -> dict[str, Any]:
+        payload = {
+            "token_ref": self.budget_token_ref,
+            "limit_units": self.budget_limit_units,
+            "unit_cost": self.budget_unit_cost,
+            "spent_units": self.budget_spent_units,
+            "remaining_units": self.budget_remaining_units,
+        }
+        if self.halted:
+            payload["halted_reason"] = "BUDGET"
+            payload["halted_index"] = self.halted_index
+        return payload
 
 
 @dataclass(frozen=True)
@@ -1379,6 +1474,90 @@ class AdapterBroker:
             underlying_code_version=adapter.backend.underlying_code_version,
         )
 
+    def batch_evaluate(self, request: BatchEvaluateRequest) -> BatchEvaluateResult:
+        items: list[BatchEvaluateItemResult] = []
+        spent_units = 0.0
+        budget_limit = request.budget_token.remaining_units
+        unit_cost = request.budget_token.unit_cost
+
+        for index, item in enumerate(request.items):
+            self._check_request_controls(item)
+            if spent_units + unit_cost > budget_limit:
+                remaining_units = max(budget_limit - spent_units, 0.0)
+                error = self._budget_error(
+                    index=index,
+                    token_ref=request.budget_token.token_ref,
+                    spent_units=spent_units,
+                    budget_limit=budget_limit,
+                    unit_cost=unit_cost,
+                    remaining_units=remaining_units,
+                )
+                items.append(BatchEvaluateItemResult(index=index, error=error))
+                partial_ref = self._write_batch_partial_provenance(
+                    request=request,
+                    items=tuple(items),
+                    spent_units=spent_units,
+                    remaining_units=remaining_units,
+                    halted_index=index,
+                    error=error,
+                )
+                return BatchEvaluateResult(
+                    items=tuple(items),
+                    n_ok=sum(1 for batch_item in items if batch_item.result is not None),
+                    halted=True,
+                    halted_index=index,
+                    budget_token_ref=request.budget_token.token_ref,
+                    budget_limit_units=budget_limit,
+                    budget_unit_cost=unit_cost,
+                    budget_spent_units=spent_units,
+                    budget_remaining_units=remaining_units,
+                    partial_provenance_ref=partial_ref,
+                )
+
+            result = self.evaluate(item)
+            spent_units += unit_cost
+            items.append(BatchEvaluateItemResult(index=index, result=result))
+
+        return BatchEvaluateResult(
+            items=tuple(items),
+            n_ok=len(items),
+            halted=False,
+            halted_index=None,
+            budget_token_ref=request.budget_token.token_ref,
+            budget_limit_units=budget_limit,
+            budget_unit_cost=unit_cost,
+            budget_spent_units=spent_units,
+            budget_remaining_units=max(budget_limit - spent_units, 0.0),
+            partial_provenance_ref=None,
+        )
+
+    def _budget_error(
+        self,
+        *,
+        index: int,
+        token_ref: str,
+        spent_units: float,
+        budget_limit: float,
+        unit_cost: float,
+        remaining_units: float,
+    ) -> S7ErrorEnvelope:
+        error = S7BudgetExceededError(
+            f"budget exhausted before batch item {index}",
+            diagnostics={
+                "index": index,
+                "token_ref": token_ref,
+                "spent_units": spent_units,
+                "limit_units": budget_limit,
+                "unit_cost": unit_cost,
+                "remaining_units": remaining_units,
+            },
+        )
+        return S7ErrorEnvelope(
+            category=error.category,
+            message=error.message,
+            diagnostics=error.diagnostics,
+        )
+
     def _check_request_controls(self, request: EvalRequest | GradRequest) -> None:
         self._check_c6_version(request.c6_version)
         if not self._required_scopes:
@@ -1556,6 +1735,72 @@ class AdapterBroker:
                     }
                 ),
                 seeds=(str(seed_decision.seed_used),) if seed_decision.seed_used is not None else (),
+            ),
+        )
+        return record.artifact_ref
+
+    def _write_batch_partial_provenance(
+        self,
+        *,
+        request: BatchEvaluateRequest,
+        items: tuple[BatchEvaluateItemResult, ...],
+        spent_units: float,
+        remaining_units: float,
+        halted_index: int,
+        error: S7ErrorEnvelope,
+    ) -> str:
+        if self._artifact_store is None:
+            raise ProvenanceUnavailableError("S8 artifact store unavailable")
+        completed_refs = tuple(
+            item.result.provenance_ref
+            for item in items
+            if item.result is not None
+        )
+        payload = {
+            "method": "batch_evaluate",
+            "c6_version": self._c6_version,
+            "requested_count": len(request.items),
+            "completed_count": len(completed_refs),
+            "completed_provenance_refs": list(completed_refs),
+            "item_statuses": [
+                {
+                    "index": item.index,
+                    "status": "OK" if item.result is not None else "ERROR",
+                    "provenance_ref": item.result.provenance_ref if item.result is not None else None,
+                    "error": asdict(item.error) if item.error is not None else None,
+                }
+                for item in items
+            ],
+            "budget": {
+                "token_ref": request.budget_token.token_ref,
+                "limit_units": request.budget_token.remaining_units,
+                "unit_cost": request.budget_token.unit_cost,
+                "spent_units": spent_units,
+                "remaining_units": remaining_units,
+                "halted_reason": error.category,
+                "halted_index": halted_index,
+            },
+            "halt_error": asdict(error),
+        }
+        record = self._artifact_store.create_artifact(
+            kind="log",
+            payload=payload,
+            producer=Producer(subsystem="S7", version=self._c6_version),
+            lineage=Lineage(
+                input_refs=completed_refs,
+                code_ref=f"s7:batch_evaluate@C6-{self._c6_version}",
+                environment_digest=hash_json(
+                    {
+                        "method": "batch_evaluate",
+                        "c6_version": self._c6_version,
+                        "budget_token_ref": request.budget_token.token_ref,
+                    }
+                ),
+                seeds=tuple(
+                    str(item.result.seed_used)
+                    for item in items
+                    if item.result is not None and item.result.seed_used is not None
+                ),
             ),
         )
         return record.artifact_ref
@@ -2040,6 +2285,28 @@ def _required_scope_string(value: Any) -> str:
     if not isinstance(value, str) or not value.strip():
         raise AdapterConformanceError("required scopes must be non-empty strings")
     return value.strip()
+
+
+def _required_budget_string(value: Any, field_name: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise AdapterConformanceError(f"{field_name} must be a non-empty string")
+    return value.strip()
+
+
+def _finite_non_negative_budget_number(value: Any, field_name: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise AdapterConformanceError(f"{field_name} must be a finite non-negative number")
+    numeric = float(value)
+    if not math.isfinite(numeric) or numeric < 0:
+        raise AdapterConformanceError(f"{field_name} must be a finite non-negative number")
+    return numeric
+
+
+def _finite_positive_budget_number(value: Any, field_name: str) -> float:
+    numeric = _finite_non_negative_budget_number(value, field_name)
+    if numeric <= 0:
+        raise AdapterConformanceError(f"{field_name} must be positive")
+    return numeric
 
 
 def _finite_backend_number(value: Any, field_name: str) -> float:

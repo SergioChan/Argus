@@ -29,12 +29,17 @@ class C6ContractSchemaTests(unittest.TestCase):
         Draft202012Validator.check_schema(cls.schema)
         cls.validator = Draft202012Validator(cls.schema)
 
-    def test_schema_is_canonical_c6_v2_2(self) -> None:
+    def test_schema_is_canonical_c6_v2_3(self) -> None:
         definitions = self.schema["$defs"]
 
-        self.assertEqual(self.schema["x-argus-contract"], {"id": "C6", "owner": "S7", "version": "2.2.0"})
+        self.assertEqual(self.schema["x-argus-contract"], {"id": "C6", "owner": "S7", "version": "2.3.0"})
         for name in (
             "AdapterDescriptor",
+            "AdapterError",
+            "BatchItemResult",
+            "BatchRequest",
+            "BatchResult",
+            "BudgetToken",
             "EvalRequest",
             "EvalResult",
             "GradRequest",
@@ -50,8 +55,24 @@ class C6ContractSchemaTests(unittest.TestCase):
         self.assertIn("call_index", definitions["EvalRequest"]["properties"])
         self.assertIn("c6_version", definitions["EvalRequest"]["properties"])
         self.assertIn("caller_scopes", definitions["EvalRequest"]["properties"])
+        self.assertIn("budget_token_ref", definitions["EvalRequest"]["properties"])
         self.assertIn("c6_version", definitions["GradRequest"]["properties"])
         self.assertIn("caller_scopes", definitions["GradRequest"]["properties"])
+        self.assertIn("budget_token_ref", definitions["GradRequest"]["properties"])
+        self.assertEqual(definitions["BatchRequest"]["properties"]["method"]["const"], "batch_evaluate")
+        self.assertEqual(definitions["BatchResult"]["properties"]["method"]["const"], "batch_evaluate")
+        self.assertEqual(
+            definitions["BatchRequest"]["properties"]["items"]["items"]["$ref"],
+            "#/$defs/EvalRequest",
+        )
+        self.assertEqual(
+            definitions["BatchResult"]["properties"]["items"]["items"]["$ref"],
+            "#/$defs/BatchItemResult",
+        )
+        self.assertEqual(
+            definitions["BatchItemResult"]["properties"]["error"]["$ref"],
+            "#/$defs/AdapterError",
+        )
         self.assertIn("seed_used", definitions["EvalResult"]["required"])
         self.assertIn("seed_source", definitions["EvalResult"]["required"])
         self.assertIn("seed_derivation", definitions["EvalResult"]["required"])
@@ -95,7 +116,7 @@ class C6ContractSchemaTests(unittest.TestCase):
         }
         request = {
             "adapter_id": "adapter:toy-bounce",
-            "c6_version": "2.2.0",
+            "c6_version": "2.3.0",
             "caller_scopes": ["adapter-invoke", "c6.read"],
             "inputs": {
                 "T_n": {"value": 100.0, "units": "GeV"},
@@ -110,11 +131,73 @@ class C6ContractSchemaTests(unittest.TestCase):
         self._assert_valid(descriptor)
         self._assert_valid(request)
 
+    def test_batch_request_and_partial_budget_result_validate(self) -> None:
+        request = {
+            "method": "batch_evaluate",
+            "items": [
+                {
+                    "adapter_id": "adapter:toy-bounce",
+                    "c6_version": "2.3.0",
+                    "caller_scopes": ["adapter-invoke"],
+                    "inputs": {"alpha": {"value": 0.1, "units": "dimensionless"}},
+                    "job_seed": 7,
+                    "dag_node_id": "batch-node",
+                    "call_index": 0,
+                    "budget_token_ref": "budget://s7/batch-token",
+                },
+                {
+                    "adapter_id": "adapter:toy-bounce",
+                    "c6_version": "2.3.0",
+                    "caller_scopes": ["adapter-invoke"],
+                    "inputs": {"alpha": {"value": 0.2, "units": "dimensionless"}},
+                    "job_seed": 7,
+                    "dag_node_id": "batch-node",
+                    "call_index": 1,
+                    "budget_token_ref": "budget://s7/batch-token",
+                },
+            ],
+            "budget_token": {
+                "token_ref": "budget://s7/batch-token",
+                "remaining_units": 1.0,
+                "unit_cost": 1.0,
+            },
+        }
+        completed_eval = json.loads(json.dumps(self.example))
+        completed_eval["adapter_id"] = "adapter:toy-bounce"
+        result = {
+            "method": "batch_evaluate",
+            "items": [
+                {"index": 0, "result": completed_eval},
+                {
+                    "index": 1,
+                    "error": {
+                        "category": "BUDGET",
+                        "message": "budget exhausted before batch item 1",
+                    },
+                },
+            ],
+            "n_ok": 1,
+            "halted": True,
+            "halted_index": 1,
+            "budget": {
+                "token_ref": "budget://s7/batch-token",
+                "limit_units": 1.0,
+                "unit_cost": 1.0,
+                "spent_units": 1.0,
+                "remaining_units": 0.0,
+                "halted_reason": "BUDGET",
+            },
+            "partial_provenance_ref": "c4://adapter-call/batch/partial",
+        }
+
+        self._assert_valid(request)
+        self._assert_valid(result)
+
     def test_grad_request_and_result_validate(self) -> None:
         request = {
             "method": "grad",
             "adapter_id": "adapter:jax-gw",
-            "c6_version": "2.2.0",
+            "c6_version": "2.3.0",
             "caller_scopes": ["adapter-invoke"],
             "inputs": {
                 "T_n": {"value": 100.0, "units": "GeV"},
@@ -175,7 +258,7 @@ class C6ContractSchemaTests(unittest.TestCase):
     def test_generated_python_binding_points_to_exact_c6_schema_digest(self) -> None:
         contract = CONTRACT_BY_ID["C6"]
 
-        self.assertEqual(contract.version, "2.2.0")
+        self.assertEqual(contract.version, "2.3.0")
         self.assertEqual(contract.schema, "c6.compute-adapter.schema.json")
         self.assertEqual(contract.schema_sha256, self._schema_sha256(self.schema))
 

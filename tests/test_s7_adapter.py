@@ -10,6 +10,7 @@ from argus_core import (
     Adapter,
     AdapterVersionError,
     BackendUnavailableError,
+    BatchEvaluateRequest,
     C6_CONTRACT_VERSION,
     EvalContext,
     EvalRequest,
@@ -22,6 +23,7 @@ from argus_core import (
     PermissionDeniedError,
     ProvenanceUnavailableError,
     Quantity,
+    S7BudgetToken,
     S7JaxBackend,
     S7NativePythonBackend,
     S7ValidityDomainGuard,
@@ -340,6 +342,82 @@ class S7UnitsAndAdapterTests(unittest.TestCase):
         )
         self.assertTrue(called)
         self.assertAlmostEqual(allowed.outputs["omega"].value, 0.3)
+
+    def test_batch_evaluate_halts_at_budget_with_partial_provenance(self) -> None:
+        store = InMemoryArtifactStore()
+        calls: list[float] = []
+
+        def evaluate(inputs: dict[str, NormalizedQuantity], _seed: int | None) -> dict[str, Quantity]:
+            calls.append(inputs["alpha"].value)
+            return {
+                "omega": Quantity(
+                    value=inputs["alpha"].value,
+                    units="dimensionless",
+                    uncertainty={"kind": "interval", "radius": 0.01},
+                )
+            }
+
+        broker = AdapterBroker(artifact_store=store)
+        broker.register(
+            SimpleAdapter(
+                AdapterDescriptor(
+                    adapter_id="metered_adapter",
+                    version="1.0.0",
+                    input_units={"alpha": "dimensionless"},
+                    output_units={"omega": "dimensionless"},
+                    validity_domain={"alpha": (0.0, 1.0)},
+                    determinism="deterministic",
+                    provenance_ref="c4://adapter/metered/v1",
+                ),
+                evaluate,
+            )
+        )
+        token_ref = "budget://s7/batch-token"
+        request = BatchEvaluateRequest(
+            items=tuple(
+                EvalRequest(
+                    adapter_id="metered_adapter",
+                    inputs={"alpha": Quantity(value=value, units="dimensionless")},
+                    budget_token_ref=token_ref,
+                    job_seed=7,
+                    dag_node_id="batch-node",
+                    call_index=index,
+                )
+                for index, value in enumerate((0.1, 0.2, 0.3, 0.4))
+            ),
+            budget_token=S7BudgetToken(token_ref=token_ref, remaining_units=2.0, unit_cost=1.0),
+        )
+
+        result = broker.batch_evaluate(request)
+
+        self.assertEqual(calls, [0.1, 0.2])
+        self.assertEqual(result.n_ok, 2)
+        self.assertTrue(result.halted)
+        self.assertEqual(result.halted_index, 2)
+        self.assertEqual(tuple(item.index for item in result.items), (0, 1, 2))
+        self.assertIsNotNone(result.items[0].result)
+        self.assertIsNone(result.items[0].error)
+        self.assertAlmostEqual(result.items[0].result.outputs["omega"].value, 0.1)
+        self.assertIsNotNone(result.items[1].result)
+        self.assertAlmostEqual(result.items[1].result.outputs["omega"].value, 0.2)
+        self.assertIsNone(result.items[2].result)
+        self.assertIsNotNone(result.items[2].error)
+        self.assertEqual(result.items[2].error.category, "BUDGET")
+        self.assertLessEqual(result.budget_spent_units, result.budget_limit_units)
+        self.assertEqual(result.budget_spent_units, 2.0)
+        self.assertEqual(result.budget_remaining_units, 0.0)
+        self.assertIsNotNone(result.partial_provenance_ref)
+        partial = json.loads(store.get_artifact(result.partial_provenance_ref))
+        self.assertEqual(partial["method"], "batch_evaluate")
+        self.assertEqual(partial["budget"]["token_ref"], token_ref)
+        self.assertEqual(partial["budget"]["halted_reason"], "BUDGET")
+        self.assertEqual(partial["budget"]["halted_index"], 2)
+        self.assertEqual(partial["completed_count"], 2)
+        self.assertEqual(
+            partial["completed_provenance_refs"],
+            [result.items[0].result.provenance_ref, result.items[1].result.provenance_ref],
+        )
+        self.assertEqual(store.get_record(result.partial_provenance_ref).kind, "log")
 
     def test_adapter_sdk_core_auto_generates_descriptor_and_passes_local_validate(self) -> None:
         @adapter_metadata(
@@ -1047,7 +1125,7 @@ class S7UnitsAndAdapterTests(unittest.TestCase):
 
         self.assertEqual(published.kind, "adapter")
         self.assertEqual(published.owner_subsystem, "S7")
-        self.assertEqual(published.contract_versions["C6"], "2.2.0")
+        self.assertEqual(published.contract_versions["C6"], "2.3.0")
         self.assertIn("gw-surrogate-a", published.independence_tags)
         self.assertEqual([descriptor.entity_id for descriptor in resolution.descriptors], ["gw_spectrum_surrogate"])
 

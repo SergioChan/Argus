@@ -6,14 +6,16 @@
   "x-argus-contract": {
     "id": "C6",
     "owner": "S7",
-    "version": "2.2.0"
+    "version": "2.3.0"
   },
   "oneOf": [
     { "$ref": "#/$defs/AdapterDescriptor" },
     { "$ref": "#/$defs/EvalRequest" },
     { "$ref": "#/$defs/EvalResult" },
     { "$ref": "#/$defs/GradRequest" },
-    { "$ref": "#/$defs/GradResult" }
+    { "$ref": "#/$defs/GradResult" },
+    { "$ref": "#/$defs/BatchRequest" },
+    { "$ref": "#/$defs/BatchResult" }
   ],
   "$defs": {
     "ArtifactRef": {
@@ -49,6 +51,53 @@
         "units": { "type": "string", "minLength": 1 },
         "output_units": { "type": "string", "minLength": 1 },
         "input_units": { "type": "string", "minLength": 1 }
+      }
+    },
+    "AdapterError": {
+      "type": "object",
+      "required": ["category", "message"],
+      "additionalProperties": false,
+      "properties": {
+        "category": {
+          "type": "string",
+          "enum": [
+            "UNITS_MISMATCH",
+            "OUT_OF_DOMAIN",
+            "PROVENANCE_UNAVAILABLE",
+            "BUDGET",
+            "ADAPTER_ERROR",
+            "NOT_DIFFERENTIABLE",
+            "BACKEND_UNAVAILABLE",
+            "VERSION_UNSUPPORTED",
+            "PERMISSION_DENIED"
+          ]
+        },
+        "message": { "type": "string" },
+        "diagnostics": { "type": "object" }
+      }
+    },
+    "BudgetToken": {
+      "type": "object",
+      "required": ["token_ref", "remaining_units", "unit_cost"],
+      "additionalProperties": false,
+      "properties": {
+        "token_ref": { "type": "string", "minLength": 1 },
+        "remaining_units": { "type": "number", "minimum": 0 },
+        "unit_cost": { "type": "number", "exclusiveMinimum": 0 }
+      }
+    },
+    "BatchBudgetState": {
+      "type": "object",
+      "required": ["token_ref", "limit_units", "unit_cost", "spent_units", "remaining_units"],
+      "additionalProperties": false,
+      "properties": {
+        "token_ref": { "type": "string", "minLength": 1 },
+        "limit_units": { "type": "number", "minimum": 0 },
+        "unit_cost": { "type": "number", "exclusiveMinimum": 0 },
+        "spent_units": { "type": "number", "minimum": 0 },
+        "remaining_units": { "type": "number", "minimum": 0 },
+        "halted_reason": { "type": "string", "enum": ["BUDGET"] },
+        "halted_index": { "type": "integer", "minimum": 0 }
       }
     },
     "DomainDiagnostics": {
@@ -154,7 +203,7 @@
         "c6_version": {
           "type": "string",
           "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$",
-          "default": "2.2.0"
+          "default": "2.3.0"
         },
         "caller_scopes": {
           "type": "array",
@@ -267,25 +316,54 @@
         "backend_hash": { "type": "string", "pattern": "^blake3:[0-9a-f]{64}$" },
         "underlying_code_version": { "type": "string", "minLength": 1 },
         "error": {
-          "type": "object",
-          "properties": {
-            "category": {
-              "type": "string",
-              "enum": [
-                "UNITS_MISMATCH",
-                "OUT_OF_DOMAIN",
-                "PROVENANCE_UNAVAILABLE",
-                "BUDGET",
-                "ADAPTER_ERROR",
-                "NOT_DIFFERENTIABLE",
-                "BACKEND_UNAVAILABLE",
-                "VERSION_UNSUPPORTED",
-                "PERMISSION_DENIED"
-              ]
-            },
-            "message": { "type": "string" }
-          }
+          "$ref": "#/$defs/AdapterError"
         }
+      }
+    },
+    "BatchRequest": {
+      "type": "object",
+      "required": ["method", "items", "budget_token"],
+      "additionalProperties": false,
+      "properties": {
+        "method": { "type": "string", "const": "batch_evaluate" },
+        "items": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/EvalRequest" }
+        },
+        "budget_token": { "$ref": "#/$defs/BudgetToken" }
+      }
+    },
+    "BatchItemResult": {
+      "type": "object",
+      "required": ["index"],
+      "additionalProperties": false,
+      "oneOf": [
+        { "required": ["result"], "not": { "required": ["error"] } },
+        { "required": ["error"], "not": { "required": ["result"] } }
+      ],
+      "properties": {
+        "index": { "type": "integer", "minimum": 0 },
+        "result": { "$ref": "#/$defs/EvalResult" },
+        "error": { "$ref": "#/$defs/AdapterError" }
+      }
+    },
+    "BatchResult": {
+      "type": "object",
+      "required": ["method", "items", "n_ok", "halted", "budget"],
+      "additionalProperties": false,
+      "properties": {
+        "method": { "type": "string", "const": "batch_evaluate" },
+        "items": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/BatchItemResult" }
+        },
+        "n_ok": { "type": "integer", "minimum": 0 },
+        "halted": { "type": "boolean" },
+        "halted_index": { "type": ["integer", "null"], "minimum": 0 },
+        "budget": { "$ref": "#/$defs/BatchBudgetState" },
+        "partial_provenance_ref": { "$ref": "#/$defs/ArtifactRef" }
       }
     },
     "GradRequest": {
@@ -298,7 +376,7 @@
         "c6_version": {
           "type": "string",
           "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$",
-          "default": "2.2.0"
+          "default": "2.3.0"
         },
         "caller_scopes": {
           "type": "array",

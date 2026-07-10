@@ -30,7 +30,7 @@ EXPECTED_CONTRACT_VERSIONS = {
     "C3": "2.0.0",
     "C4": "1.0.0",
     "C5": "1.0.0",
-    "C6": "2.2.0",
+    "C6": "2.3.0",
     "C10": "4.0.0",
 }
 
@@ -73,6 +73,11 @@ C4_REQUIRED_DEFS = {
 
 C6_REQUIRED_DEFS = {
     "AdapterDescriptor",
+    "AdapterError",
+    "BatchItemResult",
+    "BatchRequest",
+    "BatchResult",
+    "BudgetToken",
     "EvalRequest",
     "EvalResult",
     "GradRequest",
@@ -266,6 +271,38 @@ def validate_contract_schema(entry: dict) -> None:
                 fail(f"C6 {request_name} must expose c6_version")
             if "caller_scopes" not in request_props:
                 fail(f"C6 {request_name} must expose caller_scopes")
+            if "budget_token_ref" not in request_props:
+                fail(f"C6 {request_name} must expose budget_token_ref")
+        batch_request = definitions.get("BatchRequest", {})
+        batch_result = definitions.get("BatchResult", {})
+        if batch_request.get("properties", {}).get("method", {}).get("const") != "batch_evaluate":
+            fail("C6 BatchRequest.method must be const batch_evaluate")
+        batch_items_ref = (
+            batch_request.get("properties", {})
+            .get("items", {})
+            .get("items", {})
+            .get("$ref")
+        )
+        if batch_items_ref != "#/$defs/EvalRequest":
+            fail("C6 BatchRequest.items must reference EvalRequest")
+        if batch_result.get("properties", {}).get("method", {}).get("const") != "batch_evaluate":
+            fail("C6 BatchResult.method must be const batch_evaluate")
+        batch_result_items_ref = (
+            batch_result.get("properties", {})
+            .get("items", {})
+            .get("items", {})
+            .get("$ref")
+        )
+        if batch_result_items_ref != "#/$defs/BatchItemResult":
+            fail("C6 BatchResult.items must reference BatchItemResult")
+        batch_item_error_ref = (
+            definitions.get("BatchItemResult", {})
+            .get("properties", {})
+            .get("error", {})
+            .get("$ref")
+        )
+        if batch_item_error_ref != "#/$defs/AdapterError":
+            fail("C6 BatchItemResult.error must reference AdapterError")
         grad_request_required = set(grad_request.get("required", []))
         if not {"method", "adapter_id", "inputs"}.issubset(grad_request_required):
             fail("C6 GradRequest must require method, adapter_id, and inputs")
