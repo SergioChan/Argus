@@ -23,6 +23,22 @@ class ReferenceS10SandboxSpecFactoryTests(unittest.TestCase):
             if os.environ.get("ARGUS_REQUIRE_DOCKER_TESTS") == "1":
                 self.fail("docker CLI is required when ARGUS_REQUIRE_DOCKER_TESTS=1")
             self.skipTest("docker CLI is unavailable")
+        inspected = subprocess.run(
+            [docker, "image", "inspect", REFERENCE_SANDBOX_IMAGE],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if inspected.returncode != 0:
+            pulled = subprocess.run(
+                [docker, "pull", REFERENCE_SANDBOX_IMAGE],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+            self.assertEqual(pulled.returncode, 0, pulled.stderr)
 
         completed = subprocess.run(
             [
