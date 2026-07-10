@@ -178,6 +178,25 @@ OBSERVATORY_SIX_CHECKS = (
     "LEAKAGE",
     "CALIBRATION",
 )
+# Retained for import compatibility; semantic gates use the tier-specific sets below.
+
+OBSERVATORY_RECAP_CHECKS = (
+    "INJECTION",
+    "NULL_CONTROL",
+    "PHYSICAL_CONSISTENCY",
+    "CALIBRATION",
+    "RECAP_BENCHMARK",
+)
+
+OBSERVATORY_NOVEL_CHECKS = (
+    "INJECTION",
+    "NULL_CONTROL",
+    "CROSS_CODE",
+    "PHYSICAL_CONSISTENCY",
+    "LEAKAGE",
+    "CALIBRATION",
+    "RECAP_BENCHMARK",
+)
 
 
 @dataclass(frozen=True)
@@ -261,13 +280,13 @@ def verify_observatory_v0(
         failures.append("validation report aggregate.passed is not true")
 
     checks = _check_map(report_payload)
-    for check_name in OBSERVATORY_SIX_CHECKS:
+    for check_name in _observatory_required_checks(report_payload, failures):
         if check_name not in checks:
-            failures.append(f"missing six-check verdict: {check_name}")
+            failures.append(f"missing required check verdict: {check_name}")
             continue
         status = _string_field(checks[check_name], "status")
         if status != "PASS":
-            failures.append(f"six-check verdict is not PASS: {check_name}={status or '<missing>'}")
+            failures.append(f"required check verdict is not PASS: {check_name}={status or '<missing>'}")
 
     perturbation_pairs = _sequence_field(report_payload, "perturbation_pairs")
     if not perturbation_pairs:
@@ -912,7 +931,7 @@ def _observatory_v0_html(
             _summary_table(report_payload=report_payload, verification=verification),
             "    </section>",
             "    <section>",
-            "      <h2>Six Checks</h2>",
+            "      <h2>Verification Checks</h2>",
             _checks_table(report_payload),
             "    </section>",
             "    <section>",
@@ -1062,7 +1081,7 @@ def _summary_table(*, report_payload: dict[str, Any], verification: ObservatoryV
 def _checks_table(report_payload: dict[str, Any]) -> str:
     checks = _check_map(report_payload)
     rows = []
-    for check_name in OBSERVATORY_SIX_CHECKS:
+    for check_name in _observatory_display_checks(report_payload, checks):
         check = checks.get(check_name, {})
         status = _string_field(check, "status") if isinstance(check, Mapping) else ""
         rows.append(
@@ -1078,6 +1097,36 @@ def _checks_table(report_payload: dict[str, Any]) -> str:
         + "".join(rows)
         + "</tbody></table>"
     )
+
+
+def _observatory_required_checks(report_payload: Mapping[str, Any], failures: list[str]) -> tuple[str, ...]:
+    claim_tier = _string_field(report_payload, "claim_tier")
+    if claim_tier == "recapitulated-known":
+        return OBSERVATORY_RECAP_CHECKS
+    if claim_tier == "novel-needs-human":
+        return OBSERVATORY_NOVEL_CHECKS
+    failures.append(
+        "claim tier is not eligible for an Observatory VERIFIED report: "
+        f"{claim_tier or '<missing>'}"
+    )
+    return ()
+
+
+def _observatory_display_checks(
+    report_payload: Mapping[str, Any],
+    checks: Mapping[str, Mapping[str, Any]],
+) -> tuple[str, ...]:
+    claim_tier = _string_field(report_payload, "claim_tier")
+    if claim_tier == "recapitulated-known":
+        names = list(OBSERVATORY_RECAP_CHECKS)
+    elif claim_tier == "novel-needs-human":
+        names = list(OBSERVATORY_NOVEL_CHECKS)
+    else:
+        names = []
+    for check_name in checks:
+        if check_name not in names:
+            names.append(check_name)
+    return tuple(names)
 
 
 def _perturbation_table(report_payload: dict[str, Any]) -> str:

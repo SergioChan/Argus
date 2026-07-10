@@ -6823,6 +6823,7 @@ class S3Verifier:
         challenger_ids: tuple[str, ...] = (),
         independence_attestation: IndependenceAttestation | None = None,
         debate_ref: str = "c4://debate/not-run",
+        requested_tier: str = "novel-needs-human",
     ) -> dict[str, Any]:
         referee = build_referee_block(
             referee_id=self.verifier_id,
@@ -6834,7 +6835,7 @@ class S3Verifier:
         tier_decision = S3ClaimTieringRuleEngine().evaluate(
             checks=checks,
             independence_attestation=independence_attestation,
-            requested_tier="novel-needs-human",
+            requested_tier=requested_tier,
             perturbation_outcome=perturbation_outcome,
         )
         report = {

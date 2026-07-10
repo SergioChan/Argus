@@ -350,8 +350,8 @@ class ArgusM0RuntimeServiceTests(unittest.TestCase):
                 "demo": "s1-reference-physics",
                 "job_id": "m0-s1-reference-demo",
                 "final_state": "REPORTED",
-                "claim_tier": "novel-needs-human",
-                "claim_tier_is_candidate": True,
+                "claim_tier": "recapitulated-known",
+                "claim_tier_is_candidate": False,
                 "validation_report_ref": "c4://report/demo",
                 "promoted_artifact_ref": "c4://artifact/demo",
                 "observatory_html_ref": "c4://observatory/demo",
@@ -362,9 +362,7 @@ class ArgusM0RuntimeServiceTests(unittest.TestCase):
                 "checks": [
                     {"check": "INJECTION", "status": "PASS"},
                     {"check": "NULL_CONTROL", "status": "PASS"},
-                    {"check": "CROSS_CODE", "status": "PASS"},
                     {"check": "PHYSICAL_CONSISTENCY", "status": "PASS"},
-                    {"check": "LEAKAGE", "status": "PASS"},
                     {"check": "CALIBRATION", "status": "PASS"},
                     {"check": "RECAP_BENCHMARK", "status": "PASS"},
                 ],
@@ -377,7 +375,7 @@ class ArgusM0RuntimeServiceTests(unittest.TestCase):
         result = evidence["results"][-1]  # type: ignore[index]
         self.assertEqual(result["item"], "s1-reference-demo")
         self.assertEqual(result["status"], "pass")
-        self.assertEqual(result["detail"]["claim_tier"], "novel-needs-human")
+        self.assertEqual(result["detail"]["claim_tier"], "recapitulated-known")
         self.assertTrue(result["detail"]["observatory_trusted"])
 
     def test_s8_writer_service_commits_and_replays_c4_records(self) -> None:

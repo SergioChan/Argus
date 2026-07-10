@@ -644,6 +644,7 @@ class _ReferenceS3ValidationClient:
             contamination_index=self.contamination_index,
             contamination_snapshot=self.contamination_snapshot,
             extrapolated=extrapolated or self.mode == "extrapolated",
+            include_m3_checks=self.mode == "extrapolated",
             profile_ref=str(request["profile_ref"]),
             job_id=job_id,
             trace_id=trace_id,
@@ -653,8 +654,12 @@ class _ReferenceS3ValidationClient:
             dataset_payload=dataset_payload,
             perturbation_id=f"pair-{job_id}",
         )
-        challengers = _reference_challengers()
-        independence = attest_challenger_independence(challengers=challengers, min_independent=2)
+        challengers = _reference_challengers() if self.mode == "extrapolated" else ()
+        independence = (
+            attest_challenger_independence(challengers=challengers, min_independent=2)
+            if challengers
+            else None
+        )
         return self.verifier.build_report(
             profile_ref=str(request["profile_ref"]),
             frozen_pipeline_ref=str(request["frozen_pipeline_ref"]),
@@ -664,6 +669,7 @@ class _ReferenceS3ValidationClient:
             challenger_ids=tuple(challenger.entity_id for challenger in challengers),
             independence_attestation=independence,
             debate_ref=f"c4://debate/s1-reference/{job_id}",
+            requested_tier="novel-needs-human" if challengers else "recapitulated-known",
         )
 
     def _request_has_extrapolated_artifact(self, request: Mapping[str, object]) -> bool:
@@ -798,11 +804,12 @@ def _reference_plugin_checks(
     contamination_index: ContaminationIndex,
     contamination_snapshot: FrozenContaminationSnapshot,
     extrapolated: bool,
+    include_m3_checks: bool,
     profile_ref: str,
     job_id: str,
     trace_id: str | None,
 ) -> tuple[CheckResult, ...]:
-    profile = _reference_compiled_profile(profile_ref=profile_ref)
+    profile = _reference_compiled_profile(profile_ref=profile_ref, include_m3_checks=include_m3_checks)
     plugins = _reference_check_plugins(
         artifact_store=artifact_store,
         model_payload=model_payload,
@@ -810,6 +817,7 @@ def _reference_plugin_checks(
         contamination_index=contamination_index,
         contamination_snapshot=contamination_snapshot,
         extrapolated=extrapolated,
+        include_m3_checks=include_m3_checks,
         job_id=job_id,
         trace_id=trace_id,
     )
@@ -830,6 +838,7 @@ def _reference_check_plugins(
     contamination_index: ContaminationIndex,
     contamination_snapshot: FrozenContaminationSnapshot,
     extrapolated: bool,
+    include_m3_checks: bool,
     job_id: str,
     trace_id: str | None,
 ) -> tuple[Any, ...]:
@@ -852,26 +861,11 @@ def _reference_check_plugins(
         job_id=job_id,
         trace_id=trace_id,
     )
-    return (
+    plugins: list[Any] = [
         S3InjectionCheckPlugin(
             samples=_reference_injection_samples(expected_omega=expected_omega, observed_omega=observed_omega),
         ),
         S3NullControlCheckPlugin(samples=_reference_null_control_samples()),
-        S3CrossCodeCheckPlugin(
-            samples=(
-                S3CrossCodeSample(
-                    sample_id="ewpt-reference-omega",
-                    pipeline_value=observed_omega,
-                    reference_value=expected_omega,
-                    pipeline_uncertainty=omega_tolerance,
-                    reference_uncertainty=omega_tolerance,
-                    pipeline_units=_reference_omega_units(model_payload),
-                    reference_units="dimensionless",
-                    extrapolation_flag=extrapolated,
-                ),
-            ),
-            independence_resolution=_reference_independence_resolution(),
-        ),
         S3PhysicalConsistencyCheckPlugin(
             samples=(
                 S3PhysicalConsistencySample(
@@ -884,14 +878,6 @@ def _reference_check_plugins(
                     asymptotic_expected=expected_from_equation,
                 ),
             ),
-        ),
-        S3LeakageCheckPlugin(
-            candidate_text=_reference_candidate_text(
-                model_payload=model_payload,
-                observed_omega=observed_omega,
-            ),
-            contamination_index=contamination_index,
-            contamination_snapshot=contamination_snapshot,
         ),
         S3CalibrationCheckPlugin(
             samples=_reference_calibration_samples(
@@ -910,11 +896,42 @@ def _reference_check_plugins(
                 ),
             ),
         ),
-    )
+    ]
+    if include_m3_checks:
+        plugins.insert(
+            2,
+            S3CrossCodeCheckPlugin(
+                samples=(
+                    S3CrossCodeSample(
+                        sample_id="ewpt-reference-omega",
+                        pipeline_value=observed_omega,
+                        reference_value=expected_omega,
+                        pipeline_uncertainty=omega_tolerance,
+                        reference_uncertainty=omega_tolerance,
+                        pipeline_units=_reference_omega_units(model_payload),
+                        reference_units="dimensionless",
+                        extrapolation_flag=extrapolated,
+                    ),
+                ),
+                independence_resolution=_reference_independence_resolution(),
+            ),
+        )
+        plugins.insert(
+            4,
+            S3LeakageCheckPlugin(
+                candidate_text=_reference_candidate_text(
+                    model_payload=model_payload,
+                    observed_omega=observed_omega,
+                ),
+                contamination_index=contamination_index,
+                contamination_snapshot=contamination_snapshot,
+            ),
+        )
+    return tuple(plugins)
 
 
-def _reference_compiled_profile(*, profile_ref: str) -> CompiledProfile:
-    checks = (
+def _reference_compiled_profile(*, profile_ref: str, include_m3_checks: bool) -> CompiledProfile:
+    checks: list[CompiledCheckSpec] = [
         _reference_compiled_check(
             "INJECTION",
             thresholds={"recovery_rate_min": 1.0},
@@ -932,18 +949,6 @@ def _reference_compiled_profile(*, profile_ref: str) -> CompiledProfile:
             seed=18,
         ),
         _reference_compiled_check(
-            "CROSS_CODE",
-            thresholds={
-                "reduced_chi_square_min": 0.0,
-                "reduced_chi_square_max": 1.5,
-                "z_max": 3.0,
-                "max_excluded_fraction": 0.0,
-                "min_valid_points": 1,
-            },
-            requires_independence=True,
-            seed=19,
-        ),
-        _reference_compiled_check(
             "PHYSICAL_CONSISTENCY",
             thresholds={
                 "mandatory_gates": ["dimensional", "positivity", "asymptotic"],
@@ -951,19 +956,6 @@ def _reference_compiled_profile(*, profile_ref: str) -> CompiledProfile:
             },
             tolerance={"absolute_tolerance": 0.01},
             seed=20,
-        ),
-        _reference_compiled_check(
-            "LEAKAGE",
-            thresholds={
-                "mandatory_gates": ["frozen_index_overlap"],
-                "overlap_threshold": 0.8,
-                "frozen_index_threshold": 0.8,
-                "target_leakage_purity_threshold": 0.95,
-                "target_leakage_min_support": 2,
-                "shingle_size": 5,
-                "min_reward_score_delta": 0.0,
-            },
-            seed=21,
         ),
         _reference_compiled_check(
             "CALIBRATION",
@@ -976,7 +968,39 @@ def _reference_compiled_profile(*, profile_ref: str) -> CompiledProfile:
             thresholds={"absolute_tolerance": 0.01, "relative_tolerance": 0.0, "min_recovered_fraction": 1.0},
             seed=23,
         ),
-    )
+    ]
+    if include_m3_checks:
+        checks.insert(
+            2,
+            _reference_compiled_check(
+                "CROSS_CODE",
+                thresholds={
+                    "reduced_chi_square_min": 0.0,
+                    "reduced_chi_square_max": 1.5,
+                    "z_max": 3.0,
+                    "max_excluded_fraction": 0.0,
+                    "min_valid_points": 1,
+                },
+                requires_independence=True,
+                seed=19,
+            ),
+        )
+        checks.insert(
+            4,
+            _reference_compiled_check(
+                "LEAKAGE",
+                thresholds={
+                    "mandatory_gates": ["frozen_index_overlap"],
+                    "overlap_threshold": 0.8,
+                    "frozen_index_threshold": 0.8,
+                    "target_leakage_purity_threshold": 0.95,
+                    "target_leakage_min_support": 2,
+                    "shingle_size": 5,
+                    "min_reward_score_delta": 0.0,
+                },
+                seed=21,
+            ),
+        )
     return CompiledProfile(
         profile_id="s1-reference-ewpt",
         revision=1,
@@ -989,8 +1013,8 @@ def _reference_compiled_profile(*, profile_ref: str) -> CompiledProfile:
             "checks": [check.check for check in checks],
         },
         cost_estimate={"max_wallclock_s": 3.0},
-        checks=checks,
-        independence_policy={"requires_cross_code": True, "min_independent": 2},
+        checks=tuple(checks),
+        independence_policy={"requires_cross_code": include_m3_checks, "min_independent": 2 if include_m3_checks else 0},
         determinism_profile={
             "seeded_checks": [{"check": check.check, "seed": check.seed} for check in checks],
         },

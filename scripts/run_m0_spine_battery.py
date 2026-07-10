@@ -1499,9 +1499,7 @@ def _battery_s1_reference_physics_demo(evidence: dict[str, Any], s1_reference_de
     expected_checks = {
         "INJECTION",
         "NULL_CONTROL",
-        "CROSS_CODE",
         "PHYSICAL_CONSISTENCY",
-        "LEAKAGE",
         "CALIBRATION",
         "RECAP_BENCHMARK",
     }
@@ -1514,11 +1512,11 @@ def _battery_s1_reference_physics_demo(evidence: dict[str, Any], s1_reference_de
         if isinstance(check, dict)
     }
     if statuses != {check: "PASS" for check in expected_checks}:
-        raise AssertionError(f"S1 reference demo did not return seven PASS checks: {statuses}")
+        raise AssertionError(f"S1 reference demo did not return required M1 PASS checks: {statuses}")
     if response.get("final_state") != "REPORTED":
         raise AssertionError(f"S1 reference demo did not reach REPORTED: {response}")
-    if response.get("claim_tier") != "novel-needs-human" or response.get("claim_tier_is_candidate") is not True:
-        raise AssertionError(f"S1 reference demo did not preserve S3 verifier tier semantics: {response}")
+    if response.get("claim_tier") != "recapitulated-known" or response.get("claim_tier_is_candidate") is not False:
+        raise AssertionError(f"S1 reference demo did not preserve M1 recapitulation tier semantics: {response}")
     if response.get("observatory_trusted") is not True:
         raise AssertionError(f"S1 reference demo Observatory render was not trusted: {response}")
     if 'data-verdict="VERIFIED"' not in str(response.get("observatory_html", "")):

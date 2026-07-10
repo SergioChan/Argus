@@ -29,13 +29,17 @@ class S1ReferencePhysicsSubagentTests(unittest.TestCase):
         self.assertEqual(result.lifecycle_methods, ("accept", "plan", "build", "validate", "report"))
         self.assertGreaterEqual(len(result.artifact_refs), 1)
         self.assertTrue(result.validation_report_ref.startswith("c4://"))
-        self.assertEqual(result.validation_report_payload["claim_tier"], "novel-needs-human")
-        self.assertTrue(result.validation_report_payload["claim_tier_is_candidate"])
+        self.assertEqual(result.validation_report_payload["claim_tier"], "recapitulated-known")
+        self.assertFalse(result.validation_report_payload["claim_tier_is_candidate"])
+        self.assertEqual(
+            result.validation_report_payload["claim_tier_justification"]["requested_tier"],
+            "recapitulated-known",
+        )
         self.assertEqual(result.subagent_report["validation_report_ref"], result.validation_report_ref)
-        self.assertEqual(result.subagent_report["claim_tier"], "novel-needs-human")
+        self.assertEqual(result.subagent_report["claim_tier"], "recapitulated-known")
         self.assertIn("reproducibility_manifest", result.subagent_report)
         self.assertEqual(result.promoted_artifact.validation_report_ref, result.validation_report_ref)
-        self.assertEqual(result.promoted_artifact.claim_tier, "novel-needs-human")
+        self.assertEqual(result.promoted_artifact.claim_tier, "recapitulated-known")
         self.assertTrue(result.observatory_render.verification.trusted)
         self.assertIn('data-verdict="VERIFIED"', result.observatory_render.html)
         self.assertTrue(result.observatory_html_ref.startswith("c4://"))
@@ -64,9 +68,7 @@ class S1ReferencePhysicsSubagentTests(unittest.TestCase):
         expected_plugin_refs = {
             "INJECTION": "argus.s3.plugins.injection",
             "NULL_CONTROL": "argus.s3.plugins.null_control",
-            "CROSS_CODE": "argus.s3.plugins.cross_code",
             "PHYSICAL_CONSISTENCY": "argus.s3.plugins.physical_consistency",
-            "LEAKAGE": "argus.s3.plugins.leakage",
             "CALIBRATION": "argus.s3.plugins.calibration",
             "RECAP_BENCHMARK": "argus.s3.plugins.recap_benchmark",
         }
@@ -106,9 +108,7 @@ class S1ReferencePhysicsSubagentTests(unittest.TestCase):
             {
                 "INJECTION",
                 "NULL_CONTROL",
-                "CROSS_CODE",
                 "PHYSICAL_CONSISTENCY",
-                "LEAKAGE",
                 "CALIBRATION",
                 "RECAP_BENCHMARK",
             },
@@ -129,9 +129,6 @@ class S1ReferencePhysicsSubagentTests(unittest.TestCase):
             expected_omega,
         )
         self.assertEqual(result.build_payload["diagnostics"]["adapter_id"], GW_SPECTRUM_ADAPTER_ID)
-        self.assertTrue(
-            checks["LEAKAGE"]["metrics"]["sub_gates"]["frozen_index_overlap"]["snapshot_ref"].startswith("c4://")
-        )
         self.assertEqual(checks["CALIBRATION"]["metrics"]["nominal_coverage"], 0.68)
         recap_metrics = checks["RECAP_BENCHMARK"]["metrics"]
         self.assertTrue(recap_metrics["recap_benchmark_pass"])

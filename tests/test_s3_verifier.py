@@ -468,6 +468,25 @@ class S3VerifierReportTests(unittest.TestCase):
         self.assertEqual(tier_from_checks(recap_checks), "recapitulated-known")
         self.assertEqual(tier_from_checks(novel_checks), "novel-needs-human")
 
+    def test_requested_recap_tier_caps_an_otherwise_novel_report(self) -> None:
+        report = self.verifier.build_report(
+            profile_ref="c4://profile/ewpt/v1",
+            frozen_pipeline_ref="c4://pipeline/ewpt/baseline",
+            proponent_id="builder",
+            checks=self._recap_checks()
+            + (
+                CheckResult("CROSS_CODE", "PASS"),
+                CheckResult("LEAKAGE", "PASS"),
+            ),
+            perturbation_outcome=self._passing_perturbation_outcome(),
+            challenger_ids=("challenger-a", "challenger-b"),
+            requested_tier="recapitulated-known",
+        )
+
+        self.assertEqual(report["claim_tier"], "recapitulated-known")
+        self.assertFalse(report["claim_tier_is_candidate"])
+        self.assertEqual(report["claim_tier_justification"]["requested_tier"], "recapitulated-known")
+
     def test_referee_must_be_distinct_from_proponent(self) -> None:
         with self.assertRaises(RefereePolicyError):
             build_referee_block(referee_id="builder", signer_key_id="s3-key", proponent_id="builder")

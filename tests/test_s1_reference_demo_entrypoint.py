@@ -51,8 +51,8 @@ class S1ReferenceDemoEntryPointTests(unittest.TestCase):
             self.assertEqual(evidence["demo"], "s1-reference-physics")
             self.assertEqual(evidence["job_id"], "entrypoint-demo")
             self.assertEqual(evidence["final_state"], "REPORTED")
-            self.assertEqual(evidence["claim_tier"], "novel-needs-human")
-            self.assertTrue(evidence["claim_tier_is_candidate"])
+            self.assertEqual(evidence["claim_tier"], "recapitulated-known")
+            self.assertFalse(evidence["claim_tier_is_candidate"])
             self.assertTrue(evidence["observatory_trusted"])
             self.assertEqual(evidence["referee_id"], "s3-reference-verifier")
             self.assertEqual(evidence["signature_key_id"], "s3-reference-referee-key")
@@ -62,9 +62,7 @@ class S1ReferenceDemoEntryPointTests(unittest.TestCase):
                 {
                     "INJECTION": "PASS",
                     "NULL_CONTROL": "PASS",
-                    "CROSS_CODE": "PASS",
                     "PHYSICAL_CONSISTENCY": "PASS",
-                    "LEAKAGE": "PASS",
                     "CALIBRATION": "PASS",
                     "RECAP_BENCHMARK": "PASS",
                 },
@@ -86,7 +84,8 @@ class S1ReferenceDemoEntryPointTests(unittest.TestCase):
             lineage = json.loads(lineage_path.read_text(encoding="utf-8"))
             html = observatory_path.read_text(encoding="utf-8")
 
-            self.assertEqual(report["claim_tier"], "novel-needs-human")
+            self.assertEqual(report["claim_tier"], "recapitulated-known")
+            self.assertEqual(report["claim_tier_justification"]["requested_tier"], "recapitulated-known")
             self.assertEqual(report["referee"]["referee_id"], "s3-reference-verifier")
             self.assertEqual(report["signature"]["key_id"], "s3-reference-referee-key")
             recap_check = next(check for check in report["checks"] if check["check"] == "RECAP_BENCHMARK")

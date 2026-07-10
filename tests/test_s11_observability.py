@@ -70,6 +70,7 @@ class S11ObservatoryV0Tests(unittest.TestCase):
             "PHYSICAL_CONSISTENCY",
             "LEAKAGE",
             "CALIBRATION",
+            "RECAP_BENCHMARK",
         ):
             self.assertIn(check_name, html)
         self.assertIn("must-react-1", html)
@@ -168,8 +169,32 @@ class S11ObservatoryV0Tests(unittest.TestCase):
         )
 
         self.assertFalse(result.verification.trusted)
-        self.assertIn("six-check verdict is not PASS: INJECTION=FAIL", result.html)
+        self.assertIn("required check verdict is not PASS: INJECTION=FAIL", result.html)
         self.assertIn('data-verdict="FAIL"', result.html)
+
+    def test_recap_report_is_verified_without_m3_cross_code_or_leakage(self) -> None:
+        fixture = _observatory_fixture(
+            report_mutator=lambda report: report.update(
+                {
+                    "checks": [
+                        check
+                        for check in report["checks"]
+                        if check["check"] not in {"CROSS_CODE", "LEAKAGE"}
+                    ]
+                }
+            )
+        )
+
+        result = render_observatory_v0_html(
+            report_payload=fixture["report"],
+            lineage=fixture["lineage"],
+            report_verifier=fixture["verifier"],
+        )
+
+        self.assertTrue(result.verification.trusted)
+        self.assertIn('data-verdict="VERIFIED"', result.html)
+        self.assertNotIn("CROSS_CODE</td>", result.html)
+        self.assertNotIn("LEAKAGE</td>", result.html)
 
     def test_perturbation_pairs_must_be_present_bidirectional_and_pass(self) -> None:
         missing = _observatory_fixture(report_mutator=lambda report: report.pop("perturbation_pairs"))
@@ -822,6 +847,12 @@ def _observatory_report(*, profile_ref: str, pipeline_ref: str) -> dict[str, obj
                 "status": "PASS",
                 "metrics": {"ece": 0.01},
                 "evidence_refs": ["c4://evidence/calibration/example"],
+            },
+            {
+                "check": "RECAP_BENCHMARK",
+                "status": "PASS",
+                "metrics": {"recovered_fraction": 1.0},
+                "evidence_refs": ["c4://evidence/recap/example"],
             },
         ],
         "aggregate": {"passed": True, "score": 0.98},
