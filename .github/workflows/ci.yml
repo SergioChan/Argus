@@ -69,19 +69,22 @@ jobs:
       - name: Run M0 spine battery
         env:
           ARGUS_S10_TEST_IMAGE: "busybox@sha256:73aaf090f3d85aa34ee199857f03fa3a95c8ede2ffd4cc2cdb5b94e566b11662"
-        run: python3 scripts/run_m0_spine_battery.py --evidence-file m0-spine-evidence.json
+        run: python3 scripts/run_m0_spine_battery.py --evidence-file "$RUNNER_TEMP/m0-spine-evidence.json"
 
       - name: Upload M0 spine evidence
         uses: actions/upload-artifact@v4
         with:
           name: m0-spine-evidence
-          path: m0-spine-evidence.json
+          path: ${{ runner.temp }}/m0-spine-evidence.json
+
+      - name: Assert clean checkout before M1 referee battery
+        run: test -z "$(git status --porcelain)"
 
       - name: Run M1 external S3 referee battery
-        run: python3 scripts/run_m1_external_referee_battery.py --evidence-file m1-external-referee-evidence.json
+        run: python3 scripts/run_m1_external_referee_battery.py --evidence-file "$RUNNER_TEMP/m1-external-referee-evidence.json"
 
       - name: Upload M1 external S3 referee evidence
         uses: actions/upload-artifact@v4
         with:
           name: m1-external-referee-evidence
-          path: m1-external-referee-evidence.json
+          path: ${{ runner.temp }}/m1-external-referee-evidence.json
