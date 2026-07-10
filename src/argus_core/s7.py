@@ -712,6 +712,37 @@ class EvalResult:
     underlying_code_version: str = "native-python:callable"
 
 
+def c6_eval_result_payload(result: EvalResult) -> dict[str, Any]:
+    """Serialize an S7 evaluation result as the C6 wire payload."""
+
+    return {
+        "adapter_id": result.adapter_id,
+        "outputs": {
+            field: _s7_provenance_jsonable(asdict(quantity))
+            for field, quantity in sorted(result.outputs.items())
+        },
+        "in_validity_domain": result.in_validity_domain,
+        "extrapolation_flag": result.extrapolation_flag,
+        "provenance_ref": result.provenance_ref,
+        "seed_used": result.seed_used,
+        "seed_source": result.seed_source,
+        "seed_derivation": _s7_provenance_jsonable(result.seed_derivation),
+        "domain_diagnostics": _s7_provenance_jsonable(result.domain_diagnostics),
+        "unit_registry_version": result.unit_registry_version,
+        "unit_registry_hash": result.unit_registry_hash,
+        "uncertainty_engine_version": result.uncertainty_engine_version,
+        "uncertainty_engine_hash": result.uncertainty_engine_hash,
+        "validity_domain_guard_version": result.validity_domain_guard_version,
+        "validity_domain_guard_hash": result.validity_domain_guard_hash,
+        "seed_manager_version": result.seed_manager_version,
+        "seed_manager_hash": result.seed_manager_hash,
+        "backend_name": result.backend_name,
+        "backend_version": result.backend_version,
+        "backend_hash": result.backend_hash,
+        "underlying_code_version": result.underlying_code_version,
+    }
+
+
 @dataclass(frozen=True)
 class JacobianEntry:
     value: float

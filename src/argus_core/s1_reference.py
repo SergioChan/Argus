@@ -503,11 +503,17 @@ class S1ReferencePhysicsSubagent(Subagent):
             "risk_notes": [],
         }
         if result["extrapolation_flag"]:
+            domain_diagnostics = result.get("domain_diagnostics")
+            if not isinstance(domain_diagnostics, Mapping):
+                raise ValueError("C6 result domain_diagnostics must be an object")
+            violated_fields = domain_diagnostics.get("violated_fields")
+            if not isinstance(violated_fields, list) or not all(isinstance(field, str) for field in violated_fields):
+                raise ValueError("C6 result domain_diagnostics.violated_fields must be a string array")
             diagnostics["risk_notes"].append(
                 {
                     "kind": "adapter_extrapolation",
                     "extrapolation_flag": True,
-                    "violated_fields": result["violated_fields"],
+                    "violated_fields": violated_fields,
                 }
             )
         model_payload: dict[str, Any] = {

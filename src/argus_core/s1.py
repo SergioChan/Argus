@@ -17,7 +17,7 @@ from uuid import NAMESPACE_URL, uuid4, uuid5
 from argusverify import C3ReportVerifier
 from .hashing import hash_json
 from .s6 import CapabilityDescriptor, InMemoryRegistry, S1ConformanceAttestationSigner
-from .s7 import AdapterBroker, EvalRequest, EvalResult, Quantity, S7Error
+from .s7 import AdapterBroker, EvalRequest, EvalResult, Quantity, S7Error, c6_eval_result_payload
 from .s10 import (
     EgressRule,
     InMemoryAuditLedger,
@@ -1470,39 +1470,7 @@ def _eval_request_payload(request: EvalRequest) -> dict[str, Any]:
 
 
 def _eval_result_payload(result: EvalResult) -> dict[str, Any]:
-    return {
-        "adapter_id": result.adapter_id,
-        "outputs": {field: asdict(quantity) for field, quantity in sorted(result.outputs.items())},
-        "in_validity_domain": result.in_validity_domain,
-        "extrapolation_flag": result.extrapolation_flag,
-        "provenance_ref": result.provenance_ref,
-        "seed_used": result.seed_used,
-        "seed_source": result.seed_source,
-        "seed_derivation": result.seed_derivation,
-        "violated_fields": list(result.violated_fields),
-        "domain_diagnostics": _json_safe_domain_diagnostics(result.domain_diagnostics),
-        "cache_hit": result.cache_hit,
-        "unit_registry_version": result.unit_registry_version,
-        "unit_registry_hash": result.unit_registry_hash,
-        "uncertainty_engine_version": result.uncertainty_engine_version,
-        "uncertainty_engine_hash": result.uncertainty_engine_hash,
-        "validity_domain_guard_version": result.validity_domain_guard_version,
-        "validity_domain_guard_hash": result.validity_domain_guard_hash,
-        "seed_manager_version": result.seed_manager_version,
-        "seed_manager_hash": result.seed_manager_hash,
-    }
-
-
-def _json_safe_domain_diagnostics(value: Mapping[str, Any]) -> dict[str, Any]:
-    converted: dict[str, Any] = {}
-    for key, item in value.items():
-        if isinstance(item, tuple):
-            converted[key] = list(item)
-        elif isinstance(item, Mapping):
-            converted[key] = _json_safe_domain_diagnostics(item)
-        else:
-            converted[key] = item
-    return converted
+    return c6_eval_result_payload(result)
 
 
 def _raise_adapter_request_error(code: str, message: str) -> None:
