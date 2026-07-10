@@ -5,11 +5,13 @@ import unittest
 
 from argus_core import (
     CheckResult,
+    GW_SPECTRUM_ADAPTER_ID,
     Lineage,
     LifecycleState,
     Producer,
     S1_REFERENCE_PHYSICS_PROFILE_REF,
     S1ReferencePhysicsHarness,
+    evaluate_sound_wave_spectrum,
     tier_from_checks,
 )
 import argus_core.s1_reference as s1_reference_module
@@ -115,10 +117,18 @@ class S1ReferencePhysicsSubagentTests(unittest.TestCase):
         self.assertEqual(checks["INJECTION"]["metrics"]["linearity_slope"], 1.0)
         self.assertEqual(checks["NULL_CONTROL"]["metrics"]["false_positives"], 0)
         self.assertTrue(checks["PHYSICAL_CONSISTENCY"]["metrics"]["physical_consistency_pass"])
-        self.assertEqual(
+        expected_omega = evaluate_sound_wave_spectrum(
+            temperature_gev=100.0,
+            alpha=0.2,
+            beta_over_h=100.0,
+            wall_velocity=0.7,
+            frequency_hz=0.003,
+        ).omega
+        self.assertAlmostEqual(
             checks["PHYSICAL_CONSISTENCY"]["metrics"]["sub_gates"]["asymptotic"]["comparisons"][0]["expected"],
-            0.02,
+            expected_omega,
         )
+        self.assertEqual(result.build_payload["diagnostics"]["adapter_id"], GW_SPECTRUM_ADAPTER_ID)
         self.assertTrue(
             checks["LEAKAGE"]["metrics"]["sub_gates"]["frozen_index_overlap"]["snapshot_ref"].startswith("c4://")
         )
@@ -137,10 +147,39 @@ class S1ReferencePhysicsSubagentTests(unittest.TestCase):
         must_not_react_ref = "c4://log/ewpt-reference/r44-m2-underresponsive-vw"
         model_ref = "c4://model/ewpt-reference/r44-m2-underresponsive"
         pipeline_ref = "c4://pipeline/ewpt-reference/r44-m2-underresponsive"
+        reference = evaluate_sound_wave_spectrum(
+            temperature_gev=100.0,
+            alpha=0.2,
+            beta_over_h=100.0,
+            wall_velocity=0.7,
+            frequency_hz=0.003,
+        )
+        perturbed = evaluate_sound_wave_spectrum(
+            temperature_gev=100.0,
+            alpha=0.2 * 0.2,
+            beta_over_h=100.0,
+            wall_velocity=0.7,
+            frequency_hz=0.003,
+        )
+        expected_omega = reference.omega
+        observed_omega = expected_omega
+        must_react_omega = observed_omega - 0.75 * (expected_omega - perturbed.omega)
+        uncertainty_radius = 0.35 * expected_omega
         harness.artifact_store.create_artifact(
             kind="dataset",
             artifact_ref=dataset_ref,
-            payload={"rows": [{"T_n": 100.0, "alpha": 0.2, "v_w": 0.7, "known_omega": 0.02}]},
+            payload={
+                "rows": [
+                    {
+                        "T_n": 100.0,
+                        "alpha": 0.2,
+                        "beta_over_H": 100.0,
+                        "v_w": 0.7,
+                        "frequency": 0.003,
+                        "known_omega": expected_omega,
+                    }
+                ]
+            },
             producer=Producer(subsystem="S6", version="0.0.0", actor_id="s6.reference-dataset"),
             lineage=Lineage(input_refs=(), code_ref="git:s6-r44-m2-dataset", environment_digest="oci:s6-reference"),
         )
@@ -148,14 +187,14 @@ class S1ReferencePhysicsSubagentTests(unittest.TestCase):
             kind="log",
             artifact_ref=must_react_ref,
             payload={
-                "adapter_id": "gw_spectrum_surrogate",
+                "adapter_id": GW_SPECTRUM_ADAPTER_ID,
                 "perturbation": {"field": "alpha", "scale": 0.2},
-                "omega": {"value": 0.003, "units": "dimensionless"},
+                "omega": {"value": must_react_omega, "units": "dimensionless"},
             },
             producer=Producer(subsystem="S7", version="1.0.0", actor_id="s7.adapter-broker"),
             lineage=Lineage(
                 input_refs=(dataset_ref,),
-                code_ref="adapter:gw_spectrum_surrogate@1.0.0",
+                code_ref="adapter:gw_spectrum@1.0.0",
                 environment_digest="oci:s7-reference",
             ),
         )
@@ -163,14 +202,14 @@ class S1ReferencePhysicsSubagentTests(unittest.TestCase):
             kind="log",
             artifact_ref=must_not_react_ref,
             payload={
-                "adapter_id": "gw_spectrum_surrogate",
-                "perturbation": {"field": "v_w", "delta": 0.02},
-                "omega": {"value": 0.015, "units": "dimensionless"},
+                "adapter_id": GW_SPECTRUM_ADAPTER_ID,
+                "perturbation": {"field": "v_w.uncertainty.radius", "scale": 2.0},
+                "omega": {"value": observed_omega, "units": "dimensionless"},
             },
             producer=Producer(subsystem="S7", version="1.0.0", actor_id="s7.adapter-broker"),
             lineage=Lineage(
                 input_refs=(dataset_ref,),
-                code_ref="adapter:gw_spectrum_surrogate@1.0.0",
+                code_ref="adapter:gw_spectrum@1.0.0",
                 environment_digest="oci:s7-reference",
             ),
         )
@@ -183,9 +222,9 @@ class S1ReferencePhysicsSubagentTests(unittest.TestCase):
                 "dataset_ref": dataset_ref,
                 "adapter_outputs": {
                     "omega": {
-                        "value": 0.015,
+                        "value": observed_omega,
                         "units": "dimensionless",
-                        "uncertainty": {"kind": "interval", "radius": 0.01},
+                        "uncertainty": {"kind": "interval", "radius": uncertainty_radius},
                     }
                 },
                 "perturbation_observations": {
@@ -193,24 +232,24 @@ class S1ReferencePhysicsSubagentTests(unittest.TestCase):
                     "must_react": {
                         "perturbation": {"field": "alpha", "scale": 0.2},
                         "omega": {
-                            "value": 0.003,
+                            "value": must_react_omega,
                             "units": "dimensionless",
-                            "uncertainty": {"kind": "interval", "radius": 0.01},
+                            "uncertainty": {"kind": "interval", "radius": uncertainty_radius},
                         },
                         "provenance_ref": must_react_ref,
                     },
                     "must_not_react": {
-                        "perturbation": {"field": "v_w", "delta": 0.02},
+                        "perturbation": {"field": "v_w.uncertainty.radius", "scale": 2.0},
                         "omega": {
-                            "value": 0.015,
+                            "value": observed_omega,
                             "units": "dimensionless",
-                            "uncertainty": {"kind": "interval", "radius": 0.01},
+                            "uncertainty": {"kind": "interval", "radius": uncertainty_radius},
                         },
                         "provenance_ref": must_not_react_ref,
                     },
                 },
-                "diagnostics": {"dataset_ref": dataset_ref, "adapter_id": "gw_spectrum_surrogate"},
-                "uncertainty_tag": {"kind": "interval", "source": "gw_spectrum_surrogate"},
+                "diagnostics": {"dataset_ref": dataset_ref, "adapter_id": GW_SPECTRUM_ADAPTER_ID},
+                "uncertainty_tag": {"kind": "interval", "source": GW_SPECTRUM_ADAPTER_ID},
             },
             producer=Producer(subsystem="S1", version="0.0.0", actor_id="s1.reference-physics"),
             lineage=Lineage(
@@ -228,7 +267,7 @@ class S1ReferencePhysicsSubagentTests(unittest.TestCase):
                 "entrypoint": "predict",
                 "model_ref": model_ref,
                 "artifact_refs": [model_ref],
-                "uncertainty_tag": {"kind": "interval", "source": "gw_spectrum_surrogate"},
+                "uncertainty_tag": {"kind": "interval", "source": GW_SPECTRUM_ADAPTER_ID},
             },
             producer=Producer(subsystem="S1", version="0.0.0", actor_id="s1.reference-physics"),
             lineage=Lineage(
@@ -257,7 +296,10 @@ class S1ReferencePhysicsSubagentTests(unittest.TestCase):
         must_react = next(pair for pair in report["perturbation_pairs"] if pair["kind"] == "must_react")
         must_not_react = next(pair for pair in report["perturbation_pairs"] if pair["kind"] == "must_not_react")
 
-        self.assertTrue(all(check["status"] == "PASS" for check in checks.values()))
+        self.assertTrue(
+            all(check["status"] == "PASS" for check in checks.values()),
+            {name: check["status"] for name, check in checks.items()},
+        )
         self.assertEqual(must_react["verdict"], "fail")
         self.assertAlmostEqual(must_react["amplitude_linearity"]["observed"], 0.75)
         self.assertNotEqual(must_react["amplitude_linearity"]["observed"], 1.0)

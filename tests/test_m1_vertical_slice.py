@@ -5,23 +5,22 @@ import unittest
 
 from argus_core import (
     AdapterBroker,
-    AdapterDescriptor,
     BaselineBuilder,
     BuildPlan,
     C3ReportSigner,
     C3ReportVerifier,
     CheckResult,
     EvalRequest,
+    GW_SPECTRUM_ADAPTER_ID,
+    GWSpectrumAdapter,
     InMemoryArtifactStore,
     InMemoryVerifierTrustStore,
     JobEnvelope,
     LifecycleState,
     Lineage,
-    NormalizedQuantity,
     Producer,
     Quantity,
     S3Verifier,
-    SimpleAdapter,
     SubagentDescriptor,
     SubagentRuntime,
     build_subagent_report,
@@ -42,7 +41,7 @@ class M1OracleGatedVerticalSliceTests(unittest.TestCase):
                 subagent_id="subagent-ewpt",
                 contract_version="1.0.0",
                 subtopics=("ewpt",),
-                required_adapters=("gw_spectrum_surrogate",),
+                required_adapters=(GW_SPECTRUM_ADAPTER_ID,),
             )
         )
         acceptance = s1.accept(
@@ -50,8 +49,8 @@ class M1OracleGatedVerticalSliceTests(unittest.TestCase):
                 job_id="job-1",
                 envelope_version="1.0.0",
                 subtopic="ewpt",
-                required_adapters=("gw_spectrum_surrogate",),
-                allowed_adapters=("gw_spectrum_surrogate",),
+                required_adapters=(GW_SPECTRUM_ADAPTER_ID,),
+                allowed_adapters=(GW_SPECTRUM_ADAPTER_ID,),
                 verifier_profile_ref="c4://profile/ewpt/v1",
                 estimated_cost=1,
                 budget_cost=2,
@@ -74,11 +73,13 @@ class M1OracleGatedVerticalSliceTests(unittest.TestCase):
                 job_id="job-1",
                 input_refs=(dataset.artifact_ref,),
                 adapter_request=EvalRequest(
-                    adapter_id="gw_spectrum_surrogate",
+                    adapter_id=GW_SPECTRUM_ADAPTER_ID,
                     inputs={
                         "T_n": Quantity(value=100, units="GeV"),
                         "alpha": Quantity(value=0.2, units="dimensionless"),
+                        "beta_over_H": Quantity(value=100, units="dimensionless"),
                         "v_w": Quantity(value=0.7, units="dimensionless"),
+                        "frequency": Quantity(value=0.003, units="Hz"),
                     },
                     seed=7,
                 ),
@@ -166,29 +167,8 @@ class M1OracleGatedVerticalSliceTests(unittest.TestCase):
         self.assertTrue(artifacts.verify_audit_chain().valid)
 
     @staticmethod
-    def _adapter() -> SimpleAdapter:
-        descriptor = AdapterDescriptor(
-            adapter_id="gw_spectrum_surrogate",
-            version="1.0.0",
-            input_units={"T_n": "GeV", "alpha": "dimensionless", "v_w": "dimensionless"},
-            output_units={"omega": "dimensionless"},
-            validity_domain={"v_w": (0.4, 0.95)},
-            determinism="deterministic",
-            provenance_ref="c4://adapter/gw_spectrum_surrogate/v1",
-            differentiable=True,
-        )
-        return SimpleAdapter(descriptor, M1OracleGatedVerticalSliceTests._evaluate)
-
-    @staticmethod
-    def _evaluate(inputs: dict[str, NormalizedQuantity], _seed: int | None) -> dict[str, Quantity]:
-        omega = inputs["alpha"].value * inputs["T_n"].value / 1000.0
-        return {
-            "omega": Quantity(
-                value=omega,
-                units="dimensionless",
-                uncertainty={"kind": "interval", "radius": 0.01},
-            )
-        }
+    def _adapter():
+        return GWSpectrumAdapter().as_simple_adapter()
 
 
 if __name__ == "__main__":

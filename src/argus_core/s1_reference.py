@@ -49,13 +49,14 @@ from .s3 import (
     run_perturbation_pair,
 )
 from .s6 import CapabilityDescriptor, ContaminationIndex, FrozenContaminationSnapshot, SourceDocument
-from .s7 import AdapterBroker, AdapterDescriptor, NormalizedQuantity, Quantity, SimpleAdapter
+from .gw_spectrum import GW_SPECTRUM_ADAPTER_ID, GWSpectrumAdapter, evaluate_sound_wave_spectrum
+from .s7 import AdapterBroker, Quantity, SimpleAdapter
 from .s8 import ArtifactRecord, InMemoryArtifactStore, Lineage, Producer
 from .s10 import InMemoryAuditLedger, InMemoryTokenService, ScopeGrant
 from .s11 import ObservatoryLineageBundle, ObservatoryRenderResult, render_observatory_v0_html
 
 
-S1_REFERENCE_PHYSICS_ADAPTER_ID = "gw_spectrum_surrogate"
+S1_REFERENCE_PHYSICS_ADAPTER_ID = GW_SPECTRUM_ADAPTER_ID
 S1_REFERENCE_PHYSICS_SUBTOPIC = "ewpt"
 S1_REFERENCE_PHYSICS_PROFILE_REF = "c4://profile/ewpt-reference/v1"
 S1_REFERENCE_PHYSICS_DATASET_REF = "c4://dataset/ewpt-reference/v1"
@@ -63,7 +64,7 @@ S1_REFERENCE_PHYSICS_PROPONENT_ID = "s1-reference-physics"
 S1_REFERENCE_S3_VERIFIER_ID = "s3-reference-verifier"
 S1_REFERENCE_S3_REFEREE_KEY_ID = "s3-reference-referee-key"
 S1_REFERENCE_SHOULD_REACT_ALPHA_SCALE = 0.2
-S1_REFERENCE_MUST_NOT_REACT_VW_DELTA = 0.02
+S1_REFERENCE_MUST_NOT_REACT_VW_UNCERTAINTY_SCALE = 2.0
 
 S3ReferenceSignerFactory = Callable[[str, bytes], S3ReportSignerProtocol]
 
@@ -342,10 +343,30 @@ class S1ReferencePhysicsHarness:
             producer=Producer(subsystem="S3", version="0.0.0", actor_id="s3.reference-profile"),
             lineage=Lineage(input_refs=(), code_ref="git:s3-reference-profile", environment_digest="oci:s3-reference"),
         )
+        adapter_inputs = _reference_adapter_inputs()
+        known_omega = _reference_predict_omega(
+            {"model_family": "ewpt-tabular-reference"},
+            t_n=_reference_input_value(adapter_inputs, "T_n"),
+            alpha=_reference_input_value(adapter_inputs, "alpha"),
+            beta_over_h=_reference_input_value(adapter_inputs, "beta_over_H"),
+            wall_velocity=_reference_input_value(adapter_inputs, "v_w"),
+            frequency_hz=_reference_input_value(adapter_inputs, "frequency"),
+        )
         self.artifact_store.create_artifact(
             kind="dataset",
             artifact_ref=S1_REFERENCE_PHYSICS_DATASET_REF,
-            payload={"rows": [{"T_n": 100.0, "alpha": 0.2, "v_w": 0.7, "known_omega": 0.02}]},
+            payload={
+                "rows": [
+                    {
+                        "T_n": _reference_input_value(adapter_inputs, "T_n"),
+                        "alpha": _reference_input_value(adapter_inputs, "alpha"),
+                        "beta_over_H": _reference_input_value(adapter_inputs, "beta_over_H"),
+                        "v_w": _reference_input_value(adapter_inputs, "v_w"),
+                        "frequency": _reference_input_value(adapter_inputs, "frequency"),
+                        "known_omega": known_omega,
+                    }
+                ]
+            },
             producer=Producer(subsystem="S6", version="0.0.0", actor_id="s6.reference-dataset"),
             lineage=Lineage(input_refs=(), code_ref="git:s6-reference-dataset", environment_digest="oci:s6-reference"),
         )
@@ -486,6 +507,17 @@ class S1ReferencePhysicsSubagent(Subagent):
             {"inputs": self.adapter_inputs, "seed": 7},
         )
         result = dict(adapter_call["result"])
+        output_payloads = result.get("outputs")
+        if not isinstance(output_payloads, Mapping):
+            raise ValueError("C6 result outputs must be an object")
+        omega_payload = output_payloads.get("omega")
+        if not isinstance(omega_payload, Mapping):
+            raise ValueError("C6 result outputs.omega must be an object")
+        omega_uncertainty = omega_payload.get("uncertainty")
+        if not isinstance(omega_uncertainty, Mapping) or omega_uncertainty.get("kind") != "interval":
+            raise ValueError("C6 result outputs.omega must carry interval uncertainty")
+        omega_radius = float(omega_uncertainty["radius"])
+        omega_source = str(omega_uncertainty.get("source") or S1_REFERENCE_PHYSICS_ADAPTER_ID)
         perturbation_observations = _reference_adapter_perturbation_observations(
             ctx=ctx,
             adapter_inputs=self.adapter_inputs,
@@ -523,7 +555,7 @@ class S1ReferencePhysicsSubagent(Subagent):
             "adapter_outputs": result["outputs"],
             "perturbation_observations": perturbation_observations,
             "diagnostics": diagnostics,
-            "uncertainty_tag": {"kind": "interval", "source": "gw_spectrum_surrogate"},
+            "uncertainty_tag": {"kind": "interval", "source": omega_source},
         }
         lineage_inputs = (
             self.dataset_ref,
@@ -553,7 +585,7 @@ class S1ReferencePhysicsSubagent(Subagent):
                 "entrypoint": "predict",
                 "model_ref": model["artifact_ref"],
                 "adapter_provenance_ref": adapter_call["provenance_ref"],
-                "uncertainty_tag": {"kind": "interval", "source": "gw_spectrum_surrogate"},
+                "uncertainty_tag": {"kind": "interval", "source": omega_source},
             },
             kind="container",
             lineage=Lineage(
@@ -577,7 +609,7 @@ class S1ReferencePhysicsSubagent(Subagent):
             ],
             "uncertainty_summary": ctx.tag_uncertainty(
                 "interval",
-                {"radius": 0.01, "source": "gw_spectrum_surrogate"},
+                {"radius": omega_radius, "source": omega_source},
             ),
         }
 
@@ -666,7 +698,9 @@ def _reference_adapter_inputs() -> dict[str, dict[str, object]]:
     return {
         "T_n": {"value": 100.0, "units": "GeV", "uncertainty": {"kind": "interval", "radius": 1.0}},
         "alpha": {"value": 0.2, "units": "dimensionless", "uncertainty": {"kind": "interval", "radius": 0.01}},
+        "beta_over_H": {"value": 100.0, "units": "dimensionless", "uncertainty": {"kind": "interval", "radius": 5.0}},
         "v_w": {"value": 0.7, "units": "dimensionless", "uncertainty": {"kind": "interval", "radius": 0.02}},
+        "frequency": {"value": 0.003, "units": "Hz", "uncertainty": {"kind": "interval", "radius": 0.0001}},
     }
 
 
@@ -686,10 +720,10 @@ def _reference_adapter_perturbation_observations(
     )
     must_react_result = dict(must_react_call["result"])
 
-    must_not_react_inputs = _reference_inputs_with_value(
+    must_not_react_inputs = _reference_inputs_with_uncertainty_scale(
         adapter_inputs,
         field="v_w",
-        value=_reference_null_vw_value(_reference_input_value(adapter_inputs, "v_w")),
+        scale=S1_REFERENCE_MUST_NOT_REACT_VW_UNCERTAINTY_SCALE,
     )
     must_not_react_call = ctx.call_adapter(
         S1_REFERENCE_PHYSICS_ADAPTER_ID,
@@ -710,8 +744,8 @@ def _reference_adapter_perturbation_observations(
         },
         "must_not_react": {
             "perturbation": {
-                "field": "v_w",
-                "delta": S1_REFERENCE_MUST_NOT_REACT_VW_DELTA,
+                "field": "v_w.uncertainty.radius",
+                "scale": S1_REFERENCE_MUST_NOT_REACT_VW_UNCERTAINTY_SCALE,
             },
             "omega": dict(must_not_react_result["outputs"]["omega"]),
             "provenance_ref": str(must_not_react_call["provenance_ref"]),
@@ -738,39 +772,22 @@ def _reference_input_value(adapter_inputs: Mapping[str, Any], field: str) -> flo
     return float(quantity["value"])
 
 
-def _reference_null_vw_value(value: float) -> float:
-    candidate = value + S1_REFERENCE_MUST_NOT_REACT_VW_DELTA
-    if candidate <= 0.95:
-        return candidate
-    return value - S1_REFERENCE_MUST_NOT_REACT_VW_DELTA
+def _reference_inputs_with_uncertainty_scale(
+    adapter_inputs: Mapping[str, Any],
+    *,
+    field: str,
+    scale: float,
+) -> dict[str, Any]:
+    updated = {key: dict(quantity) for key, quantity in adapter_inputs.items()}
+    uncertainty = updated[field].get("uncertainty")
+    if not isinstance(uncertainty, Mapping) or "radius" not in uncertainty:
+        raise ValueError(f"reference adapter input {field} must carry interval uncertainty")
+    updated[field]["uncertainty"] = {**uncertainty, "radius": float(uncertainty["radius"]) * scale}
+    return updated
 
 
 def _reference_physics_adapter() -> SimpleAdapter:
-    return SimpleAdapter(
-        AdapterDescriptor(
-            adapter_id=S1_REFERENCE_PHYSICS_ADAPTER_ID,
-            version="1.0.0",
-            input_units={"T_n": "GeV", "alpha": "dimensionless", "v_w": "dimensionless"},
-            output_units={"omega": "dimensionless"},
-            validity_domain={"v_w": (0.4, 0.95)},
-            determinism="deterministic",
-            provenance_ref="c4://adapter/gw_spectrum_surrogate/v1",
-            differentiable=True,
-            independence_tags=("reference-physics",),
-        ),
-        _evaluate_reference_physics,
-    )
-
-
-def _evaluate_reference_physics(inputs: dict[str, NormalizedQuantity], _seed: int | None) -> dict[str, Quantity]:
-    omega = inputs["alpha"].value * inputs["T_n"].value / 1000.0
-    return {
-        "omega": Quantity(
-            value=omega,
-            units="dimensionless",
-            uncertainty={"kind": "interval", "radius": 0.01},
-        )
-    }
+    return GWSpectrumAdapter().as_simple_adapter()
 
 
 def _reference_plugin_checks(
@@ -819,11 +836,14 @@ def _reference_check_plugins(
     row = _reference_dataset_row(dataset_payload)
     observed_omega = _reference_observed_omega(model_payload)
     expected_omega = float(row["known_omega"])
-    omega_tolerance = max(_reference_omega_tolerance(model_payload), 0.01)
+    omega_tolerance = max(_reference_omega_tolerance(model_payload), abs(observed_omega) * 0.01, 1e-30)
     expected_from_equation = _reference_predict_omega(
         model_payload,
         t_n=float(row["T_n"]),
         alpha=float(row["alpha"]),
+        beta_over_h=float(row.get("beta_over_H", 100.0)),
+        wall_velocity=float(row.get("v_w", 0.7)),
+        frequency_hz=float(row.get("frequency", 0.003)),
     )
     recap_vault, recap_stage = _reference_recap_stage(
         artifact_store=artifact_store,
@@ -1116,7 +1136,14 @@ def _reference_perturbation_outcome(
     expected_omega = float(row["known_omega"])
     observed_omega = _reference_observed_omega(model_payload)
     perturbed_alpha = alpha * S1_REFERENCE_SHOULD_REACT_ALPHA_SCALE
-    expected_perturbed_omega = _reference_predict_omega(model_payload, t_n=t_n, alpha=perturbed_alpha)
+    expected_perturbed_omega = _reference_predict_omega(
+        model_payload,
+        t_n=t_n,
+        alpha=perturbed_alpha,
+        beta_over_h=float(row.get("beta_over_H", 100.0)),
+        wall_velocity=float(row.get("v_w", 0.7)),
+        frequency_hz=float(row.get("frequency", 0.003)),
+    )
     expected_delta = expected_omega - expected_perturbed_omega
 
     observed_perturbed_omega = _reference_observed_perturbation_omega(model_payload, "must_react")
@@ -1218,10 +1245,24 @@ def _reference_omega_payload(model_payload: Mapping[str, Any]) -> Mapping[str, A
     return omega
 
 
-def _reference_predict_omega(model_payload: Mapping[str, Any], *, t_n: float, alpha: float) -> float:
+def _reference_predict_omega(
+    model_payload: Mapping[str, Any],
+    *,
+    t_n: float,
+    alpha: float,
+    beta_over_h: float,
+    wall_velocity: float,
+    frequency_hz: float,
+) -> float:
     if model_payload.get("model_family") != "ewpt-tabular-reference":
         raise ValueError("reference S3 verifier only supports ewpt-tabular-reference models")
-    return alpha * t_n / 1000.0
+    return evaluate_sound_wave_spectrum(
+        temperature_gev=t_n,
+        alpha=alpha,
+        beta_over_h=beta_over_h,
+        wall_velocity=wall_velocity,
+        frequency_hz=frequency_hz,
+    ).omega
 
 
 def _reference_candidate_text(*, model_payload: Mapping[str, Any], observed_omega: float) -> str:
