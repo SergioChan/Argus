@@ -3,14 +3,14 @@
 from __future__ import annotations
 
 import copy
-from dataclasses import asdict, dataclass, field, replace
+from dataclasses import asdict, dataclass, field, is_dataclass, replace
 import json
 import math
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Mapping, Protocol
 
 from .hashing import hash_json
 from .s6 import CapabilityDescriptor, InMemoryRegistry, IndependenceAttestation
-from .s8 import InMemoryArtifactStore, Lineage, Producer
+from .s8 import ArtifactRecord, InMemoryArtifactStore, Lineage, Producer, assert_lineage_complete
 
 
 UNIT_REGISTRY_VERSION = "argus-units-1.0.0"
@@ -76,6 +76,25 @@ JAX_BACKEND_HASH = hash_json(
         "version": JAX_BACKEND_VERSION,
         "invoke": "JAX pure function over normalized scalar inputs",
         "grad": "jax.jacfwd over output/input pytrees",
+    }
+)
+S7_PROVENANCE_EMITTER_VERSION = "argus-s7-provenance-1.0.0"
+S7_PROVENANCE_SCHEMA_VERSION = "argus.s7.provenance.v1"
+S7_PROVENANCE_EMITTER_HASH = hash_json(
+    {
+        "version": S7_PROVENANCE_EMITTER_VERSION,
+        "schema": S7_PROVENANCE_SCHEMA_VERSION,
+        "required_call_fields": (
+            "adapter_version",
+            "underlying_code_version",
+            "seed",
+            "config_hash",
+            "input_hashes",
+            "container_digest",
+            "environment_digest",
+            "unit_registry_version",
+        ),
+        "failure_policy": "fail_closed_provenance_unavailable",
     }
 )
 C6_CONTRACT_VERSION = "2.3.0"
@@ -819,6 +838,7 @@ class S7Backend:
     backend_version: str = "unknown"
     backend_hash: str = "blake3:" + ("0" * 64)
     underlying_code_version: str = "unknown"
+    container_digest: str = ""
 
     def invoke(
         self,
@@ -856,6 +876,7 @@ class S7NativePythonBackend(S7Backend):
         self.backend_name = "native_python"
         self.backend_version = NATIVE_PYTHON_BACKEND_VERSION
         self.backend_hash = NATIVE_PYTHON_BACKEND_HASH
+        self.container_digest = self.backend_hash
         self.underlying_code_version = _required_backend_string(
             underlying_code_version,
             "underlying_code_version",
@@ -921,6 +942,7 @@ class S7JaxBackend(S7Backend):
         self.backend_name = "jax"
         self.backend_version = JAX_BACKEND_VERSION
         self.backend_hash = JAX_BACKEND_HASH
+        self.container_digest = self.backend_hash
         self.underlying_code_version = _required_backend_string(
             underlying_code_version or f"jax:{getattr(jax, '__version__', 'unknown')}",
             "underlying_code_version",
@@ -988,6 +1010,252 @@ class S7JaxBackend(S7Backend):
             field: self._jnp.asarray(quantity.value, dtype=self._jnp.float64)
             for field, quantity in normalized_inputs.items()
         }
+
+
+class S7ArtifactStore(Protocol):
+    """The C4 writer boundary used by the S7 provenance emitter."""
+
+    def create_artifact(
+        self,
+        *,
+        kind: str,
+        payload: Any,
+        producer: Producer,
+        lineage: Lineage,
+        artifact_ref: str | None = None,
+        claim_tier: str = "ran-toy",
+        validation_report_ref: str | None = None,
+        created_at: str | None = None,
+    ) -> ArtifactRecord: ...
+
+
+class S7ProvenanceEmitter:
+    """Writes complete, fail-closed C4 provenance for S7 broker calls."""
+
+    def __init__(self, *, artifact_store: S7ArtifactStore) -> None:
+        if artifact_store is None:
+            raise ProvenanceUnavailableError("S8 artifact store unavailable")
+        self._artifact_store = artifact_store
+
+    @property
+    def artifact_store(self) -> S7ArtifactStore:
+        return self._artifact_store
+
+    def emit_call(
+        self,
+        *,
+        descriptor: AdapterDescriptor,
+        request: EvalRequest | GradRequest,
+        seed_decision: S7SeedDecision,
+        normalized_inputs: Mapping[str, NormalizedQuantity],
+        outputs: Mapping[str, Quantity] | None,
+        jacobian: Mapping[str, Mapping[str, JacobianEntry]] | None,
+        domain_diagnostics: Mapping[str, Any],
+        method: str,
+        backend: S7Backend,
+        unit_registry: S7UnitRegistry,
+        uncertainty_engine: S7UncertaintyEngine,
+        validity_domain_guard: S7ValidityDomainGuard,
+        seed_manager: S7SeedManager,
+    ) -> str:
+        try:
+            input_hashes = {
+                field: hash_json(_s7_provenance_jsonable(asdict(quantity)))
+                for field, quantity in sorted(normalized_inputs.items())
+            }
+            input_hash = hash_json({field: asdict(quantity) for field, quantity in normalized_inputs.items()})
+            container_digest = self._required_value(backend.container_digest, "backend.container_digest")
+            backend_hash = self._required_value(backend.backend_hash, "backend.backend_hash")
+            underlying_code_version = self._required_value(
+                backend.underlying_code_version,
+                "backend.underlying_code_version",
+            )
+            config_hash = hash_json(
+                {
+                    "adapter": {
+                        "adapter_id": descriptor.adapter_id,
+                        "version": descriptor.version,
+                        "input_units": _s7_provenance_jsonable(descriptor.input_units),
+                        "output_units": _s7_provenance_jsonable(descriptor.output_units),
+                        "validity_domain": _s7_provenance_jsonable(descriptor.validity_domain),
+                        "domain_policy": descriptor.domain_policy,
+                        "determinism": descriptor.determinism,
+                        "differentiable": descriptor.differentiable,
+                        "cost_class": descriptor.cost_class,
+                        "independence_tags": list(descriptor.independence_tags),
+                        "provenance_ref": descriptor.provenance_ref,
+                    },
+                    "backend": {
+                        "name": backend.backend_name,
+                        "version": backend.backend_version,
+                        "hash": backend_hash,
+                        "container_digest": container_digest,
+                        "underlying_code_version": underlying_code_version,
+                    },
+                }
+            )
+            environment_digest = hash_json(
+                {
+                    "backend_name": backend.backend_name,
+                    "backend_version": backend.backend_version,
+                    "backend_hash": backend_hash,
+                    "container_digest": container_digest,
+                    "underlying_code_version": underlying_code_version,
+                }
+            )
+            payload: dict[str, Any] = {
+                "schema": S7_PROVENANCE_SCHEMA_VERSION,
+                "emitter_version": S7_PROVENANCE_EMITTER_VERSION,
+                "emitter_hash": S7_PROVENANCE_EMITTER_HASH,
+                "method": method,
+                "c6_version": request.c6_version,
+                "adapter_id": descriptor.adapter_id,
+                "adapter_version": descriptor.version,
+                "backend_name": backend.backend_name,
+                "backend_version": backend.backend_version,
+                "backend_hash": backend_hash,
+                "container_digest": container_digest,
+                "underlying_code_version": underlying_code_version,
+                "config_hash": config_hash,
+                "environment_digest": environment_digest,
+                "input_hash": input_hash,
+                "input_hashes": input_hashes,
+                "seed": seed_decision.seed_used,
+                "seed_used": seed_decision.seed_used,
+                "seed_source": seed_decision.seed_source,
+                "seed_derivation": _s7_provenance_jsonable(seed_decision.seed_derivation),
+                "seed_manager_version": seed_manager.version,
+                "seed_manager_hash": seed_manager.manager_hash,
+                "unit_registry_version": unit_registry.version,
+                "unit_registry_hash": unit_registry.registry_hash,
+                "validity_domain_guard_version": validity_domain_guard.version,
+                "validity_domain_guard_hash": validity_domain_guard.guard_hash,
+                "domain_diagnostics": _s7_provenance_jsonable(domain_diagnostics),
+                "domain_diagnostics_hash": hash_json(_s7_provenance_jsonable(domain_diagnostics)),
+            }
+            if request.budget_token_ref is not None:
+                payload["budget_token_ref"] = request.budget_token_ref
+            if outputs is not None:
+                payload.update(
+                    {
+                        "output_hash": hash_json({key: asdict(value) for key, value in outputs.items()}),
+                        "uncertainty_engine_version": uncertainty_engine.version,
+                        "uncertainty_engine_hash": uncertainty_engine.engine_hash,
+                        "uncertainty_hash": hash_json({key: value.uncertainty for key, value in outputs.items()}),
+                        "uncertainty_summary": {
+                            key: uncertainty_engine.summarize(value.uncertainty or {})
+                            for key, value in sorted(outputs.items())
+                        },
+                    }
+                )
+            if jacobian is not None:
+                jacobian_payload = _jacobian_payload(dict(jacobian))
+                payload.update(
+                    {
+                        "jacobian": jacobian_payload,
+                        "jacobian_hash": hash_json(jacobian_payload),
+                    }
+                )
+            lineage = Lineage(
+                input_refs=(self._required_value(descriptor.provenance_ref, "descriptor.provenance_ref"),),
+                code_ref=(
+                    f"adapter:{descriptor.adapter_id}@{descriptor.version}"
+                    if method == "evaluate"
+                    else f"adapter:{descriptor.adapter_id}@{descriptor.version}#{method}"
+                ),
+                environment_digest=environment_digest,
+                seeds=(str(seed_decision.seed_used),) if seed_decision.seed_used is not None else (),
+            )
+            return self._emit(payload=payload, producer=Producer(subsystem="S7", version=descriptor.version), lineage=lineage)
+        except ProvenanceUnavailableError:
+            raise
+        except Exception as exc:
+            raise ProvenanceUnavailableError("S7 provenance emission failed") from exc
+
+    def emit_batch_partial(
+        self,
+        *,
+        request: BatchEvaluateRequest,
+        items: tuple[BatchEvaluateItemResult, ...],
+        spent_units: float,
+        remaining_units: float,
+        halted_index: int,
+        error: S7ErrorEnvelope,
+        c6_version: str,
+    ) -> str:
+        try:
+            completed_refs = tuple(item.result.provenance_ref for item in items if item.result is not None)
+            environment_digest = hash_json(
+                {
+                    "method": "batch_evaluate",
+                    "c6_version": c6_version,
+                    "budget_token_ref": request.budget_token.token_ref,
+                }
+            )
+            payload = {
+                "schema": "argus.s7.batch-provenance.v1",
+                "emitter_version": S7_PROVENANCE_EMITTER_VERSION,
+                "emitter_hash": S7_PROVENANCE_EMITTER_HASH,
+                "method": "batch_evaluate",
+                "c6_version": c6_version,
+                "requested_count": len(request.items),
+                "completed_count": len(completed_refs),
+                "completed_provenance_refs": list(completed_refs),
+                "item_statuses": [
+                    {
+                        "index": item.index,
+                        "status": "OK" if item.result is not None else "ERROR",
+                        "provenance_ref": item.result.provenance_ref if item.result is not None else None,
+                        "error": asdict(item.error) if item.error is not None else None,
+                    }
+                    for item in items
+                ],
+                "budget": {
+                    "token_ref": request.budget_token.token_ref,
+                    "limit_units": request.budget_token.remaining_units,
+                    "unit_cost": request.budget_token.unit_cost,
+                    "spent_units": spent_units,
+                    "remaining_units": remaining_units,
+                    "halted_reason": error.category,
+                    "halted_index": halted_index,
+                },
+                "halt_error": asdict(error),
+                "environment_digest": environment_digest,
+            }
+            lineage = Lineage(
+                input_refs=completed_refs,
+                code_ref=f"s7:batch_evaluate@C6-{c6_version}",
+                environment_digest=environment_digest,
+                seeds=tuple(
+                    str(item.result.seed_used)
+                    for item in items
+                    if item.result is not None and item.result.seed_used is not None
+                ),
+            )
+            return self._emit(payload=payload, producer=Producer(subsystem="S7", version=c6_version), lineage=lineage)
+        except ProvenanceUnavailableError:
+            raise
+        except Exception as exc:
+            raise ProvenanceUnavailableError("S7 partial provenance emission failed") from exc
+
+    def _emit(self, *, payload: Mapping[str, Any], producer: Producer, lineage: Lineage) -> str:
+        assert_lineage_complete(lineage, kind="log", payload=payload)
+        record = self._artifact_store.create_artifact(
+            kind="log",
+            payload=dict(payload),
+            producer=producer,
+            lineage=lineage,
+        )
+        artifact_ref = getattr(record, "artifact_ref", None)
+        if not isinstance(artifact_ref, str) or not artifact_ref:
+            raise RuntimeError("S8 provenance writer returned no artifact_ref")
+        return artifact_ref
+
+    @staticmethod
+    def _required_value(value: Any, field_name: str) -> str:
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"{field_name} must be a non-empty string")
+        return value.strip()
 
 
 class Adapter:
@@ -1317,7 +1585,8 @@ class AdapterBroker:
     def __init__(
         self,
         *,
-        artifact_store: InMemoryArtifactStore | None,
+        artifact_store: S7ArtifactStore | None,
+        provenance_emitter: S7ProvenanceEmitter | None = None,
         unit_registry: S7UnitRegistry | None = None,
         uncertainty_engine: S7UncertaintyEngine | None = None,
         validity_domain_guard: S7ValidityDomainGuard | None = None,
@@ -1326,7 +1595,16 @@ class AdapterBroker:
         required_scopes: tuple[str, ...] = (),
         circuit_breaker_failure_threshold: int = 3,
     ) -> None:
-        self._artifact_store = artifact_store
+        if provenance_emitter is not None:
+            if artifact_store is not None and provenance_emitter.artifact_store is not artifact_store:
+                raise AdapterConformanceError("artifact_store and provenance_emitter must share the same C4 writer")
+            self._artifact_store = provenance_emitter.artifact_store
+            self._provenance_emitter = provenance_emitter
+        else:
+            self._artifact_store = artifact_store
+            self._provenance_emitter = (
+                S7ProvenanceEmitter(artifact_store=artifact_store) if artifact_store is not None else None
+            )
         self._unit_registry = unit_registry or S7UnitRegistry.default()
         self._uncertainty_engine = uncertainty_engine or S7UncertaintyEngine.default()
         self._validity_domain_guard = validity_domain_guard or S7ValidityDomainGuard(unit_registry=self._unit_registry)
@@ -1670,74 +1948,23 @@ class AdapterBroker:
         method: str,
         backend: S7Backend,
     ) -> str:
-        if self._artifact_store is None:
+        if self._provenance_emitter is None:
             raise ProvenanceUnavailableError("S8 artifact store unavailable")
-        input_hash = hash_json({key: asdict(value) for key, value in normalized_inputs.items()})
-        payload = {
-            "method": method,
-            "adapter_id": descriptor.adapter_id,
-            "adapter_version": descriptor.version,
-            "backend_name": backend.backend_name,
-            "backend_version": backend.backend_version,
-            "backend_hash": backend.backend_hash,
-            "underlying_code_version": backend.underlying_code_version,
-            "input_hash": input_hash,
-            "seed": seed_decision.seed_used,
-            "seed_used": seed_decision.seed_used,
-            "seed_source": seed_decision.seed_source,
-            "seed_derivation": seed_decision.seed_derivation,
-            "seed_manager_version": self._seed_manager.version,
-            "seed_manager_hash": self._seed_manager.manager_hash,
-            "unit_registry_version": self._unit_registry.version,
-            "unit_registry_hash": self._unit_registry.registry_hash,
-            "validity_domain_guard_version": self._validity_domain_guard.version,
-            "validity_domain_guard_hash": self._validity_domain_guard.guard_hash,
-            "domain_diagnostics": dict(domain_diagnostics),
-            "domain_diagnostics_hash": hash_json(domain_diagnostics),
-        }
-        if outputs is not None:
-            payload.update(
-                {
-                    "output_hash": hash_json({key: asdict(value) for key, value in outputs.items()}),
-                    "uncertainty_engine_version": self._uncertainty_engine.version,
-                    "uncertainty_engine_hash": self._uncertainty_engine.engine_hash,
-                    "uncertainty_hash": hash_json({key: value.uncertainty for key, value in outputs.items()}),
-                    "uncertainty_summary": {
-                        key: self._uncertainty_engine.summarize(value.uncertainty or {})
-                        for key, value in outputs.items()
-                    },
-                }
-            )
-        if jacobian is not None:
-            jacobian_payload = _jacobian_payload(jacobian)
-            payload.update(
-                {
-                    "jacobian": jacobian_payload,
-                    "jacobian_hash": hash_json(jacobian_payload),
-                }
-            )
-        record = self._artifact_store.create_artifact(
-            kind="log",
-            payload=payload,
-            producer=Producer(subsystem="S7", version=descriptor.version),
-            lineage=Lineage(
-                input_refs=(descriptor.provenance_ref,),
-                code_ref=f"adapter:{descriptor.adapter_id}@{descriptor.version}"
-                if method == "evaluate"
-                else f"adapter:{descriptor.adapter_id}@{descriptor.version}#{method}",
-                environment_digest=hash_json(
-                    {
-                        "adapter": descriptor.adapter_id,
-                        "version": descriptor.version,
-                        "backend_name": backend.backend_name,
-                        "backend_hash": backend.backend_hash,
-                        "underlying_code_version": backend.underlying_code_version,
-                    }
-                ),
-                seeds=(str(seed_decision.seed_used),) if seed_decision.seed_used is not None else (),
-            ),
+        return self._provenance_emitter.emit_call(
+            descriptor=descriptor,
+            request=request,
+            seed_decision=seed_decision,
+            normalized_inputs=normalized_inputs,
+            outputs=outputs,
+            jacobian=jacobian,
+            domain_diagnostics=domain_diagnostics,
+            method=method,
+            backend=backend,
+            unit_registry=self._unit_registry,
+            uncertainty_engine=self._uncertainty_engine,
+            validity_domain_guard=self._validity_domain_guard,
+            seed_manager=self._seed_manager,
         )
-        return record.artifact_ref
 
     def _write_batch_partial_provenance(
         self,
@@ -1749,61 +1976,17 @@ class AdapterBroker:
         halted_index: int,
         error: S7ErrorEnvelope,
     ) -> str:
-        if self._artifact_store is None:
+        if self._provenance_emitter is None:
             raise ProvenanceUnavailableError("S8 artifact store unavailable")
-        completed_refs = tuple(
-            item.result.provenance_ref
-            for item in items
-            if item.result is not None
+        return self._provenance_emitter.emit_batch_partial(
+            request=request,
+            items=items,
+            spent_units=spent_units,
+            remaining_units=remaining_units,
+            halted_index=halted_index,
+            error=error,
+            c6_version=self._c6_version,
         )
-        payload = {
-            "method": "batch_evaluate",
-            "c6_version": self._c6_version,
-            "requested_count": len(request.items),
-            "completed_count": len(completed_refs),
-            "completed_provenance_refs": list(completed_refs),
-            "item_statuses": [
-                {
-                    "index": item.index,
-                    "status": "OK" if item.result is not None else "ERROR",
-                    "provenance_ref": item.result.provenance_ref if item.result is not None else None,
-                    "error": asdict(item.error) if item.error is not None else None,
-                }
-                for item in items
-            ],
-            "budget": {
-                "token_ref": request.budget_token.token_ref,
-                "limit_units": request.budget_token.remaining_units,
-                "unit_cost": request.budget_token.unit_cost,
-                "spent_units": spent_units,
-                "remaining_units": remaining_units,
-                "halted_reason": error.category,
-                "halted_index": halted_index,
-            },
-            "halt_error": asdict(error),
-        }
-        record = self._artifact_store.create_artifact(
-            kind="log",
-            payload=payload,
-            producer=Producer(subsystem="S7", version=self._c6_version),
-            lineage=Lineage(
-                input_refs=completed_refs,
-                code_ref=f"s7:batch_evaluate@C6-{self._c6_version}",
-                environment_digest=hash_json(
-                    {
-                        "method": "batch_evaluate",
-                        "c6_version": self._c6_version,
-                        "budget_token_ref": request.budget_token.token_ref,
-                    }
-                ),
-                seeds=tuple(
-                    str(item.result.seed_used)
-                    for item in items
-                    if item.result is not None and item.result.seed_used is not None
-                ),
-            ),
-        )
-        return record.artifact_ref
 
     def _normalize_outputs_conform(self, outputs: dict[str, Quantity], expected_units: dict[str, Any]) -> dict[str, Quantity]:
         extra_fields = set(outputs) - set(expected_units)
@@ -2325,6 +2508,26 @@ def _finite_backend_number(value: Any, field_name: str) -> float:
 
 def _finite_jacobian_value(value: Any, field_name: str) -> float:
     return _finite_backend_number(value, field_name)
+
+
+def _s7_provenance_jsonable(value: Any) -> Any:
+    """Normalize S7 configuration and diagnostics before content-addressed hashing."""
+
+    if is_dataclass(value):
+        return _s7_provenance_jsonable(asdict(value))
+    if isinstance(value, Mapping):
+        return {str(key): _s7_provenance_jsonable(item) for key, item in value.items()}
+    if isinstance(value, (tuple, list)):
+        return [_s7_provenance_jsonable(item) for item in value]
+    if isinstance(value, set):
+        return sorted(_s7_provenance_jsonable(item) for item in value)
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError("S7 provenance cannot hash non-finite values")
+        return value
+    if value is None or isinstance(value, (str, int, bool)):
+        return value
+    raise TypeError(f"S7 provenance value is not JSON-compatible: {type(value).__name__}")
 
 
 def _jacobian_payload(jacobian: Mapping[str, Mapping[str, JacobianEntry]]) -> dict[str, dict[str, dict[str, Any]]]:

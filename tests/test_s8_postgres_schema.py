@@ -12,16 +12,23 @@ from tempfile import TemporaryDirectory
 import unittest
 
 from argus_core import (
+    AdapterBroker,
+    AdapterDescriptor,
     ArtifactRecord,
     DatasetRegistry,
     DatasetSplit,
+    EvalRequest,
     HashMismatchError,
     IllegalTierError,
     InMemoryArtifactStore,
     InMemoryObjectStore,
     Lineage,
     Producer,
+    Quantity,
+    S7NativePythonBackend,
     SignatureInvalidError,
+    SimpleAdapter,
+    assert_lineage_complete,
     hash_bytes,
     hash_json,
 )
@@ -277,6 +284,68 @@ class S8PostgresSchemaTests(unittest.TestCase):
         self.assertEqual(input_edge.stdout.strip(), "1")
         self.assertEqual(report_edge.stdout.strip(), "1")
         self.assertEqual(record_count.stdout.strip(), "3")
+
+    def test_s7_provenance_emitter_commits_complete_record_through_postgres_ledger(self) -> None:
+        store = self._postgres_store()
+        descriptor_record = store.create_artifact(
+            kind="adapter_descriptor",
+            payload={"adapter_id": "postgres_provenance_fixture", "version": "1.0.0"},
+            producer=Producer(subsystem="S7", version="1.0.0"),
+            lineage=Lineage(
+                input_refs=(),
+                code_ref="adapter:postgres_provenance_fixture@1.0.0",
+                environment_digest=hash_json({"fixture": "s7-provenance-parent"}),
+            ),
+        )
+        backend = S7NativePythonBackend(
+            evaluate=lambda inputs, _ctx: {
+                "omega": Quantity(
+                    value=inputs["alpha"].value,
+                    units="dimensionless",
+                    uncertainty={"kind": "interval", "radius": 0.01},
+                )
+            },
+            underlying_code_version="postgres-provenance-fixture@1",
+        )
+        broker = AdapterBroker(artifact_store=store)
+        broker.register(
+            SimpleAdapter(
+                AdapterDescriptor(
+                    adapter_id="postgres_provenance_fixture",
+                    version="1.0.0",
+                    input_units={"alpha": "dimensionless"},
+                    output_units={"omega": "dimensionless"},
+                    validity_domain={"alpha": (0.0, 1.0)},
+                    determinism="deterministic",
+                    provenance_ref=descriptor_record.artifact_ref,
+                ),
+                backend=backend,
+            )
+        )
+
+        result = broker.evaluate(
+            EvalRequest(
+                adapter_id="postgres_provenance_fixture",
+                inputs={"alpha": Quantity(value=0.2, units="dimensionless")},
+                seed=11,
+            )
+        )
+
+        record = store.get_record(result.provenance_ref)
+        payload = json.loads(store.get_artifact(result.provenance_ref).decode("utf-8"))
+        lineage = store.get_lineage(result.provenance_ref, direction="ancestors")
+        self.assertTrue(assert_lineage_complete(record.lineage).complete)
+        self.assertEqual(record.lineage.input_refs, (descriptor_record.artifact_ref,))
+        self.assertEqual(record.producer.subsystem, "S7")
+        self.assertEqual(payload["schema"], "argus.s7.provenance.v1")
+        self.assertEqual(payload["underlying_code_version"], "postgres-provenance-fixture@1")
+        self.assertEqual(payload["container_digest"], backend.container_digest)
+        self.assertTrue(payload["config_hash"].startswith("blake3:"))
+        self.assertEqual(set(payload["input_hashes"]), {"alpha"})
+        self.assertEqual(
+            {node.artifact_ref for node in lineage.nodes},
+            {descriptor_record.artifact_ref, result.provenance_ref},
+        )
 
     def test_commit_function_is_idempotent_for_identical_record(self) -> None:
         first = self._commit_record("c4://artifact/a", sequence=1)
