@@ -409,7 +409,7 @@ M1_REFERENCE_BUILDER_ROUTE = S2_REFERENCE_BUILDER_ROUTE
 M1_REFERENCE_REFEREE_ROUTE = "/v1/reference-referee/validate"
 M1_REFERENCE_PROFILE_ROUTE = "/v1/reference-referee/profile"
 M1_REFERENCE_OBSERVATORY_ROUTE = "/v1/reference-observatory/render"
-M1_REFERENCE_S2_TRAINING_ROW_COUNT = 24
+M1_REFERENCE_S2_TRAINING_ROW_COUNT = 16
 M1_REFERENCE_OMEGA_SCALE = S2_REFERENCE_OMEGA_SCALE
 
 
@@ -497,7 +497,7 @@ class M1ReferenceS2BuildDelegate:
     ) -> dict[str, Any]:
         base_inputs = _m1_copy_adapter_inputs(self.adapter_inputs)
         base_adapter_call = _m1_mapping(evidence.get("adapter_call"), "S1 reference adapter evidence")
-        rows = [_m1_s2_training_row(row_id="s7-reference-000", inputs=base_inputs, adapter_call=base_adapter_call)]
+        rows = [_m1_s2_training_row(row_id="s7-reference-base", inputs=base_inputs, adapter_call=base_adapter_call)]
         provenance_refs = [str(base_adapter_call["provenance_ref"])]
         for index in range(1, M1_REFERENCE_S2_TRAINING_ROW_COUNT):
             inputs = _m1_s2_training_inputs(base_inputs, index=index)

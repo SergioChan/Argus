@@ -37,6 +37,14 @@ S2_REFERENCE_DATASET_ID = "dataset:m1-reference-ewpt"
 S2_REFERENCE_ADAPTER_ID = "gw_spectrum"
 S2_REFERENCE_MIN_ROWS = 12
 S2_REFERENCE_OMEGA_SCALE = 1e-11
+S2_REFERENCE_HPO_LEARNING_RATES = (0.4, 0.5)
+S2_REFERENCE_HPO_MAX_EPOCHS = 3
+S2_REFERENCE_FINAL_MAX_EPOCHS = 15
+S2_REFERENCE_MAX_PERSISTED_EPOCHS = 21
+
+
+def _reference_persisted_epoch_count() -> int:
+    return len(S2_REFERENCE_HPO_LEARNING_RATES) * S2_REFERENCE_HPO_MAX_EPOCHS + S2_REFERENCE_FINAL_MAX_EPOCHS
 
 
 class _RootBoundS2ArtifactStore:
@@ -320,6 +328,12 @@ def _reference_build_request(
     dataset_ref: str,
     profile_ref: str,
 ) -> BuildOrchestrationRequest:
+    persisted_epoch_count = _reference_persisted_epoch_count()
+    if persisted_epoch_count > S2_REFERENCE_MAX_PERSISTED_EPOCHS:
+        raise ValueError(
+            "S2 reference builder training budget exceeds the persisted-epoch limit "
+            f"({persisted_epoch_count} > {S2_REFERENCE_MAX_PERSISTED_EPOCHS})"
+        )
     return BuildOrchestrationRequest(
         c2_envelope={
             "contract_version": "1.0.0",
@@ -353,9 +367,9 @@ def _reference_build_request(
         code_ref="argus-runtime:s2-reference-builder",
         environment_digest="oci:argus-s2-reference-builder:v1",
         seed="m1-reference-s2-builder",
-        hpo_parameter_grid={"learning_rate": (0.05, 0.1)},
-        hpo_max_epochs=20,
-        final_max_epochs=80,
+        hpo_parameter_grid={"learning_rate": S2_REFERENCE_HPO_LEARNING_RATES},
+        hpo_max_epochs=S2_REFERENCE_HPO_MAX_EPOCHS,
+        final_max_epochs=S2_REFERENCE_FINAL_MAX_EPOCHS,
         train_ratio=0.6,
         validation_ratio=0.2,
         test_ratio=0.2,

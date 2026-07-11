@@ -34,11 +34,17 @@ from argus_runtime.s10_supervisor_service import RuntimeIdentityMintPolicy, S10S
 from argus_runtime.s11_reference_observatory_service import S11ReferenceObservatoryApp
 from argus_runtime.s3_reference_referee_service import S3_REFERENCE_REFEREE_ROUTE, S3ReferenceRefereeApp
 from argus_runtime.s2_reference_builder_service import (
+    S2_REFERENCE_FINAL_MAX_EPOCHS,
     S2_REFERENCE_BUILDER_ROUTE,
+    S2_REFERENCE_HPO_LEARNING_RATES,
+    S2_REFERENCE_HPO_MAX_EPOCHS,
+    S2_REFERENCE_MAX_PERSISTED_EPOCHS,
     S2_REFERENCE_OMEGA_SCALE,
     S2ReferenceBuilderApp,
+    _reference_build_request,
     build_app_from_env as build_s2_reference_builder_app_from_env,
 )
+import argus_runtime.s2_reference_builder_service as s2_reference_builder_service
 from argus_runtime.s7_reference_adapter_service import (
     S7ReferenceAdapterApp,
     build_app_from_env as build_s7_reference_adapter_app_from_env,
@@ -48,6 +54,33 @@ from argus_runtime.s8_writer_service import S8WriterApp
 
 
 class M1ReferenceLifecycleServiceTests(unittest.TestCase):
+    def test_s2_reference_builder_bounds_persisted_training_epochs(self) -> None:
+        build_request = _reference_build_request(
+            job_id=M1_REFERENCE_JOB_ID,
+            dataset_ref="c4://artifact/m1-reference-training",
+            profile_ref="c4://profile/ewpt-reference/v1",
+        )
+
+        self.assertEqual(build_request.hpo_max_epochs, S2_REFERENCE_HPO_MAX_EPOCHS)
+        self.assertEqual(build_request.final_max_epochs, S2_REFERENCE_FINAL_MAX_EPOCHS)
+        self.assertEqual(build_request.hpo_parameter_grid["learning_rate"], S2_REFERENCE_HPO_LEARNING_RATES)
+        self.assertLessEqual(
+            len(S2_REFERENCE_HPO_LEARNING_RATES) * S2_REFERENCE_HPO_MAX_EPOCHS
+            + S2_REFERENCE_FINAL_MAX_EPOCHS,
+            S2_REFERENCE_MAX_PERSISTED_EPOCHS,
+        )
+        with patch.object(
+            s2_reference_builder_service,
+            "S2_REFERENCE_MAX_PERSISTED_EPOCHS",
+            S2_REFERENCE_MAX_PERSISTED_EPOCHS - 1,
+        ):
+            with self.assertRaisesRegex(ValueError, "persisted-epoch limit"):
+                _reference_build_request(
+                    job_id=M1_REFERENCE_JOB_ID,
+                    dataset_ref="c4://artifact/m1-reference-training",
+                    profile_ref="c4://profile/ewpt-reference/v1",
+                )
+
     def test_s7_reference_adapter_builds_from_access_token_only(self) -> None:
         with patch.dict(
             os.environ,
