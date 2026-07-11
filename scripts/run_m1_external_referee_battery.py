@@ -87,18 +87,20 @@ def main() -> int:
         _assert_status_ok(f"{referee_url}/healthz")
         _record(evidence, "deploy", "argus-m0 Compose started the independent S3 reference-referee service")
 
-        s1_store = _runtime_store(
+        s1_session = RuntimeIdentitySession.from_bootstrap(
             s10_url=s10_url,
-            s8_url=s8_url,
             bootstrap_token=runtime_secrets["bootstrap_token"],
             caller_id="m1-reference-s1",
+            expected_job_id="m1-reference-job",
         )
+        s1_store = S10S8ArtifactStore(session=s1_session, s8_url=s8_url)
         refs = _seed_reference_pipeline(s1_store)
         denied = _assert_s1_cannot_write_s3_report(s1_store)
         rejected = _post_json(
             f"{referee_url}{S3_REFERENCE_REFEREE_ROUTE}",
             {"job_id": "attacker-selected-job"},
             expected_status=403,
+            token=s1_session.access_token,
         )
         response = _post_json(
             f"{referee_url}{S3_REFERENCE_REFEREE_ROUTE}",
@@ -112,6 +114,7 @@ def main() -> int:
                 "trace_id": "trace:m1-external-referee",
             },
             expected_status=200,
+            token=s1_session.access_token,
         )
         s3_store = _runtime_store(
             s10_url=s10_url,
@@ -333,9 +336,18 @@ def _assert_status_ok(url: str) -> None:
         raise AssertionError(f"service health failed: {url} -> {payload}")
 
 
-def _post_json(url: str, payload: dict[str, Any], *, expected_status: int) -> dict[str, Any]:
+def _post_json(
+    url: str,
+    payload: dict[str, Any],
+    *,
+    expected_status: int,
+    token: str | None = None,
+) -> dict[str, Any]:
     encoded = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
-    request = urlrequest.Request(url, data=encoded, method="POST", headers={"Content-Type": "application/json"})
+    headers = {"Content-Type": "application/json"}
+    if token is not None:
+        headers["Authorization"] = f"Bearer {token}"
+    request = urlrequest.Request(url, data=encoded, method="POST", headers=headers)
     try:
         with urlrequest.urlopen(request, timeout=30) as response:
             status = response.status

@@ -35,6 +35,37 @@ class M1ExternalRefereeBatteryTests(unittest.TestCase):
             environment["ARGUS_RUNTIME_BOOTSTRAP_TOKEN"],
         )
 
+    def test_referee_post_uses_s1_runtime_bearer(self) -> None:
+        requests = []
+
+        class Response:
+            status = 200
+
+            def __enter__(self) -> "Response":
+                return self
+
+            def __exit__(self, exc_type: object, exc_value: object, traceback: object) -> bool:
+                return False
+
+            def read(self) -> bytes:
+                return b"{}"
+
+        def open_request(request: object, *, timeout: float) -> Response:
+            del timeout
+            requests.append(request)
+            return Response()
+
+        with patch.object(referee_battery.urlrequest, "urlopen", side_effect=open_request):
+            referee_battery._post_json(
+                "http://referee.example/v1/reference-referee/validate",
+                {"job_id": "m1-reference-job"},
+                expected_status=200,
+                token="s1-runtime-access-token",
+            )
+
+        self.assertEqual(len(requests), 1)
+        self.assertEqual(requests[0].get_header("Authorization"), "Bearer s1-runtime-access-token")
+
 
 if __name__ == "__main__":
     unittest.main()
