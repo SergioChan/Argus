@@ -17,6 +17,7 @@ from argus_core import (
     DockerSandboxSupervisor,
     EgressRule,
     FileSystemArtifactStore,
+    GWSpectrumAdapter,
     InMemoryS10KmsVerifierKeyProvider,
     S10VerifierTrustStoreClient,
     ScopeGrant,
@@ -181,9 +182,11 @@ class M1ReferenceLifecycleServiceTests(unittest.TestCase):
                 caller_id="m1-reference-s1",
             )
             adapter_provenance_ref = str(result.build_payload["diagnostics"]["adapter_provenance_ref"])
+            adapter_descriptor_ref = GWSpectrumAdapter().as_simple_adapter().descriptor.provenance_ref
             sandbox_ref = str(result.build_payload["diagnostics"]["sandbox"]["launch_provenance_ref"])
             records = {
                 "dataset": s1_store.get_record(result.dataset_ref),
+                "adapter_descriptor": s1_store.get_record(adapter_descriptor_ref),
                 "adapter": s1_store.get_record(adapter_provenance_ref),
                 "sandbox": s1_store.get_record(sandbox_ref),
                 "report": s1_store.get_record(result.validation_report_ref),
@@ -191,7 +194,10 @@ class M1ReferenceLifecycleServiceTests(unittest.TestCase):
                 "observatory": s1_store.get_record(result.observatory_html_ref),
             }
             self.assertEqual(records["dataset"].producer.subsystem.upper(), "S1")
+            self.assertEqual(records["adapter_descriptor"].kind, "adapter_descriptor")
+            self.assertEqual(records["adapter_descriptor"].producer.subsystem, "S7")
             self.assertEqual(records["adapter"].producer.subsystem, "S7")
+            self.assertEqual(records["adapter"].lineage.input_refs, (adapter_descriptor_ref,))
             self.assertEqual(records["sandbox"].producer.subsystem, "S10")
             self.assertEqual(records["report"].producer.subsystem, "S3")
             self.assertEqual(records["subject"].producer.subsystem, "S1")

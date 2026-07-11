@@ -2,10 +2,21 @@
 
 from __future__ import annotations
 
+from dataclasses import asdict
 import os
 from typing import Any, Mapping
 
-from argus_core import AdapterBroker, EvalRequest, GWSpectrumAdapter, Quantity, S7Error, c6_eval_result_payload
+from argus_core import (
+    AdapterBroker,
+    EvalRequest,
+    GWSpectrumAdapter,
+    Lineage,
+    Producer,
+    Quantity,
+    S7Error,
+    c6_eval_result_payload,
+    hash_json,
+)
 
 from .http_json import JsonHttpApp, JsonRequest, serve_json_app
 from .m1_reference_service_auth import M1RequesterUnauthorized, require_m1_s1_requester
@@ -17,6 +28,7 @@ S7_REFERENCE_ADAPTER_ROUTE = "/v1/reference-adapter/evaluate"
 S7_REFERENCE_ADAPTER_DEFAULT_CALLER_ID = "m1-reference-s7"
 S7_REFERENCE_ADAPTER_DEFAULT_JOB_ID = "m1-reference-job"
 S7_REFERENCE_ADAPTER_ID = "gw_spectrum"
+S7_REFERENCE_ADAPTER_DESCRIPTOR_SCHEMA = "argus.s7.adapter-descriptor.v1"
 
 
 class S7ReferenceAdapterApp:
@@ -69,10 +81,42 @@ class S7ReferenceAdapterApp:
 
     def _adapter_broker(self) -> AdapterBroker:
         if self._broker is None:
+            adapter = GWSpectrumAdapter().as_simple_adapter()
+            self._ensure_adapter_descriptor(adapter.descriptor)
             broker = AdapterBroker(artifact_store=self._artifact_store())
-            broker.register(GWSpectrumAdapter().as_simple_adapter())
+            broker.register(adapter)
             self._broker = broker
         return self._broker
+
+    def _ensure_adapter_descriptor(self, descriptor: Any) -> None:
+        descriptor_payload = asdict(descriptor)
+        payload = {
+            "schema": S7_REFERENCE_ADAPTER_DESCRIPTOR_SCHEMA,
+            "service": S7_REFERENCE_ADAPTER_NAME,
+            "descriptor": descriptor_payload,
+        }
+        record = self._artifact_store().create_artifact(
+            kind="adapter_descriptor",
+            artifact_ref=descriptor.provenance_ref,
+            payload=payload,
+            producer=Producer(
+                subsystem="S7",
+                version=descriptor.version,
+                actor_id=self._caller_id,
+            ),
+            lineage=Lineage(
+                input_refs=(),
+                code_ref=f"adapter:{descriptor.adapter_id}@{descriptor.version}",
+                environment_digest=hash_json(
+                    {
+                        "service": S7_REFERENCE_ADAPTER_NAME,
+                        "descriptor": descriptor_payload,
+                    }
+                ),
+            ),
+        )
+        if record.artifact_ref != descriptor.provenance_ref:
+            raise RuntimeError("S7 reference adapter descriptor record ref mismatch")
 
     def _register_routes(self) -> None:
         @self.http.route("GET", "/healthz")
