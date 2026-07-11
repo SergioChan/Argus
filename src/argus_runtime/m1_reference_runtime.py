@@ -158,6 +158,12 @@ class HttpS10SandboxLauncher:
         return _sandbox_execution_result_from_mapping(response_payload, expected_job_id=request.job_id)
 
 
+def mint_s10_launch_tokens(session: RuntimeIdentitySession) -> tuple[BudgetToken, ScopeToken]:
+    """Mint one runtime-bound S10 budget and scope token pair for a nested launch."""
+
+    return _budget_token_from_mapping(session.mint_budget()), _scope_token_from_mapping(session.mint_scope())
+
+
 def _reference_sandbox_args(adapter_inputs: Mapping[str, Any]) -> tuple[str, ...]:
     values = {
         "tn": _reference_input(adapter_inputs, "T_n"),

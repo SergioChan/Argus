@@ -23,6 +23,7 @@ from argus_core import (
     SpecCompiler,
 )
 from argus_core.s1_reference import S1_REFERENCE_PHYSICS_PROFILE_REF
+from argus_core.s10 import DIGEST_PINNED_IMAGE
 
 from .http_json import JsonHttpApp, JsonRequest, serve_json_app
 from .m1_reference_service_auth import M1RequesterUnauthorized, require_m1_s1_requester
@@ -94,6 +95,7 @@ class S2ReferenceBuilderApp:
         caller_id: str = S2_REFERENCE_BUILDER_DEFAULT_CALLER_ID,
         expected_job_id: str = S2_REFERENCE_BUILDER_DEFAULT_JOB_ID,
         require_s1_requester: bool = False,
+        pipeline_image: str = "",
     ) -> None:
         if not caller_id:
             raise ValueError("S2 reference builder caller_id is required")
@@ -101,6 +103,8 @@ class S2ReferenceBuilderApp:
             raise ValueError("S2 reference builder expected_job_id is required")
         if bool(bootstrap_token) == bool(access_token):
             raise ValueError("S2 reference builder requires exactly one runtime credential")
+        if not isinstance(pipeline_image, str) or DIGEST_PINNED_IMAGE.fullmatch(pipeline_image) is None:
+            raise ValueError("S2 reference builder pipeline_image must be digest-pinned")
         self._s10_url = s10_url.rstrip("/")
         self._s8_url = s8_url.rstrip("/")
         self._bootstrap_token = bootstrap_token
@@ -108,6 +112,7 @@ class S2ReferenceBuilderApp:
         self._caller_id = caller_id
         self._expected_job_id = expected_job_id
         self._require_s1_requester = require_s1_requester
+        self._pipeline_image = pipeline_image
         self._session: RuntimeIdentitySession | None = None
         self._store: S10S8ArtifactStore | None = None
         self.http = JsonHttpApp()
@@ -126,6 +131,7 @@ class S2ReferenceBuilderApp:
                 job_id=self._expected_job_id,
                 dataset_ref=dataset_ref,
                 profile_ref=profile_ref,
+                pipeline_image=self._pipeline_image,
             )
         )
         return {
@@ -310,6 +316,7 @@ def build_app_from_env() -> S2ReferenceBuilderApp:
         caller_id=os.environ.get("ARGUS_S2_REFERENCE_BUILDER_CALLER_ID", S2_REFERENCE_BUILDER_DEFAULT_CALLER_ID),
         expected_job_id=os.environ.get("ARGUS_S2_REFERENCE_BUILDER_JOB_ID", S2_REFERENCE_BUILDER_DEFAULT_JOB_ID),
         require_s1_requester=_env_flag(os.environ.get("ARGUS_S2_REFERENCE_BUILDER_REQUIRE_S1_REQUESTER")),
+        pipeline_image=_required_env("ARGUS_S2_REFERENCE_PIPELINE_IMAGE"),
     )
 
 
@@ -327,6 +334,7 @@ def _reference_build_request(
     job_id: str,
     dataset_ref: str,
     profile_ref: str,
+    pipeline_image: str = "sha256:" + "0" * 64,
 ) -> BuildOrchestrationRequest:
     persisted_epoch_count = _reference_persisted_epoch_count()
     if persisted_epoch_count > S2_REFERENCE_MAX_PERSISTED_EPOCHS:
@@ -378,6 +386,7 @@ def _reference_build_request(
         max_self_replay_fraction=1.0,
         wallclock_seconds_per_epoch=0.1,
         cost_usd_per_epoch=0.005,
+        container_digest=pipeline_image,
     )
 
 

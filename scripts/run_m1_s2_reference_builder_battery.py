@@ -28,6 +28,7 @@ from scripts.run_m0_spine_battery import (
     _git_head,
     _m0_runtime_secrets,
     _m1_reference_service_access_tokens,
+    _prepare_reference_pipeline_image,
     _post_json,
 )
 
@@ -84,12 +85,19 @@ def main() -> int:
     }
 
     try:
-        _run(
-            [docker, "compose", "-f", args.compose_file, "build"],
+        pipeline_image = _prepare_reference_pipeline_image(
+            docker=docker,
+            compose_file=args.compose_file,
             env=env,
             timeout=COMPOSE_BUILD_TIMEOUT_S,
         )
-        _record(evidence, "build", "argus-m0 Compose built the isolated S2 reference-builder stack")
+        evidence["target"]["s2_reference_pipeline_image"] = pipeline_image
+        _record(
+            evidence,
+            "build",
+            "argus-m0 Compose built the isolated S2 reference-builder stack and bound its frozen pipeline image",
+            {"pipeline_image": pipeline_image},
+        )
         _run(
             [docker, "compose", "-f", args.compose_file, "up", "-d", "--wait"],
             env=env,

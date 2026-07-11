@@ -112,6 +112,18 @@ class M1ReferenceLifecycleServiceTests(unittest.TestCase):
                     profile_ref="c4://profile/ewpt-reference/v1",
                 )
 
+    def test_s2_reference_builder_binds_the_frozen_pipeline_to_a_real_digest(self) -> None:
+        pipeline_image = "sha256:" + "a" * 64
+
+        build_request = _reference_build_request(
+            job_id=M1_REFERENCE_JOB_ID,
+            dataset_ref="c4://artifact/m1-reference-training",
+            profile_ref="c4://profile/ewpt-reference/v1",
+            pipeline_image=pipeline_image,
+        )
+
+        self.assertEqual(build_request.container_digest, pipeline_image)
+
     def test_s7_reference_adapter_builds_from_access_token_only(self) -> None:
         with patch.dict(
             os.environ,
@@ -134,6 +146,7 @@ class M1ReferenceLifecycleServiceTests(unittest.TestCase):
                 "ARGUS_S2_REFERENCE_BUILDER_S10_URL": "http://s10.example",
                 "ARGUS_S2_REFERENCE_BUILDER_S8_URL": "http://s8.example",
                 "ARGUS_S2_REFERENCE_BUILDER_ACCESS_TOKEN": "preprovisioned-s2-token",
+                "ARGUS_S2_REFERENCE_PIPELINE_IMAGE": "sha256:" + "a" * 64,
             },
             clear=True,
         ):
@@ -216,6 +229,7 @@ class M1ReferenceLifecycleServiceTests(unittest.TestCase):
                 access_token=access_tokens["m1-reference-s2"],
                 expected_job_id=M1_REFERENCE_JOB_ID,
                 require_s1_requester=True,
+                pipeline_image=REFERENCE_SANDBOX_IMAGE,
             )
 
             denied_status, denied = builder.http.handle(
@@ -284,6 +298,7 @@ class M1ReferenceLifecycleServiceTests(unittest.TestCase):
 
     def test_real_http_lifecycle_uses_separate_s1_s3_s7_s11_identities_and_real_s10_sandbox(self) -> None:
         docker = _require_reference_image_or_skip(self)
+        pipeline_image = _require_reference_pipeline_image_or_skip(self, docker)
         bootstrap_token = "m1-lifecycle-bootstrap"
         broker_write_key = b"m1-lifecycle-broker-write-key"
         verifier_key_token = "m1-lifecycle-verifier-key-token"
@@ -310,7 +325,11 @@ class M1ReferenceLifecycleServiceTests(unittest.TestCase):
                 producer_subsystems=("S2",),
                 allowed_datasets=("dataset:m1-reference-ewpt",),
             ),
-            "m1-reference-s3": _identity(caller_id="m1-reference-s3", producer_subsystems=("S3",)),
+            "m1-reference-s3": _identity(
+                caller_id="m1-reference-s3",
+                producer_subsystems=("S3",),
+                budget_caps=BudgetCaps(max_compute_units=10, max_wallclock_s=30, max_cost_usd=1),
+            ),
             "m1-reference-s7": _identity(caller_id="m1-reference-s7", producer_subsystems=("S7",)),
             "m1-reference-s11": _identity(caller_id="m1-reference-s11", producer_subsystems=("S11",)),
         }
@@ -356,6 +375,7 @@ class M1ReferenceLifecycleServiceTests(unittest.TestCase):
                 access_token=access_tokens["m1-reference-s2"],
                 expected_job_id=M1_REFERENCE_JOB_ID,
                 require_s1_requester=True,
+                pipeline_image=pipeline_image,
             )
             s2_url = _start_json_server(s2)
             s3 = S3ReferenceRefereeApp(
@@ -578,6 +598,37 @@ def _require_reference_image_or_skip(test_case: unittest.TestCase) -> str:
         )
         test_case.assertEqual(pulled.returncode, 0, pulled.stderr)
     return docker
+
+
+def _require_reference_pipeline_image_or_skip(test_case: unittest.TestCase, docker: str) -> str:
+    image_tag = "argus-m1-reference-pipeline-test:local"
+    built = subprocess.run(
+        [
+            docker,
+            "build",
+            "--file",
+            "deploy/argus-m0/python-service.Dockerfile",
+            "--tag",
+            image_tag,
+            ".",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=600,
+    )
+    test_case.assertEqual(built.returncode, 0, built.stderr)
+    inspected = subprocess.run(
+        [docker, "image", "inspect", "--format", "{{.Id}}", image_tag],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    test_case.assertEqual(inspected.returncode, 0, inspected.stderr)
+    image_id = inspected.stdout.strip()
+    test_case.assertRegex(image_id, r"^sha256:[0-9a-f]{64}$")
+    return image_id
 
 
 def _start_json_server(app: object) -> str:

@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
 import json
+from math import isfinite
 import os
 from pathlib import Path
 import shlex
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 from argus_core.s1_reference import (
     S1_REFERENCE_PHYSICS_PROFILE_REF,
@@ -16,7 +18,14 @@ from argus_core.s1_reference import (
     ReferenceS3ValidationEngine,
 )
 from argus_core.s10 import S10VerifierTrustStoreClient
-from argus_core.s3 import S3ReportBuilder, S3Verifier, build_frozen_pipeline_entrypoint_request
+from argus_core.s3 import (
+    InMemoryBlindDataVault,
+    S3BlindDataManager,
+    S3FrozenPipelineRunner,
+    S3ReportBuilder,
+    S3Verifier,
+    build_frozen_pipeline_entrypoint_request,
+)
 from argus_core.s8 import Lineage, Producer
 from argusverify import C3ReportVerifier
 
@@ -28,6 +37,7 @@ from .m1_runtime_artifacts import (
     S10S8ArtifactStore,
     runtime_identity_session,
 )
+from .m1_reference_runtime import HttpS10SandboxLauncher, mint_s10_launch_tokens
 from .s3_report_signer_service import RustS3ReportSigner
 from .s8_persistence import HttpS10VerifierKeyProvider
 
@@ -37,6 +47,15 @@ S3_REFERENCE_REFEREE_ROUTE = "/v1/reference-referee/validate"
 S3_REFERENCE_PROFILE_ROUTE = "/v1/reference-referee/profile"
 S3_REFERENCE_REFEREE_DEFAULT_CALLER_ID = "m1-reference-s3"
 S3_REFERENCE_REFEREE_DEFAULT_JOB_ID = "m1-reference-job"
+S3ReferencePipelineRunnerFactory = Callable[[S10S8ArtifactStore, RuntimeIdentitySession, S3BlindDataManager], Any]
+
+
+@dataclass(frozen=True)
+class _ReferenceBlindPipelineInput:
+    manager: S3BlindDataManager
+    vault: InMemoryBlindDataVault
+    handle: str
+    execution_inputs: dict[str, Any]
 
 
 class _RustReferenceReportSigner:
@@ -68,6 +87,7 @@ class S3ReferenceRefereeApp:
         verifier_key_auth_token: str,
         allow_insecure_verifier_key_store: bool = False,
         require_s1_requester: bool = False,
+        pipeline_runner_factory: S3ReferencePipelineRunnerFactory | None = None,
     ) -> None:
         if not caller_id:
             raise ValueError("S3 referee caller_id is required")
@@ -84,6 +104,7 @@ class S3ReferenceRefereeApp:
         self._caller_id = caller_id
         self._expected_job_id = expected_job_id
         self._require_s1_requester = require_s1_requester
+        self._pipeline_runner_factory = pipeline_runner_factory
         self._session: RuntimeIdentitySession | None = None
         self._store: S10S8ArtifactStore | None = None
         provider = HttpS10VerifierKeyProvider(
@@ -106,7 +127,22 @@ class S3ReferenceRefereeApp:
         if job_id != self._expected_job_id:
             raise PermissionError("job_id_mismatch")
         store = self._artifact_store()
-        build_frozen_pipeline_entrypoint_request(request_payload, artifact_store=store)
+        blind_pipeline_input = _reference_blind_pipeline_inputs(
+            store=store,
+            request=request_payload,
+            expected_job_id=self._expected_job_id,
+        )
+        runner_request = dict(request_payload)
+        runner_request["blind_dataset_handle"] = blind_pipeline_input.handle
+        entrypoint_request = build_frozen_pipeline_entrypoint_request(runner_request, artifact_store=store)
+        pipeline_run = self._pipeline_runner(
+            store=store,
+            blind_data_manager=blind_pipeline_input.manager,
+        ).run(runner_request, execution_inputs=blind_pipeline_input.execution_inputs)
+        blind_data_stage = getattr(pipeline_run, "blind_data_stage", None)
+        if blind_data_stage is None:
+            raise RuntimeArtifactStoreError("S3 nested frozen pipeline did not return its blind-data stage")
+        execution_output = _reference_execution_output(pipeline_run)
         engine = ReferenceS3ValidationEngine(
             artifact_store=store,
             verifier=self._verifier,
@@ -114,13 +150,18 @@ class S3ReferenceRefereeApp:
             contamination_snapshot=None,
             mode="happy",
         )
-        report = engine.validate(request_payload)
+        report = engine.validate(
+            runner_request,
+            frozen_pipeline_execution=execution_output,
+            recap_blind_data_vault=blind_pipeline_input.vault,
+            recap_blind_data_stage=blind_data_stage,
+        )
         verification = self._report_verifier.verify(report)
         if not verification.valid:
             raise RuntimeArtifactStoreError(
                 f"S3 generated report was rejected by the S10 verifier boundary: {verification.reason or 'invalid'}"
             )
-        input_refs = _validation_input_refs(request_payload)
+        input_refs = _validation_input_refs(request_payload) + (pipeline_run.evidence_ref,)
         committed = S3ReportBuilder(
             artifact_store=store,
             producer=Producer(
@@ -147,6 +188,9 @@ class S3ReferenceRefereeApp:
         return {
             "validation_report_payload": committed.report,
             "validation_report_ref": committed.record.artifact_ref,
+            "frozen_pipeline_execution_ref": pipeline_run.evidence_ref,
+            "nested_sandbox_id": pipeline_run.sandbox_id,
+            "entrypoint_request_id": entrypoint_request["verification_request"]["request_id"],
         }
 
     def ensure_reference_profile(self) -> dict[str, Any]:
@@ -188,6 +232,26 @@ class S3ReferenceRefereeApp:
             )
             self._store = S10S8ArtifactStore(session=self._session, s8_url=self._s8_url)
         return self._store
+
+    def _pipeline_runner(
+        self,
+        *,
+        store: S10S8ArtifactStore,
+        blind_data_manager: S3BlindDataManager,
+    ) -> Any:
+        if self._session is None:
+            raise RuntimeArtifactStoreError("S3 runtime identity session is unavailable")
+        if self._pipeline_runner_factory is not None:
+            return self._pipeline_runner_factory(store, self._session, blind_data_manager)
+        budget_token, scope_token = mint_s10_launch_tokens(self._session)
+        return S3FrozenPipelineRunner(
+            artifact_store=store,
+            sandbox_orchestrator=HttpS10SandboxLauncher(self._session),
+            budget_token=budget_token,
+            scope_token=scope_token,
+            blind_data_manager=blind_data_manager,
+            actor_id=S1_REFERENCE_S3_VERIFIER_ID,
+        )
 
     def _register_routes(self) -> None:
         @self.http.route("GET", "/healthz")
@@ -316,6 +380,126 @@ def _request_mapping(value: Mapping[str, Any]) -> dict[str, Any]:
     return {str(key): item for key, item in value.items()}
 
 
+def _reference_blind_pipeline_inputs(
+    *,
+    store: S10S8ArtifactStore,
+    request: Mapping[str, Any],
+    expected_job_id: str,
+) -> _ReferenceBlindPipelineInput:
+    frozen_pipeline_ref = _required_request_string(request, "frozen_pipeline_ref")
+    try:
+        frozen_payload = json.loads(store.get_artifact(frozen_pipeline_ref).decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeArtifactStoreError("S3 frozen pipeline payload is not valid JSON") from exc
+    if not isinstance(frozen_payload, Mapping):
+        raise RuntimeArtifactStoreError("S3 frozen pipeline payload must be an object")
+    component_refs = frozen_payload.get("component_refs")
+    if not isinstance(component_refs, Mapping):
+        raise RuntimeArtifactStoreError("S3 reference pipeline requires component_refs")
+    input_refs = component_refs.get("input_refs")
+    if not isinstance(input_refs, list):
+        raise RuntimeArtifactStoreError("S3 reference pipeline requires component input_refs")
+    dataset_ref = ""
+    for candidate in input_refs:
+        if not isinstance(candidate, str) or not candidate:
+            continue
+        if store.get_record(candidate).kind == "dataset":
+            if dataset_ref:
+                raise RuntimeArtifactStoreError("S3 reference pipeline resolves more than one dataset input")
+            dataset_ref = candidate
+    if not dataset_ref:
+        raise RuntimeArtifactStoreError("S3 reference pipeline does not resolve a dataset input")
+    try:
+        dataset_payload = json.loads(store.get_artifact(dataset_ref).decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeArtifactStoreError("S3 reference dataset payload is not valid JSON") from exc
+    if not isinstance(dataset_payload, Mapping):
+        raise RuntimeArtifactStoreError("S3 reference dataset payload must be an object")
+    rows = dataset_payload.get("rows")
+    if not isinstance(rows, list) or not rows or not isinstance(rows[0], Mapping):
+        raise RuntimeArtifactStoreError("S3 reference dataset requires at least one object row")
+    row = rows[0]
+    raw_input = row.get("adapter_omega_scaled")
+    if isinstance(raw_input, bool) or not isinstance(raw_input, int | float) or not isfinite(float(raw_input)):
+        raise RuntimeArtifactStoreError("S3 reference dataset adapter_omega_scaled must be finite")
+    raw_truth = row.get("omega_scaled")
+    if isinstance(raw_truth, bool) or not isinstance(raw_truth, int | float) or not isfinite(float(raw_truth)):
+        raise RuntimeArtifactStoreError("S3 reference dataset omega_scaled must be finite")
+    target_scale = dataset_payload.get("target_scale")
+    if (
+        isinstance(target_scale, bool)
+        or not isinstance(target_scale, int | float)
+        or not isfinite(float(target_scale))
+        or float(target_scale) <= 0.0
+    ):
+        raise RuntimeArtifactStoreError("S3 reference dataset target_scale must be a positive finite value")
+    execution_inputs = {
+        "adapter_omega_scaled": {
+            "value": float(raw_input),
+            "units": "dimensionless",
+        }
+    }
+    vault = InMemoryBlindDataVault(
+        artifact_store=store,
+        actor_id=S1_REFERENCE_S3_VERIFIER_ID,
+    )
+    record = vault.register_dataset(
+        dataset_id=f"m1-reference-{expected_job_id}",
+        version="v1",
+        split="recap",
+        dataset_kind="recap_benchmark",
+        opaque_input={
+            "samples": [
+                {
+                    "sample_id": "ewpt-reference-omega",
+                    "inputs_units_tagged": execution_inputs,
+                }
+            ]
+        },
+        truth={
+            "samples": [
+                {
+                    "sample_id": "ewpt-reference-omega",
+                    "expected": float(raw_truth) * float(target_scale),
+                }
+            ]
+        },
+    )
+    return _ReferenceBlindPipelineInput(
+        manager=S3BlindDataManager(
+            artifact_store=store,
+            vault=vault,
+            actor_id=S1_REFERENCE_S3_VERIFIER_ID,
+        ),
+        vault=vault,
+        handle=record.handle,
+        execution_inputs=execution_inputs,
+    )
+
+
+def _reference_execution_output(pipeline_run: Any) -> dict[str, Any]:
+    if getattr(pipeline_run, "status", None) != "SUCCEEDED":
+        raise RuntimeArtifactStoreError("S3 nested frozen pipeline did not succeed")
+    execution = getattr(pipeline_run, "execution", None)
+    stdout = getattr(execution, "stdout", None)
+    if not isinstance(stdout, str) or not stdout:
+        raise RuntimeArtifactStoreError("S3 nested frozen pipeline returned no execution output")
+    try:
+        output = json.loads(stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeArtifactStoreError("S3 nested frozen pipeline returned invalid JSON") from exc
+    if not isinstance(output, Mapping):
+        raise RuntimeArtifactStoreError("S3 nested frozen pipeline returned a non-object output")
+    return dict(output)
+
+
+def _required_request_string(request: Mapping[str, Any], field: str) -> str:
+    value = request.get(field)
+    if not isinstance(value, str) or not value:
+        raise RuntimeArtifactStoreError(f"S3 validation request requires {field}")
+    return value
+
+
 def _validation_input_refs(request: Mapping[str, Any]) -> tuple[str, ...]:
     refs: list[str] = []
     for value in (
@@ -325,7 +509,7 @@ def _validation_input_refs(request: Mapping[str, Any]) -> tuple[str, ...]:
     ):
         if isinstance(value, str) and value and value not in refs:
             refs.append(value)
-    return tuple(refs)
+    return tuple(dict.fromkeys(refs))
 
 
 def _required_env(name: str) -> str:

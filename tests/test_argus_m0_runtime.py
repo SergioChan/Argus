@@ -2439,6 +2439,7 @@ class ArgusM0ComposeTests(unittest.TestCase):
                 "ARGUS_S3_REFERENCE_REFEREE_SIGNER_SECRET": S3_REFERENCE_REFEREE_SIGNING_KEY,
                 "ARGUS_S1_REFERENCE_DEMO_ACCESS_TOKEN": "s1-reference-token",
                 "ARGUS_S2_REFERENCE_BUILDER_ACCESS_TOKEN": "s2-reference-token",
+                "ARGUS_S2_REFERENCE_PIPELINE_IMAGE": "sha256:" + "a" * 64,
                 "ARGUS_S3_REFERENCE_REFEREE_ACCESS_TOKEN": "s3-reference-token",
                 "ARGUS_S7_REFERENCE_ADAPTER_ACCESS_TOKEN": "s7-reference-token",
                 "ARGUS_S11_REFERENCE_OBSERVATORY_ACCESS_TOKEN": "s11-reference-token",
@@ -2560,6 +2561,10 @@ class ArgusM0ComposeTests(unittest.TestCase):
         self.assertEqual(
             services["s2-reference-builder"]["environment"]["ARGUS_S2_REFERENCE_BUILDER_REQUIRE_S1_REQUESTER"],
             "1",
+        )
+        self.assertEqual(
+            services["s2-reference-builder"]["environment"]["ARGUS_S2_REFERENCE_PIPELINE_IMAGE"],
+            "sha256:" + "a" * 64,
         )
         self.assertEqual(services["s3-reference-referee"]["environment"]["ARGUS_S3_REFERENCE_REFEREE_HOST"], "0.0.0.0")
         self.assertEqual(services["s3-reference-referee"]["environment"]["ARGUS_S3_REFERENCE_REFEREE_PORT"], "8080")

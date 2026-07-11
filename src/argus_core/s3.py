@@ -3443,6 +3443,8 @@ class S3FrozenPipelineRunResult:
     sandbox_id: str
     sandbox_state: str
     launch_request: LaunchRequest
+    execution: SandboxExecutionResult
+    blind_data_stage: BlindDataStage | None
 
 
 class S3FrozenPipelineRunner:
@@ -3471,9 +3473,9 @@ class S3FrozenPipelineRunner:
         self._scope_token = scope_token
         self._launch_envelope = launch_envelope or LaunchEnvelope(
             cpu_m=1_000,
-            mem_bytes=512_000_000,
+            mem_bytes=128 * 1024 * 1024,
             gpu_count=0,
-            wallclock_s=30,
+            wallclock_s=10,
             scratch_bytes=1_000_000,
             pids=32,
             estimated_cost_usd=0.01,
@@ -3481,7 +3483,15 @@ class S3FrozenPipelineRunner:
         self._blind_data_manager = blind_data_manager
         self._actor_id = actor_id
 
-    def run(self, validation_request: Mapping[str, Any]) -> S3FrozenPipelineRunResult:
+    def run(
+        self,
+        validation_request: Mapping[str, Any],
+        *,
+        execution_inputs: Mapping[str, Any] | None = None,
+    ) -> S3FrozenPipelineRunResult:
+        normalized_execution_inputs = (
+            None if execution_inputs is None else _runner_execution_inputs(execution_inputs)
+        )
         blind_data_stage = self._stage_blind_data(validation_request)
         if blind_data_stage is not None:
             validation_request = _runner_request_with_blind_stage(validation_request, blind_data_stage)
@@ -3501,6 +3511,7 @@ class S3FrozenPipelineRunner:
             entrypoint_request=entrypoint_request,
             pipeline_payload=pipeline_payload,
             security_probe=security_probe,
+            execution_inputs=normalized_execution_inputs,
         )
         event_start = _runner_audit_len(self._audit_ledger)
         execution = self._launch_nested_s10(launch_request)
@@ -3513,6 +3524,7 @@ class S3FrozenPipelineRunner:
             execution=execution,
             audit_events=audit_events,
             blind_data_stage=blind_data_stage,
+            execution_inputs=normalized_execution_inputs,
         )
         return S3FrozenPipelineRunResult(
             status=_runner_status(execution),
@@ -3520,6 +3532,8 @@ class S3FrozenPipelineRunner:
             sandbox_id=execution.handle.sandbox_id,
             sandbox_state=execution.handle.state,
             launch_request=launch_request,
+            execution=execution,
+            blind_data_stage=blind_data_stage,
         )
 
     def _stage_blind_data(self, validation_request: Mapping[str, Any]) -> BlindDataStage | None:
@@ -3545,6 +3559,7 @@ class S3FrozenPipelineRunner:
         entrypoint_request: Mapping[str, Any],
         pipeline_payload: Mapping[str, Any],
         security_probe: Mapping[str, Any],
+        execution_inputs: Mapping[str, Any] | None,
     ) -> LaunchRequest:
         verification_request = _runner_mapping(entrypoint_request.get("verification_request"), "verification_request")
         job_id = _non_empty_string(
@@ -3557,6 +3572,14 @@ class S3FrozenPipelineRunner:
             "--entrypoint-request-json",
             canonical_json_bytes(entrypoint_request).decode("utf-8"),
         )
+        if execution_inputs is not None:
+            normalized_inputs = _runner_execution_inputs(execution_inputs)
+            args = args + (
+                "--frozen-pipeline-json",
+                canonical_json_bytes(pipeline_payload).decode("utf-8"),
+                "--inputs-json",
+                canonical_json_bytes(normalized_inputs).decode("utf-8"),
+            )
         if security_probe:
             args = args + ("--security-probe-json", canonical_json_bytes(security_probe).decode("utf-8"))
         return LaunchRequest(
@@ -3632,6 +3655,7 @@ class S3FrozenPipelineRunner:
         execution: SandboxExecutionResult,
         audit_events: tuple[Any, ...],
         blind_data_stage: BlindDataStage | None,
+        execution_inputs: Mapping[str, Any] | None,
     ) -> str:
         status = _runner_status(execution)
         partial = execution.partial_result
@@ -3655,10 +3679,13 @@ class S3FrozenPipelineRunner:
                 "exit_code": execution.exit_code,
                 "timed_out": execution.timed_out,
                 "duration_s": execution.duration_s,
+                "stdout_hash": hash_bytes(execution.stdout.encode("utf-8")),
+                "stderr_hash": hash_bytes(execution.stderr.encode("utf-8")),
             },
             "quarantine": quarantine,
             "egress": egress,
             "blind_data_stage": _runner_blind_data_stage_payload(blind_data_stage),
+            "execution_inputs": _runner_execution_input_evidence(execution_inputs),
             "partial_result": _runner_partial_payload(partial),
             "audit_event_types": list(audit_event_types),
             "s3_test_cases": {
@@ -3898,7 +3925,50 @@ def _runner_image(pipeline_payload: Mapping[str, Any]) -> str:
             code="S3_FROZEN_PIPELINE_IMAGE_UNPINNED",
             message="frozen pipeline image must be pinned to a sha256 digest",
         )
+    if digest_source.startswith("sha256:"):
+        return digest_source
+    if "@sha256:" in digest_source and "://" not in digest_source:
+        return digest_source
     return f"argus-s3-frozen-pipeline@sha256:{digest}"
+
+
+def _runner_execution_inputs(value: Mapping[str, Any]) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        _runner_error(
+            code="S3_FROZEN_PIPELINE_EXECUTION_INPUTS_INVALID",
+            message="nested frozen-pipeline inputs must be a JSON object",
+        )
+    payload = _runner_json_value(value, path="execution_inputs")
+    if _runner_contains_label_material(payload):
+        _runner_error(
+            code="S3_FROZEN_PIPELINE_EXECUTION_INPUT_LABEL_MATERIAL_FORBIDDEN",
+            message="nested frozen-pipeline inputs contain forbidden label material",
+        )
+    return payload
+
+
+def _runner_contains_label_material(value: Any) -> bool:
+    if isinstance(value, Mapping):
+        for key, item in value.items():
+            if isinstance(key, str) and key.lower() in S3_FORBIDDEN_LABEL_MATERIAL_FIELDS:
+                return True
+            if _runner_contains_label_material(item):
+                return True
+        return False
+    if isinstance(value, list | tuple):
+        return any(_runner_contains_label_material(item) for item in value)
+    return False
+
+
+def _runner_execution_input_evidence(value: Mapping[str, Any] | None) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    payload = _runner_execution_inputs(value)
+    return {
+        "content_hash": hash_json(payload),
+        "top_level_fields": sorted(payload),
+        "label_material_present": False,
+    }
 
 
 def _runner_audit_len(audit_ledger: Any | None) -> int:

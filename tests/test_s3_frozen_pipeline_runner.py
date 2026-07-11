@@ -28,6 +28,27 @@ from argus_core import (
 
 
 class S3FrozenPipelineRunnerTests(unittest.TestCase):
+    def test_default_nested_envelope_fits_the_deployed_m0_memory_ceiling(self) -> None:
+        store, frozen_ref = self._store_with_frozen_pipeline()
+        audit = InMemoryAuditLedger()
+        runner_s10 = _ScriptedNestedS10(audit=audit, mode="success")
+        budget, scope = self._tokens(job_id=self._job_id())
+        runner = S3FrozenPipelineRunner(
+            artifact_store=store,
+            sandbox_orchestrator=runner_s10,
+            audit_ledger=audit,
+            budget_token=budget,
+            scope_token=scope,
+        )
+
+        result = runner.run(self._validation_request(frozen_ref))
+
+        envelope = result.launch_request.requested_envelope
+        self.assertEqual(envelope.mem_bytes, 128 * 1024 * 1024)
+        self.assertLessEqual(envelope.mem_bytes, 128 * 1024 * 1024)
+        self.assertEqual(envelope.wallclock_s, 10)
+        self.assertLessEqual(envelope.cpu_m * envelope.wallclock_s / 1_000, 10)
+
     def test_tc25_launches_frozen_pipeline_only_through_nested_s10_sandbox(self) -> None:
         store, frozen_ref = self._store_with_frozen_pipeline(entrypoint="evil_nonexistent_module.predict")
         audit = InMemoryAuditLedger()
@@ -47,7 +68,7 @@ class S3FrozenPipelineRunnerTests(unittest.TestCase):
         self.assertEqual(result.status, "SUCCEEDED")
         self.assertEqual(len(runner_s10.requests), 1)
         launch_request = runner_s10.requests[0]
-        self.assertEqual(launch_request.image, "argus-s3-frozen-pipeline@sha256:" + "c" * 64)
+        self.assertEqual(launch_request.image, "sha256:" + "c" * 64)
         self.assertEqual(launch_request.entrypoint, ("python", "-m", "argus_runtime.s3_frozen_pipeline_entrypoint"))
         self.assertIn("evil_nonexistent_module.predict", " ".join(launch_request.args))
         self.assertTrue(result.evidence_ref.startswith("c4://artifact/"))
@@ -59,6 +80,36 @@ class S3FrozenPipelineRunnerTests(unittest.TestCase):
         self.assertEqual(evidence["sandbox"]["state"], "SUCCEEDED")
         self.assertEqual(evidence["s3_test_cases"]["S3-TC25"]["status"], "PASS")
         self.assertIn("sandbox.launched", evidence["audit_event_types"])
+
+    def test_nested_runner_passes_immutable_pipeline_and_opaque_inputs_and_returns_execution(self) -> None:
+        store, frozen_ref = self._store_with_frozen_pipeline()
+        audit = InMemoryAuditLedger()
+        runner_s10 = _ScriptedNestedS10(audit=audit, mode="success")
+        budget, scope = self._tokens(job_id=self._job_id())
+        runner = S3FrozenPipelineRunner(
+            artifact_store=store,
+            sandbox_orchestrator=runner_s10,
+            audit_ledger=audit,
+            budget_token=budget,
+            scope_token=scope,
+            launch_envelope=self._launch_envelope(),
+        )
+
+        result = runner.run(
+            self._validation_request(frozen_ref),
+            execution_inputs={"x": {"value": 0.5, "units": "dimensionless"}},
+        )
+
+        launch = runner_s10.requests[0]
+        self.assertEqual(launch.image, "sha256:" + "c" * 64)
+        self.assertEqual(result.execution.stdout, "{\"ok\": true}")
+        self.assertEqual(result.execution.handle.sandbox_id, result.sandbox_id)
+        self.assertIn("--frozen-pipeline-json", launch.args)
+        self.assertIn("--inputs-json", launch.args)
+        pipeline_payload = json.loads(launch.args[launch.args.index("--frozen-pipeline-json") + 1])
+        input_payload = json.loads(launch.args[launch.args.index("--inputs-json") + 1])
+        self.assertEqual(pipeline_payload["container_digest"], "sha256:" + "c" * 64)
+        self.assertEqual(input_payload, {"x": {"units": "dimensionless", "value": 0.5}})
 
     def test_tc27_trust_mount_write_is_quarantined_with_sev1_evidence(self) -> None:
         store, frozen_ref = self._store_with_frozen_pipeline(

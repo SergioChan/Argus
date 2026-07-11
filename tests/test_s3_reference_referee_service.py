@@ -5,6 +5,7 @@ import socket
 import tempfile
 import time
 from threading import Thread
+from types import SimpleNamespace
 import unittest
 
 from argus_core import (
@@ -12,12 +13,17 @@ from argus_core import (
     C3ReportVerifier,
     C3ReportSigner,
     FileSystemArtifactStore,
+    FrozenPipelineRunner,
     InMemoryS10KmsVerifierKeyProvider,
     Lineage,
     Producer,
     ScopeGrant,
     S10VerifierTrustStoreClient,
     evaluate_sound_wave_spectrum,
+)
+from argus_core.s2 import (
+    S2_FROZEN_PIPELINE_ENTRYPOINT_CONTRACT_VERSION,
+    S2_FROZEN_PIPELINE_SCHEMA_VERSION,
 )
 from argus_runtime.auth import RuntimeAuth, RuntimeIdentity
 from argus_runtime.http_json import JsonRequest, serve_json_app
@@ -84,6 +90,13 @@ class S3ReferenceRefereeServiceTests(unittest.TestCase):
                 caller_id="m1-reference-s1",
             )
             refs = _seed_reference_pipeline(s1_store)
+            runner_holder: dict[str, _ReferencePipelineRunner] = {}
+
+            def runner_factory(store, _session, blind_data_manager):
+                runner = _ReferencePipelineRunner(store, blind_data_manager)
+                runner_holder["runner"] = runner
+                return runner
+
             referee = S3ReferenceRefereeApp(
                 s10_url=s10_url,
                 s8_url=s8_url,
@@ -94,6 +107,7 @@ class S3ReferenceRefereeServiceTests(unittest.TestCase):
                 verifier_key_endpoint_url=f"{s10_url}/v1/internal/verifier-keys",
                 verifier_key_auth_token=verifier_key_token,
                 allow_insecure_verifier_key_store=True,
+                pipeline_runner_factory=runner_factory,
             )
 
             status, response = referee.http.handle(
@@ -115,6 +129,14 @@ class S3ReferenceRefereeServiceTests(unittest.TestCase):
 
             self.assertEqual(status, 200, response)
             self.assertIn("validation_report_payload", response)
+            self.assertIn("frozen_pipeline_execution_ref", response)
+            self.assertIn("runner", runner_holder)
+            self.assertEqual(
+                runner_holder["runner"].execution_inputs,
+                {"adapter_omega_scaled": {"value": runner_holder["runner"].scaled_omega, "units": "dimensionless"}},
+            )
+            self.assertIsNotNone(runner_holder["runner"].blind_data_stage)
+            self.assertFalse(runner_holder["runner"].blind_data_stage.truth_bytes_delivered_to_sandbox)
             report_ref = str(response["validation_report_ref"])
             self.assertTrue(report_ref.startswith("c4://artifact/"))
             self.assertEqual(response["validation_report_payload"]["claim_tier"], "recapitulated-known")
@@ -129,6 +151,9 @@ class S3ReferenceRefereeServiceTests(unittest.TestCase):
             persisted = s3_store.get_record(report_ref)
             persisted_report = json.loads(s3_store.get_artifact(report_ref).decode("utf-8"))
             lineage = s3_store.get_lineage(report_ref, direction="ancestors")
+            blind_stage_payload = json.loads(
+                s3_store.get_artifact(runner_holder["runner"].blind_data_stage.stage_evidence_ref).decode("utf-8")
+            )
             remote_verifier = HttpS10VerifierKeyProvider(
                 endpoint_url=f"{s10_url}/v1/internal/verifier-keys",
                 auth_token=verifier_key_token,
@@ -140,7 +165,10 @@ class S3ReferenceRefereeServiceTests(unittest.TestCase):
             self.assertEqual(persisted.producer.subsystem, "S3")
             self.assertEqual(persisted.producer.job_id, "m1-reference-job")
             self.assertEqual(persisted_report, response["validation_report_payload"])
+            self.assertEqual(blind_stage_payload["dataset_kind"], "recap_benchmark")
+            self.assertFalse(blind_stage_payload["truth_bytes_delivered_to_sandbox"])
             self.assertIn(refs["frozen_pipeline_ref"], {node.artifact_ref for node in lineage.nodes})
+            self.assertIn(response["frozen_pipeline_execution_ref"], {node.artifact_ref for node in lineage.nodes})
             self.assertEqual(
                 verification.verify_signature_value(
                     key_id="s3-reference-referee-key",
@@ -220,6 +248,7 @@ def _seed_reference_pipeline(store: S10S8ArtifactStore) -> dict[str, str]:
         producer=Producer(subsystem="S1", version="0.0.0", actor_id="s1.reference-profile"),
         lineage=_lineage("s1.reference-profile"),
     )
+    scale = 1e-11
     dataset = store.create_artifact(
         kind="dataset",
         artifact_ref="c4://dataset/ewpt-reference/m1-runtime",
@@ -231,49 +260,116 @@ def _seed_reference_pipeline(store: S10S8ArtifactStore) -> dict[str, str]:
                     "beta_over_H": 100.0,
                     "v_w": 0.7,
                     "frequency": 0.003,
+                    "adapter_omega_scaled": omega / scale,
+                    "omega_scaled": omega / scale,
+                    "omega": omega,
                     "known_omega": omega,
                 }
-            ]
+            ],
+            "feature_scale": scale,
+            "target_scale": scale,
+            "reference_context": {},
         },
         producer=Producer(subsystem="S1", version="0.0.0", actor_id="s1.reference-dataset"),
         lineage=_lineage("s1.reference-dataset"),
     )
-    model = store.create_artifact(
-        kind="model",
-        payload={
-            "schema": "argus.s1.reference_physics_model.v1",
-            "model_family": "ewpt-tabular-reference",
-            "dataset_ref": dataset.artifact_ref,
-            "adapter_outputs": {
-                "omega": {
-                    "value": omega,
-                    "units": "dimensionless",
-                    "uncertainty": {"kind": "interval", "radius": max(omega * 0.01, 1e-30)},
-                }
-            },
-            "uncertainty_tag": {"kind": "interval", "source": "gw_spectrum"},
-        },
-        producer=Producer(subsystem="S1", version="0.0.0", actor_id="s1.reference-physics"),
-        lineage=_lineage("s1.reference-model", input_refs=(dataset.artifact_ref,)),
-    )
     frozen = store.create_artifact(
         kind="frozen_pipeline",
         payload={
-            "schema": "argus.s1.frozen_pipeline.v1",
+            "schema_version": S2_FROZEN_PIPELINE_SCHEMA_VERSION,
             "entrypoint": "predict",
-            "model_ref": model.artifact_ref,
-            "artifact_refs": [model.artifact_ref],
-            "code_ref": "argus-core:s1.reference-physics.freeze",
-            "environment_digest": "python:s1-reference-physics:v1",
+            "entrypoint_contract_version": S2_FROZEN_PIPELINE_ENTRYPOINT_CONTRACT_VERSION,
+            "s3_executable": True,
+            "container_digest": "sha256:" + "c" * 64,
+            "self_replay_passed": True,
+            "artifact_refs": [dataset.artifact_ref],
+            "component_refs": {"input_refs": [dataset.artifact_ref]},
+            "io_signature": {
+                "inputs": {"adapter_omega_scaled": {"units": "dimensionless", "value_type": "float"}},
+                "outputs": {"omega_scaled": {"units": "dimensionless", "value_type": "float"}},
+            },
+            "feature_graph": {
+                "nodes": [
+                    {
+                        "node_id": "adapter_omega_scaled",
+                        "feature": {"terms": [{"field_name": "adapter_omega_scaled", "exponent": 1}]},
+                    }
+                ]
+            },
+            "feature_set": {"selected_nodes": ["adapter_omega_scaled"]},
+            "model_checkpoint": {
+                "backend": "deterministic-linear",
+                "model_state": {
+                    "feature_names": ["adapter_omega_scaled"],
+                    "weights": {"adapter_omega_scaled": 1.0},
+                    "bias": 0.0,
+                },
+            },
+            "uq_calibration": {
+                "uncertainty_method": "split_conformal",
+                "interval": {"kind": "symmetric_conformal", "radius": max(omega / scale * 0.01, 1e-12)},
+            },
+            "code_ref": "argus-core:s2.reference-physics.freeze",
+            "environment_digest": "python:s2-reference-physics:v1",
         },
         producer=Producer(subsystem="S1", version="0.0.0", actor_id="s1.reference-physics"),
-        lineage=_lineage("s1.reference-freeze", input_refs=(model.artifact_ref,)),
+        lineage=_lineage("s1.reference-freeze", input_refs=(dataset.artifact_ref,)),
     )
     return {
         "profile_ref": profile.artifact_ref,
-        "model_ref": model.artifact_ref,
+        "model_ref": dataset.artifact_ref,
         "frozen_pipeline_ref": frozen.artifact_ref,
     }
+
+
+class _ReferencePipelineRunner:
+    def __init__(self, store: S10S8ArtifactStore, blind_data_manager) -> None:
+        self._store = store
+        self._blind_data_manager = blind_data_manager
+        self.execution_inputs: dict[str, object] | None = None
+        self.scaled_omega = 0.0
+        self.blind_data_stage = None
+
+    def run(self, request, *, execution_inputs):
+        self.execution_inputs = dict(execution_inputs)
+        self.scaled_omega = float(execution_inputs["adapter_omega_scaled"]["value"])
+        trace_id = request.get("trace_id")
+        self.blind_data_stage = self._blind_data_manager.stage_for_pipeline(
+            blind_data_handle=str(request["blind_dataset_handle"]),
+            job_id=str(request["job_id"]),
+            trace_id=trace_id if isinstance(trace_id, str) else None,
+        )
+        frozen_pipeline_ref = str(request["frozen_pipeline_ref"])
+        pipeline = json.loads(self._store.get_artifact(frozen_pipeline_ref).decode("utf-8"))
+        prediction = FrozenPipelineRunner(artifact_store=None).predict_payload(
+            pipeline,
+            execution_inputs,
+            loaded_from_c4=True,
+        )
+        record = self._store.get_record(frozen_pipeline_ref)
+        output = {
+            "schema": "argus.s3.frozen_pipeline_execution_output.v1",
+            "frozen_pipeline_ref": frozen_pipeline_ref,
+            "frozen_pipeline_content_hash": record.content_hash,
+            "entrypoint": "predict",
+            "outputs_units_tagged": prediction.outputs_units_tagged,
+            "uncertainty": prediction.uncertainty,
+            "io_signature": prediction.io_signature,
+            "diagnostics": prediction.diagnostics,
+        }
+        evidence = self._store.create_artifact(
+            kind="s3_frozen_pipeline_run",
+            payload={"schema": "argus.s3.frozen_pipeline_run_evidence.v1", "status": "SUCCEEDED"},
+            producer=Producer(subsystem="S3", version="0.0.0", actor_id="s3-reference-verifier", job_id="m1-reference-job"),
+            lineage=_lineage("s3.reference-sandbox", input_refs=(frozen_pipeline_ref,)),
+        )
+        return SimpleNamespace(
+            status="SUCCEEDED",
+            evidence_ref=evidence.artifact_ref,
+            sandbox_id="sandbox-reference-test",
+            execution=SimpleNamespace(stdout=json.dumps(output, separators=(",", ":"), sort_keys=True)),
+            blind_data_stage=self.blind_data_stage,
+        )
 
 
 def _lineage(code_ref: str, *, input_refs: tuple[str, ...] = ()) -> Lineage:

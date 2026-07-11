@@ -23,6 +23,7 @@ from .s1 import (
     build_error_envelope,
 )
 from .s3 import (
+    BlindDataStage,
     CheckResult,
     CheckPluginHost,
     CompiledCheckSpec,
@@ -802,13 +803,21 @@ class ReferenceS3ValidationEngine:
         self.contamination_snapshot = contamination_snapshot
         self.mode = mode
 
-    def validate(self, request: dict[str, object]) -> dict[str, Any]:
+    def validate(
+        self,
+        request: dict[str, object],
+        *,
+        frozen_pipeline_execution: Mapping[str, Any] | None = None,
+        recap_blind_data_vault: InMemoryBlindDataVault | None = None,
+        recap_blind_data_stage: BlindDataStage | None = None,
+    ) -> dict[str, Any]:
         frozen_pipeline_ref = str(request["frozen_pipeline_ref"])
         frozen_payload = _artifact_payload(self.artifact_store, frozen_pipeline_ref)
         model_payload = _reference_model_payload(
             self.artifact_store,
             frozen_pipeline_ref=frozen_pipeline_ref,
             frozen_payload=frozen_payload,
+            frozen_pipeline_execution=frozen_pipeline_execution,
         )
         dataset_payload = _artifact_payload(self.artifact_store, str(model_payload["dataset_ref"]))
         extrapolated = self._request_has_extrapolated_artifact(request)
@@ -825,6 +834,8 @@ class ReferenceS3ValidationEngine:
             profile_ref=str(request["profile_ref"]),
             job_id=job_id,
             trace_id=trace_id,
+            recap_blind_data_vault=recap_blind_data_vault,
+            recap_blind_data_stage=recap_blind_data_stage,
         )
         outcome = _reference_perturbation_outcome(
             model_payload=model_payload,
@@ -991,6 +1002,8 @@ def _reference_plugin_checks(
     profile_ref: str,
     job_id: str,
     trace_id: str | None,
+    recap_blind_data_vault: InMemoryBlindDataVault | None = None,
+    recap_blind_data_stage: BlindDataStage | None = None,
 ) -> tuple[CheckResult, ...]:
     profile = _reference_compiled_profile(profile_ref=profile_ref, include_m3_checks=include_m3_checks)
     plugins = _reference_check_plugins(
@@ -1003,6 +1016,8 @@ def _reference_plugin_checks(
         include_m3_checks=include_m3_checks,
         job_id=job_id,
         trace_id=trace_id,
+        recap_blind_data_vault=recap_blind_data_vault,
+        recap_blind_data_stage=recap_blind_data_stage,
     )
     return CheckPluginHost(
         plugins=plugins,
@@ -1024,6 +1039,8 @@ def _reference_check_plugins(
     include_m3_checks: bool,
     job_id: str,
     trace_id: str | None,
+    recap_blind_data_vault: InMemoryBlindDataVault | None = None,
+    recap_blind_data_stage: BlindDataStage | None = None,
 ) -> tuple[Any, ...]:
     row = _reference_dataset_row(dataset_payload)
     observed_omega = _reference_observed_omega(model_payload)
@@ -1037,13 +1054,19 @@ def _reference_check_plugins(
         wall_velocity=float(row.get("v_w", 0.7)),
         frequency_hz=float(row.get("frequency", 0.003)),
     )
-    recap_vault, recap_stage = _reference_recap_stage(
-        artifact_store=artifact_store,
-        row=row,
-        expected_omega=expected_omega,
-        job_id=job_id,
-        trace_id=trace_id,
-    )
+    if (recap_blind_data_vault is None) != (recap_blind_data_stage is None):
+        raise ValueError("reference recap vault and stage must be supplied together")
+    if recap_blind_data_vault is None:
+        recap_vault, recap_stage = _reference_recap_stage(
+            artifact_store=artifact_store,
+            row=row,
+            expected_omega=expected_omega,
+            job_id=job_id,
+            trace_id=trace_id,
+        )
+    else:
+        recap_vault = recap_blind_data_vault
+        recap_stage = recap_blind_data_stage
     plugins: list[Any] = [
         S3InjectionCheckPlugin(
             samples=_reference_injection_samples(expected_omega=expected_omega, observed_omega=observed_omega),
@@ -1400,6 +1423,7 @@ def _reference_model_payload(
     *,
     frozen_pipeline_ref: str,
     frozen_payload: Mapping[str, Any],
+    frozen_pipeline_execution: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     if frozen_payload.get("schema") == "argus.s1.reference_physics_model.v1":
         return dict(frozen_payload)
@@ -1408,6 +1432,7 @@ def _reference_model_payload(
             store,
             frozen_pipeline_ref=frozen_pipeline_ref,
             frozen_payload=frozen_payload,
+            frozen_pipeline_execution=frozen_pipeline_execution,
         )
     model_ref = frozen_payload.get("model_ref")
     if isinstance(model_ref, str):
@@ -1436,6 +1461,7 @@ def _reference_s2_model_payload(
     *,
     frozen_pipeline_ref: str,
     frozen_payload: Mapping[str, Any],
+    frozen_pipeline_execution: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     component_refs = frozen_payload.get("component_refs")
     if not isinstance(component_refs, Mapping):
@@ -1447,20 +1473,28 @@ def _reference_s2_model_payload(
     dataset_payload = _artifact_payload(store, dataset_ref)
     row = _reference_dataset_row(dataset_payload)
     target_scale = _reference_positive_scale(dataset_payload.get("target_scale"), "S2 reference target_scale")
-    prediction = FrozenPipelineRunner(artifact_store=store).predict(
-        frozen_pipeline_ref,
-        {
-            "adapter_omega_scaled": {
-                "value": _reference_scaled_row_value(row, "adapter_omega_scaled"),
-                "units": "dimensionless",
-            }
-        },
-    )
-    scaled_output = prediction.outputs_units_tagged.get("omega_scaled")
+    if frozen_pipeline_execution is None:
+        prediction = FrozenPipelineRunner(artifact_store=store).predict(
+            frozen_pipeline_ref,
+            {
+                "adapter_omega_scaled": {
+                    "value": _reference_scaled_row_value(row, "adapter_omega_scaled"),
+                    "units": "dimensionless",
+                }
+            },
+        )
+        outputs_units_tagged = prediction.outputs_units_tagged
+        uncertainty = prediction.uncertainty
+    else:
+        outputs_units_tagged, uncertainty = _reference_sandbox_pipeline_output(
+            store,
+            frozen_pipeline_ref=frozen_pipeline_ref,
+            execution=frozen_pipeline_execution,
+        )
+    scaled_output = outputs_units_tagged.get("omega_scaled")
     if not isinstance(scaled_output, Mapping):
         raise ValueError("S2 reference frozen pipeline did not return omega_scaled")
     scaled_value = _reference_positive_scale(scaled_output.get("value"), "S2 reference prediction")
-    uncertainty = prediction.uncertainty
     if not isinstance(uncertainty, Mapping) or uncertainty.get("kind") != "interval":
         raise ValueError("S2 reference frozen pipeline requires interval uncertainty")
     scaled_radius = _reference_non_negative_finite(uncertainty.get("radius"), "S2 reference uncertainty radius")
@@ -1488,6 +1522,32 @@ def _reference_s2_model_payload(
         },
         "perturbation_observations": perturbation_observations,
     }
+
+
+def _reference_sandbox_pipeline_output(
+    store: InMemoryArtifactStore,
+    *,
+    frozen_pipeline_ref: str,
+    execution: Mapping[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    if not isinstance(execution, Mapping):
+        raise ValueError("S2 reference sandbox execution must be a mapping")
+    if execution.get("schema") != "argus.s3.frozen_pipeline_execution_output.v1":
+        raise ValueError("S2 reference sandbox execution schema is unsupported")
+    if execution.get("entrypoint") != "predict":
+        raise ValueError("S2 reference sandbox execution entrypoint is invalid")
+    if execution.get("frozen_pipeline_ref") != frozen_pipeline_ref:
+        raise ValueError("S2 reference sandbox execution frozen pipeline does not match the validation request")
+    record = store.get_record(frozen_pipeline_ref)
+    if execution.get("frozen_pipeline_content_hash") != record.content_hash:
+        raise ValueError("S2 reference sandbox execution content hash does not match C4")
+    outputs = execution.get("outputs_units_tagged")
+    uncertainty = execution.get("uncertainty")
+    if not isinstance(outputs, Mapping):
+        raise ValueError("S2 reference sandbox execution outputs are missing")
+    if not isinstance(uncertainty, Mapping):
+        raise ValueError("S2 reference sandbox execution uncertainty is missing")
+    return dict(outputs), dict(uncertainty)
 
 
 def _reference_s2_dataset_ref(store: InMemoryArtifactStore, input_refs: list[Any]) -> str:

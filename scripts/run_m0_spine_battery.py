@@ -48,6 +48,7 @@ from argus_core import (
 )
 from argusverify import C3ReportSigner, InMemoryVerifierTrustStore, verify_report
 from argus_runtime.auth import RuntimeAuth, runtime_identity_from_dict
+from argus_core.s10 import DIGEST_PINNED_IMAGE
 
 
 DEFAULT_IMAGE = "busybox@sha256:73aaf090f3d85aa34ee199857f03fa3a95c8ede2ffd4cc2cdb5b94e566b11662"
@@ -58,6 +59,19 @@ HALT_LATENCY_LIMIT_S = 2.0
 TOKEN_REVOCATION_PROPAGATION_SLO_S = 2.0
 INFLIGHT_REVOCATION_RESPONSE_TIMEOUT_S = TOKEN_REVOCATION_PROPAGATION_SLO_S + 8.0
 M1_REFERENCE_DEMO_E2E_TIMEOUT_S = 60.0
+M1_REFERENCE_PIPELINE_IMAGE_ENV = "ARGUS_S2_REFERENCE_PIPELINE_IMAGE"
+M1_REFERENCE_PIPELINE_PLACEHOLDER_IMAGE = "sha256:" + "0" * 64
+M1_REFERENCE_PIPELINE_SERVICE = "s3-reference-referee"
+COMPOSE_BUILD_TIMEOUT_S = 600
+M1_REFERENCE_RUNTIME_SERVICES = (
+    "s8-writer",
+    "s10-supervisor",
+    "s1-reference-demo",
+    "s2-reference-builder",
+    "s3-reference-referee",
+    "s7-reference-adapter",
+    "s11-reference-observatory",
+)
 
 
 def main() -> int:
@@ -111,8 +125,20 @@ def main() -> int:
 
     try:
         if not args.skip_compose_up:
-            _record(evidence, "deploy", "argus-m0 compose up --build --wait")
-            _run([docker, "compose", "-f", args.compose_file, "up", "-d", "--build", "--wait"], env=env, timeout=240)
+            pipeline_image = _prepare_reference_pipeline_image(
+                docker=docker,
+                compose_file=args.compose_file,
+                env=env,
+            )
+            evidence["target"]["s2_reference_pipeline_image"] = pipeline_image
+            _record(
+                evidence,
+                "build",
+                "argus-m0 Compose built the S3 nested frozen-pipeline image",
+                {"pipeline_image": pipeline_image},
+            )
+            _record(evidence, "deploy", "argus-m0 compose up --wait")
+            _run([docker, "compose", "-f", args.compose_file, "up", "-d", "--wait"], env=env, timeout=240)
         _wait_health(f"{s8_url}/healthz", token=runtime_secrets["health_token"])
         _wait_health(f"{s10_url}/healthz", token=runtime_secrets["health_token"])
         _wait_health(f"{s1_reference_demo_url}/healthz", token=None)
@@ -670,6 +696,7 @@ def _m0_identity_requests() -> dict[str, dict[str, Any]]:
             "caller_id": "m1-reference-s3",
             "job_id": "m1-reference-job",
             "root_request_id": "m1-reference-root",
+            "budget_caps": {"max_compute_units": 10, "max_wallclock_s": 30, "max_cost_usd": 1},
             "scopes": {
                 "broker_audiences": ["store"],
                 "capabilities": ["s8.read"],
@@ -751,10 +778,62 @@ def _compose_environment(
         "ARGUS_S3_REFERENCE_REFEREE_SIGNER_SECRET": runtime_secrets["s3_reference_referee_signing_key"],
         "ARGUS_S1_REFERENCE_DEMO_ACCESS_TOKEN": reference_service_tokens["m1-reference-s1"],
         "ARGUS_S2_REFERENCE_BUILDER_ACCESS_TOKEN": reference_service_tokens["m1-reference-s2"],
+        M1_REFERENCE_PIPELINE_IMAGE_ENV: M1_REFERENCE_PIPELINE_PLACEHOLDER_IMAGE,
         "ARGUS_S3_REFERENCE_REFEREE_ACCESS_TOKEN": reference_service_tokens["m1-reference-s3"],
         "ARGUS_S7_REFERENCE_ADAPTER_ACCESS_TOKEN": reference_service_tokens["m1-reference-s7"],
         "ARGUS_S11_REFERENCE_OBSERVATORY_ACCESS_TOKEN": reference_service_tokens["m1-reference-s11"],
     }
+
+
+def _prepare_reference_pipeline_image(
+    *,
+    docker: str,
+    compose_file: str,
+    env: dict[str, str],
+    timeout: int = COMPOSE_BUILD_TIMEOUT_S,
+) -> str:
+    """Build one shared runtime image and bind its immutable image ID to S2."""
+
+    _run(
+        [docker, "compose", "-f", compose_file, "build", M1_REFERENCE_PIPELINE_SERVICE],
+        env=env,
+        timeout=timeout,
+    )
+    configured_images = _run(
+        [docker, "compose", "-f", compose_file, "config", "--images"],
+        env=env,
+        timeout=60,
+    )
+    service_image_names: dict[str, str] = {}
+    for image_name in (line.strip() for line in configured_images.stdout.splitlines() if line.strip()):
+        for service_name in M1_REFERENCE_RUNTIME_SERVICES:
+            if image_name.endswith(f"-{service_name}"):
+                if service_name in service_image_names:
+                    raise RuntimeError(f"Compose configured more than one image for {service_name}: {image_name!r}")
+                service_image_names[service_name] = image_name
+                break
+    missing_services = [service_name for service_name in M1_REFERENCE_RUNTIME_SERVICES if service_name not in service_image_names]
+    if missing_services:
+        raise RuntimeError(
+            "Compose is missing runtime images required to share the frozen-pipeline image: "
+            f"{missing_services!r}"
+        )
+    pipeline_image_name = service_image_names[M1_REFERENCE_PIPELINE_SERVICE]
+    inspected = _run(
+        [docker, "image", "inspect", "--format", "{{.Id}}", pipeline_image_name],
+        env=env,
+        timeout=60,
+    )
+    image_id = inspected.stdout.strip()
+    if DIGEST_PINNED_IMAGE.fullmatch(image_id) is None:
+        raise RuntimeError(f"Compose service image is not a digest-pinned Docker image ID: {image_id!r}")
+    for service_name in M1_REFERENCE_RUNTIME_SERVICES:
+        image_name = service_image_names[service_name]
+        if image_name == pipeline_image_name:
+            continue
+        _run([docker, "image", "tag", image_id, image_name], env=env, timeout=60)
+    env[M1_REFERENCE_PIPELINE_IMAGE_ENV] = image_id
+    return image_id
 
 
 def _m1_reference_service_access_tokens(runtime_secrets: Mapping[str, str]) -> dict[str, str]:

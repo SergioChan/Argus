@@ -8,6 +8,53 @@ from scripts import run_m1_external_referee_battery as referee_battery
 
 
 class M1ExternalRefereeBatteryTests(unittest.TestCase):
+    def test_external_referee_uses_an_isolated_compose_project_name(self) -> None:
+        project_name = referee_battery._isolated_compose_project_name()
+
+        self.assertRegex(project_name, r"^argus-m1-external-referee-[0-9a-f]{12}$")
+
+    def test_external_referee_rows_satisfy_the_s2_raw_and_scaled_input_contract(self) -> None:
+        rows = referee_battery._reference_rows()
+
+        self.assertEqual(len(rows), 16)
+        canonical = rows[0]
+        self.assertEqual(canonical["row_id"], "s7-reference-base")
+        self.assertEqual(canonical["T_n"], 100.0)
+        self.assertEqual(canonical["alpha"], 0.2)
+        self.assertEqual(canonical["beta_over_H"], 100.0)
+        self.assertEqual(canonical["v_w"], 0.7)
+        self.assertEqual(canonical["frequency"], 0.003)
+        self.assertEqual(
+            [str(row["row_id"]) for row in rows[1:]],
+            [f"s7-reference-{index:03d}" for index in range(1, 16)],
+        )
+        for row in rows:
+            self.assertTrue(
+                {
+                    "T_n",
+                    "alpha",
+                    "beta_over_H",
+                    "v_w",
+                    "frequency",
+                    "adapter_omega",
+                    "omega",
+                    "known_omega",
+                    "adapter_omega_scaled",
+                    "omega_scaled",
+                }.issubset(row)
+            )
+            self.assertGreater(float(row["adapter_omega"]), 0.0)
+            self.assertGreater(float(row["omega"]), 0.0)
+            self.assertAlmostEqual(float(row["known_omega"]), float(row["omega"]))
+            self.assertAlmostEqual(
+                float(row["adapter_omega_scaled"]),
+                float(row["adapter_omega"]) / referee_battery.S2_REFERENCE_OMEGA_SCALE,
+            )
+            self.assertAlmostEqual(
+                float(row["omega_scaled"]),
+                float(row["omega"]) / referee_battery.S2_REFERENCE_OMEGA_SCALE,
+            )
+
     def test_compose_environment_uses_preprovisioned_reference_service_tokens(self) -> None:
         service_tokens = {
             "m1-reference-s1": "s1-access-token",
@@ -35,6 +82,7 @@ class M1ExternalRefereeBatteryTests(unittest.TestCase):
             environment["ARGUS_S11_REFERENCE_OBSERVATORY_ACCESS_TOKEN"],
             service_tokens["m1-reference-s11"],
         )
+        self.assertEqual(environment["ARGUS_S2_REFERENCE_PIPELINE_IMAGE"], "sha256:" + "0" * 64)
         self.assertNotEqual(
             environment["ARGUS_S7_REFERENCE_ADAPTER_ACCESS_TOKEN"],
             environment["ARGUS_RUNTIME_BOOTSTRAP_TOKEN"],
