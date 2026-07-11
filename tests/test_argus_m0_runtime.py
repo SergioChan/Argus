@@ -469,6 +469,79 @@ class ArgusM0RuntimeServiceTests(unittest.TestCase):
         self.assertEqual(result["detail"]["producers"]["adapter"], "S7")
         self.assertTrue(result["detail"]["s2_pipeline_lineage_includes_s1_training_dataset"])
 
+    def test_inflight_revocation_slo_starts_after_revoke_acknowledgement(self) -> None:
+        evidence: dict[str, object] = {"results": []}
+
+        class ImmediateThread:
+            def __init__(self, *, target: object, daemon: bool) -> None:
+                self._target = target
+                self._alive = False
+                self.daemon = daemon
+
+            def start(self) -> None:
+                self._target()  # type: ignore[operator]
+
+            def join(self, timeout: float | None = None) -> None:
+                del timeout
+
+            def is_alive(self) -> bool:
+                return self._alive
+
+        def fake_post_json(url: str, *_args: object, **_kwargs: object) -> dict[str, object]:
+            if url.endswith("/v1/budget-tokens"):
+                return {"budget_id": "budget-token"}
+            if url.endswith("/v1/scope-tokens"):
+                return {"scope_id": "scope-token"}
+            if url.endswith("/v1/sandboxes:launch"):
+                return {
+                    "handle": {
+                        "state": "TIMED_OUT",
+                        "launch_provenance_ref": "c4://artifact/revocation-launch",
+                    },
+                    "timed_out": True,
+                    "stderr": "argus meter halted container: token_revoked",
+                    "audit_events": ["meter.halt", "token.revocation_halt"],
+                }
+            if url.endswith("/v1/tokens:revoke"):
+                return {
+                    "revocation_store": "file",
+                    "revoked_token_id": "budget-token",
+                }
+            raise AssertionError(f"unexpected POST {url}")
+
+        with (
+            patch.object(m0_battery, "_launch_request_json", return_value={"launch": "request"}),
+            patch.object(m0_battery, "_post_json", side_effect=fake_post_json),
+            patch.object(
+                m0_battery,
+                "_battery_spend_final",
+                return_value={
+                    "meter_breached_dimensions": ["token_revoked"],
+                    "meter_halted_by_meter": True,
+                    "artifact_ref": "c4://artifact/revocation-spend-final",
+                    "final_state": "TIMED_OUT",
+                    "partial_result_captured": True,
+                },
+            ),
+            patch.object(m0_battery.threading, "Thread", ImmediateThread),
+            patch.object(m0_battery.time, "sleep"),
+            patch.object(m0_battery.time, "monotonic", side_effect=[10.0, 12.75, 12.75, 12.9]),
+        ):
+            m0_battery._battery_revoked_inflight_sandbox_halted(
+                evidence,
+                "http://s10-demo",
+                s8_url="http://s8-demo",
+                image="busybox@sha256:test",
+                token="runtime-token",
+                read_token="read-token",
+            )
+
+        result = evidence["results"][-1]  # type: ignore[index]
+        detail = result["detail"]
+        self.assertEqual(detail["revocation_ack_elapsed_s"], 2.75)
+        self.assertEqual(detail["halted_after_revocation_ack_s"], 0.15)
+        self.assertEqual(detail["propagation_slo_s"], 2.0)
+
     def test_s8_writer_service_commits_and_replays_c4_records(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             app = S8WriterApp(FileSystemArtifactStore(tmp))

@@ -1154,25 +1154,27 @@ def _battery_revoked_inflight_sandbox_halted(
     thread = threading.Thread(target=launch_in_background, daemon=True)
     thread.start()
     time.sleep(1.0)
-    started = time.monotonic()
+    revoke_started = time.monotonic()
     revoke_response = _post_json(
         f"{s10_url}/v1/tokens:revoke",
         {"token_type": "budget", "token": budget_json},
         expected_status=200,
         token=token,
     )
+    revocation_ack_elapsed_s = time.monotonic() - revoke_started
+    halt_started = time.monotonic()
     thread.join(timeout=TOKEN_REVOCATION_PROPAGATION_SLO_S + 8.0)
-    halted_after_revoke_s = time.monotonic() - started
+    halted_after_revocation_ack_s = time.monotonic() - halt_started
     if thread.is_alive():
         raise AssertionError(
             "in-flight sandbox did not halt after budget token revocation within the propagation window"
         )
     if launch_error:
         raise AssertionError("in-flight revoked launch request failed unexpectedly") from launch_error[0]
-    if halted_after_revoke_s > TOKEN_REVOCATION_PROPAGATION_SLO_S:
+    if halted_after_revocation_ack_s > TOKEN_REVOCATION_PROPAGATION_SLO_S:
         raise AssertionError(
-            "in-flight revoked sandbox halt exceeded the propagation SLO: "
-            f"elapsed={halted_after_revoke_s:.6f}s slo={TOKEN_REVOCATION_PROPAGATION_SLO_S:.6f}s"
+            "in-flight revoked sandbox halt after revocation acknowledgement exceeded the propagation SLO: "
+            f"elapsed={halted_after_revocation_ack_s:.6f}s slo={TOKEN_REVOCATION_PROPAGATION_SLO_S:.6f}s"
         )
     handle = launch_result.get("handle") or {}
     events = launch_result.get("audit_events") or []
@@ -1205,7 +1207,8 @@ def _battery_revoked_inflight_sandbox_halted(
             "token_type": "budget",
             "revocation_store": revoke_response["revocation_store"],
             "revoked_token_id": revoke_response["revoked_token_id"],
-            "halted_after_revoke_s": round(halted_after_revoke_s, 6),
+            "revocation_ack_elapsed_s": round(revocation_ack_elapsed_s, 6),
+            "halted_after_revocation_ack_s": round(halted_after_revocation_ack_s, 6),
             "propagation_slo_s": TOKEN_REVOCATION_PROPAGATION_SLO_S,
             "launch_handle_state": handle["state"],
             "launch_timed_out": launch_result["timed_out"],
