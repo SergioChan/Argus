@@ -87,39 +87,10 @@ def main() -> int:
         "ARGUS_M0_S8_PORT": str(_free_port()),
         "ARGUS_M0_S10_PORT": str(_free_port()),
         "ARGUS_M0_S1_DEMO_PORT": str(_free_port()),
+        "ARGUS_M0_S2_REFERENCE_BUILDER_PORT": str(_free_port()),
         "ARGUS_M0_S3_REFERENCE_REFEREE_PORT": str(_free_port()),
     }
-    env = {
-        **os.environ,
-        **ports,
-        "ARGUS_RUNTIME_BOOTSTRAP_TOKEN": runtime_secrets["bootstrap_token"],
-        "ARGUS_RUNTIME_IDENTITY_SIGNING_KEY": runtime_secrets["identity_signing_key"],
-        "ARGUS_RUNTIME_IDENTITY_MINT_POLICY_JSON": _m0_identity_mint_policy_json(),
-        "ARGUS_M0_HEALTH_TOKEN": runtime_secrets["health_token"],
-        "ARGUS_S10_TOKEN_ED25519_PRIVATE_KEY_HEX": runtime_secrets["s10_token_ed25519_private_key_hex"],
-        "ARGUS_S10_TOKEN_ED25519_PUBLIC_KEY_HEX": runtime_secrets["s10_token_ed25519_public_key_hex"],
-        "ARGUS_S10_POLICY_SIGNING_KEY": runtime_secrets["s10_policy_signing_key"],
-        "ARGUS_S10_CHECKPOINT_SIGNING_KEY": runtime_secrets["s10_checkpoint_signing_key"],
-        "ARGUS_S10_CHECKPOINT_SIGNER_AUTH_TOKEN": runtime_secrets["s10_checkpoint_signer_auth_token"],
-        "ARGUS_S10_VERIFIER_KEY_AUTH_TOKEN": runtime_secrets["s10_verifier_key_auth_token"],
-        "ARGUS_S10_C3_VERIFIER_KEYS_JSON": json.dumps(
-            {
-                M0_C3_VERIFIER_KEY_ID: runtime_secrets["c3_verifier_signing_key"],
-                M1_S3_REFERENCE_REFEREE_KEY_ID: runtime_secrets["s3_reference_referee_signing_key"],
-            },
-            separators=(",", ":"),
-            sort_keys=True,
-        ),
-        "ARGUS_S10_PRICE_TABLE_SIGNING_KEY": runtime_secrets["s10_price_table_signing_key"],
-        "ARGUS_S10_PRICE_TABLE_ISSUED_AT": str(price_table_now - 60),
-        "ARGUS_S10_PRICE_TABLE_EXPIRES_AT": str(price_table_now + 86_400),
-        "ARGUS_S8_BROKER_WRITE_KEY": runtime_secrets["s8_broker_write_key"],
-        "ARGUS_S3_REFERENCE_REFEREE_SIGNER_SECRET": runtime_secrets["s3_reference_referee_signing_key"],
-        "ARGUS_S1_REFERENCE_DEMO_ACCESS_TOKEN": reference_service_tokens["m1-reference-s1"],
-        "ARGUS_S3_REFERENCE_REFEREE_ACCESS_TOKEN": reference_service_tokens["m1-reference-s3"],
-        "ARGUS_S7_REFERENCE_ADAPTER_ACCESS_TOKEN": reference_service_tokens["m1-reference-s7"],
-        "ARGUS_S11_REFERENCE_OBSERVATORY_ACCESS_TOKEN": reference_service_tokens["m1-reference-s11"],
-    }
+    env = _compose_environment(runtime_secrets=runtime_secrets, ports=ports, now=price_table_now)
     s8_url = f"http://127.0.0.1:{ports['ARGUS_M0_S8_PORT']}"
     s10_url = f"http://127.0.0.1:{ports['ARGUS_M0_S10_PORT']}"
     s1_reference_demo_url = f"http://127.0.0.1:{ports['ARGUS_M0_S1_DEMO_PORT']}"
@@ -128,6 +99,7 @@ def main() -> int:
         "s8_url": s8_url,
         "s10_url": s10_url,
         "s1_reference_demo_url": s1_reference_demo_url,
+        "s2_reference_builder_url": f"http://127.0.0.1:{ports['ARGUS_M0_S2_REFERENCE_BUILDER_PORT']}",
         "s3_reference_referee_url": f"http://127.0.0.1:{ports['ARGUS_M0_S3_REFERENCE_REFEREE_PORT']}",
         "ports": ports,
         "persistence": "postgres-minio",
@@ -679,6 +651,19 @@ def _m0_identity_requests() -> dict[str, dict[str, Any]]:
                 "sandbox_risk_class": "standard",
             },
         },
+        "m1-reference-s2": {
+            "caller_id": "m1-reference-s2",
+            "job_id": "m1-reference-job",
+            "root_request_id": "m1-reference-root",
+            "budget_caps": {"max_compute_units": 10, "max_wallclock_s": 30, "max_cost_usd": 1},
+            "scopes": {
+                "allowed_datasets": ["dataset:m1-reference-ewpt"],
+                "broker_audiences": ["store"],
+                "capabilities": ["s8.read"],
+                "producer_subsystems": ["S2"],
+                "sandbox_risk_class": "standard",
+            },
+        },
         "m1-reference-s3": {
             "caller_id": "m1-reference-s3",
             "job_id": "m1-reference-job",
@@ -729,13 +714,54 @@ def _m0_identity_mint_policy_json() -> str:
     return json.dumps(policy, separators=(",", ":"), sort_keys=True)
 
 
+def _compose_environment(
+    *,
+    runtime_secrets: Mapping[str, str],
+    ports: Mapping[str, str],
+    now: int,
+) -> dict[str, str]:
+    reference_service_tokens = _m1_reference_service_access_tokens(runtime_secrets)
+    return {
+        **os.environ,
+        **ports,
+        "ARGUS_RUNTIME_BOOTSTRAP_TOKEN": runtime_secrets["bootstrap_token"],
+        "ARGUS_RUNTIME_IDENTITY_SIGNING_KEY": runtime_secrets["identity_signing_key"],
+        "ARGUS_RUNTIME_IDENTITY_MINT_POLICY_JSON": _m0_identity_mint_policy_json(),
+        "ARGUS_M0_HEALTH_TOKEN": runtime_secrets["health_token"],
+        "ARGUS_S10_TOKEN_ED25519_PRIVATE_KEY_HEX": runtime_secrets["s10_token_ed25519_private_key_hex"],
+        "ARGUS_S10_TOKEN_ED25519_PUBLIC_KEY_HEX": runtime_secrets["s10_token_ed25519_public_key_hex"],
+        "ARGUS_S10_POLICY_SIGNING_KEY": runtime_secrets["s10_policy_signing_key"],
+        "ARGUS_S10_CHECKPOINT_SIGNING_KEY": runtime_secrets["s10_checkpoint_signing_key"],
+        "ARGUS_S10_CHECKPOINT_SIGNER_AUTH_TOKEN": runtime_secrets["s10_checkpoint_signer_auth_token"],
+        "ARGUS_S10_VERIFIER_KEY_AUTH_TOKEN": runtime_secrets["s10_verifier_key_auth_token"],
+        "ARGUS_S10_C3_VERIFIER_KEYS_JSON": json.dumps(
+            {
+                M0_C3_VERIFIER_KEY_ID: runtime_secrets["c3_verifier_signing_key"],
+                M1_S3_REFERENCE_REFEREE_KEY_ID: runtime_secrets["s3_reference_referee_signing_key"],
+            },
+            separators=(",", ":"),
+            sort_keys=True,
+        ),
+        "ARGUS_S10_PRICE_TABLE_SIGNING_KEY": runtime_secrets["s10_price_table_signing_key"],
+        "ARGUS_S10_PRICE_TABLE_ISSUED_AT": str(now - 60),
+        "ARGUS_S10_PRICE_TABLE_EXPIRES_AT": str(now + 86_400),
+        "ARGUS_S8_BROKER_WRITE_KEY": runtime_secrets["s8_broker_write_key"],
+        "ARGUS_S3_REFERENCE_REFEREE_SIGNER_SECRET": runtime_secrets["s3_reference_referee_signing_key"],
+        "ARGUS_S1_REFERENCE_DEMO_ACCESS_TOKEN": reference_service_tokens["m1-reference-s1"],
+        "ARGUS_S2_REFERENCE_BUILDER_ACCESS_TOKEN": reference_service_tokens["m1-reference-s2"],
+        "ARGUS_S3_REFERENCE_REFEREE_ACCESS_TOKEN": reference_service_tokens["m1-reference-s3"],
+        "ARGUS_S7_REFERENCE_ADAPTER_ACCESS_TOKEN": reference_service_tokens["m1-reference-s7"],
+        "ARGUS_S11_REFERENCE_OBSERVATORY_ACCESS_TOKEN": reference_service_tokens["m1-reference-s11"],
+    }
+
+
 def _m1_reference_service_access_tokens(runtime_secrets: Mapping[str, str]) -> dict[str, str]:
     issuer = RuntimeAuth.with_signed_identities(
         bootstrap_token=runtime_secrets["bootstrap_token"],
         identity_signing_key=runtime_secrets["identity_signing_key"].encode("utf-8"),
     )
     tokens: dict[str, str] = {}
-    for caller_id in ("m1-reference-s1", "m1-reference-s3", "m1-reference-s7", "m1-reference-s11"):
+    for caller_id in ("m1-reference-s1", "m1-reference-s2", "m1-reference-s3", "m1-reference-s7", "m1-reference-s11"):
         identity = runtime_identity_from_dict(
             {
                 **_m0_identity_requests()[caller_id],

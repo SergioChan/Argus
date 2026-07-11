@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -30,13 +29,11 @@ from argus_runtime.m1_runtime_artifacts import RuntimeArtifactStoreError, Runtim
 from argus_runtime.s3_reference_referee_service import S3_REFERENCE_REFEREE_ROUTE
 from argus_runtime.s8_persistence import HttpS10VerifierKeyProvider
 from scripts.run_m0_spine_battery import (
-    M0_C3_VERIFIER_KEY_ID,
-    M1_S3_REFERENCE_REFEREE_KEY_ID,
+    _compose_environment,
     _free_port,
     _git_dirty,
     _git_head,
     _m0_identity_mint_policy_json,
-    _m1_reference_service_access_tokens,
     _m0_runtime_secrets,
 )
 
@@ -61,6 +58,7 @@ def main() -> int:
         "ARGUS_M0_S8_PORT": str(_free_port()),
         "ARGUS_M0_S10_PORT": str(_free_port()),
         "ARGUS_M0_S1_DEMO_PORT": str(_free_port()),
+        "ARGUS_M0_S2_REFERENCE_BUILDER_PORT": str(_free_port()),
         "ARGUS_M0_S3_REFERENCE_REFEREE_PORT": str(_free_port()),
     }
     env = _compose_environment(runtime_secrets=runtime_secrets, ports=ports, now=now)
@@ -184,46 +182,6 @@ def main() -> int:
             path = Path(args.evidence_file).resolve()
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(json.dumps(evidence, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-
-
-def _compose_environment(
-    *,
-    runtime_secrets: Mapping[str, str],
-    ports: Mapping[str, str],
-    now: int,
-) -> dict[str, str]:
-    reference_service_tokens = _m1_reference_service_access_tokens(runtime_secrets)
-    return {
-        **os.environ,
-        **ports,
-        "ARGUS_RUNTIME_BOOTSTRAP_TOKEN": runtime_secrets["bootstrap_token"],
-        "ARGUS_RUNTIME_IDENTITY_SIGNING_KEY": runtime_secrets["identity_signing_key"],
-        "ARGUS_RUNTIME_IDENTITY_MINT_POLICY_JSON": _m0_identity_mint_policy_json(),
-        "ARGUS_M0_HEALTH_TOKEN": runtime_secrets["health_token"],
-        "ARGUS_S10_TOKEN_ED25519_PRIVATE_KEY_HEX": runtime_secrets["s10_token_ed25519_private_key_hex"],
-        "ARGUS_S10_TOKEN_ED25519_PUBLIC_KEY_HEX": runtime_secrets["s10_token_ed25519_public_key_hex"],
-        "ARGUS_S10_POLICY_SIGNING_KEY": runtime_secrets["s10_policy_signing_key"],
-        "ARGUS_S10_CHECKPOINT_SIGNING_KEY": runtime_secrets["s10_checkpoint_signing_key"],
-        "ARGUS_S10_CHECKPOINT_SIGNER_AUTH_TOKEN": runtime_secrets["s10_checkpoint_signer_auth_token"],
-        "ARGUS_S10_VERIFIER_KEY_AUTH_TOKEN": runtime_secrets["s10_verifier_key_auth_token"],
-        "ARGUS_S10_C3_VERIFIER_KEYS_JSON": json.dumps(
-            {
-                M0_C3_VERIFIER_KEY_ID: runtime_secrets["c3_verifier_signing_key"],
-                M1_S3_REFERENCE_REFEREE_KEY_ID: runtime_secrets["s3_reference_referee_signing_key"],
-            },
-            separators=(",", ":"),
-            sort_keys=True,
-        ),
-        "ARGUS_S10_PRICE_TABLE_SIGNING_KEY": runtime_secrets["s10_price_table_signing_key"],
-        "ARGUS_S10_PRICE_TABLE_ISSUED_AT": str(now - 60),
-        "ARGUS_S10_PRICE_TABLE_EXPIRES_AT": str(now + 86_400),
-        "ARGUS_S8_BROKER_WRITE_KEY": runtime_secrets["s8_broker_write_key"],
-        "ARGUS_S3_REFERENCE_REFEREE_SIGNER_SECRET": runtime_secrets["s3_reference_referee_signing_key"],
-        "ARGUS_S1_REFERENCE_DEMO_ACCESS_TOKEN": reference_service_tokens["m1-reference-s1"],
-        "ARGUS_S3_REFERENCE_REFEREE_ACCESS_TOKEN": reference_service_tokens["m1-reference-s3"],
-        "ARGUS_S7_REFERENCE_ADAPTER_ACCESS_TOKEN": reference_service_tokens["m1-reference-s7"],
-        "ARGUS_S11_REFERENCE_OBSERVATORY_ACCESS_TOKEN": reference_service_tokens["m1-reference-s11"],
-    }
 
 
 def _runtime_store(*, s10_url: str, s8_url: str, bootstrap_token: str, caller_id: str) -> S10S8ArtifactStore:

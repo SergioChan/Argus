@@ -11,12 +11,13 @@ class M1ExternalRefereeBatteryTests(unittest.TestCase):
     def test_compose_environment_uses_preprovisioned_reference_service_tokens(self) -> None:
         service_tokens = {
             "m1-reference-s1": "s1-access-token",
+            "m1-reference-s2": "s2-access-token",
             "m1-reference-s3": "s3-access-token",
             "m1-reference-s7": "s7-access-token",
             "m1-reference-s11": "s11-access-token",
         }
 
-        with patch.object(referee_battery, "_m1_reference_service_access_tokens", return_value=service_tokens):
+        with patch.object(m0_battery, "_m1_reference_service_access_tokens", return_value=service_tokens):
             environment = referee_battery._compose_environment(
                 runtime_secrets=m0_battery._m0_runtime_secrets(),
                 ports={"ARGUS_M0_S10_PORT": "18080"},
@@ -24,6 +25,10 @@ class M1ExternalRefereeBatteryTests(unittest.TestCase):
             )
 
         self.assertEqual(environment["ARGUS_S1_REFERENCE_DEMO_ACCESS_TOKEN"], service_tokens["m1-reference-s1"])
+        self.assertEqual(
+            environment["ARGUS_S2_REFERENCE_BUILDER_ACCESS_TOKEN"],
+            service_tokens["m1-reference-s2"],
+        )
         self.assertEqual(environment["ARGUS_S3_REFERENCE_REFEREE_ACCESS_TOKEN"], service_tokens["m1-reference-s3"])
         self.assertEqual(environment["ARGUS_S7_REFERENCE_ADAPTER_ACCESS_TOKEN"], service_tokens["m1-reference-s7"])
         self.assertEqual(

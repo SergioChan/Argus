@@ -19,8 +19,11 @@ from argus_core import (
     FileSystemArtifactStore,
     GWSpectrumAdapter,
     InMemoryS10KmsVerifierKeyProvider,
+    Lineage,
+    Producer,
     S10VerifierTrustStoreClient,
     ScopeGrant,
+    evaluate_sound_wave_spectrum,
 )
 from argus_runtime.auth import RuntimeAuth, RuntimeIdentity
 from argus_runtime.http_json import JsonRequest, serve_json_app
@@ -29,6 +32,11 @@ from argus_runtime.m1_runtime_artifacts import RuntimeIdentitySession, S10S8Arti
 from argus_runtime.s10_supervisor_service import RuntimeIdentityMintPolicy, S10SupervisorApp, S8BrokeredArtifactStoreClient
 from argus_runtime.s11_reference_observatory_service import S11ReferenceObservatoryApp
 from argus_runtime.s3_reference_referee_service import S3_REFERENCE_REFEREE_ROUTE, S3ReferenceRefereeApp
+from argus_runtime.s2_reference_builder_service import (
+    S2_REFERENCE_BUILDER_ROUTE,
+    S2ReferenceBuilderApp,
+    build_app_from_env as build_s2_reference_builder_app_from_env,
+)
 from argus_runtime.s7_reference_adapter_service import (
     S7ReferenceAdapterApp,
     build_app_from_env as build_s7_reference_adapter_app_from_env,
@@ -52,6 +60,159 @@ class M1ReferenceLifecycleServiceTests(unittest.TestCase):
 
         self.assertEqual(app._caller_id, "m1-reference-s7")
         self.assertEqual(app._expected_job_id, M1_REFERENCE_JOB_ID)
+
+    def test_s2_reference_builder_builds_from_access_token_only(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "ARGUS_S2_REFERENCE_BUILDER_S10_URL": "http://s10.example",
+                "ARGUS_S2_REFERENCE_BUILDER_S8_URL": "http://s8.example",
+                "ARGUS_S2_REFERENCE_BUILDER_ACCESS_TOKEN": "preprovisioned-s2-token",
+            },
+            clear=True,
+        ):
+            app = build_s2_reference_builder_app_from_env()
+
+        self.assertEqual(app._caller_id, "m1-reference-s2")
+        self.assertEqual(app._expected_job_id, M1_REFERENCE_JOB_ID)
+
+    def test_s2_reference_builder_requires_s1_and_persists_real_frozen_pipeline(self) -> None:
+        bootstrap_token = "m1-s2-builder-bootstrap"
+        broker_write_key = b"m1-s2-builder-broker-write-key"
+        auth = RuntimeAuth.with_signed_identities(
+            bootstrap_token=bootstrap_token,
+            identity_signing_key=b"m1-s2-builder-identity-signing-key",
+        )
+        identities = {
+            "m1-reference-s1": _identity(
+                caller_id="m1-reference-s1",
+                producer_subsystems=("S1",),
+                allowed_adapters=("gw_spectrum",),
+                allowed_datasets=("dataset:m1-reference-ewpt",),
+                broker_audiences=("store", "gw_spectrum"),
+            ),
+            "m1-reference-s2": _identity(
+                caller_id="m1-reference-s2",
+                producer_subsystems=("S2",),
+                allowed_datasets=("dataset:m1-reference-ewpt",),
+            ),
+        }
+        access_tokens = {
+            caller_id: str(auth.mint_identity_token(identity, ttl_s=600)["access_token"])
+            for caller_id, identity in identities.items()
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            durable_store = FileSystemArtifactStore(tmp)
+            s8 = S8WriterApp(durable_store, auth=auth, broker_write_key=broker_write_key)
+            s8_url = _start_json_server(s8)
+            s10 = S10SupervisorApp(
+                signing_key=b"m1-s2-builder-s10-signing-key",
+                artifact_store=S8BrokeredArtifactStoreClient(
+                    endpoint_url=f"{s8_url}/v1/internal/brokered-artifacts",
+                    broker_write_key=broker_write_key,
+                ),
+                auth=auth,
+                runtime_identity_mint_policy=RuntimeIdentityMintPolicy(identities_by_caller=identities),
+            )
+            s10_url = _start_json_server(s10)
+            s1_session = RuntimeIdentitySession.from_access_token(
+                s10_url=s10_url,
+                access_token=access_tokens["m1-reference-s1"],
+                caller_id="m1-reference-s1",
+                expected_job_id=M1_REFERENCE_JOB_ID,
+            )
+            s1_store = S10S8ArtifactStore(session=s1_session, s8_url=s8_url)
+            dataset = s1_store.create_artifact(
+                kind="dataset",
+                payload={
+                    "schema": {"features": ["adapter_omega"], "target": "omega"},
+                    "rows": _reference_builder_rows(),
+                },
+                producer=Producer(
+                    subsystem="S1",
+                    version="0.0.0",
+                    actor_id="s1.reference-input",
+                    job_id=M1_REFERENCE_JOB_ID,
+                ),
+                lineage=Lineage(
+                    input_refs=(),
+                    code_ref="argus-test:m1-s2-reference-input",
+                    environment_digest="python:m1-s2-reference-test",
+                    job_id=M1_REFERENCE_JOB_ID,
+                ),
+            )
+            builder = S2ReferenceBuilderApp(
+                s10_url=s10_url,
+                s8_url=s8_url,
+                access_token=access_tokens["m1-reference-s2"],
+                expected_job_id=M1_REFERENCE_JOB_ID,
+                require_s1_requester=True,
+            )
+
+            denied_status, denied = builder.http.handle(
+                JsonRequest(
+                    method="POST",
+                    path=S2_REFERENCE_BUILDER_ROUTE,
+                    query={},
+                    body={"job_id": M1_REFERENCE_JOB_ID, "dataset_ref": dataset.artifact_ref},
+                )
+            )
+            status, payload = builder.http.handle(
+                JsonRequest(
+                    method="POST",
+                    path=S2_REFERENCE_BUILDER_ROUTE,
+                    query={},
+                    body={"job_id": M1_REFERENCE_JOB_ID, "dataset_ref": dataset.artifact_ref},
+                    headers={"Authorization": f"Bearer {access_tokens['m1-reference-s1']}"},
+                )
+            )
+
+            self.assertEqual(denied_status, 403)
+            self.assertEqual(denied["error"], "requester_unauthorized")
+
+            wrong_job_status, wrong_job = builder.http.handle(
+                JsonRequest(
+                    method="POST",
+                    path=S2_REFERENCE_BUILDER_ROUTE,
+                    query={},
+                    body={"job_id": "attacker-selected-job", "dataset_ref": dataset.artifact_ref},
+                    headers={"Authorization": f"Bearer {access_tokens['m1-reference-s1']}"},
+                )
+            )
+
+            self.assertEqual(wrong_job_status, 403)
+            self.assertEqual(wrong_job["error"], "job_id_mismatch")
+            self.assertEqual(status, 200, payload)
+            self.assertEqual(payload["claim_tier"], "ran-toy")
+            self.assertTrue(payload["frozen_pipeline_ref"])
+            self.assertTrue(payload["uq_calibration_ref"])
+            self.assertTrue(payload["sandbox_evidence_ref"])
+
+            s2_session = RuntimeIdentitySession.from_access_token(
+                s10_url=s10_url,
+                access_token=access_tokens["m1-reference-s2"],
+                caller_id="m1-reference-s2",
+                expected_job_id=M1_REFERENCE_JOB_ID,
+            )
+            s2_store = S10S8ArtifactStore(session=s2_session, s8_url=s8_url)
+            frozen = s2_store.get_record(str(payload["frozen_pipeline_ref"]))
+            calibration = s2_store.get_record(str(payload["uq_calibration_ref"]))
+            sandbox_evidence = s2_store.get_record(str(payload["sandbox_evidence_ref"]))
+            artifact_refs = payload["artifact_refs"]
+            self.assertIsInstance(artifact_refs, list)
+            self.assertGreater(len(artifact_refs), 0)
+            for artifact_ref in artifact_refs:
+                artifact = s2_store.get_record(str(artifact_ref))
+                self.assertEqual(artifact.producer.subsystem, "S2")
+                self.assertEqual(artifact.producer.job_id, M1_REFERENCE_JOB_ID)
+                self.assertEqual(artifact.lineage.job_id, M1_REFERENCE_JOB_ID)
+            self.assertEqual(frozen.kind, "frozen_pipeline")
+            self.assertEqual(frozen.producer.subsystem, "S2")
+            self.assertEqual(calibration.kind, "uq_calibration")
+            self.assertEqual(calibration.producer.subsystem, "S2")
+            self.assertEqual(sandbox_evidence.kind, "s2_sandbox_evidence")
+            self.assertEqual(sandbox_evidence.producer.subsystem, "S2")
 
     def test_real_http_lifecycle_uses_separate_s1_s3_s7_s11_identities_and_real_s10_sandbox(self) -> None:
         docker = _require_reference_image_or_skip(self)
@@ -251,6 +412,31 @@ def _runtime_store(*, s10_url: str, s8_url: str, bootstrap_token: str, caller_id
         expected_job_id=M1_REFERENCE_JOB_ID,
     )
     return S10S8ArtifactStore(session=session, s8_url=s8_url)
+
+
+def _reference_builder_rows() -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    for index in range(60):
+        alpha = 0.05 + (index % 10) * 0.02
+        beta_over_h = 70.0 + (index // 10) * 12.0
+        wall_velocity = 0.45 + (index % 6) * 0.07
+        frequency_hz = 0.001 + (index % 8) * 0.0005
+        omega = evaluate_sound_wave_spectrum(
+            temperature_gev=100.0,
+            alpha=alpha,
+            beta_over_h=beta_over_h,
+            wall_velocity=wall_velocity,
+            frequency_hz=frequency_hz,
+        ).omega
+        rows.append(
+            {
+                "row_id": f"ewpt-{index:03d}",
+                "adapter_omega": omega,
+                "omega": omega,
+                "role": "train",
+            }
+        )
+    return rows
 
 
 def _require_reference_image_or_skip(test_case: unittest.TestCase) -> str:

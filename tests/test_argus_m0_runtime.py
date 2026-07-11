@@ -344,6 +344,7 @@ class ArgusM0RuntimeServiceTests(unittest.TestCase):
         )
         expected_producers = {
             "m1-reference-s1": "S1",
+            "m1-reference-s2": "S2",
             "m1-reference-s3": "S3",
             "m1-reference-s7": "S7",
             "m1-reference-s11": "S11",
@@ -2321,6 +2322,7 @@ class ArgusM0ComposeTests(unittest.TestCase):
                 "ARGUS_S10_VERIFIER_KEY_AUTH_TOKEN": S10_VERIFIER_KEY_AUTH_TOKEN,
                 "ARGUS_S3_REFERENCE_REFEREE_SIGNER_SECRET": S3_REFERENCE_REFEREE_SIGNING_KEY,
                 "ARGUS_S1_REFERENCE_DEMO_ACCESS_TOKEN": "s1-reference-token",
+                "ARGUS_S2_REFERENCE_BUILDER_ACCESS_TOKEN": "s2-reference-token",
                 "ARGUS_S3_REFERENCE_REFEREE_ACCESS_TOKEN": "s3-reference-token",
                 "ARGUS_S7_REFERENCE_ADAPTER_ACCESS_TOKEN": "s7-reference-token",
                 "ARGUS_S11_REFERENCE_OBSERVATORY_ACCESS_TOKEN": "s11-reference-token",
@@ -2338,6 +2340,7 @@ class ArgusM0ComposeTests(unittest.TestCase):
                 "s8-writer",
                 "s10-supervisor",
                 "s1-reference-demo",
+                "s2-reference-builder",
                 "s3-reference-referee",
                 "s7-reference-adapter",
                 "s11-reference-observatory",
@@ -2351,6 +2354,10 @@ class ArgusM0ComposeTests(unittest.TestCase):
         self.assertEqual(
             services["s1-reference-demo"]["command"],
             ["python", "-m", "argus_runtime.s1_reference_demo_service", "--serve"],
+        )
+        self.assertEqual(
+            services["s2-reference-builder"]["command"],
+            ["python", "-m", "argus_runtime.s2_reference_builder_service"],
         )
         self.assertEqual(
             services["s3-reference-referee"]["command"],
@@ -2422,6 +2429,18 @@ class ArgusM0ComposeTests(unittest.TestCase):
             "http://s11-reference-observatory:8080",
         )
         self.assertEqual(services["s1-reference-demo"]["environment"]["ARGUS_SCHEMA_ROOT"], "/app/schemas")
+        self.assertEqual(
+            services["s2-reference-builder"]["environment"]["ARGUS_S2_REFERENCE_BUILDER_S10_URL"],
+            "http://s10-supervisor:8080",
+        )
+        self.assertEqual(
+            services["s2-reference-builder"]["environment"]["ARGUS_S2_REFERENCE_BUILDER_S8_URL"],
+            "http://s8-writer:8080",
+        )
+        self.assertEqual(
+            services["s2-reference-builder"]["environment"]["ARGUS_S2_REFERENCE_BUILDER_REQUIRE_S1_REQUESTER"],
+            "1",
+        )
         self.assertEqual(services["s3-reference-referee"]["environment"]["ARGUS_S3_REFERENCE_REFEREE_HOST"], "0.0.0.0")
         self.assertEqual(services["s3-reference-referee"]["environment"]["ARGUS_S3_REFERENCE_REFEREE_PORT"], "8080")
         self.assertEqual(
@@ -2455,6 +2474,7 @@ class ArgusM0ComposeTests(unittest.TestCase):
         self.assertEqual(services["s8-writer"]["ports"][0]["host_ip"], "127.0.0.1")
         self.assertEqual(services["s10-supervisor"]["ports"][0]["host_ip"], "127.0.0.1")
         self.assertEqual(services["s1-reference-demo"]["ports"][0]["host_ip"], "127.0.0.1")
+        self.assertEqual(services["s2-reference-builder"]["ports"][0]["host_ip"], "127.0.0.1")
         self.assertEqual(services["s3-reference-referee"]["ports"][0]["host_ip"], "127.0.0.1")
         self.assertNotIn("ports", services["s7-reference-adapter"])
         self.assertNotIn("ports", services["s11-reference-observatory"])
@@ -2468,6 +2488,7 @@ class ArgusM0ComposeTests(unittest.TestCase):
         self.assertIn("ARGUS_RUNTIME_IDENTITY_MINT_POLICY_JSON", services["s10-supervisor"]["environment"])
         reference_service_credentials = {
             "s1-reference-demo": ("ARGUS_S1_REFERENCE_DEMO_ACCESS_TOKEN", "s1-reference-token"),
+            "s2-reference-builder": ("ARGUS_S2_REFERENCE_BUILDER_ACCESS_TOKEN", "s2-reference-token"),
             "s3-reference-referee": ("ARGUS_S3_REFERENCE_REFEREE_ACCESS_TOKEN", "s3-reference-token"),
             "s7-reference-adapter": ("ARGUS_S7_REFERENCE_ADAPTER_ACCESS_TOKEN", "s7-reference-token"),
             "s11-reference-observatory": ("ARGUS_S11_REFERENCE_OBSERVATORY_ACCESS_TOKEN", "s11-reference-token"),

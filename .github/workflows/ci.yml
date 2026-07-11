@@ -88,3 +88,15 @@ jobs:
         with:
           name: m1-external-referee-evidence
           path: ${{ runner.temp }}/m1-external-referee-evidence.json
+
+      - name: Assert clean checkout before M1 S2 builder battery
+        run: test -z "$(git status --porcelain)"
+
+      - name: Run M1 S2 reference-builder battery
+        run: python3 scripts/run_m1_s2_reference_builder_battery.py --evidence-file "$RUNNER_TEMP/m1-s2-reference-builder-evidence.json"
+
+      - name: Upload M1 S2 reference-builder evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: m1-s2-reference-builder-evidence
+          path: ${{ runner.temp }}/m1-s2-reference-builder-evidence.json
