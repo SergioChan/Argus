@@ -125,6 +125,13 @@ def main(argv: list[str] | None = None) -> int:
     return 0
 
 
+def _required_env(name: str) -> str:
+    value = os.environ.get(name)
+    if not value:
+        raise RuntimeError(f"{name} is required")
+    return value
+
+
 def _eval_request_from_body(body: Mapping[str, Any]) -> EvalRequest:
     raw = _mapping(body.get("eval_request"), "reference adapter eval_request")
     adapter_id = _required_str(raw, "adapter_id", "reference adapter eval_request")

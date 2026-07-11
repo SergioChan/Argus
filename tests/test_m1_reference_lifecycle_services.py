@@ -8,6 +8,7 @@ import tempfile
 import time
 from threading import Thread
 import unittest
+from unittest.mock import patch
 
 from argus_core import (
     BudgetCaps,
@@ -27,12 +28,30 @@ from argus_runtime.m1_runtime_artifacts import RuntimeIdentitySession, S10S8Arti
 from argus_runtime.s10_supervisor_service import RuntimeIdentityMintPolicy, S10SupervisorApp, S8BrokeredArtifactStoreClient
 from argus_runtime.s11_reference_observatory_service import S11ReferenceObservatoryApp
 from argus_runtime.s3_reference_referee_service import S3_REFERENCE_REFEREE_ROUTE, S3ReferenceRefereeApp
-from argus_runtime.s7_reference_adapter_service import S7ReferenceAdapterApp
+from argus_runtime.s7_reference_adapter_service import (
+    S7ReferenceAdapterApp,
+    build_app_from_env as build_s7_reference_adapter_app_from_env,
+)
 from argus_runtime.s8_persistence import HttpS10VerifierKeyProvider
 from argus_runtime.s8_writer_service import S8WriterApp
 
 
 class M1ReferenceLifecycleServiceTests(unittest.TestCase):
+    def test_s7_reference_adapter_builds_from_access_token_only(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "ARGUS_S7_REFERENCE_ADAPTER_S10_URL": "http://s10.example",
+                "ARGUS_S7_REFERENCE_ADAPTER_S8_URL": "http://s8.example",
+                "ARGUS_S7_REFERENCE_ADAPTER_ACCESS_TOKEN": "preprovisioned-s7-token",
+            },
+            clear=True,
+        ):
+            app = build_s7_reference_adapter_app_from_env()
+
+        self.assertEqual(app._caller_id, "m1-reference-s7")
+        self.assertEqual(app._expected_job_id, M1_REFERENCE_JOB_ID)
+
     def test_real_http_lifecycle_uses_separate_s1_s3_s7_s11_identities_and_real_s10_sandbox(self) -> None:
         docker = _require_reference_image_or_skip(self)
         bootstrap_token = "m1-lifecycle-bootstrap"
