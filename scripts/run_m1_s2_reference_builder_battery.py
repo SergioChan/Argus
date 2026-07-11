@@ -20,7 +20,7 @@ if str(ROOT) not in sys.path:
 
 from argus_core import Lineage, Producer, evaluate_sound_wave_spectrum
 from argus_runtime.m1_runtime_artifacts import RuntimeIdentitySession, S10S8ArtifactStore
-from argus_runtime.s2_reference_builder_service import S2_REFERENCE_BUILDER_ROUTE
+from argus_runtime.s2_reference_builder_service import S2_REFERENCE_BUILDER_ROUTE, S2_REFERENCE_OMEGA_SCALE
 from scripts.run_m0_spine_battery import (
     _compose_environment,
     _free_port,
@@ -108,8 +108,10 @@ def main() -> int:
         dataset = s1_store.create_artifact(
             kind="dataset",
             payload={
-                "schema": {"features": ["adapter_omega"], "target": "omega"},
+                "schema": {"features": ["adapter_omega_scaled"], "target": "omega_scaled"},
                 "rows": _reference_rows(),
+                "feature_scale": S2_REFERENCE_OMEGA_SCALE,
+                "target_scale": S2_REFERENCE_OMEGA_SCALE,
                 "source_class": "m1-controlled-reference-input",
             },
             producer=Producer(
@@ -226,6 +228,8 @@ def _reference_rows() -> list[dict[str, object]]:
                 "row_id": f"ewpt-{index:03d}",
                 "adapter_omega": omega,
                 "omega": omega,
+                "adapter_omega_scaled": omega / S2_REFERENCE_OMEGA_SCALE,
+                "omega_scaled": omega / S2_REFERENCE_OMEGA_SCALE,
                 "role": "train",
             }
         )

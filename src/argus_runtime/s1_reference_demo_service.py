@@ -171,6 +171,7 @@ def build_app_from_env() -> S1ReferenceDemoApp:
         s8_url=_required_env("ARGUS_S1_REFERENCE_DEMO_S8_URL"),
         access_token=_required_env("ARGUS_S1_REFERENCE_DEMO_ACCESS_TOKEN"),
         s7_url=_required_env("ARGUS_S1_REFERENCE_DEMO_S7_URL"),
+        s2_url=_required_env("ARGUS_S1_REFERENCE_DEMO_S2_URL"),
         s3_url=_required_env("ARGUS_S1_REFERENCE_DEMO_S3_URL"),
         s11_url=_required_env("ARGUS_S1_REFERENCE_DEMO_S11_URL"),
         verifier_key_endpoint_url=os.environ.get(

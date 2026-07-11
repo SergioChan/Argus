@@ -54,6 +54,7 @@ from .s6 import CapabilityDescriptor, ContaminationIndex, FrozenContaminationSna
 from .gw_spectrum import GW_SPECTRUM_ADAPTER_ID, GWSpectrumAdapter, evaluate_sound_wave_spectrum
 from .s7 import AdapterBroker, Quantity, SimpleAdapter
 from .s8 import ArtifactRecord, InMemoryArtifactStore, Lineage, Producer
+from .s2 import FrozenPipelineRunner
 from .s10 import InMemoryAuditLedger, InMemoryTokenService, ScopeGrant
 from .s11 import ObservatoryLineageBundle, ObservatoryRenderResult, render_observatory_v0_html
 
@@ -70,6 +71,10 @@ S1_REFERENCE_MUST_NOT_REACT_VW_UNCERTAINTY_SCALE = 2.0
 
 S3ReferenceSignerFactory = Callable[[str, bytes], S3ReportSignerProtocol]
 ReferenceSandboxSpecFactory = Callable[[str, Mapping[str, Any]], Mapping[str, Any]]
+ReferenceBuildDelegate = Callable[
+    [ExecContext, Mapping[str, Any], Mapping[str, Any]],
+    Mapping[str, Any],
+]
 
 
 @dataclass(frozen=True)
@@ -487,6 +492,7 @@ class S1ReferencePhysicsSubagent(Subagent):
         variant_base_ref: str | None = None,
         variant_parameters: Mapping[str, Any] | None = None,
         sandbox_spec_factory: ReferenceSandboxSpecFactory | None = None,
+        build_delegate: ReferenceBuildDelegate | None = None,
     ) -> None:
         super().__init__(descriptor)
         self.dataset_ref = dataset_ref
@@ -494,6 +500,7 @@ class S1ReferencePhysicsSubagent(Subagent):
         self.variant_base_ref = variant_base_ref
         self.variant_parameters = dict(variant_parameters or {})
         self.sandbox_spec_factory = sandbox_spec_factory
+        self.build_delegate = build_delegate
 
     def plan(self, ctx: ExecContext, envelope: JobEnvelope) -> Mapping[str, Any]:
         del ctx
@@ -567,6 +574,21 @@ class S1ReferencePhysicsSubagent(Subagent):
                     "extrapolation_flag": True,
                     "violated_fields": violated_fields,
                 }
+            )
+        if self.build_delegate is not None:
+            return self.build_delegate(
+                ctx,
+                plan,
+                {
+                    "dataset": dict(dataset),
+                    "adapter_call": dict(adapter_call),
+                    "adapter_outputs": dict(output_payloads),
+                    "omega_radius": omega_radius,
+                    "omega_source": omega_source,
+                    "perturbation_observations": dict(perturbation_observations),
+                    "sandbox_diagnostics": dict(sandbox_diagnostics) if sandbox_diagnostics is not None else None,
+                    "diagnostics": diagnostics,
+                },
             )
         model_payload: dict[str, Any] = {
             "schema": "argus.s1.reference_physics_model.v1",
@@ -781,8 +803,13 @@ class ReferenceS3ValidationEngine:
         self.mode = mode
 
     def validate(self, request: dict[str, object]) -> dict[str, Any]:
-        frozen_payload = _artifact_payload(self.artifact_store, str(request["frozen_pipeline_ref"]))
-        model_payload = _reference_model_payload(self.artifact_store, frozen_payload)
+        frozen_pipeline_ref = str(request["frozen_pipeline_ref"])
+        frozen_payload = _artifact_payload(self.artifact_store, frozen_pipeline_ref)
+        model_payload = _reference_model_payload(
+            self.artifact_store,
+            frozen_pipeline_ref=frozen_pipeline_ref,
+            frozen_payload=frozen_payload,
+        )
         dataset_payload = _artifact_payload(self.artifact_store, str(model_payload["dataset_ref"]))
         extrapolated = self._request_has_extrapolated_artifact(request)
         job_id = str(request["job_id"])
@@ -1368,9 +1395,20 @@ def _reference_ratio(numerator: float, denominator: float) -> float:
     return numerator / denominator
 
 
-def _reference_model_payload(store: InMemoryArtifactStore, frozen_payload: Mapping[str, Any]) -> dict[str, Any]:
+def _reference_model_payload(
+    store: InMemoryArtifactStore,
+    *,
+    frozen_pipeline_ref: str,
+    frozen_payload: Mapping[str, Any],
+) -> dict[str, Any]:
     if frozen_payload.get("schema") == "argus.s1.reference_physics_model.v1":
         return dict(frozen_payload)
+    if frozen_payload.get("s3_executable") is True and isinstance(frozen_payload.get("component_refs"), Mapping):
+        return _reference_s2_model_payload(
+            store,
+            frozen_pipeline_ref=frozen_pipeline_ref,
+            frozen_payload=frozen_payload,
+        )
     model_ref = frozen_payload.get("model_ref")
     if isinstance(model_ref, str):
         model_payload = _artifact_payload(store, model_ref)
@@ -1391,6 +1429,103 @@ def _reference_model_payload(store: InMemoryArtifactStore, frozen_payload: Mappi
             if model_payload.get("schema") == "argus.s1.reference_physics_model.v1":
                 return model_payload
     raise ValueError("reference frozen pipeline does not point at a physics model artifact")
+
+
+def _reference_s2_model_payload(
+    store: InMemoryArtifactStore,
+    *,
+    frozen_pipeline_ref: str,
+    frozen_payload: Mapping[str, Any],
+) -> dict[str, Any]:
+    component_refs = frozen_payload.get("component_refs")
+    if not isinstance(component_refs, Mapping):
+        raise ValueError("S2 reference frozen pipeline requires component_refs")
+    input_refs = component_refs.get("input_refs")
+    if not isinstance(input_refs, list):
+        raise ValueError("S2 reference frozen pipeline requires input_refs")
+    dataset_ref = _reference_s2_dataset_ref(store, input_refs)
+    dataset_payload = _artifact_payload(store, dataset_ref)
+    row = _reference_dataset_row(dataset_payload)
+    target_scale = _reference_positive_scale(dataset_payload.get("target_scale"), "S2 reference target_scale")
+    prediction = FrozenPipelineRunner(artifact_store=store).predict(
+        frozen_pipeline_ref,
+        {
+            "adapter_omega_scaled": {
+                "value": _reference_scaled_row_value(row, "adapter_omega_scaled"),
+                "units": "dimensionless",
+            }
+        },
+    )
+    scaled_output = prediction.outputs_units_tagged.get("omega_scaled")
+    if not isinstance(scaled_output, Mapping):
+        raise ValueError("S2 reference frozen pipeline did not return omega_scaled")
+    scaled_value = _reference_positive_scale(scaled_output.get("value"), "S2 reference prediction")
+    uncertainty = prediction.uncertainty
+    if not isinstance(uncertainty, Mapping) or uncertainty.get("kind") != "interval":
+        raise ValueError("S2 reference frozen pipeline requires interval uncertainty")
+    scaled_radius = _reference_non_negative_finite(uncertainty.get("radius"), "S2 reference uncertainty radius")
+    reference_context = dataset_payload.get("reference_context")
+    perturbation_observations = (
+        dict(reference_context.get("perturbation_observations"))
+        if isinstance(reference_context, Mapping) and isinstance(reference_context.get("perturbation_observations"), Mapping)
+        else {}
+    )
+    return {
+        "schema": "argus.s3.s2_reference_model_view.v1",
+        "model_family": "s2-ewpt-tabular-reference",
+        "dataset_ref": dataset_ref,
+        "s2_frozen_pipeline_ref": frozen_pipeline_ref,
+        "adapter_outputs": {
+            "omega": {
+                "value": scaled_value * target_scale,
+                "units": "dimensionless",
+                "uncertainty": {
+                    "kind": "interval",
+                    "radius": scaled_radius * target_scale,
+                    "source": uncertainty.get("source", "s2-uq"),
+                },
+            }
+        },
+        "perturbation_observations": perturbation_observations,
+    }
+
+
+def _reference_s2_dataset_ref(store: InMemoryArtifactStore, input_refs: list[Any]) -> str:
+    dataset_refs: list[str] = []
+    for artifact_ref in input_refs:
+        if not isinstance(artifact_ref, str) or not artifact_ref:
+            continue
+        try:
+            record = store.get_record(artifact_ref)
+        except KeyError:
+            continue
+        if record.kind == "dataset":
+            dataset_refs.append(artifact_ref)
+    if len(dataset_refs) != 1:
+        raise ValueError("S2 reference frozen pipeline must resolve exactly one dataset input")
+    return dataset_refs[0]
+
+
+def _reference_scaled_row_value(row: Mapping[str, Any], field: str) -> float:
+    return _reference_positive_scale(row.get(field), f"reference dataset {field}")
+
+
+def _reference_positive_scale(value: Any, context: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{context} must be a positive finite number")
+    normalized = float(value)
+    if not isfinite(normalized) or normalized <= 0.0:
+        raise ValueError(f"{context} must be a positive finite number")
+    return normalized
+
+
+def _reference_non_negative_finite(value: Any, context: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{context} must be a finite number")
+    normalized = float(value)
+    if not isfinite(normalized) or normalized < 0.0:
+        raise ValueError(f"{context} must be a finite number")
+    return normalized
 
 
 def _reference_dataset_row(dataset_payload: Mapping[str, Any]) -> Mapping[str, Any]:
@@ -1436,7 +1571,7 @@ def _reference_predict_omega(
     wall_velocity: float,
     frequency_hz: float,
 ) -> float:
-    if model_payload.get("model_family") != "ewpt-tabular-reference":
+    if model_payload.get("model_family") not in {"ewpt-tabular-reference", "s2-ewpt-tabular-reference"}:
         raise ValueError("reference S3 verifier only supports ewpt-tabular-reference models")
     return evaluate_sound_wave_spectrum(
         temperature_gev=t_n,

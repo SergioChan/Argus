@@ -26,14 +26,13 @@ from argus_core import (
 )
 from argus_core.s10 import BudgetUsage, DIGEST_PINNED_IMAGE
 from argus_core.s10 import S10VerifierTrustStoreClient
-from argus_core.s1 import JobEnvelope, S10SandboxMarshaler, SubagentDescriptor, SubagentRuntime, SubagentSDKRunner
+from argus_core.s1 import ExecContext, JobEnvelope, S10SandboxMarshaler, SubagentDescriptor, SubagentRuntime, SubagentSDKRunner
 from argus_core.s1_reference import (
     S1_REFERENCE_PHYSICS_ADAPTER_ID,
     S1_REFERENCE_PHYSICS_DATASET_REF,
     S1_REFERENCE_PHYSICS_PROFILE_REF,
     S1ReferencePhysicsSubagent,
 )
-from argus_core.gw_spectrum import evaluate_sound_wave_spectrum
 from argus_core.s7 import EvalRequest, EvalResult, Quantity, S7Error
 from argus_core.s8 import Lineage, Producer
 from argusverify import C3ReportVerifier
@@ -44,6 +43,7 @@ from .m1_runtime_artifacts import (
     S10S8ArtifactStore,
     runtime_identity_session,
 )
+from .s2_reference_builder_service import S2_REFERENCE_BUILDER_ROUTE, S2_REFERENCE_OMEGA_SCALE
 from .s8_persistence import HttpS10VerifierKeyProvider
 
 
@@ -405,9 +405,12 @@ M1_REFERENCE_JOB_ID = "m1-reference-job"
 M1_REFERENCE_S1_CALLER_ID = "m1-reference-s1"
 M1_REFERENCE_ADAPTER_EGRESS_RULE = EgressRule("s7-reference-adapter", 443, "https")
 M1_REFERENCE_ADAPTER_ROUTE = "/v1/reference-adapter/evaluate"
+M1_REFERENCE_BUILDER_ROUTE = S2_REFERENCE_BUILDER_ROUTE
 M1_REFERENCE_REFEREE_ROUTE = "/v1/reference-referee/validate"
 M1_REFERENCE_PROFILE_ROUTE = "/v1/reference-referee/profile"
 M1_REFERENCE_OBSERVATORY_ROUTE = "/v1/reference-observatory/render"
+M1_REFERENCE_S2_TRAINING_ROW_COUNT = 24
+M1_REFERENCE_OMEGA_SCALE = S2_REFERENCE_OMEGA_SCALE
 
 
 @dataclass(frozen=True)
@@ -433,6 +436,166 @@ class HttpM1ReferenceAdapterClient:
         except RuntimeArtifactStoreError as exc:
             raise S7Error("REFERENCE_ADAPTER_UNAVAILABLE", str(exc)) from exc
         return _m1_eval_result_from_payload(response)
+
+
+@dataclass(frozen=True)
+class HttpM1ReferenceBuilderClient:
+    """S1-facing client for the separately deployed S2 reference builder."""
+
+    endpoint_url: str
+    session: RuntimeIdentitySession
+
+    def build(self, *, dataset_ref: str, profile_ref: str) -> dict[str, Any]:
+        response = _m1_request_json(
+            "POST",
+            self.endpoint_url,
+            body={
+                "job_id": self.session.job_id,
+                "dataset_ref": dataset_ref,
+                "profile_ref": profile_ref,
+            },
+            bearer_token=self.session.access_token,
+            timeout_s=self.session.timeout_s,
+        )
+        if response.get("job_id") != self.session.job_id:
+            raise RuntimeArtifactStoreError("S2 builder response job_id does not match the S1 runtime identity")
+        if response.get("dataset_ref") != dataset_ref:
+            raise RuntimeArtifactStoreError("S2 builder response does not bind the requested training dataset")
+        if response.get("claim_tier") != "ran-toy":
+            raise RuntimeArtifactStoreError("S2 builder response violates the ran-toy claim-tier cap")
+        for field in (
+            "model_ref",
+            "frozen_pipeline_ref",
+            "training_log_ref",
+            "uq_calibration_ref",
+            "sandbox_evidence_ref",
+        ):
+            _m1_required_str(response, field, "S2 builder response")
+        artifact_refs = response.get("artifact_refs")
+        if not isinstance(artifact_refs, list) or not artifact_refs or not all(
+            isinstance(ref, str) and ref for ref in artifact_refs
+        ):
+            raise RuntimeArtifactStoreError("S2 builder response requires non-empty string artifact_refs")
+        if response["frozen_pipeline_ref"] not in artifact_refs:
+            raise RuntimeArtifactStoreError("S2 builder response omits the frozen pipeline from artifact_refs")
+        return dict(response)
+
+
+@dataclass(frozen=True)
+class M1ReferenceS2BuildDelegate:
+    """Converts S7-backed training evidence into an authenticated S2 build request."""
+
+    builder: HttpM1ReferenceBuilderClient
+    source_dataset_ref: str
+    adapter_inputs: Mapping[str, Any]
+
+    def __call__(
+        self,
+        ctx: ExecContext,
+        plan: Mapping[str, Any],
+        evidence: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        base_inputs = _m1_copy_adapter_inputs(self.adapter_inputs)
+        base_adapter_call = _m1_mapping(evidence.get("adapter_call"), "S1 reference adapter evidence")
+        rows = [_m1_s2_training_row(row_id="s7-reference-000", inputs=base_inputs, adapter_call=base_adapter_call)]
+        provenance_refs = [str(base_adapter_call["provenance_ref"])]
+        for index in range(1, M1_REFERENCE_S2_TRAINING_ROW_COUNT):
+            inputs = _m1_s2_training_inputs(base_inputs, index=index)
+            adapter_call = ctx.call_adapter(
+                S1_REFERENCE_PHYSICS_ADAPTER_ID,
+                {"inputs": inputs, "seed": 1000 + index},
+            )
+            rows.append(
+                _m1_s2_training_row(
+                    row_id=f"s7-reference-{index:03d}",
+                    inputs=inputs,
+                    adapter_call=adapter_call,
+                )
+            )
+            provenance_refs.append(str(adapter_call["provenance_ref"]))
+
+        perturbation_observations = _m1_mapping(
+            evidence.get("perturbation_observations"),
+            "S1 reference perturbation evidence",
+        )
+        for observation in perturbation_observations.values():
+            if isinstance(observation, Mapping):
+                provenance_ref = observation.get("provenance_ref")
+                if isinstance(provenance_ref, str) and provenance_ref:
+                    provenance_refs.append(provenance_ref)
+        training_dataset = ctx.emit_artifact(
+            {
+                "schema": {
+                    "features": ["adapter_omega_scaled"],
+                    "target": "omega_scaled",
+                },
+                "rows": rows,
+                "feature_scale": M1_REFERENCE_OMEGA_SCALE,
+                "target_scale": M1_REFERENCE_OMEGA_SCALE,
+                "source_class": "m1-s7-derived-reference-training",
+                "reference_context": {
+                    "source_dataset_ref": self.source_dataset_ref,
+                    "canonical_row_id": rows[0]["row_id"],
+                    "canonical_adapter_outputs": _m1_mapping(
+                        evidence.get("adapter_outputs"),
+                        "S1 reference adapter outputs",
+                    ),
+                    "canonical_adapter_provenance_ref": str(base_adapter_call["provenance_ref"]),
+                    "perturbation_observations": perturbation_observations,
+                },
+            },
+            kind="dataset",
+            lineage=Lineage(
+                input_refs=tuple(dict.fromkeys((self.source_dataset_ref, *provenance_refs))),
+                code_ref="argus-runtime:m1-s1-s7-training-dataset",
+                environment_digest="oci:argus-s1-reference-runtime:v2",
+                seeds=("m1-reference-s7-training-v1",),
+                job_id=ctx.job_id,
+            ),
+        )
+        training_dataset_ref = _m1_required_str(training_dataset, "artifact_ref", "S1 training dataset")
+        remote_build = self.builder.build(
+            dataset_ref=training_dataset_ref,
+            profile_ref=_m1_required_str(plan, "verifier_profile_ref", "S1 reference plan"),
+        )
+        remote_artifact_refs = tuple(str(ref) for ref in remote_build["artifact_refs"])
+        diagnostics = _m1_mapping(evidence.get("diagnostics"), "S1 reference diagnostics")
+        diagnostics.update(
+            {
+                "s2_training_dataset_ref": training_dataset_ref,
+                "external_frozen_pipeline": {
+                    "artifact_ref": str(remote_build["frozen_pipeline_ref"]),
+                    "producer_subsystem": "S2",
+                    "builder": "s2-reference-builder",
+                    "model_ref": str(remote_build["model_ref"]),
+                    "uq_calibration_ref": str(remote_build["uq_calibration_ref"]),
+                    "sandbox_evidence_ref": str(remote_build["sandbox_evidence_ref"]),
+                },
+            }
+        )
+        omega_radius = float(evidence["omega_radius"])
+        omega_source = str(evidence["omega_source"])
+        return {
+            "job_id": plan["job_id"],
+            "artifact_refs": list(dict.fromkeys((training_dataset_ref, *remote_artifact_refs))),
+            "training_log_ref": str(remote_build["training_log_ref"]),
+            "diagnostics": diagnostics,
+            "self_checks": [
+                {
+                    "type": "PHYSICAL_CONSISTENCY",
+                    "status": "PASS",
+                    "advisory": True,
+                }
+            ],
+            "uncertainty_summary": ctx.tag_uncertainty(
+                "interval",
+                {
+                    "radius": omega_radius,
+                    "source": omega_source,
+                    "s2_uq_calibration_ref": str(remote_build["uq_calibration_ref"]),
+                },
+            ),
+        }
 
 
 @dataclass(frozen=True)
@@ -519,6 +682,7 @@ class M1ReferenceLifecycleResult:
         checks = report.get("checks")
         diagnostics = _m1_mapping(self.build_payload.get("diagnostics"), "S1 build diagnostics")
         sandbox = diagnostics.get("sandbox")
+        external_frozen_pipeline = diagnostics.get("external_frozen_pipeline")
         return {
             "demo": "s1-reference-physics",
             "job_id": self.job_id,
@@ -529,6 +693,12 @@ class M1ReferenceLifecycleResult:
                 "adapter_provenance_ref": diagnostics.get("adapter_provenance_ref"),
                 "sandbox_launch_provenance_ref": (
                     sandbox.get("launch_provenance_ref") if isinstance(sandbox, Mapping) else None
+                ),
+                "s2_training_dataset_ref": diagnostics.get("s2_training_dataset_ref"),
+                "s2_frozen_pipeline_ref": (
+                    external_frozen_pipeline.get("artifact_ref")
+                    if isinstance(external_frozen_pipeline, Mapping)
+                    else None
                 ),
             },
             "artifact_refs": list(self.build_payload.get("artifact_refs", ())),
@@ -567,6 +737,7 @@ class M1ReferenceLifecycleRunner:
         bootstrap_token: str | None = None,
         access_token: str | None = None,
         s7_url: str,
+        s2_url: str,
         s3_url: str,
         s11_url: str,
         verifier_key_endpoint_url: str,
@@ -584,6 +755,7 @@ class M1ReferenceLifecycleRunner:
         self._bootstrap_token = bootstrap_token
         self._access_token = access_token
         self._s7_url = s7_url.rstrip("/")
+        self._s2_url = s2_url.rstrip("/")
         self._s3_url = s3_url.rstrip("/")
         self._s11_url = s11_url.rstrip("/")
         self._verifier_key_endpoint_url = verifier_key_endpoint_url
@@ -616,6 +788,10 @@ class M1ReferenceLifecycleRunner:
             endpoint_url=f"{self._s7_url}{M1_REFERENCE_ADAPTER_ROUTE}",
             session=session,
         )
+        builder_client = HttpM1ReferenceBuilderClient(
+            endpoint_url=f"{self._s2_url}{M1_REFERENCE_BUILDER_ROUTE}",
+            session=session,
+        )
         provider = HttpS10VerifierKeyProvider(
             endpoint_url=self._verifier_key_endpoint_url,
             auth_token=self._verifier_key_auth_token,
@@ -633,6 +809,11 @@ class M1ReferenceLifecycleRunner:
             dataset_ref=dataset_ref,
             adapter_inputs=_m1_reference_adapter_inputs(),
             sandbox_spec_factory=ReferenceS10SandboxSpecFactory(session=session),
+            build_delegate=M1ReferenceS2BuildDelegate(
+                builder=builder_client,
+                source_dataset_ref=dataset_ref,
+                adapter_inputs=_m1_reference_adapter_inputs(),
+            ),
         )
         runtime = SubagentRuntime(
             descriptor=descriptor,
@@ -707,18 +888,11 @@ class M1ReferenceLifecycleRunner:
 
     def _ensure_controlled_reference_dataset(self, store: S10S8ArtifactStore) -> str:
         inputs = _m1_reference_adapter_inputs()
-        spectrum = evaluate_sound_wave_spectrum(
-            temperature_gev=float(inputs["T_n"]["value"]),
-            alpha=float(inputs["alpha"]["value"]),
-            beta_over_h=float(inputs["beta_over_H"]["value"]),
-            wall_velocity=float(inputs["v_w"]["value"]),
-            frequency_hz=float(inputs["frequency"]["value"]),
-        )
         record = store.create_artifact(
             kind="dataset",
             artifact_ref=S1_REFERENCE_PHYSICS_DATASET_REF,
             payload={
-                "schema": "argus.m1.reference_input.v1",
+                "schema": "argus.m1.reference_request_context.v2",
                 "rows": [
                     {
                         "T_n": inputs["T_n"]["value"],
@@ -726,10 +900,9 @@ class M1ReferenceLifecycleRunner:
                         "beta_over_H": inputs["beta_over_H"]["value"],
                         "v_w": inputs["v_w"]["value"],
                         "frequency": inputs["frequency"]["value"],
-                        "known_omega": spectrum.omega,
                     }
                 ],
-                "source_class": "m1-controlled-reference-input",
+                "source_class": "m1-reference-request-context",
             },
             producer=Producer(
                 subsystem="S1",
@@ -803,6 +976,82 @@ def _m1_reference_adapter_inputs() -> dict[str, dict[str, object]]:
         "v_w": {"value": 0.7, "units": "dimensionless", "uncertainty": {"kind": "interval", "radius": 0.02}},
         "frequency": {"value": 0.003, "units": "Hz", "uncertainty": {"kind": "interval", "radius": 0.0001}},
     }
+
+
+def _m1_copy_adapter_inputs(inputs: Mapping[str, Any]) -> dict[str, dict[str, object]]:
+    copied: dict[str, dict[str, object]] = {}
+    for field in ("T_n", "alpha", "beta_over_H", "v_w", "frequency"):
+        payload = _m1_mapping(inputs.get(field), f"reference adapter input {field}")
+        copied[field] = dict(payload)
+        uncertainty = copied[field].get("uncertainty")
+        if isinstance(uncertainty, Mapping):
+            copied[field]["uncertainty"] = dict(uncertainty)
+    return copied
+
+
+def _m1_s2_training_inputs(
+    template: Mapping[str, Any],
+    *,
+    index: int,
+) -> dict[str, dict[str, object]]:
+    inputs = _m1_copy_adapter_inputs(template)
+    values = {
+        "alpha": 0.05 + (index % 10) * 0.02,
+        "beta_over_H": 70.0 + (index // 10) * 12.0,
+        "v_w": 0.45 + (index % 6) * 0.07,
+        "frequency": 0.001 + (index % 8) * 0.0005,
+    }
+    for field, value in values.items():
+        inputs[field] = {**inputs[field], "value": value}
+    return inputs
+
+
+def _m1_s2_training_row(
+    *,
+    row_id: str,
+    inputs: Mapping[str, Any],
+    adapter_call: Mapping[str, Any],
+) -> dict[str, Any]:
+    result = _m1_mapping(adapter_call.get("result"), "S7 training adapter result")
+    outputs = _m1_mapping(result.get("outputs"), "S7 training adapter outputs")
+    omega = _m1_mapping(outputs.get("omega"), "S7 training adapter omega")
+    try:
+        omega_value = float(omega["value"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise RuntimeArtifactStoreError("S7 training adapter omega must be numeric") from exc
+    if not isfinite(omega_value) or omega_value <= 0.0:
+        raise RuntimeArtifactStoreError("S7 training adapter omega must be finite and positive")
+    provenance_ref = _m1_required_str(adapter_call, "provenance_ref", "S7 training adapter result")
+    row = {
+        "row_id": row_id,
+        "T_n": _m1_adapter_input_value(inputs, "T_n"),
+        "alpha": _m1_adapter_input_value(inputs, "alpha"),
+        "beta_over_H": _m1_adapter_input_value(inputs, "beta_over_H"),
+        "v_w": _m1_adapter_input_value(inputs, "v_w"),
+        "frequency": _m1_adapter_input_value(inputs, "frequency"),
+        "adapter_omega": omega_value,
+        "omega": omega_value,
+        "known_omega": omega_value,
+        "adapter_omega_scaled": omega_value / M1_REFERENCE_OMEGA_SCALE,
+        "omega_scaled": omega_value / M1_REFERENCE_OMEGA_SCALE,
+        "adapter_provenance_ref": provenance_ref,
+        "role": "train",
+    }
+    uncertainty = omega.get("uncertainty")
+    if isinstance(uncertainty, Mapping):
+        row["omega_uncertainty"] = dict(uncertainty)
+    return row
+
+
+def _m1_adapter_input_value(inputs: Mapping[str, Any], field: str) -> float:
+    quantity = _m1_mapping(inputs.get(field), f"reference adapter input {field}")
+    try:
+        value = float(quantity["value"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise RuntimeArtifactStoreError(f"reference adapter input {field} must be numeric") from exc
+    if not isfinite(value) or value <= 0.0:
+        raise RuntimeArtifactStoreError(f"reference adapter input {field} must be finite and positive")
+    return value
 
 
 def _m1_eval_request_payload(request: EvalRequest) -> dict[str, Any]:

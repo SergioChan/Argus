@@ -1672,6 +1672,8 @@ def _battery_s1_reference_physics_demo(
         "dataset": response.get("dataset_ref"),
         "adapter": runtime_provenance.get("adapter_provenance_ref"),
         "sandbox": runtime_provenance.get("sandbox_launch_provenance_ref"),
+        "s2_training_dataset": runtime_provenance.get("s2_training_dataset_ref"),
+        "s2_frozen_pipeline": runtime_provenance.get("s2_frozen_pipeline_ref"),
         "report": response.get("validation_report_ref"),
         "subject": response.get("promoted_artifact_ref"),
         "observatory": response.get("observatory_html_ref"),
@@ -1689,12 +1691,24 @@ def _battery_s1_reference_physics_demo(
         "dataset": "S1",
         "adapter": "S7",
         "sandbox": "S10",
+        "s2_training_dataset": "S1",
+        "s2_frozen_pipeline": "S2",
         "report": "S3",
         "subject": "S1",
         "observatory": "S11",
     }
     if producers != expected_producers:
         raise AssertionError(f"M1 reference lifecycle producer separation failed: {producers}")
+    s2_pipeline_payload = _get_json(
+        f"{s8_url}/v1/artifacts/{parse.quote(str(artifact_refs['s2_frozen_pipeline']), safe='')}/payload",
+        token=read_token,
+    )
+    component_refs = s2_pipeline_payload.get("component_refs")
+    if not isinstance(component_refs, dict):
+        raise AssertionError("S2 reference frozen pipeline is missing component_refs")
+    pipeline_input_refs = component_refs.get("input_refs")
+    if not isinstance(pipeline_input_refs, list) or artifact_refs["s2_training_dataset"] not in pipeline_input_refs:
+        raise AssertionError("S2 reference frozen pipeline lineage omits the S1 S7-derived training dataset")
     _record(
         evidence,
         "s1-reference-demo",
@@ -1714,6 +1728,7 @@ def _battery_s1_reference_physics_demo(
             "checks": statuses,
             "artifact_refs": artifact_refs,
             "producers": producers,
+            "s2_pipeline_lineage_includes_s1_training_dataset": True,
         },
     )
 

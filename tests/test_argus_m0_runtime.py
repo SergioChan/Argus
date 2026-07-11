@@ -392,6 +392,8 @@ class ArgusM0RuntimeServiceTests(unittest.TestCase):
                 "runtime_provenance": {
                     "adapter_provenance_ref": "c4://adapter/demo",
                     "sandbox_launch_provenance_ref": "c4://container/demo",
+                    "s2_training_dataset_ref": "c4://dataset/s2-training-demo",
+                    "s2_frozen_pipeline_ref": "c4://pipeline/s2-demo",
                 },
                 "validation_report_ref": "c4://report/demo",
                 "promoted_artifact_ref": "c4://artifact/demo",
@@ -417,10 +419,18 @@ class ArgusM0RuntimeServiceTests(unittest.TestCase):
         ) -> dict[str, object]:
             self.assertEqual(expected_status, 200)
             self.assertEqual(token, "read-token")
+            if url.endswith("/payload"):
+                return {
+                    "component_refs": {
+                        "input_refs": ["c4://dataset/s2-training-demo"],
+                    }
+                }
             producer_by_ref = {
                 "c4://dataset/ewpt-reference/v1": "S1",
                 "c4://adapter/demo": "S7",
                 "c4://container/demo": "S10",
+                "c4://dataset/s2-training-demo": "S1",
+                "c4://pipeline/s2-demo": "S2",
                 "c4://report/demo": "S3",
                 "c4://artifact/demo": "S1",
                 "c4://observatory/demo": "S11",
@@ -447,6 +457,7 @@ class ArgusM0RuntimeServiceTests(unittest.TestCase):
         self.assertEqual(result["detail"]["claim_tier"], "recapitulated-known")
         self.assertTrue(result["detail"]["observatory_trusted"])
         self.assertEqual(result["detail"]["producers"]["adapter"], "S7")
+        self.assertTrue(result["detail"]["s2_pipeline_lineage_includes_s1_training_dataset"])
 
     def test_s8_writer_service_commits_and_replays_c4_records(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -2419,6 +2430,10 @@ class ArgusM0ComposeTests(unittest.TestCase):
         self.assertEqual(
             services["s1-reference-demo"]["environment"]["ARGUS_S1_REFERENCE_DEMO_S7_URL"],
             "http://s7-reference-adapter:8080",
+        )
+        self.assertEqual(
+            services["s1-reference-demo"]["environment"]["ARGUS_S1_REFERENCE_DEMO_S2_URL"],
+            "http://s2-reference-builder:8080",
         )
         self.assertEqual(
             services["s1-reference-demo"]["environment"]["ARGUS_S1_REFERENCE_DEMO_S3_URL"],

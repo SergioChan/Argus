@@ -1212,6 +1212,45 @@ class S1SDKBaseClassTests(unittest.TestCase):
         self.assertEqual(runner.runtime.store.current(self.envelope.job_id).state, LifecycleState.BUILDING)
         self.assertEqual(len(artifacts.query_artifacts({"kind": "report"})), 1)
 
+    def test_runner_validate_rejects_external_frozen_pipeline_not_owned_by_s2(self) -> None:
+        artifacts = InMemoryArtifactStore()
+        runner, build = self._validation_runner(artifacts)
+        forged_pipeline = artifacts.create_artifact(
+            kind="frozen_pipeline",
+            payload={"entrypoint": "predict"},
+            producer=Producer(subsystem="S1", version="0.0.0", actor_id="s1-forged-pipeline"),
+            lineage=Lineage(
+                input_refs=(),
+                code_ref="argus-test:s1-forged-pipeline",
+                environment_digest="python:s1-forged-pipeline",
+                job_id=self.envelope.job_id,
+            ),
+        )
+        build_payload = dict(build.payload)
+        build_payload["artifact_refs"] = [*build.payload["artifact_refs"], forged_pipeline.artifact_ref]
+        build_payload["diagnostics"] = {
+            **dict(build.payload["diagnostics"]),
+            "external_frozen_pipeline": {"artifact_ref": forged_pipeline.artifact_ref},
+        }
+
+        class NeverCalledS3Client:
+            def validate(self, request: dict[str, object]) -> dict[str, object]:
+                raise AssertionError(f"S3 must not receive an invalid external pipeline: {request}")
+
+        with self.assertRaises(LifecyclePolicyError) as raised:
+            runner.validate(
+                self.envelope.job_id,
+                build_payload,
+                profile_ref=str(self.envelope.verifier_profile_ref),
+                blind_dataset_handle="blind://s3/labels/forged-external-pipeline",
+                budget_token_ref="budget://token/forged-external-pipeline",
+                validation_client=NeverCalledS3Client(),
+                report_verifier=object(),
+            )
+
+        self.assertEqual(raised.exception.envelope.code, "S1_EXTERNAL_FROZEN_PIPELINE_PRODUCER_INVALID")
+        self.assertEqual(runner.runtime.store.current(self.envelope.job_id).state, LifecycleState.BUILDING)
+
     def test_runner_validate_fails_closed_without_s3_validation_client(self) -> None:
         class ArtifactBuildSubagent(ExampleSubagent):
             def build(self, ctx: ExecContext, plan: dict[str, object]) -> dict[str, object]:

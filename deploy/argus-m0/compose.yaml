@@ -265,6 +265,7 @@ services:
       ARGUS_S1_REFERENCE_DEMO_S10_URL: http://s10-supervisor:8080
       ARGUS_S1_REFERENCE_DEMO_S8_URL: http://s8-writer:8080
       ARGUS_S1_REFERENCE_DEMO_S7_URL: http://s7-reference-adapter:8080
+      ARGUS_S1_REFERENCE_DEMO_S2_URL: http://s2-reference-builder:8080
       ARGUS_S1_REFERENCE_DEMO_S3_URL: http://s3-reference-referee:8080
       ARGUS_S1_REFERENCE_DEMO_S11_URL: http://s11-reference-observatory:8080
       ARGUS_S1_REFERENCE_DEMO_VERIFIER_KEY_ENDPOINT_URL: http://s10-supervisor:8080/v1/internal/verifier-keys
@@ -282,6 +283,8 @@ services:
       s3-reference-referee:
         condition: service_healthy
       s7-reference-adapter:
+        condition: service_healthy
+      s2-reference-builder:
         condition: service_healthy
       s11-reference-observatory:
         condition: service_healthy

@@ -669,6 +669,7 @@ BUILD_RESULT_TIER_SELF_PROMOTION_FIELDS = frozenset(
         "validation_report_ref",
     }
 )
+S1_EXTERNAL_FROZEN_PIPELINE_DIAGNOSTIC_KEY = "external_frozen_pipeline"
 
 
 def no_uncertainty_summary() -> dict[str, Any]:
@@ -4475,20 +4476,31 @@ def _build_validation_handoff_payload(
     budget_token_ref = _non_empty_string(budget_token_ref, "budget_token_ref")
     trace_id = _non_empty_string(trace_id, "trace_id")
 
-    frozen_pipeline_record = artifact_store.create_artifact(
-        kind=S1_FROZEN_PIPELINE_KIND,
-        payload=_frozen_pipeline_payload(job_id=job_id, build_payload=build_payload, artifact_refs=artifact_refs),
-        producer=Producer(subsystem="S1", version="0.0.0", actor_id="s1.validate", job_id=job_id),
-        lineage=Lineage(
-            input_refs=artifact_refs,
-            code_ref=S1_VALIDATION_HANDOFF_CODE_REF,
-            environment_digest=S1_VALIDATION_HANDOFF_ENVIRONMENT_DIGEST,
+    external_frozen_pipeline_ref = _external_frozen_pipeline_ref(build_payload)
+    if external_frozen_pipeline_ref is None:
+        frozen_pipeline_record = artifact_store.create_artifact(
+            kind=S1_FROZEN_PIPELINE_KIND,
+            payload=_frozen_pipeline_payload(job_id=job_id, build_payload=build_payload, artifact_refs=artifact_refs),
+            producer=Producer(subsystem="S1", version="0.0.0", actor_id="s1.validate", job_id=job_id),
+            lineage=Lineage(
+                input_refs=artifact_refs,
+                code_ref=S1_VALIDATION_HANDOFF_CODE_REF,
+                environment_digest=S1_VALIDATION_HANDOFF_ENVIRONMENT_DIGEST,
+                job_id=job_id,
+            ),
+        )
+        frozen_pipeline_ref = frozen_pipeline_record.artifact_ref
+    else:
+        _assert_external_frozen_pipeline(
+            artifact_store=artifact_store,
+            artifact_ref=external_frozen_pipeline_ref,
+            artifact_refs=artifact_refs,
             job_id=job_id,
-        ),
-    )
+        )
+        frozen_pipeline_ref = external_frozen_pipeline_ref
     validation_request = {
         "job_id": job_id,
-        "frozen_pipeline_ref": frozen_pipeline_record.artifact_ref,
+        "frozen_pipeline_ref": frozen_pipeline_ref,
         "artifact_refs": list(artifact_refs),
         "profile_ref": profile_ref,
         "blind_dataset_handle": blind_dataset_handle,
@@ -4500,7 +4512,7 @@ def _build_validation_handoff_payload(
         payload=validation_request,
         producer=Producer(subsystem="S1", version="0.0.0", actor_id="s1.validate", job_id=job_id),
         lineage=Lineage(
-            input_refs=(frozen_pipeline_record.artifact_ref, profile_ref),
+            input_refs=tuple(dict.fromkeys((frozen_pipeline_ref, profile_ref, *artifact_refs))),
             code_ref=S1_VALIDATION_HANDOFF_CODE_REF,
             environment_digest=S1_VALIDATION_HANDOFF_ENVIRONMENT_DIGEST,
             job_id=job_id,
@@ -4524,7 +4536,7 @@ def _build_validation_handoff_payload(
             artifact_store=artifact_store,
             artifact_ref=external_validation_report_ref,
             expected_payload=validation_report_payload,
-            frozen_pipeline_ref=frozen_pipeline_record.artifact_ref,
+            frozen_pipeline_ref=frozen_pipeline_ref,
         )
     else:
         from .s3 import S3ReportBuilder
@@ -4536,7 +4548,7 @@ def _build_validation_handoff_payload(
             environment_digest="python:s3-validate:v1",
         ).commit_signed_report(
             validation_report_payload,
-            input_refs=(validation_request_record.artifact_ref, frozen_pipeline_record.artifact_ref, profile_ref, *artifact_refs),
+            input_refs=(validation_request_record.artifact_ref, frozen_pipeline_ref, profile_ref, *artifact_refs),
             job_id=job_id,
         )
         validation_report_payload = committed_report.report
@@ -4550,13 +4562,75 @@ def _build_validation_handoff_payload(
     )
     return {
         "job_id": job_id,
-        "frozen_pipeline_ref": frozen_pipeline_record.artifact_ref,
+        "frozen_pipeline_ref": frozen_pipeline_ref,
         "validation_request_ref": validation_request_record.artifact_ref,
         "validation_request": validation_request,
         "validation_report_ref": report_record.artifact_ref,
         "validation_report_payload": validation_report_payload,
         "subagent_report": _subagent_report_payload(job_id=job_id, subagent_id=subagent_id, report=report),
     }
+
+
+def _external_frozen_pipeline_ref(build_payload: Mapping[str, Any]) -> str | None:
+    diagnostics = build_payload.get("diagnostics")
+    if not isinstance(diagnostics, Mapping):
+        return None
+    handoff = diagnostics.get(S1_EXTERNAL_FROZEN_PIPELINE_DIAGNOSTIC_KEY)
+    if handoff is None:
+        return None
+    if not isinstance(handoff, Mapping):
+        _raise_policy(
+            "S1_EXTERNAL_FROZEN_PIPELINE_HANDOFF_INVALID",
+            "external_frozen_pipeline diagnostics must be an object",
+        )
+    artifact_ref = handoff.get("artifact_ref")
+    if not isinstance(artifact_ref, str) or not artifact_ref:
+        _raise_policy(
+            "S1_EXTERNAL_FROZEN_PIPELINE_HANDOFF_INVALID",
+            "external_frozen_pipeline diagnostics require a non-empty artifact_ref",
+        )
+    return artifact_ref
+
+
+def _assert_external_frozen_pipeline(
+    *,
+    artifact_store: Any,
+    artifact_ref: str,
+    artifact_refs: tuple[str, ...],
+    job_id: str,
+) -> None:
+    if artifact_ref not in artifact_refs:
+        _raise_policy(
+            "S1_EXTERNAL_FROZEN_PIPELINE_NOT_DECLARED",
+            "external frozen pipeline must be included in build artifact_refs",
+        )
+    try:
+        record = artifact_store.get_record(artifact_ref)
+    except KeyError as exc:
+        raise LifecyclePolicyError(
+            build_error_envelope(
+                category="POLICY",
+                code="S1_EXTERNAL_FROZEN_PIPELINE_NOT_FOUND",
+                message="external frozen pipeline does not resolve in the C4 artifact store",
+            )
+        ) from exc
+    if getattr(record, "kind", None) not in {"frozen_pipeline", "container", "pipeline"}:
+        _raise_policy(
+            "S1_EXTERNAL_FROZEN_PIPELINE_KIND_INVALID",
+            "external frozen pipeline must resolve to a frozen_pipeline, container, or pipeline artifact",
+        )
+    producer = getattr(record, "producer", None)
+    lineage = getattr(record, "lineage", None)
+    if getattr(producer, "subsystem", None) != "S2":
+        _raise_policy(
+            "S1_EXTERNAL_FROZEN_PIPELINE_PRODUCER_INVALID",
+            "external frozen pipeline must be produced by S2",
+        )
+    if getattr(producer, "job_id", None) != job_id or getattr(lineage, "job_id", None) != job_id:
+        _raise_policy(
+            "S1_EXTERNAL_FROZEN_PIPELINE_JOB_MISMATCH",
+            "external frozen pipeline producer and lineage must match the lifecycle job",
+        )
 
 
 def _frozen_pipeline_payload(

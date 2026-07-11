@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import socket
@@ -34,6 +35,7 @@ from argus_runtime.s11_reference_observatory_service import S11ReferenceObservat
 from argus_runtime.s3_reference_referee_service import S3_REFERENCE_REFEREE_ROUTE, S3ReferenceRefereeApp
 from argus_runtime.s2_reference_builder_service import (
     S2_REFERENCE_BUILDER_ROUTE,
+    S2_REFERENCE_OMEGA_SCALE,
     S2ReferenceBuilderApp,
     build_app_from_env as build_s2_reference_builder_app_from_env,
 )
@@ -126,8 +128,10 @@ class M1ReferenceLifecycleServiceTests(unittest.TestCase):
             dataset = s1_store.create_artifact(
                 kind="dataset",
                 payload={
-                    "schema": {"features": ["adapter_omega"], "target": "omega"},
+                    "schema": {"features": ["adapter_omega_scaled"], "target": "omega_scaled"},
                     "rows": _reference_builder_rows(),
+                    "feature_scale": S2_REFERENCE_OMEGA_SCALE,
+                    "target_scale": S2_REFERENCE_OMEGA_SCALE,
                 },
                 producer=Producer(
                     subsystem="S1",
@@ -237,6 +241,11 @@ class M1ReferenceLifecycleServiceTests(unittest.TestCase):
                 broker_audiences=("store", "gw_spectrum"),
                 budget_caps=BudgetCaps(max_compute_units=10, max_wallclock_s=30, max_cost_usd=1),
             ),
+            "m1-reference-s2": _identity(
+                caller_id="m1-reference-s2",
+                producer_subsystems=("S2",),
+                allowed_datasets=("dataset:m1-reference-ewpt",),
+            ),
             "m1-reference-s3": _identity(caller_id="m1-reference-s3", producer_subsystems=("S3",)),
             "m1-reference-s7": _identity(caller_id="m1-reference-s7", producer_subsystems=("S7",)),
             "m1-reference-s11": _identity(caller_id="m1-reference-s11", producer_subsystems=("S11",)),
@@ -277,6 +286,14 @@ class M1ReferenceLifecycleServiceTests(unittest.TestCase):
                 expected_job_id=M1_REFERENCE_JOB_ID,
             )
             s7_url = _start_json_server(s7)
+            s2 = S2ReferenceBuilderApp(
+                s10_url=s10_url,
+                s8_url=s8_url,
+                access_token=access_tokens["m1-reference-s2"],
+                expected_job_id=M1_REFERENCE_JOB_ID,
+                require_s1_requester=True,
+            )
+            s2_url = _start_json_server(s2)
             s3 = S3ReferenceRefereeApp(
                 s10_url=s10_url,
                 s8_url=s8_url,
@@ -308,6 +325,7 @@ class M1ReferenceLifecycleServiceTests(unittest.TestCase):
                 s8_url=s8_url,
                 access_token=access_tokens["m1-reference-s1"],
                 s7_url=s7_url,
+                s2_url=s2_url,
                 s3_url=s3_url,
                 s11_url=s11_url,
                 verifier_key_endpoint_url=f"{s10_url}/v1/internal/verifier-keys",
@@ -342,11 +360,17 @@ class M1ReferenceLifecycleServiceTests(unittest.TestCase):
                 bootstrap_token=bootstrap_token,
                 caller_id="m1-reference-s1",
             )
+            s2_training_dataset_ref = str(result.build_payload["diagnostics"]["s2_training_dataset_ref"])
+            s2_frozen_pipeline_ref = str(
+                result.build_payload["diagnostics"]["external_frozen_pipeline"]["artifact_ref"]
+            )
             adapter_provenance_ref = str(result.build_payload["diagnostics"]["adapter_provenance_ref"])
             adapter_descriptor_ref = GWSpectrumAdapter().as_simple_adapter().descriptor.provenance_ref
             sandbox_ref = str(result.build_payload["diagnostics"]["sandbox"]["launch_provenance_ref"])
             records = {
                 "dataset": s1_store.get_record(result.dataset_ref),
+                "s2_training_dataset": s1_store.get_record(s2_training_dataset_ref),
+                "s2_frozen_pipeline": s1_store.get_record(s2_frozen_pipeline_ref),
                 "adapter_descriptor": s1_store.get_record(adapter_descriptor_ref),
                 "adapter": s1_store.get_record(adapter_provenance_ref),
                 "sandbox": s1_store.get_record(sandbox_ref),
@@ -355,6 +379,32 @@ class M1ReferenceLifecycleServiceTests(unittest.TestCase):
                 "observatory": s1_store.get_record(result.observatory_html_ref),
             }
             self.assertEqual(records["dataset"].producer.subsystem.upper(), "S1")
+            self.assertEqual(records["s2_training_dataset"].producer.subsystem, "S1")
+            self.assertEqual(records["s2_training_dataset"].producer.job_id, M1_REFERENCE_JOB_ID)
+            training_dataset_payload = json.loads(
+                s1_store.get_artifact(s2_training_dataset_ref).decode("utf-8")
+            )
+            training_rows = training_dataset_payload["rows"]
+            self.assertGreaterEqual(len(training_rows), 12)
+            self.assertTrue(all(row["adapter_provenance_ref"] for row in training_rows))
+            self.assertTrue(
+                set(row["adapter_provenance_ref"] for row in training_rows).issubset(
+                    set(records["s2_training_dataset"].lineage.input_refs)
+                )
+            )
+            for provenance_ref in {row["adapter_provenance_ref"] for row in training_rows}:
+                self.assertEqual(s1_store.get_record(provenance_ref).producer.subsystem, "S7")
+            self.assertEqual(records["s2_frozen_pipeline"].kind, "frozen_pipeline")
+            self.assertEqual(records["s2_frozen_pipeline"].producer.subsystem, "S2")
+            self.assertEqual(records["s2_frozen_pipeline"].producer.job_id, M1_REFERENCE_JOB_ID)
+            self.assertIn(
+                s2_training_dataset_ref,
+                {node.artifact_ref for node in s1_store.get_lineage(s2_frozen_pipeline_ref).nodes},
+            )
+            self.assertEqual(
+                result.validation_report_payload["frozen_pipeline_ref"],
+                s2_frozen_pipeline_ref,
+            )
             self.assertEqual(records["adapter_descriptor"].kind, "adapter_descriptor")
             self.assertEqual(records["adapter_descriptor"].producer.subsystem, "S7")
             self.assertEqual(records["adapter"].producer.subsystem, "S7")
@@ -433,6 +483,8 @@ def _reference_builder_rows() -> list[dict[str, object]]:
                 "row_id": f"ewpt-{index:03d}",
                 "adapter_omega": omega,
                 "omega": omega,
+                "adapter_omega_scaled": omega / S2_REFERENCE_OMEGA_SCALE,
+                "omega_scaled": omega / S2_REFERENCE_OMEGA_SCALE,
                 "role": "train",
             }
         )

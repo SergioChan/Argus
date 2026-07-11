@@ -36,6 +36,7 @@ S2_REFERENCE_BUILDER_DEFAULT_JOB_ID = "m1-reference-job"
 S2_REFERENCE_DATASET_ID = "dataset:m1-reference-ewpt"
 S2_REFERENCE_ADAPTER_ID = "gw_spectrum"
 S2_REFERENCE_MIN_ROWS = 12
+S2_REFERENCE_OMEGA_SCALE = 1e-11
 
 
 class _RootBoundS2ArtifactStore:
@@ -225,6 +226,10 @@ class S2ReferenceBuilderApp:
         if record.producer.job_id != self._expected_job_id:
             raise PermissionError("dataset_job_id_mismatch")
         payload = _artifact_payload(store, dataset_ref)
+        feature_scale = _positive_finite(payload.get("feature_scale"), "reference dataset feature_scale")
+        target_scale = _positive_finite(payload.get("target_scale"), "reference dataset target_scale")
+        if feature_scale != S2_REFERENCE_OMEGA_SCALE or target_scale != S2_REFERENCE_OMEGA_SCALE:
+            raise ValueError("reference dataset must use the fixed M1 omega scale")
         rows = payload.get("rows")
         if not isinstance(rows, list) or len(rows) < S2_REFERENCE_MIN_ROWS:
             raise ValueError(f"reference dataset requires at least {S2_REFERENCE_MIN_ROWS} rows")
@@ -233,12 +238,24 @@ class S2ReferenceBuilderApp:
                 raise ValueError(f"reference dataset row {index} must be an object")
             if not isinstance(row.get("row_id"), str) or not row["row_id"]:
                 raise ValueError(f"reference dataset row {index} requires row_id")
-            for field in ("adapter_omega", "omega"):
+            for field in ("adapter_omega", "omega", "adapter_omega_scaled", "omega_scaled"):
                 value = row.get(field)
                 if isinstance(value, bool) or not isinstance(value, (int, float)) or not isfinite(float(value)):
                     raise ValueError(f"reference dataset row {index} requires finite {field}")
                 if float(value) <= 0.0:
                     raise ValueError(f"reference dataset row {index} requires positive {field}")
+            _assert_scaled_value(
+                value=float(row["adapter_omega_scaled"]),
+                raw=float(row["adapter_omega"]),
+                scale=feature_scale,
+                field=f"reference dataset row {index} adapter_omega_scaled",
+            )
+            _assert_scaled_value(
+                value=float(row["omega_scaled"]),
+                raw=float(row["omega"]),
+                scale=target_scale,
+                field=f"reference dataset row {index} omega_scaled",
+            )
 
     def _register_routes(self) -> None:
         @self.http.route("GET", "/healthz")
@@ -312,9 +329,9 @@ def _reference_build_request(
             "subtopic": "ewpt",
             "problem_spec": {
                 "task_type": "regression",
-                "observable": "omega",
+                "observable": "omega_scaled",
                 "target_units": "dimensionless",
-                "inputs_schema": [{"name": "adapter_omega", "units": "dimensionless"}],
+                "inputs_schema": [{"name": "adapter_omega_scaled", "units": "dimensionless"}],
             },
             "required_claim_tier_max": "recapitulated-known",
             "verifier_profile_ref": profile_ref,
@@ -336,16 +353,17 @@ def _reference_build_request(
         code_ref="argus-runtime:s2-reference-builder",
         environment_digest="oci:argus-s2-reference-builder:v1",
         seed="m1-reference-s2-builder",
-        hpo_parameter_grid={"learning_rate": (0.02, 0.05)},
-        hpo_max_epochs=2,
-        final_max_epochs=5,
+        hpo_parameter_grid={"learning_rate": (0.05, 0.1)},
+        hpo_max_epochs=20,
+        final_max_epochs=80,
         train_ratio=0.6,
         validation_ratio=0.2,
         test_ratio=0.2,
         nominal_coverage=0.8,
         coverage_tolerance=0.5,
         max_self_replay_fraction=1.0,
-        cost_usd_per_epoch=0.01,
+        wallclock_seconds_per_epoch=0.1,
+        cost_usd_per_epoch=0.005,
     )
 
 
@@ -375,6 +393,22 @@ def _optional_str(value: Any, field: str) -> str | None:
     if not isinstance(value, str) or not value:
         raise ValueError(f"S2 reference builder {field} must be a non-empty string")
     return value
+
+
+def _positive_finite(value: Any, context: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not isfinite(float(value)):
+        raise ValueError(f"{context} must be finite")
+    normalized = float(value)
+    if normalized <= 0.0:
+        raise ValueError(f"{context} must be positive")
+    return normalized
+
+
+def _assert_scaled_value(*, value: float, raw: float, scale: float, field: str) -> None:
+    expected = raw / scale
+    tolerance = max(abs(expected) * 1e-12, 1e-15)
+    if abs(value - expected) > tolerance:
+        raise ValueError(f"{field} does not match its declared scale")
 
 
 def _required_env(name: str) -> str:
