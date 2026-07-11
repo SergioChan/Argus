@@ -501,6 +501,11 @@ class ArgusM0RuntimeServiceTests(unittest.TestCase):
                     "timed_out": True,
                     "stderr": "argus meter halted container: token_revoked",
                     "audit_events": ["meter.halt", "token.revocation_halt"],
+                    "halt_telemetry": {
+                        "reason": "token_revoked",
+                        "revocation_ack_to_freeze_s": 0.15,
+                        "revocation_ack_to_terminate_s": 0.19,
+                    },
                 }
             if url.endswith("/v1/tokens:revoke"):
                 return {
@@ -521,6 +526,11 @@ class ArgusM0RuntimeServiceTests(unittest.TestCase):
                     "artifact_ref": "c4://artifact/revocation-spend-final",
                     "final_state": "TIMED_OUT",
                     "partial_result_captured": True,
+                    "halt_telemetry": {
+                        "reason": "token_revoked",
+                        "revocation_ack_to_freeze_s": 0.15,
+                        "revocation_ack_to_terminate_s": 0.19,
+                    },
                 },
             ),
             patch.object(m0_battery.threading, "Thread", ImmediateThread),
@@ -540,7 +550,19 @@ class ArgusM0RuntimeServiceTests(unittest.TestCase):
         detail = result["detail"]
         self.assertEqual(detail["revocation_ack_elapsed_s"], 2.75)
         self.assertEqual(detail["halted_after_revocation_ack_s"], 0.15)
+        self.assertEqual(detail["terminated_after_revocation_ack_s"], 0.19)
+        self.assertEqual(detail["launch_response_after_revocation_ack_s"], 0.15)
         self.assertEqual(detail["propagation_slo_s"], 2.0)
+
+    def test_revocation_halt_telemetry_rejects_slow_physical_termination(self) -> None:
+        with self.assertRaisesRegex(AssertionError, "physical termination"):
+            m0_battery._revocation_halt_telemetry(
+                {
+                    "reason": "token_revoked",
+                    "revocation_ack_to_freeze_s": 0.15,
+                    "revocation_ack_to_terminate_s": 2.01,
+                }
+            )
 
     def test_s8_writer_service_commits_and_replays_c4_records(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

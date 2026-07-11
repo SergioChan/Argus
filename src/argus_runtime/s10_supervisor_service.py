@@ -252,6 +252,9 @@ class S10SupervisorApp:
         self._refresh_artifacts()
         result = self._docker_orchestrator.launch_and_wait(launch)
         payload = asdict(result)
+        halt_telemetry = self._docker_orchestrator.halt_telemetry_for(result.handle.sandbox_id)
+        if halt_telemetry is not None:
+            payload["halt_telemetry"] = halt_telemetry
         payload["audit_events"] = self._recent_audit_event_types()
         return payload
 

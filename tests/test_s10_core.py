@@ -1409,13 +1409,19 @@ class S10ResourceMeterGapTests(unittest.TestCase):
         )
         supervisor = _RuntimeHaltDockerApiSupervisor()
         samples: list[s10_module.ResourceMeterSample] = []
+        halt_telemetry: list[s10_module.SandboxHaltTelemetry] = []
 
         exit_code, timed_out, stderr, usage, partial_result = supervisor._wait_for_container_with_meter(
             container_id="container-revoked",
             request=request,
             started_at=s10_module.time.monotonic(),
             meter_sample_sink=samples.append,
-            runtime_halt_probe=lambda: ("token_revoked", ("token_revoked", "budget_token")),
+            runtime_halt_probe=lambda: s10_module._RuntimeHaltSignal(
+                reason="token_revoked",
+                dimensions=("token_revoked", "budget_token"),
+                revocation_acknowledged_at=s10_module.time.monotonic() - 0.01,
+            ),
+            halt_telemetry_sink=halt_telemetry.append,
         )
 
         self.assertIsNone(exit_code)
@@ -1433,6 +1439,12 @@ class S10ResourceMeterGapTests(unittest.TestCase):
         self.assertTrue(any(sample.halted for sample in samples))
         self.assertIn("token_revoked", samples[0].breached_dimensions)
         self.assertIn("budget_token", samples[0].breached_dimensions)
+        self.assertEqual(len(halt_telemetry), 1)
+        self.assertEqual(halt_telemetry[0].reason, "token_revoked")
+        self.assertIsNotNone(halt_telemetry[0].revocation_ack_to_freeze_s)
+        self.assertIsNotNone(halt_telemetry[0].revocation_ack_to_terminate_s)
+        self.assertLessEqual(halt_telemetry[0].revocation_ack_to_freeze_s or 99, 2)
+        self.assertLessEqual(halt_telemetry[0].revocation_ack_to_terminate_s or 99, 2)
 
     def test_partial_log_capture_is_byte_bounded_and_marks_truncation(self) -> None:
         supervisor = _CappedLogDockerApiSupervisor()
@@ -2519,10 +2531,17 @@ class S10DockerOrchestratorFailureTests(unittest.TestCase):
         event_types = [event.event_type for event in audit.events()]
         self.assertIn("meter.halt", event_types)
         self.assertIn("token.revocation_halt", event_types)
+        self.assertIn("sandbox.halt_completed", event_types)
         self.assertIn("sandbox.timeout", event_types)
         token_halt = next(event for event in audit.events() if event.event_type == "token.revocation_halt")
         self.assertEqual(token_halt.payload["budget_id"], request.budget_token.budget_id)
         self.assertEqual(token_halt.payload["scope_id"], request.scope_token.scope_id)
+        halt_telemetry = orchestrator.halt_telemetry_for(result.handle.sandbox_id)
+        self.assertIsNotNone(halt_telemetry)
+        assert halt_telemetry is not None
+        self.assertEqual(halt_telemetry["reason"], "token_revoked")
+        self.assertLessEqual(halt_telemetry["revocation_ack_to_freeze_s"], 2)
+        self.assertLessEqual(halt_telemetry["revocation_ack_to_terminate_s"], 2)
 
         spend_records = artifacts.query_artifacts({"kind": "spend.final"})
         self.assertEqual(len(spend_records), 1)
@@ -2531,6 +2550,7 @@ class S10DockerOrchestratorFailureTests(unittest.TestCase):
         self.assertTrue(payload["metering"]["halted_by_meter"])
         self.assertIn("token_revoked", payload["metering"]["samples"][0]["breached_dimensions"])
         self.assertTrue(payload["partial_result_captured"])
+        self.assertEqual(payload["halt_telemetry"], halt_telemetry)
 
     @staticmethod
     def _signed_price_table(*, cpu_rate: str) -> tuple[PriceTable, PriceTableTrustStore]:
@@ -2970,12 +2990,19 @@ class _RevokingRuntimeHaltSupervisor:
         materialized_env: dict[str, str],
         meter_sample_sink=None,
         runtime_halt_probe=None,
+        halt_telemetry_sink=None,
     ) -> SandboxExecutionResult:
         self._tokens.revoke(request.budget_token.budget_id)
         runtime_halt = runtime_halt_probe() if runtime_halt_probe is not None else None
         if runtime_halt is None:
             raise AssertionError("runtime halt probe did not observe the revoked budget token")
-        reason, dimensions = runtime_halt
+        if isinstance(runtime_halt, s10_module._RuntimeHaltSignal):
+            reason = runtime_halt.reason
+            dimensions = runtime_halt.dimensions
+            acknowledgement = runtime_halt.revocation_acknowledged_at
+        else:
+            reason, dimensions = runtime_halt
+            acknowledgement = None
         usage = BudgetUsage(wallclock_s=0.2)
         if meter_sample_sink is not None:
             meter_sample_sink(
@@ -2987,6 +3014,18 @@ class _RevokingRuntimeHaltSupervisor:
                     source="runtime-token-verifier",
                     breached_dimensions=dimensions,
                     halted=True,
+                )
+            )
+        if halt_telemetry_sink is not None:
+            halt_telemetry_sink(
+                s10_module.SandboxHaltTelemetry(
+                    reason=reason,
+                    halt_detected_elapsed_s=0.2,
+                    freeze_completed_elapsed_s=0.21,
+                    terminate_completed_elapsed_s=0.22,
+                    revocation_ack_to_detect_s=0.01 if acknowledgement is not None else None,
+                    revocation_ack_to_freeze_s=0.02 if acknowledgement is not None else None,
+                    revocation_ack_to_terminate_s=0.03 if acknowledgement is not None else None,
                 )
             )
         partial_result = s10_module.SandboxPartialResult(

@@ -56,6 +56,7 @@ M1_S3_REFERENCE_REFEREE_KEY_ID = "s3-reference-referee-key"
 HALT_LATENCY_TRIALS = 50
 HALT_LATENCY_LIMIT_S = 2.0
 TOKEN_REVOCATION_PROPAGATION_SLO_S = 2.0
+INFLIGHT_REVOCATION_RESPONSE_TIMEOUT_S = TOKEN_REVOCATION_PROPAGATION_SLO_S + 8.0
 M1_REFERENCE_DEMO_E2E_TIMEOUT_S = 60.0
 
 
@@ -1163,19 +1164,17 @@ def _battery_revoked_inflight_sandbox_halted(
     )
     revocation_ack_elapsed_s = time.monotonic() - revoke_started
     halt_started = time.monotonic()
-    thread.join(timeout=TOKEN_REVOCATION_PROPAGATION_SLO_S + 8.0)
-    halted_after_revocation_ack_s = time.monotonic() - halt_started
+    thread.join(timeout=INFLIGHT_REVOCATION_RESPONSE_TIMEOUT_S)
+    launch_response_after_revocation_ack_s = time.monotonic() - halt_started
     if thread.is_alive():
         raise AssertionError(
             "in-flight sandbox did not halt after budget token revocation within the propagation window"
         )
     if launch_error:
         raise AssertionError("in-flight revoked launch request failed unexpectedly") from launch_error[0]
-    if halted_after_revocation_ack_s > TOKEN_REVOCATION_PROPAGATION_SLO_S:
-        raise AssertionError(
-            "in-flight revoked sandbox halt after revocation acknowledgement exceeded the propagation SLO: "
-            f"elapsed={halted_after_revocation_ack_s:.6f}s slo={TOKEN_REVOCATION_PROPAGATION_SLO_S:.6f}s"
-        )
+    halted_after_revocation_ack_s, terminated_after_revocation_ack_s = _revocation_halt_telemetry(
+        launch_result.get("halt_telemetry")
+    )
     handle = launch_result.get("handle") or {}
     events = launch_result.get("audit_events") or []
     stderr = str(launch_result.get("stderr") or "")
@@ -1199,6 +1198,11 @@ def _battery_revoked_inflight_sandbox_halted(
         raise AssertionError(f"spend.final missing token_revoked metering dimension: {spend_final}")
     if spend_final["meter_halted_by_meter"] is not True:
         raise AssertionError(f"spend.final did not mark the token revocation halt as metered: {spend_final}")
+    if spend_final.get("halt_telemetry") != launch_result.get("halt_telemetry"):
+        raise AssertionError(
+            "spend.final did not persist the in-flight revocation physical-halt telemetry: "
+            f"launch={launch_result} spend_final={spend_final}"
+        )
     _record(
         evidence,
         "inflight-revoked",
@@ -1209,6 +1213,8 @@ def _battery_revoked_inflight_sandbox_halted(
             "revoked_token_id": revoke_response["revoked_token_id"],
             "revocation_ack_elapsed_s": round(revocation_ack_elapsed_s, 6),
             "halted_after_revocation_ack_s": round(halted_after_revocation_ack_s, 6),
+            "terminated_after_revocation_ack_s": round(terminated_after_revocation_ack_s, 6),
+            "launch_response_after_revocation_ack_s": round(launch_response_after_revocation_ack_s, 6),
             "propagation_slo_s": TOKEN_REVOCATION_PROPAGATION_SLO_S,
             "launch_handle_state": handle["state"],
             "launch_timed_out": launch_result["timed_out"],
@@ -1220,7 +1226,32 @@ def _battery_revoked_inflight_sandbox_halted(
             "spend_final_meter_halted_by_meter": spend_final["meter_halted_by_meter"],
             "spend_final_meter_breached_dimensions": spend_final["meter_breached_dimensions"],
             "spend_final_partial_result_captured": spend_final["partial_result_captured"],
+            "spend_final_halt_telemetry": spend_final["halt_telemetry"],
         },
+    )
+
+
+def _revocation_halt_telemetry(value: object) -> tuple[float, float]:
+    if not isinstance(value, dict):
+        raise AssertionError(f"in-flight revoked sandbox missing physical-halt telemetry: {value}")
+    if value.get("reason") != "token_revoked":
+        raise AssertionError(f"in-flight revoked sandbox telemetry reason was not token_revoked: {value}")
+
+    def require_latency(field: str, label: str) -> float:
+        raw = value.get(field)
+        if isinstance(raw, bool) or not isinstance(raw, (int, float)) or not math.isfinite(float(raw)) or raw < 0:
+            raise AssertionError(f"in-flight revoked sandbox {label} telemetry must be finite and non-negative: {value}")
+        latency_s = float(raw)
+        if latency_s > TOKEN_REVOCATION_PROPAGATION_SLO_S:
+            raise AssertionError(
+                f"in-flight revoked sandbox {label} after revocation acknowledgement exceeded the propagation SLO: "
+                f"elapsed={latency_s:.6f}s slo={TOKEN_REVOCATION_PROPAGATION_SLO_S:.6f}s"
+            )
+        return latency_s
+
+    return (
+        require_latency("revocation_ack_to_freeze_s", "physical freeze"),
+        require_latency("revocation_ack_to_terminate_s", "physical termination"),
     )
 
 
@@ -2854,6 +2885,9 @@ def _battery_spend_final(
     meter_samples = metering.get("samples") or []
     partial_result_ref = payload.get("partial_result_ref")
     partial_result_captured = bool(payload.get("partial_result_captured"))
+    halt_telemetry = payload.get("halt_telemetry")
+    if halt_telemetry is not None and not isinstance(halt_telemetry, dict):
+        raise AssertionError(f"spend.final halt telemetry must be an object or null: {payload}")
     if partial_result_ref:
         if not isinstance(partial_result_ref, str):
             raise AssertionError(f"spend.final partial_result_ref must be a string: {payload}")
@@ -2981,6 +3015,7 @@ def _battery_spend_final(
         "meter_gap_max_conservative_gap_s": meter_gap_max_conservative_gap_s,
         "partial_result_ref": partial_result_ref,
         "partial_result_captured": partial_result_captured,
+        "halt_telemetry": halt_telemetry,
     }
 
 

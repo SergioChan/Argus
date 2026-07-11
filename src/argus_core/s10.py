@@ -11,6 +11,7 @@ import selectors
 import shutil
 import socket
 import subprocess
+import threading
 import time
 from dataclasses import asdict, dataclass, field, replace
 from decimal import Decimal
@@ -440,6 +441,26 @@ class SandboxExecutionResult:
     duration_s: float
     budget_usage: BudgetUsage
     partial_result: SandboxPartialResult | None = None
+
+
+@dataclass(frozen=True)
+class SandboxHaltTelemetry:
+    """Runtime-only timing evidence for a physical sandbox halt."""
+
+    reason: str
+    halt_detected_elapsed_s: float
+    freeze_completed_elapsed_s: float | None
+    terminate_completed_elapsed_s: float | None
+    revocation_ack_to_detect_s: float | None
+    revocation_ack_to_freeze_s: float | None
+    revocation_ack_to_terminate_s: float | None
+
+
+@dataclass(frozen=True)
+class _RuntimeHaltSignal:
+    reason: str
+    dimensions: tuple[str, ...]
+    revocation_acknowledged_at: float | None = None
 
 
 @dataclass(frozen=True)
@@ -1030,6 +1051,7 @@ class InMemoryTokenService:
         verifier: TokenSignatureTrustStore | None = None,
         revocation_store: InMemoryTokenRevocationStore | FileTokenRevocationStore | None = None,
         now_fn: Callable[[], int] | None = None,
+        monotonic_fn: Callable[[], float] | None = None,
     ) -> None:
         if signer is not None and signing_key is not None:
             raise ValueError("configure either signing_key or signer, not both")
@@ -1041,6 +1063,9 @@ class InMemoryTokenService:
         self._verifier = verifier or signer.trust_store()
         self._revocation_store = revocation_store or InMemoryTokenRevocationStore()
         self._now_fn = now_fn or (lambda: int(time.time()))
+        self._monotonic_fn = monotonic_fn or time.monotonic
+        self._revocation_acknowledgements: dict[str, float] = {}
+        self._revocation_acknowledgements_lock = threading.Lock()
         self.minting_enabled = True
 
     @property
@@ -1144,8 +1169,20 @@ class InMemoryTokenService:
     def verify_scope(self, token: ScopeToken) -> TokenVerification:
         return self._verify_token(token, token.scope_id)
 
-    def revoke(self, token_id: str) -> None:
+    def revoke(self, token_id: str) -> float:
+        token_id = _validate_token_id(token_id)
         self._revocation_store.revoke(token_id)
+        acknowledged_at = self._monotonic_fn()
+        with self._revocation_acknowledgements_lock:
+            self._revocation_acknowledgements[token_id] = acknowledged_at
+            while len(self._revocation_acknowledgements) > 4_096:
+                self._revocation_acknowledgements.pop(next(iter(self._revocation_acknowledgements)))
+        return acknowledged_at
+
+    def revocation_acknowledged_at(self, token_id: str) -> float | None:
+        token_id = _validate_token_id(token_id)
+        with self._revocation_acknowledgements_lock:
+            return self._revocation_acknowledgements.get(token_id)
 
     def _require_valid_budget(self, token: BudgetToken) -> None:
         verification = self.verify_budget(token)
@@ -1604,6 +1641,38 @@ def _resource_meter_sample_payload(sample: ResourceMeterSample) -> dict[str, Any
         "breached_dimensions": list(sample.breached_dimensions),
         "halted": sample.halted,
         "conservative_gap_s": round(sample.conservative_gap_s, 6),
+    }
+
+
+def _sandbox_halt_telemetry_payload(telemetry: SandboxHaltTelemetry) -> dict[str, Any]:
+    return {
+        "reason": telemetry.reason,
+        "halt_detected_elapsed_s": round(telemetry.halt_detected_elapsed_s, 6),
+        "freeze_completed_elapsed_s": (
+            round(telemetry.freeze_completed_elapsed_s, 6)
+            if telemetry.freeze_completed_elapsed_s is not None
+            else None
+        ),
+        "terminate_completed_elapsed_s": (
+            round(telemetry.terminate_completed_elapsed_s, 6)
+            if telemetry.terminate_completed_elapsed_s is not None
+            else None
+        ),
+        "revocation_ack_to_detect_s": (
+            round(telemetry.revocation_ack_to_detect_s, 6)
+            if telemetry.revocation_ack_to_detect_s is not None
+            else None
+        ),
+        "revocation_ack_to_freeze_s": (
+            round(telemetry.revocation_ack_to_freeze_s, 6)
+            if telemetry.revocation_ack_to_freeze_s is not None
+            else None
+        ),
+        "revocation_ack_to_terminate_s": (
+            round(telemetry.revocation_ack_to_terminate_s, 6)
+            if telemetry.revocation_ack_to_terminate_s is not None
+            else None
+        ),
     }
 
 
@@ -2280,7 +2349,8 @@ class DockerSandboxSupervisor:
         request: LaunchRequest,
         materialized_env: dict[str, str],
         meter_sample_sink: Callable[[ResourceMeterSample], None] | None = None,
-        runtime_halt_probe: Callable[[], tuple[str, tuple[str, ...]] | None] | None = None,
+        runtime_halt_probe: Callable[[], _RuntimeHaltSignal | tuple[str, tuple[str, ...]] | None] | None = None,
+        halt_telemetry_sink: Callable[[SandboxHaltTelemetry], None] | None = None,
     ) -> SandboxExecutionResult:
         if not _is_digest_pinned_image(request.image):
             raise PolicyDeniedError("image must be digest-pinned")
@@ -2294,6 +2364,7 @@ class DockerSandboxSupervisor:
                     materialized_env=materialized_env,
                     meter_sample_sink=meter_sample_sink,
                     runtime_halt_probe=runtime_halt_probe,
+                    halt_telemetry_sink=halt_telemetry_sink,
                 )
             except SandboxRuntimeUnavailableError:
                 if shutil.which(self._docker_bin) is None and "/" not in self._docker_bin:
@@ -2374,7 +2445,8 @@ class DockerSandboxSupervisor:
         request: LaunchRequest,
         materialized_env: dict[str, str],
         meter_sample_sink: Callable[[ResourceMeterSample], None] | None = None,
-        runtime_halt_probe: Callable[[], tuple[str, tuple[str, ...]] | None] | None = None,
+        runtime_halt_probe: Callable[[], _RuntimeHaltSignal | tuple[str, tuple[str, ...]] | None] | None = None,
+        halt_telemetry_sink: Callable[[SandboxHaltTelemetry], None] | None = None,
     ) -> SandboxExecutionResult:
         container_name = f"argus-{handle.sandbox_id.replace('-', '')[:24]}"
         envelope = request.requested_envelope
@@ -2417,6 +2489,7 @@ class DockerSandboxSupervisor:
                 started_at=started_at,
                 meter_sample_sink=meter_sample_sink,
                 runtime_halt_probe=runtime_halt_probe,
+                halt_telemetry_sink=halt_telemetry_sink,
             )
             if partial_result is None:
                 log_capture = self._docker_api_logs(container_id)
@@ -2447,7 +2520,8 @@ class DockerSandboxSupervisor:
         request: LaunchRequest,
         started_at: float,
         meter_sample_sink: Callable[[ResourceMeterSample], None] | None,
-        runtime_halt_probe: Callable[[], tuple[str, tuple[str, ...]] | None] | None = None,
+        runtime_halt_probe: Callable[[], _RuntimeHaltSignal | tuple[str, tuple[str, ...]] | None] | None = None,
+        halt_telemetry_sink: Callable[[SandboxHaltTelemetry], None] | None = None,
     ) -> tuple[int | None, bool, str, BudgetUsage, SandboxPartialResult | None]:
         envelope = request.requested_envelope
         sample_seq = 0
@@ -2488,6 +2562,7 @@ class DockerSandboxSupervisor:
                     last_sample=sample,
                     sample_seq=sample_seq,
                     meter_sample_sink=meter_sample_sink,
+                    halt_telemetry_sink=halt_telemetry_sink,
                 )
 
             state = self._docker_api_request("GET", f"/containers/{container_id}/json", expected=(200,), timeout=1)
@@ -2514,7 +2589,13 @@ class DockerSandboxSupervisor:
 
             runtime_halt = runtime_halt_probe() if runtime_halt_probe is not None else None
             if runtime_halt is not None:
-                reason, dimensions = runtime_halt
+                if isinstance(runtime_halt, _RuntimeHaltSignal):
+                    reason = runtime_halt.reason
+                    dimensions = runtime_halt.dimensions
+                    revocation_acknowledged_at = runtime_halt.revocation_acknowledged_at
+                else:
+                    reason, dimensions = runtime_halt
+                    revocation_acknowledged_at = None
                 sample_seq += 1
                 sample = ResourceMeterSample(
                     sample_seq=sample_seq,
@@ -2535,6 +2616,8 @@ class DockerSandboxSupervisor:
                     last_sample=sample,
                     sample_seq=sample_seq,
                     meter_sample_sink=meter_sample_sink,
+                    halt_telemetry_sink=halt_telemetry_sink,
+                    revocation_acknowledged_at=revocation_acknowledged_at,
                 )
 
             if now >= next_sample_at:
@@ -2565,6 +2648,7 @@ class DockerSandboxSupervisor:
                         last_sample=sample,
                         sample_seq=sample_seq,
                         meter_sample_sink=meter_sample_sink,
+                        halt_telemetry_sink=halt_telemetry_sink,
                     )
                 next_sample_at = time.monotonic() + self._meter_interval_s
                 if envelope.wallclock_s > 0:
@@ -2584,7 +2668,12 @@ class DockerSandboxSupervisor:
         last_sample: ResourceMeterSample,
         sample_seq: int,
         meter_sample_sink: Callable[[ResourceMeterSample], None] | None,
+        halt_telemetry_sink: Callable[[SandboxHaltTelemetry], None] | None = None,
+        revocation_acknowledged_at: float | None = None,
     ) -> tuple[int | None, bool, str, BudgetUsage, SandboxPartialResult]:
+        halt_detected_at = time.monotonic()
+        freeze_completed_at: float | None = None
+        terminate_completed_at: float | None = None
         freeze_succeeded = False
         terminate_succeeded = False
         stdout = ""
@@ -2599,6 +2688,7 @@ class DockerSandboxSupervisor:
         try:
             self._docker_api_request("POST", f"/containers/{container_id}/pause", expected=(204,), timeout=2)
             freeze_succeeded = True
+            freeze_completed_at = time.monotonic()
         except (SandboxRuntimeUnavailableError, TimeoutError) as exc:
             capture_error = f"freeze_failed:{type(exc).__name__}:{exc}"
 
@@ -2624,9 +2714,39 @@ class DockerSandboxSupervisor:
         try:
             self._docker_api_request("POST", f"/containers/{container_id}/kill", expected=(204, 304, 404, 409), timeout=2)
             terminate_succeeded = True
+            terminate_completed_at = time.monotonic()
         except (SandboxRuntimeUnavailableError, TimeoutError) as exc:
             message = f"terminate_failed:{type(exc).__name__}:{exc}"
             capture_error = message if capture_error is None else f"{capture_error};{message}"
+
+        if halt_telemetry_sink is not None:
+            halt_telemetry_sink(
+                SandboxHaltTelemetry(
+                    reason=reason,
+                    halt_detected_elapsed_s=max(halt_detected_at - started_at, 0.0),
+                    freeze_completed_elapsed_s=(
+                        max(freeze_completed_at - started_at, 0.0) if freeze_completed_at is not None else None
+                    ),
+                    terminate_completed_elapsed_s=(
+                        max(terminate_completed_at - started_at, 0.0) if terminate_completed_at is not None else None
+                    ),
+                    revocation_ack_to_detect_s=(
+                        max(halt_detected_at - revocation_acknowledged_at, 0.0)
+                        if revocation_acknowledged_at is not None
+                        else None
+                    ),
+                    revocation_ack_to_freeze_s=(
+                        max(freeze_completed_at - revocation_acknowledged_at, 0.0)
+                        if freeze_completed_at is not None and revocation_acknowledged_at is not None
+                        else None
+                    ),
+                    revocation_ack_to_terminate_s=(
+                        max(terminate_completed_at - revocation_acknowledged_at, 0.0)
+                        if terminate_completed_at is not None and revocation_acknowledged_at is not None
+                        else None
+                    ),
+                )
+            )
 
         duration_s = time.monotonic() - started_at
         final_usage = _max_budget_usage(last_sample.usage, _runtime_budget_usage(request.requested_envelope, duration_s))
@@ -3268,12 +3388,14 @@ class DockerSandboxOrchestrator(InMemorySandboxOrchestrator):
         self._price_table_trust_store = price_table_trust_store
         self._price_table_gpu_model = price_table_gpu_model
         self._price_table_model_id = price_table_model_id
+        self._halt_telemetry_by_sandbox: dict[str, SandboxHaltTelemetry] = {}
 
     def launch_and_wait(self, request: LaunchRequest) -> SandboxExecutionResult:
         handle = super().launch(request)
         materialized_env = materialize_sandbox_env(request.env, request.env_allowlist)
         reserved_usage = request.requested_envelope.budget_usage()
         meter_samples: list[ResourceMeterSample] = []
+        halt_telemetry_items: list[SandboxHaltTelemetry] = []
         meter_halt_recorded = False
         token_revocation_halt_recorded = False
 
@@ -3308,19 +3430,34 @@ class DockerSandboxOrchestrator(InMemorySandboxOrchestrator):
                     },
                 )
 
+        def record_halt_telemetry(telemetry: SandboxHaltTelemetry) -> None:
+            halt_telemetry_items.append(telemetry)
+
         self._audit_ledger.append(
             "sandbox.started",
             {"sandbox_id": handle.sandbox_id, "job_id": request.job_id, "runtime_class": handle.runtime_class},
         )
         try:
             try:
-                result = self._supervisor.run(
-                    handle=handle,
-                    request=request,
-                    materialized_env=materialized_env,
-                    meter_sample_sink=record_meter_sample,
-                    runtime_halt_probe=self._runtime_halt_probe(request),
-                )
+                try:
+                    result = self._supervisor.run(
+                        handle=handle,
+                        request=request,
+                        materialized_env=materialized_env,
+                        meter_sample_sink=record_meter_sample,
+                        runtime_halt_probe=self._runtime_halt_probe(request),
+                        halt_telemetry_sink=record_halt_telemetry,
+                    )
+                except TypeError as telemetry_exc:
+                    if "halt_telemetry_sink" not in str(telemetry_exc):
+                        raise
+                    result = self._supervisor.run(
+                        handle=handle,
+                        request=request,
+                        materialized_env=materialized_env,
+                        meter_sample_sink=record_meter_sample,
+                        runtime_halt_probe=self._runtime_halt_probe(request),
+                    )
             except TypeError as exc:
                 if "runtime_halt_probe" in str(exc):
                     try:
@@ -3349,6 +3486,26 @@ class DockerSandboxOrchestrator(InMemorySandboxOrchestrator):
         except Exception as exc:
             self._record_runtime_failure(handle, request, reserved_usage, exc)
             raise
+
+        if len(halt_telemetry_items) > 1:
+            self._record_runtime_failure(
+                handle,
+                request,
+                reserved_usage,
+                PolicyDeniedError("sandbox emitted multiple halt telemetry records"),
+            )
+            raise PolicyDeniedError("sandbox emitted multiple halt telemetry records")
+        halt_telemetry = halt_telemetry_items[0] if halt_telemetry_items else None
+        if halt_telemetry is not None:
+            self._halt_telemetry_by_sandbox[handle.sandbox_id] = halt_telemetry
+            self._audit_ledger.append(
+                "sandbox.halt_completed",
+                {
+                    "sandbox_id": handle.sandbox_id,
+                    "job_id": request.job_id,
+                    **_sandbox_halt_telemetry_payload(halt_telemetry),
+                },
+            )
 
         try:
             price_rollup = self._roll_up_spend(result.budget_usage)
@@ -3395,6 +3552,7 @@ class DockerSandboxOrchestrator(InMemorySandboxOrchestrator):
                 price_rollup=price_rollup,
                 meter_samples=tuple(meter_samples),
                 partial_result_ref=partial_result_ref,
+                halt_telemetry=halt_telemetry,
             )
             raise
         self._audit_ledger.append(
@@ -3413,26 +3571,52 @@ class DockerSandboxOrchestrator(InMemorySandboxOrchestrator):
             price_rollup=price_rollup,
             meter_samples=tuple(meter_samples),
             partial_result_ref=partial_result_ref,
+            halt_telemetry=halt_telemetry,
         )
         return replace(result, handle=final_handle)
 
-    def _runtime_halt_probe(self, request: LaunchRequest) -> Callable[[], tuple[str, tuple[str, ...]] | None]:
-        def probe() -> tuple[str, tuple[str, ...]] | None:
+    def _runtime_halt_probe(
+        self,
+        request: LaunchRequest,
+    ) -> Callable[[], _RuntimeHaltSignal | None]:
+        def probe() -> _RuntimeHaltSignal | None:
             budget_verification = self._token_service.verify_budget(request.budget_token)
             if not budget_verification.valid:
-                return _token_runtime_halt(
+                reason, dimensions = _token_runtime_halt(
                     reason=budget_verification.reason,
                     token_dimension="budget_token",
                 )
+                return _RuntimeHaltSignal(
+                    reason=reason,
+                    dimensions=dimensions,
+                    revocation_acknowledged_at=(
+                        self._token_service.revocation_acknowledged_at(request.budget_token.budget_id)
+                        if budget_verification.reason == "revoked"
+                        else None
+                    ),
+                )
             scope_verification = self._token_service.verify_scope(request.scope_token)
             if not scope_verification.valid:
-                return _token_runtime_halt(
+                reason, dimensions = _token_runtime_halt(
                     reason=scope_verification.reason,
                     token_dimension="scope_token",
+                )
+                return _RuntimeHaltSignal(
+                    reason=reason,
+                    dimensions=dimensions,
+                    revocation_acknowledged_at=(
+                        self._token_service.revocation_acknowledged_at(request.scope_token.scope_id)
+                        if scope_verification.reason == "revoked"
+                        else None
+                    ),
                 )
             return None
 
         return probe
+
+    def halt_telemetry_for(self, sandbox_id: str) -> dict[str, Any] | None:
+        telemetry = self._halt_telemetry_by_sandbox.get(sandbox_id)
+        return _sandbox_halt_telemetry_payload(telemetry) if telemetry is not None else None
 
     @property
     def price_table_version(self) -> str | None:
@@ -3472,6 +3656,7 @@ class DockerSandboxOrchestrator(InMemorySandboxOrchestrator):
         price_rollup: PriceTableRollup,
         meter_samples: tuple[ResourceMeterSample, ...] = (),
         partial_result_ref: str | None = None,
+        halt_telemetry: SandboxHaltTelemetry | None = None,
     ) -> str | None:
         if self._artifact_store is None:
             return None
@@ -3494,6 +3679,9 @@ class DockerSandboxOrchestrator(InMemorySandboxOrchestrator):
             "usage": asdict(usage),
             "partial_result_captured": partial_result_ref is not None,
             "partial_result_ref": partial_result_ref,
+            "halt_telemetry": (
+                _sandbox_halt_telemetry_payload(halt_telemetry) if halt_telemetry is not None else None
+            ),
             "usd_rollup": {
                 "cost_usd": usage.cost_usd,
                 "cost_usd_exact": price_rollup.cost_usd_exact,
@@ -3513,6 +3701,9 @@ class DockerSandboxOrchestrator(InMemorySandboxOrchestrator):
                 "kind": "argus.s10.spend.final.env.v1",
                 "launch_provenance_ref": handle.launch_provenance_ref,
                 "partial_result_ref": partial_result_ref,
+                "halt_telemetry": (
+                    _sandbox_halt_telemetry_payload(halt_telemetry) if halt_telemetry is not None else None
+                ),
                 "price_table_hash": price_rollup.price_table_hash,
                 "price_table_version": price_rollup.price_table_version,
             }
