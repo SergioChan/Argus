@@ -14,6 +14,7 @@ from typing import Any, Mapping
 from argus_core import S1ReferencePhysicsHarness, S1ReferencePhysicsRunResult
 
 from .http_json import JsonHttpApp, JsonRequest, serve_json_app
+from .m1_reference_runtime import M1_REFERENCE_JOB_ID, M1ReferenceLifecycleRunner
 from .s3_report_signer_service import RustS3ReportSigner
 
 
@@ -123,7 +124,14 @@ def _rust_s3_report_signer_environment(*, key_id: str, key_material: bytes) -> d
 
 
 class S1ReferenceDemoApp:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        lifecycle_runner: M1ReferenceLifecycleRunner | None = None,
+        default_job_id: str = S1_REFERENCE_DEMO_DEFAULT_JOB_ID,
+    ) -> None:
+        self._lifecycle_runner = lifecycle_runner
+        self._default_job_id = default_job_id
         self.http = JsonHttpApp()
         self._register_routes()
 
@@ -138,15 +146,43 @@ class S1ReferenceDemoApp:
                 return 400, {"error": "invalid_json_body"}
             body = request.body if isinstance(request.body, dict) else {}
             try:
-                job_id = _job_id_from_body(body)
+                job_id = _job_id_from_body(body, default_job_id=self._default_job_id)
             except ValueError as exc:
                 return 400, {"error": "invalid_job_id", "message": str(exc)}
+            if self._lifecycle_runner is not None:
+                try:
+                    result = self._lifecycle_runner.run(job_id=job_id)
+                except ValueError as exc:
+                    return 403, {"error": str(exc)}
+                except Exception as exc:
+                    return 502, {"error": type(exc).__name__, "message": str(exc)}
+                return 200, {**result.as_payload(), "observatory_html": result.observatory_html}
             evidence, artifacts = build_reference_demo(job_id)
             return 200, {**evidence, "observatory_html": artifacts["observatory_html"]}
 
 
 def build_app() -> S1ReferenceDemoApp:
     return S1ReferenceDemoApp()
+
+
+def build_app_from_env() -> S1ReferenceDemoApp:
+    runner = M1ReferenceLifecycleRunner(
+        s10_url=_required_env("ARGUS_S1_REFERENCE_DEMO_S10_URL"),
+        s8_url=_required_env("ARGUS_S1_REFERENCE_DEMO_S8_URL"),
+        access_token=_required_env("ARGUS_S1_REFERENCE_DEMO_ACCESS_TOKEN"),
+        s7_url=_required_env("ARGUS_S1_REFERENCE_DEMO_S7_URL"),
+        s3_url=_required_env("ARGUS_S1_REFERENCE_DEMO_S3_URL"),
+        s11_url=_required_env("ARGUS_S1_REFERENCE_DEMO_S11_URL"),
+        verifier_key_endpoint_url=os.environ.get(
+            "ARGUS_S1_REFERENCE_DEMO_VERIFIER_KEY_ENDPOINT_URL",
+            "http://s10-supervisor:8080/v1/internal/verifier-keys",
+        ),
+        verifier_key_auth_token=_required_env("ARGUS_S10_VERIFIER_KEY_AUTH_TOKEN"),
+        allow_insecure_verifier_key_store=_env_flag(
+            os.environ.get("ARGUS_S1_REFERENCE_DEMO_ALLOW_INSECURE_VERIFIER_KEY_STORE")
+        ),
+    )
+    return S1ReferenceDemoApp(lifecycle_runner=runner, default_job_id=M1_REFERENCE_JOB_ID)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -160,7 +196,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     if args.serve:
-        serve_json_app(build_app().http, host=args.host, port=args.port)
+        serve_json_app(build_app_from_env().http, host=args.host, port=args.port)
         return 0
 
     evidence, artifacts = build_reference_demo(args.job_id)
@@ -207,10 +243,10 @@ def _lineage_payload(harness: S1ReferencePhysicsHarness, result: S1ReferencePhys
     }
 
 
-def _job_id_from_body(body: Mapping[str, Any]) -> str:
+def _job_id_from_body(body: Mapping[str, Any], *, default_job_id: str = S1_REFERENCE_DEMO_DEFAULT_JOB_ID) -> str:
     job_id = body.get("job_id")
     if job_id is None:
-        return S1_REFERENCE_DEMO_DEFAULT_JOB_ID
+        return default_job_id
     if not isinstance(job_id, str) or not job_id:
         raise ValueError("job_id must be a non-empty string")
     return job_id
@@ -248,6 +284,17 @@ def _jsonable(value: Any) -> Any:
     if isinstance(value, (list, tuple)):
         return [_jsonable(item) for item in value]
     return value
+
+
+def _required_env(name: str) -> str:
+    value = os.environ.get(name)
+    if not value:
+        raise RuntimeError(f"{name} is required")
+    return value
+
+
+def _env_flag(value: str | None) -> bool:
+    return value is not None and value.strip().lower() in {"1", "true", "yes", "on"}
 
 
 if __name__ == "__main__":

@@ -10,23 +10,31 @@ import shlex
 from typing import Any, Mapping
 
 from argus_core.s1_reference import (
+    S1_REFERENCE_PHYSICS_PROFILE_REF,
     S1_REFERENCE_S3_REFEREE_KEY_ID,
     S1_REFERENCE_S3_VERIFIER_ID,
     ReferenceS3ValidationEngine,
 )
 from argus_core.s10 import S10VerifierTrustStoreClient
 from argus_core.s3 import S3ReportBuilder, S3Verifier, build_frozen_pipeline_entrypoint_request
-from argus_core.s8 import Producer
+from argus_core.s8 import Lineage, Producer
 from argusverify import C3ReportVerifier
 
 from .http_json import JsonHttpApp, JsonRequest, serve_json_app
-from .m1_runtime_artifacts import RuntimeArtifactStoreError, RuntimeIdentitySession, S10S8ArtifactStore
+from .m1_reference_service_auth import M1RequesterUnauthorized, require_m1_s1_requester
+from .m1_runtime_artifacts import (
+    RuntimeArtifactStoreError,
+    RuntimeIdentitySession,
+    S10S8ArtifactStore,
+    runtime_identity_session,
+)
 from .s3_report_signer_service import RustS3ReportSigner
 from .s8_persistence import HttpS10VerifierKeyProvider
 
 
 S3_REFERENCE_REFEREE_NAME = "s3-reference-referee"
 S3_REFERENCE_REFEREE_ROUTE = "/v1/reference-referee/validate"
+S3_REFERENCE_PROFILE_ROUTE = "/v1/reference-referee/profile"
 S3_REFERENCE_REFEREE_DEFAULT_CALLER_ID = "m1-reference-s3"
 S3_REFERENCE_REFEREE_DEFAULT_JOB_ID = "m1-reference-job"
 
@@ -51,27 +59,31 @@ class S3ReferenceRefereeApp:
         *,
         s10_url: str,
         s8_url: str,
-        bootstrap_token: str,
+        bootstrap_token: str | None = None,
+        access_token: str | None = None,
         caller_id: str,
         expected_job_id: str,
         signer: Any,
         verifier_key_endpoint_url: str,
         verifier_key_auth_token: str,
         allow_insecure_verifier_key_store: bool = False,
+        require_s1_requester: bool = False,
     ) -> None:
         if not caller_id:
             raise ValueError("S3 referee caller_id is required")
         if not expected_job_id:
             raise ValueError("S3 referee expected_job_id is required")
-        if not bootstrap_token:
-            raise ValueError("S3 referee bootstrap token is required")
+        if bool(bootstrap_token) == bool(access_token):
+            raise ValueError("S3 referee requires exactly one runtime credential")
         if not getattr(signer, "key_id", None) or not callable(getattr(signer, "sign", None)):
             raise ValueError("S3 referee signer must expose key_id and sign")
         self._s10_url = s10_url
         self._s8_url = s8_url
         self._bootstrap_token = bootstrap_token
+        self._access_token = access_token
         self._caller_id = caller_id
         self._expected_job_id = expected_job_id
+        self._require_s1_requester = require_s1_requester
         self._session: RuntimeIdentitySession | None = None
         self._store: S10S8ArtifactStore | None = None
         provider = HttpS10VerifierKeyProvider(
@@ -137,13 +149,42 @@ class S3ReferenceRefereeApp:
             "validation_report_ref": committed.record.artifact_ref,
         }
 
+    def ensure_reference_profile(self) -> dict[str, Any]:
+        """Commit the fixed M1 verifier profile through the S3 identity."""
+
+        profile_payload = {
+            "schema": "argus.s3.reference_profile.v1",
+            "profile": "ewpt-reference",
+            "subtopic": "ewpt",
+            "checks": ["injection", "null", "physical-consistency"],
+        }
+        record = self._artifact_store().create_artifact(
+            kind="profile",
+            artifact_ref=S1_REFERENCE_PHYSICS_PROFILE_REF,
+            payload=profile_payload,
+            producer=Producer(
+                subsystem="S3",
+                version="0.0.0",
+                actor_id=S1_REFERENCE_S3_VERIFIER_ID,
+                job_id=self._expected_job_id,
+            ),
+            lineage=Lineage(
+                input_refs=(),
+                code_ref="argus-runtime:s3-reference-profile",
+                environment_digest="oci:argus-s3-reference-referee:v1",
+                job_id=self._expected_job_id,
+            ),
+        )
+        return {"profile_ref": record.artifact_ref, "profile_payload": profile_payload}
+
     def _artifact_store(self) -> S10S8ArtifactStore:
         if self._store is None:
-            self._session = RuntimeIdentitySession.from_bootstrap(
+            self._session = runtime_identity_session(
                 s10_url=self._s10_url,
-                bootstrap_token=self._bootstrap_token,
                 caller_id=self._caller_id,
                 expected_job_id=self._expected_job_id,
+                bootstrap_token=self._bootstrap_token,
+                access_token=self._access_token,
             )
             self._store = S10S8ArtifactStore(session=self._session, s8_url=self._s8_url)
         return self._store
@@ -158,12 +199,25 @@ class S3ReferenceRefereeApp:
                 "signer_key_id": self._verifier.signer_key_id,
             }
 
+        @self.http.route("GET", S3_REFERENCE_PROFILE_ROUTE)
+        def profile(request: JsonRequest) -> tuple[int, Any]:
+            try:
+                self._authorize_s1_requester(request)
+                return 200, self.ensure_reference_profile()
+            except M1RequesterUnauthorized as exc:
+                return 403, {"error": "requester_unauthorized", "message": str(exc)}
+            except Exception as exc:
+                return 400, {"error": type(exc).__name__, "message": str(exc)}
+
         @self.http.route("POST", S3_REFERENCE_REFEREE_ROUTE)
         def validate(request: JsonRequest) -> tuple[int, Any]:
             if not isinstance(request.body, Mapping):
                 return 400, {"error": "invalid_json_body"}
             try:
+                self._authorize_s1_requester(request)
                 return 200, self.validate(request.body)
+            except M1RequesterUnauthorized as exc:
+                return 403, {"error": "requester_unauthorized", "message": str(exc)}
             except PermissionError as exc:
                 if str(exc) == "job_id_mismatch":
                     return 403, {"error": "job_id_mismatch"}
@@ -171,13 +225,22 @@ class S3ReferenceRefereeApp:
             except Exception as exc:
                 return 400, {"error": type(exc).__name__, "message": str(exc)}
 
+    def _authorize_s1_requester(self, request: JsonRequest) -> None:
+        if not self._require_s1_requester:
+            return
+        require_m1_s1_requester(
+            request,
+            s10_url=self._s10_url,
+            expected_job_id=self._expected_job_id,
+        )
+
 
 def build_app_from_env() -> S3ReferenceRefereeApp:
     signer = _rust_signer_from_env()
     return S3ReferenceRefereeApp(
         s10_url=_required_env("ARGUS_S3_REFERENCE_REFEREE_S10_URL"),
         s8_url=_required_env("ARGUS_S3_REFERENCE_REFEREE_S8_URL"),
-        bootstrap_token=_required_env("ARGUS_RUNTIME_BOOTSTRAP_TOKEN"),
+        access_token=_required_env("ARGUS_S3_REFERENCE_REFEREE_ACCESS_TOKEN"),
         caller_id=os.environ.get("ARGUS_S3_REFERENCE_REFEREE_CALLER_ID", S3_REFERENCE_REFEREE_DEFAULT_CALLER_ID),
         expected_job_id=os.environ.get("ARGUS_S3_REFERENCE_REFEREE_JOB_ID", S3_REFERENCE_REFEREE_DEFAULT_JOB_ID),
         signer=signer,
@@ -189,6 +252,7 @@ def build_app_from_env() -> S3ReferenceRefereeApp:
         allow_insecure_verifier_key_store=_env_flag(
             os.environ.get("ARGUS_S3_REFERENCE_REFEREE_ALLOW_INSECURE_VERIFIER_KEY_STORE")
         ),
+        require_s1_requester=_env_flag(os.environ.get("ARGUS_S3_REFERENCE_REFEREE_REQUIRE_S1_REQUESTER")),
     )
 
 

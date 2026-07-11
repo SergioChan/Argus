@@ -47,6 +47,7 @@ from argus_core import (
     s8_checkpoint_signature_payload,
 )
 from argusverify import C3ReportSigner, InMemoryVerifierTrustStore, verify_report
+from argus_runtime.auth import RuntimeAuth, runtime_identity_from_dict
 
 
 DEFAULT_IMAGE = "busybox@sha256:73aaf090f3d85aa34ee199857f03fa3a95c8ede2ffd4cc2cdb5b94e566b11662"
@@ -77,6 +78,7 @@ def main() -> int:
         "results": [],
     }
     runtime_secrets = _m0_runtime_secrets()
+    reference_service_tokens = _m1_reference_service_access_tokens(runtime_secrets)
     price_table_now = int(time.time())
     ports = {
         "ARGUS_M0_POSTGRES_PORT": str(_free_port()),
@@ -113,6 +115,10 @@ def main() -> int:
         "ARGUS_S10_PRICE_TABLE_EXPIRES_AT": str(price_table_now + 86_400),
         "ARGUS_S8_BROKER_WRITE_KEY": runtime_secrets["s8_broker_write_key"],
         "ARGUS_S3_REFERENCE_REFEREE_SIGNER_SECRET": runtime_secrets["s3_reference_referee_signing_key"],
+        "ARGUS_S1_REFERENCE_DEMO_ACCESS_TOKEN": reference_service_tokens["m1-reference-s1"],
+        "ARGUS_S3_REFERENCE_REFEREE_ACCESS_TOKEN": reference_service_tokens["m1-reference-s3"],
+        "ARGUS_S7_REFERENCE_ADAPTER_ACCESS_TOKEN": reference_service_tokens["m1-reference-s7"],
+        "ARGUS_S11_REFERENCE_OBSERVATORY_ACCESS_TOKEN": reference_service_tokens["m1-reference-s11"],
     }
     s8_url = f"http://127.0.0.1:{ports['ARGUS_M0_S8_PORT']}"
     s10_url = f"http://127.0.0.1:{ports['ARGUS_M0_S10_PORT']}"
@@ -126,6 +132,7 @@ def main() -> int:
         "ports": ports,
         "persistence": "postgres-minio",
         "auth_callers": list(_m0_identity_requests().keys()),
+        "reference_service_auth": "preprovisioned-runtime-identity-tokens",
     }
 
     try:
@@ -135,10 +142,20 @@ def main() -> int:
         _wait_health(f"{s8_url}/healthz", token=runtime_secrets["health_token"])
         _wait_health(f"{s10_url}/healthz", token=runtime_secrets["health_token"])
         _wait_health(f"{s1_reference_demo_url}/healthz", token=None)
-        _battery_s1_reference_physics_demo(evidence, s1_reference_demo_url)
-        _battery_runtime_identity_mint_policy(evidence, s10_url, bootstrap_token=runtime_secrets["bootstrap_token"])
-        auth_tokens = _mint_m0_runtime_identities(s10_url=s10_url, bootstrap_token=runtime_secrets["bootstrap_token"])
         _ensure_image(docker, args.image)
+        _battery_runtime_identity_mint_policy(
+            evidence,
+            s10_url,
+            bootstrap_token=runtime_secrets["bootstrap_token"],
+            service_access_token=reference_service_tokens["m1-reference-s7"],
+        )
+        auth_tokens = _mint_m0_runtime_identities(s10_url=s10_url, bootstrap_token=runtime_secrets["bootstrap_token"])
+        _battery_s1_reference_physics_demo(
+            evidence,
+            s1_reference_demo_url,
+            s8_url=s8_url,
+            read_token=auth_tokens["read"],
+        )
 
         _battery_a_contracts(evidence)
         _battery_s8_capability_scopes(
@@ -648,8 +665,15 @@ def _m0_identity_requests() -> dict[str, dict[str, Any]]:
             "caller_id": "m1-reference-s1",
             "job_id": "m1-reference-job",
             "root_request_id": "m1-reference-root",
+            "budget_caps": {"max_compute_units": 10, "max_wallclock_s": 30, "max_cost_usd": 1},
             "scopes": {
-                "broker_audiences": ["store"],
+                "allowed_adapters": ["gw_spectrum"],
+                "allowed_datasets": ["c4://dataset/ewpt-reference/v1"],
+                "egress_allowlist": [
+                    {"host": "store.local", "port": 443, "proto": "https"},
+                    {"host": "s7-reference-adapter", "port": 443, "proto": "https"},
+                ],
+                "broker_audiences": ["store", "gw_spectrum"],
                 "capabilities": ["s8.read"],
                 "producer_subsystems": ["S1"],
                 "sandbox_risk_class": "standard",
@@ -663,6 +687,28 @@ def _m0_identity_requests() -> dict[str, dict[str, Any]]:
                 "broker_audiences": ["store"],
                 "capabilities": ["s8.read"],
                 "producer_subsystems": ["S3"],
+                "sandbox_risk_class": "standard",
+            },
+        },
+        "m1-reference-s7": {
+            "caller_id": "m1-reference-s7",
+            "job_id": "m1-reference-job",
+            "root_request_id": "m1-reference-root",
+            "scopes": {
+                "broker_audiences": ["store"],
+                "capabilities": ["s8.read"],
+                "producer_subsystems": ["S7"],
+                "sandbox_risk_class": "standard",
+            },
+        },
+        "m1-reference-s11": {
+            "caller_id": "m1-reference-s11",
+            "job_id": "m1-reference-job",
+            "root_request_id": "m1-reference-root",
+            "scopes": {
+                "broker_audiences": ["store"],
+                "capabilities": ["s8.read"],
+                "producer_subsystems": ["S11"],
                 "sandbox_risk_class": "standard",
             },
         },
@@ -683,7 +729,30 @@ def _m0_identity_mint_policy_json() -> str:
     return json.dumps(policy, separators=(",", ":"), sort_keys=True)
 
 
-def _battery_runtime_identity_mint_policy(evidence: dict[str, Any], s10_url: str, *, bootstrap_token: str) -> None:
+def _m1_reference_service_access_tokens(runtime_secrets: Mapping[str, str]) -> dict[str, str]:
+    issuer = RuntimeAuth.with_signed_identities(
+        bootstrap_token=runtime_secrets["bootstrap_token"],
+        identity_signing_key=runtime_secrets["identity_signing_key"].encode("utf-8"),
+    )
+    tokens: dict[str, str] = {}
+    for caller_id in ("m1-reference-s1", "m1-reference-s3", "m1-reference-s7", "m1-reference-s11"):
+        identity = runtime_identity_from_dict(
+            {
+                **_m0_identity_requests()[caller_id],
+                "max_ttl_s": 900,
+            }
+        )
+        tokens[caller_id] = str(issuer.mint_identity_token(identity, ttl_s=900)["access_token"])
+    return tokens
+
+
+def _battery_runtime_identity_mint_policy(
+    evidence: dict[str, Any],
+    s10_url: str,
+    *,
+    bootstrap_token: str,
+    service_access_token: str,
+) -> None:
     override = _post_json(
         f"{s10_url}/v1/runtime-identities",
         {"caller_id": "m0-spine-launch", "job_id": "attacker-selected-job"},
@@ -702,10 +771,18 @@ def _battery_runtime_identity_mint_policy(evidence: dict[str, Any], s10_url: str
         expected_status=403,
         token=bootstrap_token,
     )
+    delegated = _post_json(
+        f"{s10_url}/v1/runtime-identities",
+        {"caller_id": "m1-reference-s1"},
+        expected_status=403,
+        token=service_access_token,
+    )
     if override["error"] != "IdentityOverrideError":
         raise AssertionError(f"unexpected runtime identity override error: {override}")
     if unknown["error"] != "PermissionError" or ttl["error"] != "PermissionError":
         raise AssertionError(f"unexpected runtime identity policy errors: unknown={unknown}, ttl={ttl}")
+    if delegated["error"] != "PermissionError":
+        raise AssertionError(f"preprovisioned service token minted an identity: {delegated}")
     _record(
         evidence,
         "identity-policy",
@@ -714,6 +791,7 @@ def _battery_runtime_identity_mint_policy(evidence: dict[str, Any], s10_url: str
             "override": override["error"],
             "unknown_caller": unknown["error"],
             "ttl_ceiling": ttl["error"],
+            "preprovisioned_identity_mint_denied": delegated["error"],
         },
     )
 
@@ -1520,10 +1598,16 @@ def _battery_deployed_report_verifier(
     )
 
 
-def _battery_s1_reference_physics_demo(evidence: dict[str, Any], s1_reference_demo_url: str) -> None:
+def _battery_s1_reference_physics_demo(
+    evidence: dict[str, Any],
+    s1_reference_demo_url: str,
+    *,
+    s8_url: str,
+    read_token: str,
+) -> None:
     response = _post_json(
         f"{s1_reference_demo_url}/v1/s1-reference-physics-demo",
-        {"job_id": "m0-s1-reference-demo"},
+        {"job_id": "m1-reference-job"},
         expected_status=200,
     )
     expected_checks = {
@@ -1555,6 +1639,36 @@ def _battery_s1_reference_physics_demo(evidence: dict[str, Any], s1_reference_de
         raise AssertionError(f"S1 reference demo did not use the reference S3 referee id: {response}")
     if response.get("signature_key_id") != "s3-reference-referee-key":
         raise AssertionError(f"S1 reference demo did not use the reference S3 referee key: {response}")
+    runtime_provenance = response.get("runtime_provenance")
+    if not isinstance(runtime_provenance, dict):
+        raise AssertionError(f"S1 reference demo did not return deployed provenance references: {response}")
+    artifact_refs = {
+        "dataset": response.get("dataset_ref"),
+        "adapter": runtime_provenance.get("adapter_provenance_ref"),
+        "sandbox": runtime_provenance.get("sandbox_launch_provenance_ref"),
+        "report": response.get("validation_report_ref"),
+        "subject": response.get("promoted_artifact_ref"),
+        "observatory": response.get("observatory_html_ref"),
+    }
+    if not all(isinstance(ref, str) and ref for ref in artifact_refs.values()):
+        raise AssertionError(f"S1 reference demo returned incomplete deployed provenance references: {artifact_refs}")
+    producers = {
+        name: _get_json(
+            f"{s8_url}/v1/artifacts/{parse.quote(str(ref), safe='')}/record",
+            token=read_token,
+        )["producer"]["subsystem"]
+        for name, ref in artifact_refs.items()
+    }
+    expected_producers = {
+        "dataset": "S1",
+        "adapter": "S7",
+        "sandbox": "S10",
+        "report": "S3",
+        "subject": "S1",
+        "observatory": "S11",
+    }
+    if producers != expected_producers:
+        raise AssertionError(f"M1 reference lifecycle producer separation failed: {producers}")
     _record(
         evidence,
         "s1-reference-demo",
@@ -1572,6 +1686,8 @@ def _battery_s1_reference_physics_demo(evidence: dict[str, Any], s1_reference_de
             "referee_id": response["referee_id"],
             "signature_key_id": response["signature_key_id"],
             "checks": statuses,
+            "artifact_refs": artifact_refs,
+            "producers": producers,
         },
     )
 

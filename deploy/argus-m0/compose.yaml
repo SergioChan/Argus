@@ -146,15 +146,72 @@ services:
       ARGUS_S3_REFERENCE_REFEREE_S8_URL: http://s8-writer:8080
       ARGUS_S3_REFERENCE_REFEREE_VERIFIER_KEY_ENDPOINT_URL: http://s10-supervisor:8080/v1/internal/verifier-keys
       ARGUS_S3_REFERENCE_REFEREE_ALLOW_INSECURE_VERIFIER_KEY_STORE: "1"
+      ARGUS_S3_REFERENCE_REFEREE_REQUIRE_S1_REQUESTER: "1"
       ARGUS_S3_REFERENCE_REFEREE_CALLER_ID: m1-reference-s3
       ARGUS_S3_REFERENCE_REFEREE_JOB_ID: m1-reference-job
       ARGUS_S3_REFERENCE_REFEREE_SIGNER_KEY_ID: s3-reference-referee-key
       ARGUS_S3_REFERENCE_REFEREE_SIGNER_SECRET: ${ARGUS_S3_REFERENCE_REFEREE_SIGNER_SECRET:?ARGUS_S3_REFERENCE_REFEREE_SIGNER_SECRET is required}
-      ARGUS_RUNTIME_BOOTSTRAP_TOKEN: ${ARGUS_RUNTIME_BOOTSTRAP_TOKEN:?ARGUS_RUNTIME_BOOTSTRAP_TOKEN is required}
+      ARGUS_S3_REFERENCE_REFEREE_ACCESS_TOKEN: ${ARGUS_S3_REFERENCE_REFEREE_ACCESS_TOKEN:?ARGUS_S3_REFERENCE_REFEREE_ACCESS_TOKEN is required}
       ARGUS_S10_VERIFIER_KEY_AUTH_TOKEN: ${ARGUS_S10_VERIFIER_KEY_AUTH_TOKEN:?ARGUS_S10_VERIFIER_KEY_AUTH_TOKEN is required}
       ARGUS_SCHEMA_ROOT: /app/schemas
     ports:
       - "127.0.0.1:${ARGUS_M0_S3_REFERENCE_REFEREE_PORT:-58083}:8080"
+    depends_on:
+      s8-writer:
+        condition: service_healthy
+      s10-supervisor:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - "python -c \"import json, urllib.request; assert json.load(urllib.request.urlopen('http://127.0.0.1:8080/healthz'))['status'] == 'ok'\""
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  s7-reference-adapter:
+    build:
+      context: ../..
+      dockerfile: deploy/argus-m0/python-service.Dockerfile
+    command: ["python", "-m", "argus_runtime.s7_reference_adapter_service"]
+    environment:
+      ARGUS_S7_REFERENCE_ADAPTER_HOST: "0.0.0.0"
+      ARGUS_S7_REFERENCE_ADAPTER_PORT: "8080"
+      ARGUS_S7_REFERENCE_ADAPTER_S10_URL: http://s10-supervisor:8080
+      ARGUS_S7_REFERENCE_ADAPTER_S8_URL: http://s8-writer:8080
+      ARGUS_S7_REFERENCE_ADAPTER_CALLER_ID: m1-reference-s7
+      ARGUS_S7_REFERENCE_ADAPTER_JOB_ID: m1-reference-job
+      ARGUS_S7_REFERENCE_ADAPTER_ACCESS_TOKEN: ${ARGUS_S7_REFERENCE_ADAPTER_ACCESS_TOKEN:?ARGUS_S7_REFERENCE_ADAPTER_ACCESS_TOKEN is required}
+    depends_on:
+      s8-writer:
+        condition: service_healthy
+      s10-supervisor:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - "python -c \"import json, urllib.request; assert json.load(urllib.request.urlopen('http://127.0.0.1:8080/healthz'))['status'] == 'ok'\""
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  s11-reference-observatory:
+    build:
+      context: ../..
+      dockerfile: deploy/argus-m0/python-service.Dockerfile
+    command: ["python", "-m", "argus_runtime.s11_reference_observatory_service"]
+    environment:
+      ARGUS_S11_REFERENCE_OBSERVATORY_HOST: "0.0.0.0"
+      ARGUS_S11_REFERENCE_OBSERVATORY_PORT: "8080"
+      ARGUS_S11_REFERENCE_OBSERVATORY_S10_URL: http://s10-supervisor:8080
+      ARGUS_S11_REFERENCE_OBSERVATORY_S8_URL: http://s8-writer:8080
+      ARGUS_S11_REFERENCE_OBSERVATORY_VERIFIER_KEY_ENDPOINT_URL: http://s10-supervisor:8080/v1/internal/verifier-keys
+      ARGUS_S11_REFERENCE_OBSERVATORY_ALLOW_INSECURE_VERIFIER_KEY_STORE: "1"
+      ARGUS_S11_REFERENCE_OBSERVATORY_CALLER_ID: m1-reference-s11
+      ARGUS_S11_REFERENCE_OBSERVATORY_JOB_ID: m1-reference-job
+      ARGUS_S11_REFERENCE_OBSERVATORY_ACCESS_TOKEN: ${ARGUS_S11_REFERENCE_OBSERVATORY_ACCESS_TOKEN:?ARGUS_S11_REFERENCE_OBSERVATORY_ACCESS_TOKEN is required}
+      ARGUS_S10_VERIFIER_KEY_AUTH_TOKEN: ${ARGUS_S10_VERIFIER_KEY_AUTH_TOKEN:?ARGUS_S10_VERIFIER_KEY_AUTH_TOKEN is required}
+      ARGUS_SCHEMA_ROOT: /app/schemas
     depends_on:
       s8-writer:
         condition: service_healthy
@@ -176,6 +233,15 @@ services:
     environment:
       ARGUS_S1_REFERENCE_DEMO_HOST: "0.0.0.0"
       ARGUS_S1_REFERENCE_DEMO_PORT: "8080"
+      ARGUS_S1_REFERENCE_DEMO_S10_URL: http://s10-supervisor:8080
+      ARGUS_S1_REFERENCE_DEMO_S8_URL: http://s8-writer:8080
+      ARGUS_S1_REFERENCE_DEMO_S7_URL: http://s7-reference-adapter:8080
+      ARGUS_S1_REFERENCE_DEMO_S3_URL: http://s3-reference-referee:8080
+      ARGUS_S1_REFERENCE_DEMO_S11_URL: http://s11-reference-observatory:8080
+      ARGUS_S1_REFERENCE_DEMO_VERIFIER_KEY_ENDPOINT_URL: http://s10-supervisor:8080/v1/internal/verifier-keys
+      ARGUS_S1_REFERENCE_DEMO_ALLOW_INSECURE_VERIFIER_KEY_STORE: "1"
+      ARGUS_S1_REFERENCE_DEMO_ACCESS_TOKEN: ${ARGUS_S1_REFERENCE_DEMO_ACCESS_TOKEN:?ARGUS_S1_REFERENCE_DEMO_ACCESS_TOKEN is required}
+      ARGUS_S10_VERIFIER_KEY_AUTH_TOKEN: ${ARGUS_S10_VERIFIER_KEY_AUTH_TOKEN:?ARGUS_S10_VERIFIER_KEY_AUTH_TOKEN is required}
       ARGUS_SCHEMA_ROOT: /app/schemas
     ports:
       - "127.0.0.1:${ARGUS_M0_S1_DEMO_PORT:-58082}:8080"
@@ -183,6 +249,12 @@ services:
       s8-writer:
         condition: service_healthy
       s10-supervisor:
+        condition: service_healthy
+      s3-reference-referee:
+        condition: service_healthy
+      s7-reference-adapter:
+        condition: service_healthy
+      s11-reference-observatory:
         condition: service_healthy
     healthcheck:
       test:

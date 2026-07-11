@@ -11,6 +11,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+from urllib.parse import unquote
 
 import argus_core.s10 as s10_module
 from scripts import run_m0_spine_battery as m0_battery
@@ -334,6 +335,36 @@ class ArgusM0RuntimeServiceTests(unittest.TestCase):
         self.assertEqual(policy["m0-partial-capture"]["job_id"], "m0-partial-capture-job")
         self.assertEqual(policy["m0-partial-capture"]["budget_caps"]["max_wallclock_s"], 10)
 
+    def test_m1_reference_service_tokens_are_preprovisioned_and_non_minting(self) -> None:
+        secrets = m0_battery._m0_runtime_secrets()
+        tokens = m0_battery._m1_reference_service_access_tokens(secrets)
+        auth = RuntimeAuth.with_signed_identities(
+            bootstrap_token=secrets["bootstrap_token"],
+            identity_signing_key=secrets["identity_signing_key"].encode("utf-8"),
+        )
+        expected_producers = {
+            "m1-reference-s1": "S1",
+            "m1-reference-s3": "S3",
+            "m1-reference-s7": "S7",
+            "m1-reference-s11": "S11",
+        }
+
+        self.assertEqual(set(tokens), set(expected_producers))
+        for caller_id, producer in expected_producers.items():
+            identity = auth.authenticate(
+                JsonRequest(
+                    method="GET",
+                    path="/test",
+                    query={},
+                    body=None,
+                    headers={"authorization": f"Bearer {tokens[caller_id]}"},
+                )
+            )
+            self.assertEqual(identity.caller_id, caller_id)
+            self.assertEqual(identity.job_id, "m1-reference-job")
+            self.assertEqual(identity.scopes.producer_subsystems, (producer,))
+            self.assertFalse(identity.can_mint_runtime_identity)
+
     def test_s1_reference_physics_demo_battery_requires_verified_http_face(self) -> None:
         evidence: dict[str, object] = {"results": []}
         posted: list[tuple[str, dict[str, object]]] = []
@@ -349,13 +380,18 @@ class ArgusM0RuntimeServiceTests(unittest.TestCase):
             posted.append((url, body))
             self.assertEqual(expected_status, 200)
             self.assertEqual(url, "http://s1-demo/v1/s1-reference-physics-demo")
-            self.assertEqual(body["job_id"], "m0-s1-reference-demo")
+            self.assertEqual(body["job_id"], "m1-reference-job")
             return {
                 "demo": "s1-reference-physics",
-                "job_id": "m0-s1-reference-demo",
+                "job_id": "m1-reference-job",
                 "final_state": "REPORTED",
                 "claim_tier": "recapitulated-known",
                 "claim_tier_is_candidate": False,
+                "dataset_ref": "c4://dataset/ewpt-reference/v1",
+                "runtime_provenance": {
+                    "adapter_provenance_ref": "c4://adapter/demo",
+                    "sandbox_launch_provenance_ref": "c4://container/demo",
+                },
                 "validation_report_ref": "c4://report/demo",
                 "promoted_artifact_ref": "c4://artifact/demo",
                 "observatory_html_ref": "c4://observatory/demo",
@@ -372,15 +408,44 @@ class ArgusM0RuntimeServiceTests(unittest.TestCase):
                 ],
             }
 
-        with patch.object(m0_battery, "_post_json", side_effect=fake_post_json):
-            m0_battery._battery_s1_reference_physics_demo(evidence, "http://s1-demo")
+        def fake_get_json(
+            url: str,
+            *,
+            expected_status: int = 200,
+            token: str | None = None,
+        ) -> dict[str, object]:
+            self.assertEqual(expected_status, 200)
+            self.assertEqual(token, "read-token")
+            producer_by_ref = {
+                "c4://dataset/ewpt-reference/v1": "S1",
+                "c4://adapter/demo": "S7",
+                "c4://container/demo": "S10",
+                "c4://report/demo": "S3",
+                "c4://artifact/demo": "S1",
+                "c4://observatory/demo": "S11",
+            }
+            decoded_url = unquote(url)
+            producer = next(value for ref, value in producer_by_ref.items() if ref in decoded_url)
+            return {"producer": {"subsystem": producer}}
 
-        self.assertEqual(posted, [("http://s1-demo/v1/s1-reference-physics-demo", {"job_id": "m0-s1-reference-demo"})])
+        with (
+            patch.object(m0_battery, "_post_json", side_effect=fake_post_json),
+            patch.object(m0_battery, "_get_json", side_effect=fake_get_json),
+        ):
+            m0_battery._battery_s1_reference_physics_demo(
+                evidence,
+                "http://s1-demo",
+                s8_url="http://s8-demo",
+                read_token="read-token",
+            )
+
+        self.assertEqual(posted, [("http://s1-demo/v1/s1-reference-physics-demo", {"job_id": "m1-reference-job"})])
         result = evidence["results"][-1]  # type: ignore[index]
         self.assertEqual(result["item"], "s1-reference-demo")
         self.assertEqual(result["status"], "pass")
         self.assertEqual(result["detail"]["claim_tier"], "recapitulated-known")
         self.assertTrue(result["detail"]["observatory_trusted"])
+        self.assertEqual(result["detail"]["producers"]["adapter"], "S7")
 
     def test_s8_writer_service_commits_and_replays_c4_records(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -2255,6 +2320,10 @@ class ArgusM0ComposeTests(unittest.TestCase):
                 "ARGUS_S10_C3_VERIFIER_KEYS_JSON": S10_C3_VERIFIER_KEYS_JSON,
                 "ARGUS_S10_VERIFIER_KEY_AUTH_TOKEN": S10_VERIFIER_KEY_AUTH_TOKEN,
                 "ARGUS_S3_REFERENCE_REFEREE_SIGNER_SECRET": S3_REFERENCE_REFEREE_SIGNING_KEY,
+                "ARGUS_S1_REFERENCE_DEMO_ACCESS_TOKEN": "s1-reference-token",
+                "ARGUS_S3_REFERENCE_REFEREE_ACCESS_TOKEN": "s3-reference-token",
+                "ARGUS_S7_REFERENCE_ADAPTER_ACCESS_TOKEN": "s7-reference-token",
+                "ARGUS_S11_REFERENCE_OBSERVATORY_ACCESS_TOKEN": "s11-reference-token",
             },
         )
         if config.returncode != 0:
@@ -2263,7 +2332,16 @@ class ArgusM0ComposeTests(unittest.TestCase):
         rendered = json.loads(config.stdout)
         services = rendered["services"]
         self.assertEqual(
-            {"postgres", "minio", "s8-writer", "s10-supervisor", "s1-reference-demo", "s3-reference-referee"},
+            {
+                "postgres",
+                "minio",
+                "s8-writer",
+                "s10-supervisor",
+                "s1-reference-demo",
+                "s3-reference-referee",
+                "s7-reference-adapter",
+                "s11-reference-observatory",
+            },
             set(services),
         )
         self.assertTrue(services["postgres"]["image"].startswith("postgres@sha256:"))
@@ -2277,6 +2355,14 @@ class ArgusM0ComposeTests(unittest.TestCase):
         self.assertEqual(
             services["s3-reference-referee"]["command"],
             ["python", "-m", "argus_runtime.s3_reference_referee_service"],
+        )
+        self.assertEqual(
+            services["s7-reference-adapter"]["command"],
+            ["python", "-m", "argus_runtime.s7_reference_adapter_service"],
+        )
+        self.assertEqual(
+            services["s11-reference-observatory"]["command"],
+            ["python", "-m", "argus_runtime.s11_reference_observatory_service"],
         )
         self.assertEqual(services["s8-writer"]["environment"]["ARGUS_S8_HOST"], "0.0.0.0")
         self.assertEqual(
@@ -2323,6 +2409,18 @@ class ArgusM0ComposeTests(unittest.TestCase):
         self.assertEqual(services["s10-supervisor"]["environment"]["ARGUS_S10_HOST"], "0.0.0.0")
         self.assertEqual(services["s1-reference-demo"]["environment"]["ARGUS_S1_REFERENCE_DEMO_HOST"], "0.0.0.0")
         self.assertEqual(services["s1-reference-demo"]["environment"]["ARGUS_S1_REFERENCE_DEMO_PORT"], "8080")
+        self.assertEqual(
+            services["s1-reference-demo"]["environment"]["ARGUS_S1_REFERENCE_DEMO_S7_URL"],
+            "http://s7-reference-adapter:8080",
+        )
+        self.assertEqual(
+            services["s1-reference-demo"]["environment"]["ARGUS_S1_REFERENCE_DEMO_S3_URL"],
+            "http://s3-reference-referee:8080",
+        )
+        self.assertEqual(
+            services["s1-reference-demo"]["environment"]["ARGUS_S1_REFERENCE_DEMO_S11_URL"],
+            "http://s11-reference-observatory:8080",
+        )
         self.assertEqual(services["s1-reference-demo"]["environment"]["ARGUS_SCHEMA_ROOT"], "/app/schemas")
         self.assertEqual(services["s3-reference-referee"]["environment"]["ARGUS_S3_REFERENCE_REFEREE_HOST"], "0.0.0.0")
         self.assertEqual(services["s3-reference-referee"]["environment"]["ARGUS_S3_REFERENCE_REFEREE_PORT"], "8080")
@@ -2342,10 +2440,24 @@ class ArgusM0ComposeTests(unittest.TestCase):
             services["s3-reference-referee"]["environment"]["ARGUS_S3_REFERENCE_REFEREE_SIGNER_SECRET"],
             S3_REFERENCE_REFEREE_SIGNING_KEY,
         )
+        self.assertEqual(
+            services["s3-reference-referee"]["environment"]["ARGUS_S3_REFERENCE_REFEREE_REQUIRE_S1_REQUESTER"],
+            "1",
+        )
+        self.assertEqual(
+            services["s7-reference-adapter"]["environment"]["ARGUS_S7_REFERENCE_ADAPTER_S10_URL"],
+            "http://s10-supervisor:8080",
+        )
+        self.assertEqual(
+            services["s11-reference-observatory"]["environment"]["ARGUS_S11_REFERENCE_OBSERVATORY_S8_URL"],
+            "http://s8-writer:8080",
+        )
         self.assertEqual(services["s8-writer"]["ports"][0]["host_ip"], "127.0.0.1")
         self.assertEqual(services["s10-supervisor"]["ports"][0]["host_ip"], "127.0.0.1")
         self.assertEqual(services["s1-reference-demo"]["ports"][0]["host_ip"], "127.0.0.1")
         self.assertEqual(services["s3-reference-referee"]["ports"][0]["host_ip"], "127.0.0.1")
+        self.assertNotIn("ports", services["s7-reference-adapter"])
+        self.assertNotIn("ports", services["s11-reference-observatory"])
         self.assertNotIn("volumes", services["s8-writer"])
         self.assertIn("ARGUS_RUNTIME_BOOTSTRAP_TOKEN", services["s8-writer"]["environment"])
         self.assertIn("ARGUS_RUNTIME_IDENTITY_SIGNING_KEY", services["s8-writer"]["environment"])
@@ -2354,10 +2466,16 @@ class ArgusM0ComposeTests(unittest.TestCase):
         self.assertIn("ARGUS_RUNTIME_BOOTSTRAP_TOKEN", services["s10-supervisor"]["environment"])
         self.assertIn("ARGUS_RUNTIME_IDENTITY_SIGNING_KEY", services["s10-supervisor"]["environment"])
         self.assertIn("ARGUS_RUNTIME_IDENTITY_MINT_POLICY_JSON", services["s10-supervisor"]["environment"])
-        self.assertEqual(
-            services["s3-reference-referee"]["environment"]["ARGUS_RUNTIME_BOOTSTRAP_TOKEN"],
-            BOOTSTRAP_TOKEN,
-        )
+        reference_service_credentials = {
+            "s1-reference-demo": ("ARGUS_S1_REFERENCE_DEMO_ACCESS_TOKEN", "s1-reference-token"),
+            "s3-reference-referee": ("ARGUS_S3_REFERENCE_REFEREE_ACCESS_TOKEN", "s3-reference-token"),
+            "s7-reference-adapter": ("ARGUS_S7_REFERENCE_ADAPTER_ACCESS_TOKEN", "s7-reference-token"),
+            "s11-reference-observatory": ("ARGUS_S11_REFERENCE_OBSERVATORY_ACCESS_TOKEN", "s11-reference-token"),
+        }
+        for service_name, (credential_name, credential_value) in reference_service_credentials.items():
+            environment = services[service_name]["environment"]
+            self.assertNotIn("ARGUS_RUNTIME_BOOTSTRAP_TOKEN", environment)
+            self.assertEqual(environment[credential_name], credential_value)
         self.assertEqual(
             services["s3-reference-referee"]["environment"]["ARGUS_S10_VERIFIER_KEY_AUTH_TOKEN"],
             S10_VERIFIER_KEY_AUTH_TOKEN,
@@ -2453,6 +2571,9 @@ class ArgusM0ComposeTests(unittest.TestCase):
         self.assertIn("s10-supervisor", services["s1-reference-demo"]["depends_on"])
         self.assertIn("s8-writer", services["s3-reference-referee"]["depends_on"])
         self.assertIn("s10-supervisor", services["s3-reference-referee"]["depends_on"])
+        self.assertIn("s7-reference-adapter", services["s1-reference-demo"]["depends_on"])
+        self.assertIn("s11-reference-observatory", services["s1-reference-demo"]["depends_on"])
+        self.assertIn("s3-reference-referee", services["s1-reference-demo"]["depends_on"])
         self.assertNotIn("s8-data", rendered["volumes"])
         self.assertIn("postgres-data", rendered["volumes"])
         self.assertIn("minio-data", rendered["volumes"])

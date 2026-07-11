@@ -1063,7 +1063,7 @@ class ExecContext:
             validation_report_ref=validation_report_ref,
         )
         producer = Producer(
-            subsystem="s1",
+            subsystem="S1",
             version="exec-context-v1",
             actor_id="subagent-runtime",
             job_id=self.job_id,

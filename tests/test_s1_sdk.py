@@ -847,7 +847,7 @@ class S1SDKBaseClassTests(unittest.TestCase):
         self.assertEqual(record.kind, "model")
         self.assertEqual(record.content_hash, result["content_hash"])
         self.assertEqual(hash_bytes(payload_bytes), record.content_hash)
-        self.assertEqual(record.producer.subsystem, "s1")
+        self.assertEqual(record.producer.subsystem, "S1")
         self.assertEqual(record.producer.job_id, self.envelope.job_id)
         self.assertEqual(record.lineage.input_refs, (source.artifact_ref,))
         self.assertEqual(record.lineage.job_id, self.envelope.job_id)
@@ -955,7 +955,7 @@ class S1SDKBaseClassTests(unittest.TestCase):
 
         self.assertEqual(built.payload["artifact_refs"], [record.artifact_ref])
         self.assertEqual(record.kind, "model")
-        self.assertEqual(record.producer.subsystem, "s1")
+        self.assertEqual(record.producer.subsystem, "S1")
         self.assertEqual(record.lineage.input_refs, (source.artifact_ref,))
         self.assertEqual(
             {node.artifact_ref for node in lineage_graph.nodes},

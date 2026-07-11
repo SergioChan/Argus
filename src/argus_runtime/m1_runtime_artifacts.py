@@ -82,6 +82,30 @@ class RuntimeIdentitySession:
             timeout_s=timeout_s,
         )
 
+    @classmethod
+    def from_access_token(
+        cls,
+        *,
+        s10_url: str,
+        access_token: str,
+        caller_id: str,
+        expected_job_id: str,
+        timeout_s: float = 10.0,
+    ) -> "RuntimeIdentitySession":
+        if not access_token:
+            raise RuntimeArtifactStoreError("runtime access token is required")
+        if not caller_id:
+            raise RuntimeArtifactStoreError("runtime identity caller_id is required")
+        if not expected_job_id:
+            raise RuntimeArtifactStoreError("expected runtime identity job_id is required")
+        return cls(
+            s10_url=_normalized_base_url(s10_url),
+            access_token=access_token,
+            caller_id=caller_id,
+            job_id=expected_job_id,
+            timeout_s=timeout_s,
+        )
+
     def mint_scope(self, *, ttl_s: int = DEFAULT_RUNTIME_TOKEN_TTL_S) -> dict[str, Any]:
         response = _request_json(
             "POST",
@@ -110,6 +134,44 @@ class RuntimeIdentitySession:
         _required_str(response, "budget_id", context="budget token response")
         _required_str(response, "signature", context="budget token response")
         return response
+
+
+def runtime_identity_session(
+    *,
+    s10_url: str,
+    caller_id: str,
+    expected_job_id: str,
+    bootstrap_token: str | None = None,
+    access_token: str | None = None,
+    ttl_s: int = DEFAULT_RUNTIME_TOKEN_TTL_S,
+    timeout_s: float = 10.0,
+) -> RuntimeIdentitySession:
+    """Create one runtime session from exactly one deployment credential."""
+
+    has_bootstrap = bool(bootstrap_token)
+    has_access_token = bool(access_token)
+    if has_bootstrap == has_access_token:
+        raise RuntimeArtifactStoreError("runtime session requires exactly one bootstrap or access credential")
+    if has_access_token:
+        assert access_token is not None
+        return RuntimeIdentitySession.from_access_token(
+            s10_url=s10_url,
+            access_token=access_token,
+            caller_id=caller_id,
+            expected_job_id=expected_job_id,
+            timeout_s=timeout_s,
+        )
+    if has_bootstrap:
+        assert bootstrap_token is not None
+        return RuntimeIdentitySession.from_bootstrap(
+            s10_url=s10_url,
+            bootstrap_token=bootstrap_token,
+            caller_id=caller_id,
+            expected_job_id=expected_job_id,
+            ttl_s=ttl_s,
+            timeout_s=timeout_s,
+        )
+    raise RuntimeArtifactStoreError("runtime session requires an access token or bootstrap credential")
 
 
 class S10S8ArtifactStore:
