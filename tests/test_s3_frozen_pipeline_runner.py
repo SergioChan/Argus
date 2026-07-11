@@ -78,6 +78,17 @@ class S3FrozenPipelineRunnerTests(unittest.TestCase):
         self.assertEqual(evidence["execution_boundary"], "nested_s10_sandbox")
         self.assertFalse(evidence["verifier_imported_pipeline_code"])
         self.assertEqual(evidence["sandbox"]["state"], "SUCCEEDED")
+        self.assertEqual(
+            evidence["actual_cost"],
+            {
+                "source": "s10_budget_usage",
+                "compute_units": 0.0,
+                "gpu_seconds": 0.0,
+                "model_tokens": 0.0,
+                "wallclock_seconds": 0.1,
+                "cost_usd": 0.01,
+            },
+        )
         self.assertEqual(evidence["s3_test_cases"]["S3-TC25"]["status"], "PASS")
         self.assertIn("sandbox.launched", evidence["audit_event_types"])
 

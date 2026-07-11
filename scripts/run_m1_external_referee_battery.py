@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from math import isfinite
 from pathlib import Path
 import shutil
 import subprocess
@@ -146,6 +147,11 @@ def main() -> int:
             expected_status=200,
             token=s1_session.access_token,
         )
+        verification_cost_actual = _metered_cost_actual(
+            response.get("verification_cost_actual"),
+            context="external S3 referee response",
+        )
+        build_verify_cost_ratio = _build_verify_cost_ratio(refs["build_cost_actual"], verification_cost_actual)
         s3_store = _runtime_store(
             s10_url=s10_url,
             s8_url=s8_url,
@@ -191,6 +197,9 @@ def main() -> int:
                 "sandbox": pipeline_run.get("sandbox"),
                 "execution_inputs": pipeline_run.get("execution_inputs"),
             },
+            "build_cost_actual": refs["build_cost_actual"],
+            "verification_cost_actual": verification_cost_actual,
+            "build_verify_cost_ratio": build_verify_cost_ratio,
         }
         if not verification.valid:
             raise AssertionError(f"S10 KMS trust client rejected the external S3 report: {verification.reason}")
@@ -211,6 +220,8 @@ def main() -> int:
             raise AssertionError("reference referee did not execute the frozen pipeline through nested S10")
         if pipeline_run.get("verifier_imported_pipeline_code") is not False:
             raise AssertionError("reference referee did not declare the verifier-process import boundary")
+        if _metered_cost_actual(pipeline_run.get("actual_cost"), context="nested execution evidence") != verification_cost_actual:
+            raise AssertionError("external referee response cost did not match persisted nested S10 execution evidence")
         launch_request = _required_dict(pipeline_run, "launch_request")
         if launch_request.get("image") != pipeline_image:
             raise AssertionError("nested S10 request did not use the S2 frozen pipeline image ID")
@@ -251,6 +262,9 @@ def main() -> int:
                 "blind_stage_evidence_ref": blind_stage_evidence_ref,
                 "blind_stage_dataset_kind": blind_stage_evidence["dataset_kind"],
                 "blind_truth_bytes_delivered_to_sandbox": False,
+                "build_cost_actual": refs["build_cost_actual"],
+                "verification_cost_actual": verification_cost_actual,
+                "build_verify_cost_ratio": build_verify_cost_ratio,
             },
         )
         print(json.dumps(evidence, indent=2, sort_keys=True))
@@ -313,12 +327,14 @@ def _build_reference_pipeline(
         isinstance(ref, str) and ref for ref in artifact_refs
     ):
         raise AssertionError("S2 builder response requires non-empty artifact_refs")
+    build_cost_actual = _metered_cost_actual(response.get("cost_actual"), context="external S2 builder response")
     return {
         "profile_ref": profile_ref,
         "dataset_ref": dataset.artifact_ref,
         "model_ref": _required_str(response, "model_ref"),
         "frozen_pipeline_ref": _required_str(response, "frozen_pipeline_ref"),
         "artifact_refs": list(artifact_refs),
+        "build_cost_actual": build_cost_actual,
     }
 
 
@@ -362,6 +378,40 @@ def _reference_rows() -> list[dict[str, object]]:
             }
         )
     return rows
+
+
+def _build_verify_cost_ratio(
+    build_cost_actual: Mapping[str, Any], verification_cost_actual: Mapping[str, Any]
+) -> dict[str, float | str]:
+    build_cost_usd = _positive_cost_usd(build_cost_actual, context="build")
+    verify_cost_usd = _positive_cost_usd(verification_cost_actual, context="verify")
+    return {
+        "build_cost_usd": build_cost_usd,
+        "verify_cost_usd": verify_cost_usd,
+        "build_to_verify_cost_ratio": build_cost_usd / verify_cost_usd,
+        "formula": "build_cost_usd / verify_cost_usd",
+    }
+
+
+def _metered_cost_actual(value: Any, *, context: str) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        raise AssertionError(f"{context} requires an actual-cost object")
+    normalized = dict(value)
+    cost_usd = normalized.get("cost_usd")
+    if isinstance(cost_usd, bool) or not isinstance(cost_usd, (int, float)):
+        raise AssertionError(f"{context} actual cost must include numeric cost_usd")
+    numeric = float(cost_usd)
+    if not isfinite(numeric) or numeric < 0:
+        raise AssertionError(f"{context} actual cost cost_usd must be finite and non-negative")
+    normalized["cost_usd"] = numeric
+    return normalized
+
+
+def _positive_cost_usd(value: Mapping[str, Any], *, context: str) -> float:
+    cost = _metered_cost_actual(value, context=context)["cost_usd"]
+    if not isinstance(cost, float) or cost <= 0:
+        raise AssertionError(f"{context} actual cost must be positive for a build:verify ratio")
+    return cost
 
 
 def _assert_s1_cannot_write_s3_report(store: S10S8ArtifactStore) -> str:

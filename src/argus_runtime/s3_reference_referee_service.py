@@ -139,6 +139,7 @@ class S3ReferenceRefereeApp:
             store=store,
             blind_data_manager=blind_pipeline_input.manager,
         ).run(runner_request, execution_inputs=blind_pipeline_input.execution_inputs)
+        verification_cost_actual = _reference_execution_cost_actual(store, pipeline_run)
         blind_data_stage = getattr(pipeline_run, "blind_data_stage", None)
         if blind_data_stage is None:
             raise RuntimeArtifactStoreError("S3 nested frozen pipeline did not return its blind-data stage")
@@ -190,6 +191,7 @@ class S3ReferenceRefereeApp:
             "validation_report_ref": committed.record.artifact_ref,
             "frozen_pipeline_execution_ref": pipeline_run.evidence_ref,
             "nested_sandbox_id": pipeline_run.sandbox_id,
+            "verification_cost_actual": verification_cost_actual,
             "entrypoint_request_id": entrypoint_request["verification_request"]["request_id"],
         }
 
@@ -491,6 +493,33 @@ def _reference_execution_output(pipeline_run: Any) -> dict[str, Any]:
     if not isinstance(output, Mapping):
         raise RuntimeArtifactStoreError("S3 nested frozen pipeline returned a non-object output")
     return dict(output)
+
+
+def _reference_execution_cost_actual(store: S10S8ArtifactStore, pipeline_run: Any) -> dict[str, float | str]:
+    evidence_ref = getattr(pipeline_run, "evidence_ref", None)
+    if not isinstance(evidence_ref, str) or not evidence_ref:
+        raise RuntimeArtifactStoreError("S3 nested frozen pipeline returned no execution evidence ref")
+    try:
+        evidence = json.loads(store.get_artifact(evidence_ref).decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeArtifactStoreError("S3 nested frozen pipeline execution evidence is invalid") from exc
+    if not isinstance(evidence, Mapping):
+        raise RuntimeArtifactStoreError("S3 nested frozen pipeline execution evidence is not an object")
+    cost = evidence.get("actual_cost")
+    if not isinstance(cost, Mapping) or cost.get("source") != "s10_budget_usage":
+        raise RuntimeArtifactStoreError("S3 nested frozen pipeline execution evidence has no S10 actual-cost payload")
+    normalized: dict[str, float | str] = {"source": "s10_budget_usage"}
+    for field in ("compute_units", "gpu_seconds", "model_tokens", "wallclock_seconds", "cost_usd"):
+        value = cost.get(field)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise RuntimeArtifactStoreError(f"S3 nested frozen pipeline actual cost {field} must be numeric")
+        numeric = float(value)
+        if not isfinite(numeric) or numeric < 0:
+            raise RuntimeArtifactStoreError(
+                f"S3 nested frozen pipeline actual cost {field} must be finite and non-negative"
+            )
+        normalized[field] = numeric
+    return normalized
 
 
 def _required_request_string(request: Mapping[str, Any], field: str) -> str:

@@ -8,6 +8,24 @@ from scripts import run_m1_external_referee_battery as referee_battery
 
 
 class M1ExternalRefereeBatteryTests(unittest.TestCase):
+    def test_build_verify_cost_ratio_uses_positive_metered_costs(self) -> None:
+        ratio = referee_battery._build_verify_cost_ratio(
+            {"cost_usd": 0.05},
+            {"cost_usd": 0.01},
+        )
+
+        self.assertEqual(
+            ratio,
+            {
+                "build_cost_usd": 0.05,
+                "verify_cost_usd": 0.01,
+                "build_to_verify_cost_ratio": 5.0,
+                "formula": "build_cost_usd / verify_cost_usd",
+            },
+        )
+        with self.assertRaisesRegex(AssertionError, "positive"):
+            referee_battery._build_verify_cost_ratio({"cost_usd": 0.05}, {"cost_usd": 0.0})
+
     def test_external_referee_uses_an_isolated_compose_project_name(self) -> None:
         project_name = referee_battery._isolated_compose_project_name()
 

@@ -3686,6 +3686,7 @@ class S3FrozenPipelineRunner:
             "egress": egress,
             "blind_data_stage": _runner_blind_data_stage_payload(blind_data_stage),
             "execution_inputs": _runner_execution_input_evidence(execution_inputs),
+            "actual_cost": _runner_actual_cost_payload(execution),
             "partial_result": _runner_partial_payload(partial),
             "audit_event_types": list(audit_event_types),
             "s3_test_cases": {
@@ -4017,6 +4018,33 @@ def _runner_launch_payload(request: LaunchRequest) -> dict[str, Any]:
         "scope_id": request.scope_token.scope_id,
         "requested_envelope": asdict(request.requested_envelope),
     }
+
+
+def _runner_actual_cost_payload(execution: SandboxExecutionResult) -> dict[str, float | str]:
+    usage = execution.budget_usage
+    return {
+        "source": "s10_budget_usage",
+        "compute_units": _runner_nonnegative_finite_number(usage.compute_units, "compute_units"),
+        "gpu_seconds": _runner_nonnegative_finite_number(usage.gpu_seconds, "gpu_seconds"),
+        "model_tokens": _runner_nonnegative_finite_number(usage.model_tokens, "model_tokens"),
+        "wallclock_seconds": _runner_nonnegative_finite_number(usage.wallclock_s, "wallclock_s"),
+        "cost_usd": _runner_nonnegative_finite_number(usage.cost_usd, "cost_usd"),
+    }
+
+
+def _runner_nonnegative_finite_number(value: Any, field: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        _runner_error(
+            code="S3_FROZEN_PIPELINE_COST_INVALID",
+            message=f"nested S10 budget usage {field} must be numeric",
+        )
+    numeric = float(value)
+    if not math.isfinite(numeric) or numeric < 0:
+        _runner_error(
+            code="S3_FROZEN_PIPELINE_COST_INVALID",
+            message=f"nested S10 budget usage {field} must be finite and non-negative",
+        )
+    return numeric
 
 
 def _runner_partial_payload(partial: Any | None) -> dict[str, Any] | None:

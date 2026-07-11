@@ -141,6 +141,17 @@ class S3ReferenceRefereeServiceTests(unittest.TestCase):
             self.assertTrue(report_ref.startswith("c4://artifact/"))
             self.assertEqual(response["validation_report_payload"]["claim_tier"], "recapitulated-known")
             self.assertEqual(response["validation_report_payload"]["referee"]["referee_id"], "s3-reference-verifier")
+            self.assertEqual(
+                response["verification_cost_actual"],
+                {
+                    "source": "s10_budget_usage",
+                    "compute_units": 0.2,
+                    "gpu_seconds": 0.0,
+                    "model_tokens": 0.0,
+                    "wallclock_seconds": 0.2,
+                    "cost_usd": 0.002,
+                },
+            )
 
             s3_store = _runtime_store(
                 s10_url=s10_url,
@@ -359,7 +370,18 @@ class _ReferencePipelineRunner:
         }
         evidence = self._store.create_artifact(
             kind="s3_frozen_pipeline_run",
-            payload={"schema": "argus.s3.frozen_pipeline_run_evidence.v1", "status": "SUCCEEDED"},
+            payload={
+                "schema": "argus.s3.frozen_pipeline_run_evidence.v1",
+                "status": "SUCCEEDED",
+                "actual_cost": {
+                    "source": "s10_budget_usage",
+                    "compute_units": 0.2,
+                    "gpu_seconds": 0.0,
+                    "model_tokens": 0.0,
+                    "wallclock_seconds": 0.2,
+                    "cost_usd": 0.002,
+                },
+            },
             producer=Producer(subsystem="S3", version="0.0.0", actor_id="s3-reference-verifier", job_id="m1-reference-job"),
             lineage=_lineage("s3.reference-sandbox", input_refs=(frozen_pipeline_ref,)),
         )
