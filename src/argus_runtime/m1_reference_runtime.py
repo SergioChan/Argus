@@ -409,6 +409,7 @@ M1_REFERENCE_BUILDER_ROUTE = S2_REFERENCE_BUILDER_ROUTE
 M1_REFERENCE_REFEREE_ROUTE = "/v1/reference-referee/validate"
 M1_REFERENCE_PROFILE_ROUTE = "/v1/reference-referee/profile"
 M1_REFERENCE_OBSERVATORY_ROUTE = "/v1/reference-observatory/render"
+M1_REFERENCE_SERVICE_REQUEST_TIMEOUT_S = 30.0
 M1_REFERENCE_S2_TRAINING_ROW_COUNT = 16
 M1_REFERENCE_OMEGA_SCALE = S2_REFERENCE_OMEGA_SCALE
 
@@ -764,16 +765,20 @@ class M1ReferenceLifecycleRunner:
         self._caller_id = caller_id
         self._expected_job_id = expected_job_id
 
-    def run(self, *, job_id: str) -> M1ReferenceLifecycleResult:
-        if job_id != self._expected_job_id:
-            raise ValueError("job_id_mismatch")
-        session = runtime_identity_session(
+    def _runtime_session(self) -> RuntimeIdentitySession:
+        return runtime_identity_session(
             s10_url=self._s10_url,
             caller_id=self._caller_id,
             expected_job_id=self._expected_job_id,
             bootstrap_token=self._bootstrap_token,
             access_token=self._access_token,
+            timeout_s=M1_REFERENCE_SERVICE_REQUEST_TIMEOUT_S,
         )
+
+    def run(self, *, job_id: str) -> M1ReferenceLifecycleResult:
+        if job_id != self._expected_job_id:
+            raise ValueError("job_id_mismatch")
+        session = self._runtime_session()
         store = S10S8ArtifactStore(session=session, s8_url=self._s8_url)
         referee = HttpM1ReferenceRefereeClient(
             endpoint_url=f"{self._s3_url}{M1_REFERENCE_REFEREE_ROUTE}",

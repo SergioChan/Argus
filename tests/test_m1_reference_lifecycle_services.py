@@ -28,7 +28,12 @@ from argus_core import (
 )
 from argus_runtime.auth import RuntimeAuth, RuntimeIdentity
 from argus_runtime.http_json import JsonRequest, serve_json_app
-from argus_runtime.m1_reference_runtime import M1_REFERENCE_JOB_ID, M1ReferenceLifecycleRunner, REFERENCE_SANDBOX_IMAGE
+from argus_runtime.m1_reference_runtime import (
+    M1_REFERENCE_JOB_ID,
+    M1_REFERENCE_SERVICE_REQUEST_TIMEOUT_S,
+    M1ReferenceLifecycleRunner,
+    REFERENCE_SANDBOX_IMAGE,
+)
 from argus_runtime.m1_runtime_artifacts import RuntimeIdentitySession, S10S8ArtifactStore
 from argus_runtime.s10_supervisor_service import RuntimeIdentityMintPolicy, S10SupervisorApp, S8BrokeredArtifactStoreClient
 from argus_runtime.s11_reference_observatory_service import S11ReferenceObservatoryApp
@@ -54,6 +59,32 @@ from argus_runtime.s8_writer_service import S8WriterApp
 
 
 class M1ReferenceLifecycleServiceTests(unittest.TestCase):
+    def test_m1_reference_lifecycle_uses_build_budget_for_remote_requests(self) -> None:
+        runner = M1ReferenceLifecycleRunner(
+            s10_url="http://s10.example",
+            s8_url="http://s8.example",
+            access_token="m1-reference-s1-token",
+            s7_url="http://s7.example",
+            s2_url="http://s2.example",
+            s3_url="http://s3.example",
+            s11_url="http://s11.example",
+            verifier_key_endpoint_url="http://s10.example/v1/internal/verifier-keys",
+            verifier_key_auth_token="m1-reference-verifier-key-token",
+            allow_insecure_verifier_key_store=True,
+        )
+        session = object()
+
+        with patch(
+            "argus_runtime.m1_reference_runtime.runtime_identity_session",
+            return_value=session,
+        ) as create_session:
+            self.assertIs(runner._runtime_session(), session)
+
+        self.assertEqual(
+            create_session.call_args.kwargs["timeout_s"],
+            M1_REFERENCE_SERVICE_REQUEST_TIMEOUT_S,
+        )
+
     def test_s2_reference_builder_bounds_persisted_training_epochs(self) -> None:
         build_request = _reference_build_request(
             job_id=M1_REFERENCE_JOB_ID,

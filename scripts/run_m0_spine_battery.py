@@ -56,6 +56,7 @@ M1_S3_REFERENCE_REFEREE_KEY_ID = "s3-reference-referee-key"
 HALT_LATENCY_TRIALS = 50
 HALT_LATENCY_LIMIT_S = 2.0
 TOKEN_REVOCATION_PROPAGATION_SLO_S = 2.0
+M1_REFERENCE_DEMO_E2E_TIMEOUT_S = 60.0
 
 
 def main() -> int:
@@ -1635,6 +1636,7 @@ def _battery_s1_reference_physics_demo(
         f"{s1_reference_demo_url}/v1/s1-reference-physics-demo",
         {"job_id": "m1-reference-job"},
         expected_status=200,
+        timeout=M1_REFERENCE_DEMO_E2E_TIMEOUT_S,
     )
     expected_checks = {
         "INJECTION",

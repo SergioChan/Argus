@@ -368,7 +368,7 @@ class ArgusM0RuntimeServiceTests(unittest.TestCase):
 
     def test_s1_reference_physics_demo_battery_requires_verified_http_face(self) -> None:
         evidence: dict[str, object] = {"results": []}
-        posted: list[tuple[str, dict[str, object]]] = []
+        posted: list[tuple[str, dict[str, object], float]] = []
 
         def fake_post_json(
             url: str,
@@ -376,9 +376,10 @@ class ArgusM0RuntimeServiceTests(unittest.TestCase):
             *,
             expected_status: int = 200,
             token: str | None = None,
+            timeout: float = 10,
         ) -> dict[str, object]:
             del token
-            posted.append((url, body))
+            posted.append((url, body, timeout))
             self.assertEqual(expected_status, 200)
             self.assertEqual(url, "http://s1-demo/v1/s1-reference-physics-demo")
             self.assertEqual(body["job_id"], "m1-reference-job")
@@ -450,7 +451,16 @@ class ArgusM0RuntimeServiceTests(unittest.TestCase):
                 read_token="read-token",
             )
 
-        self.assertEqual(posted, [("http://s1-demo/v1/s1-reference-physics-demo", {"job_id": "m1-reference-job"})])
+        self.assertEqual(
+            posted,
+            [
+                (
+                    "http://s1-demo/v1/s1-reference-physics-demo",
+                    {"job_id": "m1-reference-job"},
+                    m0_battery.M1_REFERENCE_DEMO_E2E_TIMEOUT_S,
+                )
+            ],
+        )
         result = evidence["results"][-1]  # type: ignore[index]
         self.assertEqual(result["item"], "s1-reference-demo")
         self.assertEqual(result["status"], "pass")
