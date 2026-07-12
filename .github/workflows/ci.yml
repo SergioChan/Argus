@@ -100,3 +100,15 @@ jobs:
         with:
           name: m1-s2-reference-builder-evidence
           path: ${{ runner.temp }}/m1-s2-reference-builder-evidence.json
+
+      - name: Assert clean checkout before M1 pilot console battery
+        run: test -z "$(git status --porcelain)"
+
+      - name: Run M1 pilot console battery
+        run: python3 scripts/run_m1_pilot_console_battery.py --evidence-file "$RUNNER_TEMP/m1-pilot-console-evidence.json"
+
+      - name: Upload M1 pilot console evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: m1-pilot-console-evidence
+          path: ${{ runner.temp }}/m1-pilot-console-evidence.json

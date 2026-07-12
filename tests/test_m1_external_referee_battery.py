@@ -90,6 +90,7 @@ class M1ExternalRefereeBatteryTests(unittest.TestCase):
             )
 
         self.assertEqual(environment["ARGUS_S1_REFERENCE_DEMO_ACCESS_TOKEN"], service_tokens["m1-reference-s1"])
+        self.assertTrue(environment["ARGUS_S1_REFERENCE_DEMO_PILOT_ACCESS_TOKEN"])
         self.assertEqual(
             environment["ARGUS_S2_REFERENCE_BUILDER_ACCESS_TOKEN"],
             service_tokens["m1-reference-s2"],

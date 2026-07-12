@@ -559,6 +559,7 @@ def _m0_runtime_secrets() -> dict[str, str]:
         "s8_broker_write_key": f"argus-s8-broker-key-{uuid4().hex}",
         "c3_verifier_signing_key": f"argus-c3-verifier-key-{uuid4().hex}",
         "s3_reference_referee_signing_key": f"argus-s3-reference-referee-key-{uuid4().hex}",
+        "m1_pilot_console_access_token": f"argus-m1-pilot-access-{uuid4().hex}",
     }
 
 
@@ -777,6 +778,7 @@ def _compose_environment(
         "ARGUS_S8_BROKER_WRITE_KEY": runtime_secrets["s8_broker_write_key"],
         "ARGUS_S3_REFERENCE_REFEREE_SIGNER_SECRET": runtime_secrets["s3_reference_referee_signing_key"],
         "ARGUS_S1_REFERENCE_DEMO_ACCESS_TOKEN": reference_service_tokens["m1-reference-s1"],
+        "ARGUS_S1_REFERENCE_DEMO_PILOT_ACCESS_TOKEN": runtime_secrets["m1_pilot_console_access_token"],
         "ARGUS_S2_REFERENCE_BUILDER_ACCESS_TOKEN": reference_service_tokens["m1-reference-s2"],
         M1_REFERENCE_PIPELINE_IMAGE_ENV: M1_REFERENCE_PIPELINE_PLACEHOLDER_IMAGE,
         "ARGUS_S3_REFERENCE_REFEREE_ACCESS_TOKEN": reference_service_tokens["m1-reference-s3"],

@@ -417,7 +417,8 @@ class M1ReferenceLifecycleServiceTests(unittest.TestCase):
                 allow_insecure_verifier_key_store=True,
             )
 
-            result = runner.run(job_id=M1_REFERENCE_JOB_ID)
+            lifecycle_events: list[dict[str, object]] = []
+            result = runner.run(job_id=M1_REFERENCE_JOB_ID, event_sink=lifecycle_events.append)
             repeated_result = runner.run(job_id=M1_REFERENCE_JOB_ID)
 
             self.assertEqual(result.final_state, "REPORTED")
@@ -425,6 +426,35 @@ class M1ReferenceLifecycleServiceTests(unittest.TestCase):
             self.assertEqual(repeated_result.final_state, "REPORTED")
             self.assertEqual(repeated_result.dataset_ref, result.dataset_ref)
             self.assertTrue(result.observatory_trusted, result.observatory_failures)
+            self.assertEqual(
+                [(event["stage"], event["status"]) for event in lifecycle_events],
+                [
+                    ("runtime_identity", "started"),
+                    ("runtime_identity", "completed"),
+                    ("verifier_profile", "started"),
+                    ("verifier_profile", "completed"),
+                    ("reference_dataset", "started"),
+                    ("reference_dataset", "completed"),
+                    ("accept", "started"),
+                    ("accept", "completed"),
+                    ("plan", "started"),
+                    ("plan", "completed"),
+                    ("build", "started"),
+                    ("build", "completed"),
+                    ("validate", "started"),
+                    ("validate", "completed"),
+                    ("report", "started"),
+                    ("report", "completed"),
+                    ("observatory", "started"),
+                    ("observatory", "completed"),
+                    ("run", "completed"),
+                ],
+            )
+            fresh_verification = runner.verify_artifact(result=result)
+            self.assertTrue(fresh_verification.trusted, fresh_verification.failures)
+            self.assertTrue(fresh_verification.report_matches_run_result)
+            self.assertEqual(fresh_verification.subject_ref, result.promoted_artifact_ref)
+            self.assertEqual(fresh_verification.report_ref, result.validation_report_ref)
             self.assertEqual(result.validation_report_payload["claim_tier"], "recapitulated-known")
             self.assertTrue(result.validation_report_payload["aggregate"]["passed"])
             self.assertEqual(

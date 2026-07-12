@@ -139,6 +139,8 @@ The **Oracle-Gated Vertical Slice**: S5 is not yet present, so the slice is driv
 
 **M1.5 — demand-validation gate (Rev B, blocking; see §0a.4).** After the battery above is green on the declared target: demo the slice to ≥1 pilot physicist on a real subtopic, record the net-time accounting (pilot wall-clock to a verified artifact vs. status-quo estimate), and measure the first real build:verify cost ratio into the budget-envelope numbers. M2 work does not start until this gate is recorded; a negative pilot signal triggers a direction re-review.
 
+The M1.5 pilot may use the bounded browser workflow in `docs/M1_5_PILOT_CONSOLE.md`. It accepts only the fixed M1 EWPT/GW reference profile, shows actual lifecycle evidence, and renders/re-verifies the signed artifact; it is a gate-supporting surface, not M2 `S11-T37`, and no human-demand evidence is claimed until a real pilot session is reviewed and recorded.
+
 **Parallel tracks.**
 - **Track A (S1 runtime):** the entire S1 stack — depends on M0 C1 schema + S8/S10.
 - **Track B (S7 adapters):** SDK/backends/broker + reference adapters — depends on M0 C6 schema + S8/S10; independent of S1 except the reference example test (S1-T28) consumes a C6 adapter.

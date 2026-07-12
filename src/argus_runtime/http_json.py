@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, is_dataclass
+from dataclasses import asdict, dataclass, field, is_dataclass
 import json
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable
@@ -10,6 +10,15 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 
 JsonHandler = Callable[["JsonRequest"], tuple[int, Any]]
+
+
+@dataclass(frozen=True)
+class HttpResponse:
+    """A non-JSON response returned through the shared HTTP dispatcher."""
+
+    body: str | bytes
+    content_type: str
+    headers: dict[str, str] = field(default_factory=dict)
 
 
 class JsonRequest:
@@ -80,9 +89,18 @@ def serve_json_app(app: JsonHttpApp, *, host: str, port: int) -> None:
                     headers={key.lower(): value for key, value in self.headers.items()},
                 )
             )
-            encoded = json.dumps(_jsonable(payload), sort_keys=True).encode("utf-8")
+            if isinstance(payload, HttpResponse):
+                encoded = payload.body.encode("utf-8") if isinstance(payload.body, str) else payload.body
+                content_type = payload.content_type
+                headers = payload.headers
+            else:
+                encoded = json.dumps(_jsonable(payload), sort_keys=True).encode("utf-8")
+                content_type = "application/json"
+                headers = {}
             self.send_response(status)
-            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Type", content_type)
+            for name, value in headers.items():
+                self.send_header(name, value)
             self.send_header("Content-Length", str(len(encoded)))
             self.end_headers()
             self.wfile.write(encoded)

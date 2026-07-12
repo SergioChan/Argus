@@ -2438,6 +2438,7 @@ class ArgusM0ComposeTests(unittest.TestCase):
                 "ARGUS_S10_VERIFIER_KEY_AUTH_TOKEN": S10_VERIFIER_KEY_AUTH_TOKEN,
                 "ARGUS_S3_REFERENCE_REFEREE_SIGNER_SECRET": S3_REFERENCE_REFEREE_SIGNING_KEY,
                 "ARGUS_S1_REFERENCE_DEMO_ACCESS_TOKEN": "s1-reference-token",
+                "ARGUS_S1_REFERENCE_DEMO_PILOT_ACCESS_TOKEN": "m1-pilot-access-token",
                 "ARGUS_S2_REFERENCE_BUILDER_ACCESS_TOKEN": "s2-reference-token",
                 "ARGUS_S2_REFERENCE_PIPELINE_IMAGE": "sha256:" + "a" * 64,
                 "ARGUS_S3_REFERENCE_REFEREE_ACCESS_TOKEN": "s3-reference-token",
@@ -2622,6 +2623,10 @@ class ArgusM0ComposeTests(unittest.TestCase):
             environment = services[service_name]["environment"]
             self.assertNotIn("ARGUS_RUNTIME_BOOTSTRAP_TOKEN", environment)
             self.assertEqual(environment[credential_name], credential_value)
+        self.assertEqual(
+            services["s1-reference-demo"]["environment"]["ARGUS_S1_REFERENCE_DEMO_PILOT_ACCESS_TOKEN"],
+            "m1-pilot-access-token",
+        )
         self.assertEqual(
             services["s3-reference-referee"]["environment"]["ARGUS_S10_VERIFIER_KEY_AUTH_TOKEN"],
             S10_VERIFIER_KEY_AUTH_TOKEN,

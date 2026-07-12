@@ -13,7 +13,21 @@ from typing import Any, Mapping
 
 from argus_core import S1ReferencePhysicsHarness, S1ReferencePhysicsRunResult
 
-from .http_json import JsonHttpApp, JsonRequest, serve_json_app
+from .http_json import HttpResponse, JsonHttpApp, JsonRequest, serve_json_app
+from .m1_pilot_console import (
+    M1_PILOT_CONSOLE_CONFIG_ROUTE,
+    M1_PILOT_RUNS_ROUTE,
+    M1PilotRunManager,
+    PilotArtifactNotReady,
+    PilotConsoleError,
+    PilotIntake,
+    PilotIntakeError,
+    PilotRunConflict,
+    PilotRunNotFound,
+    pilot_access_authorized,
+    pilot_console_config,
+    render_m1_pilot_console_html,
+)
 from .m1_reference_runtime import M1_REFERENCE_JOB_ID, M1ReferenceLifecycleRunner
 from .s3_report_signer_service import RustS3ReportSigner
 
@@ -129,9 +143,12 @@ class S1ReferenceDemoApp:
         *,
         lifecycle_runner: M1ReferenceLifecycleRunner | None = None,
         default_job_id: str = S1_REFERENCE_DEMO_DEFAULT_JOB_ID,
+        pilot_access_token: str | None = None,
     ) -> None:
         self._lifecycle_runner = lifecycle_runner
         self._default_job_id = default_job_id
+        self._pilot_access_token = pilot_access_token
+        self._pilot_runs = M1PilotRunManager(lifecycle_runner=lifecycle_runner) if lifecycle_runner is not None else None
         self.http = JsonHttpApp()
         self._register_routes()
 
@@ -139,6 +156,83 @@ class S1ReferenceDemoApp:
         @self.http.route("GET", "/healthz")
         def health(_request: JsonRequest) -> tuple[int, Any]:
             return 200, {"status": "ok", "service": S1_REFERENCE_DEMO_NAME}
+
+        @self.http.route("GET", "/")
+        def pilot_console(_request: JsonRequest) -> tuple[int, Any]:
+            return 200, HttpResponse(
+                body=render_m1_pilot_console_html(),
+                content_type="text/html; charset=utf-8",
+                headers={
+                    "Cache-Control": "no-store",
+                    "Content-Security-Policy": (
+                        "default-src 'self'; base-uri 'none'; connect-src 'self'; "
+                        "form-action 'self'; frame-src 'self'; frame-ancestors 'none'; img-src 'self' data:; "
+                        "script-src 'unsafe-inline'; style-src 'unsafe-inline'"
+                    ),
+                },
+            )
+
+        @self.http.route("GET", M1_PILOT_CONSOLE_CONFIG_ROUTE)
+        def pilot_console_configuration(_request: JsonRequest) -> tuple[int, Any]:
+            return 200, pilot_console_config(
+                available=self._pilot_runs is not None,
+                access_required=self._pilot_access_token is not None,
+            )
+
+        @self.http.route("POST", M1_PILOT_RUNS_ROUTE)
+        def start_pilot_run(request: JsonRequest) -> tuple[int, Any]:
+            authorized = self._require_pilot_access(request)
+            if authorized is not None:
+                return authorized
+            if not isinstance(request.body, Mapping):
+                return 400, {"error": "invalid_json_body"}
+            try:
+                snapshot = self._pilot_run_manager().start(PilotIntake.from_payload(request.body))
+            except PilotIntakeError as exc:
+                return 422, {"error": str(exc)}
+            except PilotRunConflict as exc:
+                return 409, {"error": str(exc)}
+            return 202, snapshot
+
+        @self.http.prefix("GET", f"{M1_PILOT_RUNS_ROUTE}/")
+        def get_pilot_run(request: JsonRequest) -> tuple[int, Any]:
+            authorized = self._require_pilot_access(request)
+            if authorized is not None:
+                return authorized
+            run_id, suffix = _pilot_run_path(request.path)
+            if run_id is None:
+                return 404, {"error": "not_found"}
+            try:
+                if suffix == "":
+                    return 200, self._pilot_run_manager().get_snapshot(run_id)
+                if suffix == "observatory":
+                    return 200, HttpResponse(
+                        body=self._pilot_run_manager().get_observatory_html(run_id),
+                        content_type="text/html; charset=utf-8",
+                        headers={"Cache-Control": "no-store"},
+                    )
+            except PilotRunNotFound as exc:
+                return 404, {"error": str(exc)}
+            except PilotArtifactNotReady as exc:
+                return 409, {"error": str(exc)}
+            return 404, {"error": "not_found"}
+
+        @self.http.prefix("POST", f"{M1_PILOT_RUNS_ROUTE}/")
+        def reverify_pilot_run(request: JsonRequest) -> tuple[int, Any]:
+            authorized = self._require_pilot_access(request)
+            if authorized is not None:
+                return authorized
+            run_id, suffix = _pilot_run_path(request.path)
+            if run_id is None or suffix != "verify":
+                return 404, {"error": "not_found"}
+            try:
+                return 200, self._pilot_run_manager().reverify(run_id)
+            except PilotRunNotFound as exc:
+                return 404, {"error": str(exc)}
+            except PilotArtifactNotReady as exc:
+                return 409, {"error": str(exc)}
+            except PilotRunConflict as exc:
+                return 409, {"error": str(exc)}
 
         @self.http.route("POST", S1_REFERENCE_DEMO_ROUTE)
         def run_demo(request: JsonRequest) -> tuple[int, Any]:
@@ -159,6 +253,21 @@ class S1ReferenceDemoApp:
                 return 200, {**result.as_payload(), "observatory_html": result.observatory_html}
             evidence, artifacts = build_reference_demo(job_id)
             return 200, {**evidence, "observatory_html": artifacts["observatory_html"]}
+
+    def _pilot_run_manager(self) -> M1PilotRunManager:
+        if self._pilot_runs is None:
+            raise PilotConsoleError("pilot_console_unavailable")
+        return self._pilot_runs
+
+    def _require_pilot_access(self, request: JsonRequest) -> tuple[int, Any] | None:
+        if self._pilot_runs is None:
+            return 503, {"error": "pilot_console_unavailable"}
+        if not pilot_access_authorized(
+            authorization_header=request.headers.get("authorization"),
+            access_token=self._pilot_access_token,
+        ):
+            return 401, {"error": "pilot_access_unauthorized"}
+        return None
 
 
 def build_app() -> S1ReferenceDemoApp:
@@ -183,7 +292,11 @@ def build_app_from_env() -> S1ReferenceDemoApp:
             os.environ.get("ARGUS_S1_REFERENCE_DEMO_ALLOW_INSECURE_VERIFIER_KEY_STORE")
         ),
     )
-    return S1ReferenceDemoApp(lifecycle_runner=runner, default_job_id=M1_REFERENCE_JOB_ID)
+    return S1ReferenceDemoApp(
+        lifecycle_runner=runner,
+        default_job_id=M1_REFERENCE_JOB_ID,
+        pilot_access_token=_required_env("ARGUS_S1_REFERENCE_DEMO_PILOT_ACCESS_TOKEN"),
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -251,6 +364,18 @@ def _job_id_from_body(body: Mapping[str, Any], *, default_job_id: str = S1_REFER
     if not isinstance(job_id, str) or not job_id:
         raise ValueError("job_id must be a non-empty string")
     return job_id
+
+
+def _pilot_run_path(path: str) -> tuple[str | None, str]:
+    prefix = f"{M1_PILOT_RUNS_ROUTE}/"
+    if not path.startswith(prefix):
+        return None, ""
+    parts = [part for part in path.removeprefix(prefix).split("/") if part]
+    if len(parts) == 1:
+        return parts[0], ""
+    if len(parts) == 2:
+        return parts[0], parts[1]
+    return None, ""
 
 
 def _check_summary(check: Any) -> dict[str, Any]:

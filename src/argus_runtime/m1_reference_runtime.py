@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
 import json
 from math import isfinite
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 from urllib import error as urlerror
 from urllib import request as urlrequest
 
@@ -35,6 +36,7 @@ from argus_core.s1_reference import (
 )
 from argus_core.s7 import EvalRequest, EvalResult, Quantity, S7Error
 from argus_core.s8 import Lineage, Producer
+from argus_core.s11 import ObservatoryLineageBundle, verify_observatory_v0
 from argusverify import C3ReportVerifier
 
 from .m1_runtime_artifacts import (
@@ -733,6 +735,50 @@ class M1ReferenceLifecycleResult:
         }
 
 
+M1ReferenceLifecycleEventSink = Callable[[dict[str, Any]], None]
+
+
+@dataclass(frozen=True)
+class M1ReferenceArtifactVerification:
+    """Fresh C3/C4 verification evidence for a completed M1 reference run."""
+
+    trusted: bool
+    failures: tuple[str, ...]
+    signature_key_id: str | None
+    subject_ref: str
+    report_ref: str
+    report_matches_run_result: bool
+    checked_at: str
+
+    def as_payload(self) -> dict[str, Any]:
+        return {
+            "trusted": self.trusted,
+            "failures": list(self.failures),
+            "signature_key_id": self.signature_key_id,
+            "subject_ref": self.subject_ref,
+            "report_ref": self.report_ref,
+            "report_matches_run_result": self.report_matches_run_result,
+            "checked_at": self.checked_at,
+        }
+
+
+def _emit_lifecycle_event(
+    event_sink: M1ReferenceLifecycleEventSink | None,
+    *,
+    stage: str,
+    status: str,
+    detail: Mapping[str, Any] | None = None,
+) -> None:
+    if event_sink is None:
+        return
+    event = {"stage": stage, "status": status, "detail": dict(detail or {})}
+    # A read-only observer must never be able to alter the trusted execution path.
+    try:
+        event_sink(event)
+    except Exception:
+        return
+
+
 class M1ReferenceLifecycleRunner:
     """Runs the deployed S1/S7/S3/S11 reference path without in-memory fallbacks."""
 
@@ -781,20 +827,41 @@ class M1ReferenceLifecycleRunner:
             timeout_s=M1_REFERENCE_SERVICE_REQUEST_TIMEOUT_S,
         )
 
-    def run(self, *, job_id: str) -> M1ReferenceLifecycleResult:
+    def run(
+        self,
+        *,
+        job_id: str,
+        event_sink: M1ReferenceLifecycleEventSink | None = None,
+    ) -> M1ReferenceLifecycleResult:
         if job_id != self._expected_job_id:
             raise ValueError("job_id_mismatch")
+        _emit_lifecycle_event(event_sink, stage="runtime_identity", status="started")
         session = self._runtime_session()
+        _emit_lifecycle_event(event_sink, stage="runtime_identity", status="completed")
         store = S10S8ArtifactStore(session=session, s8_url=self._s8_url)
         referee = HttpM1ReferenceRefereeClient(
             endpoint_url=f"{self._s3_url}{M1_REFERENCE_REFEREE_ROUTE}",
             profile_endpoint_url=f"{self._s3_url}{M1_REFERENCE_PROFILE_ROUTE}",
             session=session,
         )
+        _emit_lifecycle_event(event_sink, stage="verifier_profile", status="started")
         profile_ref = referee.ensure_profile()
         if profile_ref != S1_REFERENCE_PHYSICS_PROFILE_REF:
             raise RuntimeArtifactStoreError("S3 returned an unexpected fixed reference profile")
+        _emit_lifecycle_event(
+            event_sink,
+            stage="verifier_profile",
+            status="completed",
+            detail={"profile_ref": profile_ref},
+        )
+        _emit_lifecycle_event(event_sink, stage="reference_dataset", status="started")
         dataset_ref = self._ensure_controlled_reference_dataset(store)
+        _emit_lifecycle_event(
+            event_sink,
+            stage="reference_dataset",
+            status="completed",
+            detail={"dataset_ref": dataset_ref},
+        )
         adapter_client = HttpM1ReferenceAdapterClient(
             endpoint_url=f"{self._s7_url}{M1_REFERENCE_ADAPTER_ROUTE}",
             session=session,
@@ -844,11 +911,35 @@ class M1ReferenceLifecycleRunner:
             estimated_cost=1.0,
             budget_cost=2.0,
         )
+        _emit_lifecycle_event(event_sink, stage="accept", status="started")
         acceptance = runner.accept(envelope)
         if not acceptance.accepted:
             raise RuntimeArtifactStoreError(f"S1 reference lifecycle was refused: {acceptance.reason}")
+        _emit_lifecycle_event(event_sink, stage="accept", status="completed")
+        _emit_lifecycle_event(event_sink, stage="plan", status="started")
         plan = runner.plan(envelope)
+        _emit_lifecycle_event(event_sink, stage="plan", status="completed")
+        _emit_lifecycle_event(
+            event_sink,
+            stage="build",
+            status="started",
+            detail={"components": ["S10", "S7", "S2"]},
+        )
         build = runner.build(job_id, plan.payload)
+        build_diagnostics = _m1_mapping(build.payload.get("diagnostics"), "S1 build diagnostics")
+        frozen_pipeline = build_diagnostics.get("external_frozen_pipeline")
+        _emit_lifecycle_event(
+            event_sink,
+            stage="build",
+            status="completed",
+            detail={
+                "artifact_refs": [str(ref) for ref in build.payload.get("artifact_refs", ())],
+                "frozen_pipeline_ref": (
+                    frozen_pipeline.get("artifact_ref") if isinstance(frozen_pipeline, Mapping) else None
+                ),
+            },
+        )
+        _emit_lifecycle_event(event_sink, stage="validate", status="started", detail={"component": "S3"})
         validation = runner.validate(
             job_id,
             build.payload,
@@ -859,6 +950,13 @@ class M1ReferenceLifecycleRunner:
             report_verifier=report_verifier,
             trace_id=f"trace:{job_id}",
         )
+        _emit_lifecycle_event(
+            event_sink,
+            stage="validate",
+            status="completed",
+            detail={"validation_report_ref": validation.payload.get("validation_report_ref")},
+        )
+        _emit_lifecycle_event(event_sink, stage="report", status="started")
         promoted_ref = self._promote_validated_subject(
             store=store,
             job_id=job_id,
@@ -873,6 +971,13 @@ class M1ReferenceLifecycleRunner:
             "lineage_ref": promoted_ref,
         }
         runner.report(job_id, subagent_report)
+        _emit_lifecycle_event(
+            event_sink,
+            stage="report",
+            status="completed",
+            detail={"promoted_artifact_ref": promoted_ref},
+        )
+        _emit_lifecycle_event(event_sink, stage="observatory", status="started", detail={"component": "S11"})
         observatory = HttpM1ReferenceObservatoryClient(
             endpoint_url=f"{self._s11_url}{M1_REFERENCE_OBSERVATORY_ROUTE}",
             session=session,
@@ -882,7 +987,7 @@ class M1ReferenceLifecycleRunner:
         )
         state = runner.runtime.store.current(job_id).state.value
         methods = tuple(event.method for event in runner.runtime.store.events(job_id))
-        return M1ReferenceLifecycleResult(
+        result = M1ReferenceLifecycleResult(
             job_id=job_id,
             final_state=state,
             lifecycle_methods=methods,
@@ -895,6 +1000,63 @@ class M1ReferenceLifecycleRunner:
             observatory_html=str(observatory["observatory_html"]),
             observatory_trusted=bool(observatory["trusted"]),
             observatory_failures=tuple(str(item) for item in observatory.get("failures", ())),
+        )
+        _emit_lifecycle_event(
+            event_sink,
+            stage="observatory",
+            status="completed",
+            detail={
+                "observatory_html_ref": result.observatory_html_ref,
+                "trusted": result.observatory_trusted,
+            },
+        )
+        _emit_lifecycle_event(
+            event_sink,
+            stage="run",
+            status="completed",
+            detail={"final_state": result.final_state},
+        )
+        return result
+
+    def verify_artifact(self, *, result: M1ReferenceLifecycleResult) -> M1ReferenceArtifactVerification:
+        """Re-read the persisted report and lineage before returning a pilot-facing verdict."""
+
+        if result.job_id != self._expected_job_id:
+            raise ValueError("job_id_mismatch")
+        session = self._runtime_session()
+        store = S10S8ArtifactStore(session=session, s8_url=self._s8_url)
+        try:
+            persisted_report = json.loads(store.get_artifact(result.validation_report_ref).decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise RuntimeArtifactStoreError("persisted validation report is invalid JSON") from exc
+        if not isinstance(persisted_report, dict):
+            raise RuntimeArtifactStoreError("persisted validation report must be an object")
+        provider = HttpS10VerifierKeyProvider(
+            endpoint_url=self._verifier_key_endpoint_url,
+            auth_token=self._verifier_key_auth_token,
+            allow_insecure_verifier_key_store=self._allow_insecure_verifier_key_store,
+        )
+        verification = verify_observatory_v0(
+            report_payload=persisted_report,
+            lineage=ObservatoryLineageBundle(
+                subject_ref=result.promoted_artifact_ref,
+                report_ref=result.validation_report_ref,
+                graph=store.get_lineage(result.promoted_artifact_ref, direction="ancestors"),
+            ),
+            report_verifier=C3ReportVerifier(S10VerifierTrustStoreClient(provider)),
+        )
+        report_matches_run_result = persisted_report == result.validation_report_payload
+        failures = list(verification.failures)
+        if not report_matches_run_result:
+            failures.append("persisted validation report does not match the run result")
+        return M1ReferenceArtifactVerification(
+            trusted=verification.trusted and report_matches_run_result,
+            failures=tuple(failures),
+            signature_key_id=verification.signature_key_id,
+            subject_ref=result.promoted_artifact_ref,
+            report_ref=result.validation_report_ref,
+            report_matches_run_result=report_matches_run_result,
+            checked_at=datetime.now(timezone.utc).isoformat(),
         )
 
     def _ensure_controlled_reference_dataset(self, store: S10S8ArtifactStore) -> str:
