@@ -8,7 +8,11 @@ uses that service's deployed `M1ReferenceLifecycleRunner`; it does not use a
 mock runner or a separate demo artifact.
 
 The console is a supporting artifact for the M1.5 demand-validation gate. It
-does not by itself record a human pilot, close M1.5, or authorize M2 work.
+does not by itself record a human pilot or close M1.5. Per the owner's
+2026-07-12 sequencing directive, the real-pilot evidence remains required but
+is deferred to the final unified real-human validation phase; the open gate no
+longer blocks dependency-valid M2+ implementation and cannot be counted as
+complete before that evidence is reviewed and recorded.
 
 ## Supported Study Boundary
 
