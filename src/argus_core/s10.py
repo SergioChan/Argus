@@ -5,6 +5,7 @@ from __future__ import annotations
 import http.client as http_client
 import hmac
 import json
+import math
 import os
 import re
 import selectors
@@ -1345,18 +1346,9 @@ class InMemoryQuotaLedger:
 
 def decide_policy(bundle: PolicyBundle, request: LaunchRequest) -> PolicyVerdict:
     """Pure S10 policy decision: no clock, IO, randomness, or mutation."""
-    envelope = request.requested_envelope
-    ceilings = bundle.resource_ceilings
-    if envelope.cpu_m > ceilings.cpu_m:
-        return PolicyVerdict(False, None, (), "cpu_ceiling")
-    if envelope.mem_bytes > ceilings.mem_bytes:
-        return PolicyVerdict(False, None, (), "memory_ceiling")
-    if envelope.gpu_count > ceilings.gpu_count:
-        return PolicyVerdict(False, None, (), "gpu_ceiling")
-    if envelope.wallclock_s > ceilings.wallclock_s:
-        return PolicyVerdict(False, None, (), "wallclock_ceiling")
-    if envelope.estimated_cost_usd > ceilings.max_cost_usd:
-        return PolicyVerdict(False, None, (), "cost_ceiling")
+    ceiling_violations = _policy_ceiling_violations(bundle, request)
+    if ceiling_violations:
+        return PolicyVerdict(False, None, (), ceiling_violations[0])
     if request.scope_token.scopes.sandbox_risk_class != request.budget_token.risk_class:
         return PolicyVerdict(False, None, (), "risk_class_mismatch")
 
@@ -1374,6 +1366,56 @@ def decide_policy(bundle: PolicyBundle, request: LaunchRequest) -> PolicyVerdict
         )
     )
     return PolicyVerdict(True, runtime_class, egress_acl)
+
+
+def _policy_ceiling_violations(bundle: PolicyBundle, request: LaunchRequest) -> tuple[str, ...]:
+    envelope = request.requested_envelope
+    ceilings = bundle.resource_ceilings
+    violations: list[str] = []
+    if envelope.cpu_m > ceilings.cpu_m:
+        violations.append("cpu_ceiling")
+    if envelope.mem_bytes > ceilings.mem_bytes:
+        violations.append("memory_ceiling")
+    if envelope.gpu_count > ceilings.gpu_count:
+        violations.append("gpu_ceiling")
+    if envelope.wallclock_s > ceilings.wallclock_s:
+        violations.append("wallclock_ceiling")
+    if not math.isfinite(ceilings.max_cost_usd) or ceilings.max_cost_usd < 0:
+        violations.append("cost_ceiling_invalid")
+    elif not math.isfinite(envelope.estimated_cost_usd) or envelope.estimated_cost_usd < 0:
+        violations.append("cost_estimate_invalid")
+    elif envelope.estimated_cost_usd > ceilings.max_cost_usd:
+        violations.append("cost_ceiling")
+    return tuple(violations)
+
+
+def _policy_ceiling_reject_payload(
+    bundle: PolicyBundle,
+    request: LaunchRequest,
+    violations: tuple[str, ...],
+) -> dict[str, Any]:
+    requested_envelope = asdict(request.requested_envelope)
+    resource_ceilings = asdict(bundle.resource_ceilings)
+    requested_envelope["estimated_cost_usd"] = _json_safe_float(request.requested_envelope.estimated_cost_usd)
+    resource_ceilings["max_cost_usd"] = _json_safe_float(bundle.resource_ceilings.max_cost_usd)
+    return {
+        "job_id": request.job_id,
+        "within_ceiling": False,
+        "violations": list(violations),
+        "requested_envelope": requested_envelope,
+        "resource_ceilings": resource_ceilings,
+        "policy_bundle_version": bundle.bundle_version,
+    }
+
+
+def _json_safe_float(value: float) -> float | str:
+    if math.isnan(value):
+        return "nan"
+    if value == math.inf:
+        return "infinity"
+    if value == -math.inf:
+        return "-infinity"
+    return value
 
 
 def materialize_sandbox_env(env: dict[str, str], env_allowlist: tuple[str, ...]) -> dict[str, str]:
@@ -3044,6 +3086,12 @@ class InMemorySandboxOrchestrator:
         policy_bundle = self._policy_service.active_bundle
         verdict = self._policy_service.decide(request)
         if not verdict.allowed:
+            ceiling_violations = _policy_ceiling_violations(policy_bundle, request)
+            if ceiling_violations:
+                self._audit_ledger.append(
+                    "ceiling.reject",
+                    _policy_ceiling_reject_payload(policy_bundle, request, ceiling_violations),
+                )
             self._audit_ledger.append("sandbox.denied", {"reason": verdict.deny_reason, "job_id": request.job_id})
             raise PolicyDeniedError(verdict.deny_reason or "policy denied")
         try:
@@ -3062,7 +3110,10 @@ class InMemorySandboxOrchestrator:
         try:
             self._quota_ledger.reserve(request.budget_token.budget_id, request.requested_envelope.budget_usage())
         except BudgetExceededError:
-            self._audit_ledger.append("budget.reject", {"budget_id": request.budget_token.budget_id})
+            self._audit_ledger.append(
+                "budget.reject",
+                {"budget_id": request.budget_token.budget_id, "job_id": request.job_id},
+            )
             raise
 
         launch_provenance_ref = self._emit_launch_provenance(request, verdict, policy_bundle)
@@ -3542,6 +3593,7 @@ class DockerSandboxOrchestrator(InMemorySandboxOrchestrator):
                 {
                     "sandbox_id": handle.sandbox_id,
                     "budget_id": request.budget_token.budget_id,
+                    "job_id": request.job_id,
                     "usage": asdict(result.budget_usage),
                 },
             )
@@ -3560,6 +3612,7 @@ class DockerSandboxOrchestrator(InMemorySandboxOrchestrator):
             {
                 "sandbox_id": handle.sandbox_id,
                 "budget_id": request.budget_token.budget_id,
+                "job_id": request.job_id,
                 "usage": asdict(result.budget_usage),
             },
         )
@@ -3725,6 +3778,7 @@ class DockerSandboxOrchestrator(InMemorySandboxOrchestrator):
             {
                 "sandbox_id": handle.sandbox_id,
                 "budget_id": request.budget_token.budget_id,
+                "job_id": request.job_id,
                 "artifact_ref": record.artifact_ref,
                 "price_table_version": price_rollup.price_table_version,
                 "cost_usd_exact": price_rollup.cost_usd_exact,
@@ -3832,6 +3886,7 @@ class DockerSandboxOrchestrator(InMemorySandboxOrchestrator):
             "budget.release",
             {
                 "budget_id": request.budget_token.budget_id,
+                "job_id": request.job_id,
                 "usage": asdict(reserved_usage),
             },
         )

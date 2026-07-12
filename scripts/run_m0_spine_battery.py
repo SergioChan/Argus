@@ -473,6 +473,14 @@ def main() -> int:
             token=auth_tokens["budget-reject"],
             read_token=auth_tokens["read"],
         )
+        _battery_s10_flagship_hpc_ceiling_reject(
+            evidence,
+            s10_url,
+            args.image,
+            s8_url,
+            token=auth_tokens["flagship-hpc-reject"],
+            read_token=auth_tokens["read"],
+        )
         _battery_partial_capture(
             evidence,
             s10_url,
@@ -628,6 +636,18 @@ def _m0_identity_requests() -> dict[str, dict[str, Any]]:
             "job_id": "m0-budget-reject-job",
             "root_request_id": "m0-budget-reject-root",
             "budget_caps": {"max_compute_units": 10, "max_wallclock_s": 10, "max_cost_usd": 0.01},
+            "scopes": {"sandbox_risk_class": "standard"},
+        },
+        "flagship-hpc-reject": {
+            "caller_id": "m0-flagship-hpc-reject",
+            "job_id": "m0-flagship-hpc-reject-job",
+            "root_request_id": "m0-flagship-hpc-reject-root",
+            "budget_caps": {
+                "max_compute_units": 100_000,
+                "max_gpu_seconds": 1_000_000,
+                "max_wallclock_s": 100_000,
+                "max_cost_usd": 50_000,
+            },
             "scopes": {"sandbox_risk_class": "standard"},
         },
         "halt-latency": {
@@ -2539,6 +2559,98 @@ def _battery_s10_preflight_budget_reject(
     )
 
 
+def _battery_s10_flagship_hpc_ceiling_reject(
+    evidence: dict[str, Any],
+    s10_url: str,
+    image: str,
+    s8_url: str,
+    *,
+    token: str,
+    read_token: str,
+) -> None:
+    job_id = "m0-flagship-hpc-reject-job"
+    budget_json = _post_json(
+        f"{s10_url}/v1/budget-tokens",
+        {},
+        expected_status=201,
+        token=token,
+    )
+    scope_json = _post_json(
+        f"{s10_url}/v1/scope-tokens",
+        {},
+        expected_status=201,
+        token=token,
+    )
+    launch_body = _launch_request_json(
+        job_id=job_id,
+        image=image,
+        budget=budget_json,
+        scope=scope_json,
+        args=("-c", "echo flagship-hpc-should-not-run"),
+        env={},
+        env_allowlist=(),
+        gpu_count=8,
+        wallclock_s=86_400,
+        estimated_cost_usd=25_000,
+    )
+    response = _post_json(
+        f"{s10_url}/v1/sandboxes:launch",
+        launch_body,
+        expected_status=403,
+        token=token,
+    )
+    if response.get("error") != "PolicyDeniedError":
+        raise AssertionError(f"flagship-HPC ceiling reject did not fail with PolicyDeniedError: {response}")
+    if response.get("handle") is not None:
+        raise AssertionError(f"flagship-HPC ceiling reject unexpectedly returned a sandbox handle: {response}")
+    ceiling_reject = response.get("ceiling_reject")
+    if not isinstance(ceiling_reject, dict):
+        raise AssertionError(f"flagship-HPC ceiling reject evidence missing: {response}")
+    if ceiling_reject.get("within_ceiling") is not False:
+        raise AssertionError(f"flagship-HPC request was not recorded outside the ceiling: {ceiling_reject}")
+    expected_violations = ["gpu_ceiling", "wallclock_ceiling", "cost_ceiling"]
+    if ceiling_reject.get("violations") != expected_violations:
+        raise AssertionError(f"flagship-HPC ceiling violations drifted: {ceiling_reject}")
+    events = response.get("audit_events") or []
+    if "ceiling.reject" not in events or "sandbox.denied" not in events:
+        raise AssertionError(f"flagship-HPC ceiling audit events missing: {events}")
+    if "budget.reject" in events:
+        raise AssertionError(f"flagship-HPC policy guard was incorrectly reported as budget exhaustion: {events}")
+    spend_query = _get_json(
+        f"{s8_url}/v1/artifacts?kind=spend.final&job_id={parse.quote(job_id, safe='')}&page_size=20",
+        token=read_token,
+    )
+    container_query = _get_json(
+        f"{s8_url}/v1/artifacts?kind=container&job_id={parse.quote(job_id, safe='')}&page_size=20",
+        token=read_token,
+    )
+    if spend_query.get("records") or container_query.get("records"):
+        raise AssertionError(
+            "flagship-HPC ceiling reject wrote pre-launch artifacts: "
+            f"spend={spend_query}, container={container_query}"
+        )
+    if float(budget_json["caps"]["max_cost_usd"]) <= float(launch_body["requested_envelope"]["estimated_cost_usd"]):
+        raise AssertionError(f"flagship-HPC test budget was not independently sufficient: {budget_json}")
+    _record(
+        evidence,
+        "s10-flagship-hpc-ceiling-reject",
+        "deployed S10 rejected a budget-sufficient flagship-HPC envelope at the signed policy ceiling before launch",
+        {
+            "error": response["error"],
+            "handle_absent": response.get("handle") is None,
+            "events": events,
+            "within_ceiling": ceiling_reject["within_ceiling"],
+            "violations": ceiling_reject["violations"],
+            "requested_envelope": ceiling_reject["requested_envelope"],
+            "resource_ceilings": ceiling_reject["resource_ceilings"],
+            "policy_bundle_version": ceiling_reject["policy_bundle_version"],
+            "budget_max_cost_usd": budget_json["caps"]["max_cost_usd"],
+            "spend_final_records": len(spend_query.get("records") or []),
+            "container_records": len(container_query.get("records") or []),
+        },
+    )
+
+
 def _battery_partial_capture(
     evidence: dict[str, Any],
     s10_url: str,
@@ -3296,6 +3408,7 @@ def _launch_request_json(
     env: dict[str, str],
     env_allowlist: tuple[str, ...],
     wallclock_s: int,
+    gpu_count: int = 0,
     estimated_cost_usd: float = 0,
 ) -> dict[str, Any]:
     return {
@@ -3312,7 +3425,7 @@ def _launch_request_json(
         "requested_envelope": {
             "cpu_m": 1000,
             "mem_bytes": 32 * 1024 * 1024,
-            "gpu_count": 0,
+            "gpu_count": gpu_count,
             "wallclock_s": wallclock_s,
             "scratch_bytes": 1024 * 1024,
             "pids": 16,

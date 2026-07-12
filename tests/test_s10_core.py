@@ -960,6 +960,70 @@ class S10OrchestratorAndAuditTests(unittest.TestCase):
         self.assertEqual(self.audit.events()[-1].event_type, "budget.reject")
         self.assertNotIn("sandbox.launched", [event.event_type for event in self.audit.events()])
 
+    def test_flagship_hpc_policy_ceiling_rejects_before_quota_or_provenance(self) -> None:
+        artifacts = InMemoryArtifactStore()
+        orchestrator = InMemorySandboxOrchestrator(
+            token_service=self.tokens,
+            quota_ledger=self.quota,
+            audit_ledger=self.audit,
+            policy_bundle=self.bundle,
+            artifact_store=artifacts,
+        )
+        base_request = self._launch_request(max_cost_usd=50_000, estimated_cost_usd=25_000)
+        sufficient_budget = self.tokens.mint_budget(
+            caps=BudgetCaps(
+                max_compute_units=100_000_000,
+                max_gpu_seconds=1_000_000,
+                max_wallclock_s=100_000,
+                max_cost_usd=50_000,
+            ),
+            job_id=base_request.job_id,
+            root_request_id=base_request.budget_token.root_request_id,
+        )
+        request = replace(
+            base_request,
+            budget_token=sufficient_budget,
+            requested_envelope=replace(
+                base_request.requested_envelope,
+                gpu_count=8,
+                wallclock_s=86_400,
+            ),
+        )
+
+        with self.assertRaisesRegex(PolicyDeniedError, "gpu_ceiling"):
+            orchestrator.launch(request)
+
+        with self.assertRaises(KeyError):
+            self.quota.state(request.budget_token.budget_id)
+        self.assertEqual(orchestrator._handles, {})
+        self.assertEqual(artifacts.record_count, 0)
+        events = self.audit.events()
+        self.assertEqual([event.event_type for event in events], ["ceiling.reject", "sandbox.denied"])
+        ceiling_reject = events[0].payload
+        self.assertFalse(ceiling_reject["within_ceiling"])
+        self.assertEqual(
+            ceiling_reject["violations"],
+            ["gpu_ceiling", "wallclock_ceiling", "cost_ceiling"],
+        )
+        self.assertEqual(ceiling_reject["policy_bundle_version"], self.bundle.bundle_version)
+        self.assertEqual(ceiling_reject["requested_envelope"]["gpu_count"], 8)
+        self.assertEqual(ceiling_reject["requested_envelope"]["wallclock_s"], 86_400)
+        self.assertEqual(ceiling_reject["requested_envelope"]["estimated_cost_usd"], 25_000)
+        self.assertEqual(ceiling_reject["resource_ceilings"]["max_cost_usd"], 100)
+
+    def test_non_finite_cost_estimate_fails_closed_before_quota(self) -> None:
+        request = self._launch_request(max_cost_usd=50_000, estimated_cost_usd=float("nan"))
+
+        with self.assertRaisesRegex(PolicyDeniedError, "cost_estimate_invalid"):
+            self.orchestrator.launch(request)
+
+        with self.assertRaises(KeyError):
+            self.quota.state(request.budget_token.budget_id)
+        events = self.audit.events()
+        self.assertEqual([event.event_type for event in events], ["ceiling.reject", "sandbox.denied"])
+        self.assertEqual(events[0].payload["violations"], ["cost_estimate_invalid"])
+        self.assertEqual(events[0].payload["requested_envelope"]["estimated_cost_usd"], "nan")
+
     def test_launch_rejects_invalid_token_fail_closed(self) -> None:
         request = self._launch_request(max_cost_usd=10, estimated_cost_usd=2)
         tampered_request = replace(

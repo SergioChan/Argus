@@ -329,6 +329,11 @@ class ArgusM0RuntimeServiceTests(unittest.TestCase):
         self.assertEqual(requests["halt-latency"]["job_id"], "m0-halt-latency-job")
         self.assertEqual(policy["m0-halt-latency"]["job_id"], "m0-halt-latency-job")
         self.assertEqual(policy["m0-halt-latency"]["budget_caps"]["max_wallclock_s"], 1)
+        self.assertIn("flagship-hpc-reject", requests)
+        self.assertEqual(requests["flagship-hpc-reject"]["caller_id"], "m0-flagship-hpc-reject")
+        self.assertEqual(requests["flagship-hpc-reject"]["job_id"], "m0-flagship-hpc-reject-job")
+        self.assertEqual(policy["m0-flagship-hpc-reject"]["job_id"], "m0-flagship-hpc-reject-job")
+        self.assertEqual(policy["m0-flagship-hpc-reject"]["budget_caps"]["max_cost_usd"], 50_000)
         self.assertIn("partial-capture", requests)
         self.assertEqual(requests["partial-capture"]["caller_id"], "m0-partial-capture")
         self.assertEqual(requests["partial-capture"]["job_id"], "m0-partial-capture-job")
@@ -1777,6 +1782,7 @@ class ArgusM0RuntimeServiceTests(unittest.TestCase):
             }
         )
         app = S10SupervisorApp(signing_key=b"test-key", auth=auth, docker_supervisor=supervisor)
+        app.audit.append("sandbox.denied", {"job_id": "other-job", "reason": "cpu_ceiling"})
         launch = _launch_body(app)
         requested_envelope = dict(launch["requested_envelope"])
         requested_envelope["estimated_cost_usd"] = 0.02
@@ -1796,15 +1802,74 @@ class ArgusM0RuntimeServiceTests(unittest.TestCase):
         self.assertEqual(payload["error"], "BudgetExceededError")
         self.assertIsNone(payload["handle"])
         self.assertIn("budget.reject", payload["audit_events"])
+        self.assertEqual(payload["audit_events"], ["budget.reject"])
         self.assertNotIn("sandbox.launched", payload["audit_events"])
         self.assertNotIn("sandbox.started", payload["audit_events"])
         self.assertNotIn("spend.final", payload["audit_events"])
         self.assertEqual(supervisor.calls, [])
         self.assertEqual(app.artifacts.record_count, 0)
 
+    def test_s10_http_rejects_flagship_hpc_policy_ceiling_with_evidence(self) -> None:
+        supervisor = _SuccessfulSupervisor()
+        auth = RuntimeAuth(
+            {
+                AUTH_TOKEN: RuntimeIdentity(
+                    caller_id="test-caller",
+                    job_id="job-auth",
+                    root_request_id="root-auth",
+                    scopes=ScopeGrant(broker_audiences=("store",), producer_subsystems=("S2",)),
+                    budget_caps=BudgetCaps(
+                        max_compute_units=100_000_000,
+                        max_gpu_seconds=1_000_000,
+                        max_wallclock_s=100_000,
+                        max_cost_usd=50_000,
+                    ),
+                    max_ttl_s=300,
+                )
+            }
+        )
+        app = S10SupervisorApp(signing_key=b"test-key", auth=auth, docker_supervisor=supervisor)
+        app.audit.append("budget.reject", {"job_id": "other-job", "budget_id": "other-budget"})
+        launch = _launch_body(app)
+        requested_envelope = dict(launch["requested_envelope"])
+        requested_envelope.update(
+            {
+                "gpu_count": 8,
+                "wallclock_s": 86_400,
+                "estimated_cost_usd": 25_000,
+            }
+        )
+        launch["requested_envelope"] = requested_envelope
+
+        status, payload = app.http.handle(
+            JsonRequest(
+                method="POST",
+                path="/v1/sandboxes:launch",
+                query={},
+                body=launch,
+                headers=_auth_headers(),
+            )
+        )
+
+        self.assertEqual(status, 403)
+        self.assertEqual(payload["error"], "PolicyDeniedError")
+        self.assertIsNone(payload["handle"])
+        self.assertEqual(payload["ceiling_reject"]["within_ceiling"], False)
+        self.assertEqual(
+            payload["ceiling_reject"]["violations"],
+            ["gpu_ceiling", "wallclock_ceiling", "cost_ceiling"],
+        )
+        self.assertEqual(payload["ceiling_reject"]["policy_bundle_version"], "argus-m0-dev")
+        self.assertIn("ceiling.reject", payload["audit_events"])
+        self.assertIn("sandbox.denied", payload["audit_events"])
+        self.assertNotIn("budget.reject", payload["audit_events"])
+        self.assertEqual(supervisor.calls, [])
+        self.assertEqual(app.artifacts.record_count, 0)
+
     def test_s10_http_launch_budget_halt_returns_audit_and_provenance(self) -> None:
         supervisor = _SuccessfulSupervisor(usage=BudgetUsage(compute_units=11, wallclock_s=1))
         app = S10SupervisorApp(signing_key=b"test-key", auth=_runtime_auth(), docker_supervisor=supervisor)
+        app.audit.append("budget.reject", {"job_id": "other-job", "budget_id": "other-budget"})
         launch = _launch_body(app)
 
         status, payload = app.http.handle(
@@ -1823,6 +1888,7 @@ class ArgusM0RuntimeServiceTests(unittest.TestCase):
         self.assertIsNotNone(payload["handle"]["launch_provenance_ref"])
         self.assertIn("budget.halt", payload["audit_events"])
         self.assertIn("spend.final", payload["audit_events"])
+        self.assertNotIn("budget.reject", payload["audit_events"])
         spend_records = app.artifacts.query_artifacts({"kind": "spend.final", "job_id": "job-auth"})
         self.assertEqual(len(spend_records), 1)
         spend_payload = json.loads(app.artifacts.get_artifact(spend_records[0].artifact_ref).decode("utf-8"))

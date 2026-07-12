@@ -539,6 +539,7 @@ class S10SupervisorApp:
 
     def _launch_error_payload(self, exc: Exception, launch: LaunchRequest | None) -> dict[str, Any]:
         handle = None
+        ceiling_reject = None
         if launch is not None:
             handles = [
                 asdict(candidate)
@@ -547,15 +548,35 @@ class S10SupervisorApp:
             ]
             if handles:
                 handle = handles[-1]
-        return {
+            ceiling_reject = next(
+                (
+                    dict(event.payload)
+                    for event in reversed(self.audit.events())
+                    if event.event_type == "ceiling.reject" and event.payload.get("job_id") == launch.job_id
+                ),
+                None,
+            )
+        payload = {
             "error": type(exc).__name__,
             "message": str(exc),
             "handle": handle,
-            "audit_events": self._recent_audit_event_types(),
+            "audit_events": self._audit_event_types_for_job(launch.job_id)
+            if launch is not None
+            else self._recent_audit_event_types(),
         }
+        if ceiling_reject is not None:
+            payload["ceiling_reject"] = ceiling_reject
+        return payload
 
     def _recent_audit_event_types(self, *, limit: int = 12) -> list[str]:
         return [event.event_type for event in self.audit.events()[-limit:]]
+
+    def _audit_event_types_for_job(self, job_id: str, *, limit: int = 12) -> list[str]:
+        return [
+            event.event_type
+            for event in self.audit.events()
+            if event.payload.get("job_id") == job_id
+        ][-limit:]
 
 
 def build_app_from_env() -> S10SupervisorApp:
