@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import argparse
+from collections import deque
 from collections.abc import Callable
+from dataclasses import dataclass
 import ipaddress
 import json
 import os
@@ -29,6 +31,103 @@ RELAY_BUFFER_LIMIT_BYTES = 256 * 1024
 DEFAULT_PROXY_PORT = 15001
 DEFAULT_PROXY_UID = 65531
 DEFAULT_SANDBOX_UID = 65532
+
+
+@dataclass(frozen=True)
+class _ExfiltrationReservation:
+    requested_bytes: int
+    permitted_bytes: int
+    dropped_bytes: int
+
+
+@dataclass(frozen=True)
+class _ExfiltrationObservation:
+    attempted_bytes: int
+    dropped_bytes: int
+    bytes_to_upstream: int
+    soft_alert: bool
+    hard_halt: bool
+
+
+class _ExfiltrationByteMeter:
+    """Thread-safe, conservative aggregate byte admission for one sandbox."""
+
+    def __init__(self, *, soft_bytes: int, hard_bytes: int) -> None:
+        if soft_bytes < 1 or hard_bytes <= soft_bytes:
+            raise ValueError("exfil thresholds must be positive and ordered")
+        self._soft_bytes = soft_bytes
+        self._hard_bytes = hard_bytes
+        self._bytes_to_upstream = 0
+        self._reserved_bytes = 0
+        self._attempted_bytes = 0
+        self._dropped_bytes = 0
+        self._soft_alert_emitted = False
+        self._hard_halt_emitted = False
+        self._lock = threading.Lock()
+
+    @property
+    def bytes_to_upstream(self) -> int:
+        with self._lock:
+            return self._bytes_to_upstream
+
+    def reserve(self, requested_bytes: int) -> _ExfiltrationReservation:
+        if isinstance(requested_bytes, bool) or not isinstance(requested_bytes, int) or requested_bytes < 0:
+            raise ValueError("requested exfil bytes must be a non-negative integer")
+        with self._lock:
+            remaining = max(
+                self._hard_bytes - self._bytes_to_upstream - self._reserved_bytes,
+                0,
+            )
+            permitted = min(requested_bytes, remaining)
+            dropped = requested_bytes - permitted
+            self._reserved_bytes += permitted
+            self._attempted_bytes += requested_bytes
+            self._dropped_bytes += dropped
+            return _ExfiltrationReservation(
+                requested_bytes=requested_bytes,
+                permitted_bytes=permitted,
+                dropped_bytes=dropped,
+            )
+
+    def commit(self, sent_bytes: int) -> _ExfiltrationObservation:
+        if isinstance(sent_bytes, bool) or not isinstance(sent_bytes, int) or sent_bytes < 0:
+            raise ValueError("committed exfil bytes must be a non-negative integer")
+        with self._lock:
+            if sent_bytes > self._reserved_bytes:
+                raise ValueError("committed exfil bytes exceed the active reservation")
+            self._reserved_bytes -= sent_bytes
+            self._bytes_to_upstream += sent_bytes
+            soft_alert = (
+                not self._soft_alert_emitted
+                and self._bytes_to_upstream >= self._soft_bytes
+            )
+            hard_halt = (
+                not self._hard_halt_emitted
+                and self._bytes_to_upstream >= self._hard_bytes
+            )
+            if soft_alert:
+                self._soft_alert_emitted = True
+            if hard_halt:
+                self._hard_halt_emitted = True
+            return _ExfiltrationObservation(
+                attempted_bytes=self._attempted_bytes,
+                dropped_bytes=self._dropped_bytes,
+                bytes_to_upstream=self._bytes_to_upstream,
+                soft_alert=soft_alert,
+                hard_halt=hard_halt,
+            )
+
+    def release(self, unsent_bytes: int) -> None:
+        if isinstance(unsent_bytes, bool) or not isinstance(unsent_bytes, int) or unsent_bytes < 0:
+            raise ValueError("released exfil bytes must be a non-negative integer")
+        with self._lock:
+            if unsent_bytes > self._reserved_bytes:
+                raise ValueError("released exfil bytes exceed the active reservation")
+            self._reserved_bytes -= unsent_bytes
+
+    def hard_capacity_reserved(self) -> bool:
+        with self._lock:
+            return self._bytes_to_upstream + self._reserved_bytes >= self._hard_bytes
 
 
 class EgressProxyProtocolError(ValueError):
@@ -96,6 +195,13 @@ class EgressConnectProxy:
         self._audit_sink = audit_sink or (lambda _event_type, _payload: None)
         self._connect_timeout_s = max(float(connect_timeout_s), 0.1)
         self._handshake_timeout_s = max(float(handshake_timeout_s), 0.1)
+        self._exfil_meter = _ExfiltrationByteMeter(
+            soft_bytes=manifest.exfil_thresholds.soft_bytes,
+            hard_bytes=manifest.exfil_thresholds.hard_bytes,
+        )
+        self._exfil_event_lock = threading.Lock()
+        self._pending_exfil_events: dict[int, tuple[str, dict[str, object]]] = {}
+        self._next_exfil_event_sequence = 1
         self._rules_by_destination: dict[tuple[str, int], tuple[EgressRule, ...]] = {}
         for rule in manifest.rules:
             key = (rule.host, rule.port)
@@ -175,8 +281,19 @@ class EgressConnectProxy:
 
             if not tls_protocols:
                 _send_response(client, 200, "Connection Established")
-            if buffered:
-                upstream.sendall(buffered)
+            initial_bytes = _send_metered_payload(
+                upstream,
+                buffered,
+                meter=self._exfil_meter,
+                event_sink=lambda observation: self._emit_exfil_events(
+                    observation,
+                    host=host,
+                    port=port,
+                    proto=proto,
+                    sni=sni,
+                    resolved_ip=pinned_ip,
+                ),
+            )
             self._audit(
                 "egress.allowed",
                 {
@@ -186,13 +303,27 @@ class EgressConnectProxy:
                     "sni": sni,
                     "resolved_ip": pinned_ip,
                     "dns_answer_count": len(answers),
-                    "bytes_to_upstream": len(buffered),
+                    "bytes_to_upstream": initial_bytes,
                     "peer": _peer_label(peer),
                 },
             )
+            if self._exfil_meter.hard_capacity_reserved():
+                return
             client.settimeout(None)
             upstream.settimeout(None)
-            _relay_bidirectional(client, upstream)
+            _relay_bidirectional(
+                client,
+                upstream,
+                outbound_meter=self._exfil_meter,
+                outbound_event_sink=lambda reservation: self._emit_exfil_events(
+                    reservation,
+                    host=host,
+                    port=port,
+                    proto=proto,
+                    sni=sni,
+                    resolved_ip=pinned_ip,
+                ),
+            )
         except (BrokenPipeError, ConnectionError, OSError):
             return
         finally:
@@ -273,6 +404,66 @@ class EgressConnectProxy:
                 **payload,
             },
         )
+
+    def _emit_exfil_events(
+        self,
+        observation: _ExfiltrationObservation,
+        *,
+        host: str,
+        port: int,
+        proto: str,
+        sni: str,
+        resolved_ip: str,
+    ) -> None:
+        common: dict[str, object] = {
+            "host": host,
+            "port": port,
+            "proto": proto,
+            "sni": sni,
+            "resolved_ip": resolved_ip,
+            "bytes_to_upstream": observation.bytes_to_upstream,
+            "attempted_bytes": observation.attempted_bytes,
+        }
+        events: list[tuple[int, str, dict[str, object]]] = []
+        if observation.soft_alert:
+            events.append(
+                (
+                    1,
+                    "egress.exfil_soft_alert",
+                    {
+                        **common,
+                        "threshold_bytes": self._manifest.exfil_thresholds.soft_bytes,
+                        "dropped_bytes": observation.dropped_bytes,
+                        "action": "alert",
+                    },
+                )
+            )
+        if observation.hard_halt:
+            events.append(
+                (
+                    2,
+                    "egress.exfil_hard_halt",
+                    {
+                        **common,
+                        "threshold_bytes": self._manifest.exfil_thresholds.hard_bytes,
+                        "dropped_bytes": observation.dropped_bytes,
+                        "action": "drop_and_halt",
+                    },
+                )
+            )
+        if not events:
+            return
+
+        with self._exfil_event_lock:
+            for sequence, event_type, payload in events:
+                if sequence < self._next_exfil_event_sequence or sequence in self._pending_exfil_events:
+                    raise RuntimeError("duplicate exfil threshold event")
+                self._pending_exfil_events[sequence] = (event_type, payload)
+            while self._next_exfil_event_sequence in self._pending_exfil_events:
+                event_type, payload = self._pending_exfil_events[self._next_exfil_event_sequence]
+                self._audit(event_type, payload)
+                del self._pending_exfil_events[self._next_exfil_event_sequence]
+                self._next_exfil_event_sequence += 1
 
 
 class LinuxEgressFirewall:
@@ -579,12 +770,51 @@ def _connect_numeric(ip: str, port: int, timeout_s: float) -> socket.socket:
     return upstream
 
 
-def _relay_bidirectional(left: socket.socket, right: socket.socket) -> None:
+def _send_metered_payload(
+    target: socket.socket,
+    payload: bytes,
+    *,
+    meter: _ExfiltrationByteMeter,
+    event_sink: Callable[[_ExfiltrationObservation], None],
+) -> int:
+    reservation = meter.reserve(len(payload))
+    permitted = memoryview(payload)[: reservation.permitted_bytes]
+    sent_bytes = 0
+    try:
+        while sent_bytes < len(permitted):
+            sent = target.send(permitted[sent_bytes:])
+            if sent <= 0:
+                raise BrokenPipeError("upstream socket closed during metered send")
+            sent_bytes += sent
+            observation = meter.commit(sent)
+            event_sink(observation)
+    finally:
+        unsent_bytes = reservation.permitted_bytes - sent_bytes
+        if unsent_bytes:
+            meter.release(unsent_bytes)
+    return sent_bytes
+
+
+@dataclass
+class _PendingExfiltrationReservation:
+    remaining_bytes: int
+
+
+def _relay_bidirectional(
+    left: socket.socket,
+    right: socket.socket,
+    *,
+    outbound_meter: _ExfiltrationByteMeter | None = None,
+    outbound_event_sink: Callable[[_ExfiltrationObservation], None] | None = None,
+) -> int:
     selector = selectors.DefaultSelector()
     peers = {left: right, right: left}
     buffers = {left: bytearray(), right: bytearray()}
     read_open = {left: True, right: True}
     write_shutdown = {left: False, right: False}
+    pending_outbound: deque[_PendingExfiltrationReservation] = deque()
+    outbound_bytes = 0
+    hard_drop = False
     for sock in peers:
         sock.setblocking(False)
 
@@ -634,7 +864,22 @@ def _relay_bidirectional(left: socket.socket, right: socket.socket) -> None:
                     except BlockingIOError:
                         chunk = None
                     if chunk:
-                        buffers[target].extend(chunk)
+                        if sock is left and outbound_meter is not None:
+                            reservation = outbound_meter.reserve(len(chunk))
+                            if reservation.permitted_bytes:
+                                buffers[target].extend(chunk[: reservation.permitted_bytes])
+                                pending_outbound.append(
+                                    _PendingExfiltrationReservation(
+                                        remaining_bytes=reservation.permitted_bytes,
+                                    )
+                                )
+                            if outbound_meter.hard_capacity_reserved():
+                                hard_drop = True
+                                read_open[left] = False
+                                read_open[right] = False
+                                buffers[left].clear()
+                        else:
+                            buffers[target].extend(chunk)
                     elif chunk == b"":
                         read_open[sock] = False
                 if mask & selectors.EVENT_WRITE and buffers[sock]:
@@ -644,10 +889,29 @@ def _relay_bidirectional(left: socket.socket, right: socket.socket) -> None:
                         sent = 0
                     if sent > 0:
                         del buffers[sock][:sent]
+                        if sock is right and outbound_meter is not None:
+                            remaining_sent = sent
+                            while remaining_sent > 0 and pending_outbound:
+                                pending = pending_outbound[0]
+                                consumed = min(remaining_sent, pending.remaining_bytes)
+                                pending.remaining_bytes -= consumed
+                                remaining_sent -= consumed
+                                outbound_bytes += consumed
+                                observation = outbound_meter.commit(consumed)
+                                if outbound_event_sink is not None:
+                                    outbound_event_sink(observation)
+                                if pending.remaining_bytes == 0:
+                                    pending_outbound.popleft()
             for sock in peers:
                 refresh(sock)
+            if hard_drop and not buffers[right]:
+                break
     finally:
+        if outbound_meter is not None:
+            for pending in pending_outbound:
+                outbound_meter.release(pending.remaining_bytes)
         selector.close()
+    return outbound_bytes
 
 
 def _send_response(client: socket.socket, status: int, reason: str) -> None:
@@ -777,6 +1041,8 @@ def main(argv: list[str] | None = None) -> None:
             {
                 "sandbox_id": manifest.sandbox_id,
                 "job_id": manifest.job_id,
+                "scope_id": manifest.scope_id,
+                "policy_bundle_version": manifest.policy_bundle_version,
                 "manifest_hash": manifest.manifest_hash,
                 "listen_host": args.listen_host,
                 "listen_port": listener.getsockname()[1],

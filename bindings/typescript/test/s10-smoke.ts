@@ -109,6 +109,10 @@ const policyBundle = {
       "proto": "https"
     }
   ],
+  "exfil_thresholds": {
+    "soft_bytes": 67108864,
+    "hard_bytes": 134217728
+  },
   "resource_ceilings": {
     "cpu_m": 1000,
     "mem_bytes": 536870912,
@@ -126,11 +130,18 @@ const policyBundle = {
   "signature": "hmac-sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
 };
 
-assert.equal(C10_SCHEMA_SHA256, "sha256:44d35c3706762b4b6d1aa7d83598d6dceacaa0e6ee14c940ef92b582f9353523");
+assert.equal(C10_SCHEMA_SHA256, "sha256:9024e26bed52046bf608ea972937683e796d79220fbdce5b4933c479ae7f044f");
 assert.doesNotThrow(() => assertLaunchRequest(launchRequest));
 assert.doesNotThrow(() => assertBudgetToken(launchRequest.budget_token));
 assert.doesNotThrow(() => assertScopeToken(launchRequest.scope_token));
 assert.doesNotThrow(() => assertPolicyBundle(policyBundle));
+assert.throws(
+  () => assertPolicyBundle({
+    ...policyBundle,
+    exfil_thresholds: { soft_bytes: 2048, hard_bytes: 1024 },
+  }),
+  /hard_bytes/,
+);
 
 assert.throws(
   () => assertLaunchRequest({

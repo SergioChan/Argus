@@ -44,6 +44,8 @@ SIGNATURE_PREFIX = "hmac-sha256:"
 TOKEN_ED25519_SIGNATURE_PREFIX = "ed25519:"
 DOCKER_SANDBOX_USER = "65532:65532"
 PARTIAL_RESULT_LOG_CAPTURE_LIMIT_BYTES = 64 * 1024
+DEFAULT_EXFIL_SOFT_BYTES = 64 * 1024 * 1024
+DEFAULT_EXFIL_HARD_BYTES = 128 * 1024 * 1024
 SECRET_VALUE_PATTERNS = (
     re.compile(r"-----BEGIN [A-Z ]+PRIVATE KEY-----"),
     re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
@@ -362,6 +364,26 @@ class ResourceCeilings:
 
 
 @dataclass(frozen=True)
+class ExfilThresholds:
+    soft_bytes: int = DEFAULT_EXFIL_SOFT_BYTES
+    hard_bytes: int = DEFAULT_EXFIL_HARD_BYTES
+
+    def __post_init__(self) -> None:
+        if (
+            isinstance(self.soft_bytes, bool)
+            or not isinstance(self.soft_bytes, int)
+            or self.soft_bytes < 1
+        ):
+            raise ValueError("exfil soft byte threshold must be a positive integer")
+        if (
+            isinstance(self.hard_bytes, bool)
+            or not isinstance(self.hard_bytes, int)
+            or self.hard_bytes <= self.soft_bytes
+        ):
+            raise ValueError("exfil hard byte threshold must be an integer greater than soft_bytes")
+
+
+@dataclass(frozen=True)
 class PolicyBundle:
     bundle_version: str
     egress_allowlist: tuple[EgressRule, ...]
@@ -370,6 +392,7 @@ class PolicyBundle:
     seccomp_profile_hash: str
     signer_key_id: str
     signature: str
+    exfil_thresholds: ExfilThresholds = field(default_factory=ExfilThresholds)
 
 
 @dataclass(frozen=True)
@@ -474,6 +497,7 @@ class _RuntimeHaltSignal:
     reason: str
     dimensions: tuple[str, ...]
     revocation_acknowledged_at: float | None = None
+    source: str = "runtime-token-verifier"
 
 
 @dataclass(frozen=True)
@@ -2150,6 +2174,7 @@ class EgressProxyManifest:
     policy_bundle_version: str
     policy_bundle_hash: str
     scope_token_hash: str
+    exfil_thresholds: ExfilThresholds
     rules: tuple[EgressRule, ...]
     manifest_hash: str
 
@@ -2172,13 +2197,14 @@ class EgressProxyManifest:
         for rule in rules:
             _validate_egress_rule(rule)
         manifest = cls(
-            schema_version=1,
+            schema_version=2,
             sandbox_id=sandbox_id,
             job_id=scope_token.job_id,
             scope_id=scope_token.scope_id,
             policy_bundle_version=policy_bundle.bundle_version,
             policy_bundle_hash=hash_json(asdict(policy_bundle)),
             scope_token_hash=hash_json(asdict(scope_token)),
+            exfil_thresholds=policy_bundle.exfil_thresholds,
             rules=rules,
             manifest_hash="",
         )
@@ -2202,6 +2228,7 @@ class EgressProxyManifest:
             "policy_bundle_version",
             "policy_bundle_hash",
             "scope_token_hash",
+            "exfil_thresholds",
             "rules",
             "manifest_hash",
         }
@@ -2228,6 +2255,16 @@ class EgressProxyManifest:
             )
             _validate_egress_rule(rule)
             rules.append(rule)
+        raw_thresholds = parsed.get("exfil_thresholds")
+        if not isinstance(raw_thresholds, dict) or set(raw_thresholds) != {"soft_bytes", "hard_bytes"}:
+            raise EgressProxyManifestError("egress proxy manifest exfil thresholds are invalid")
+        try:
+            exfil_thresholds = ExfilThresholds(
+                soft_bytes=raw_thresholds["soft_bytes"],
+                hard_bytes=raw_thresholds["hard_bytes"],
+            )
+        except (TypeError, ValueError) as exc:
+            raise EgressProxyManifestError("egress proxy manifest exfil thresholds are invalid") from exc
         scalar_fields = (
             "sandbox_id",
             "job_id",
@@ -2249,6 +2286,7 @@ class EgressProxyManifest:
             policy_bundle_version=parsed["policy_bundle_version"],
             policy_bundle_hash=parsed["policy_bundle_hash"],
             scope_token_hash=parsed["scope_token_hash"],
+            exfil_thresholds=exfil_thresholds,
             rules=tuple(rules),
             manifest_hash=parsed["manifest_hash"],
         )
@@ -2269,6 +2307,7 @@ class EgressProxyManifest:
                 "policy_bundle_version": self.policy_bundle_version,
                 "policy_bundle_hash": self.policy_bundle_hash,
                 "scope_token_hash": self.scope_token_hash,
+                "exfil_thresholds": asdict(self.exfil_thresholds),
                 "rules": [asdict(rule) for rule in self.rules],
             }
         )
@@ -2280,7 +2319,7 @@ class EgressProxyManifest:
         return canonical_json_bytes(asdict(self)).decode("utf-8")
 
     def _validate(self) -> None:
-        if self.schema_version != 1:
+        if self.schema_version != 2:
             raise EgressProxyManifestError("unsupported egress proxy manifest schema version")
         if not all((self.sandbox_id, self.job_id, self.scope_id, self.policy_bundle_version)):
             raise EgressProxyManifestError("egress proxy manifest identity fields are required")
@@ -4502,7 +4541,26 @@ class DockerSandboxSupervisor:
         envelope = request.requested_envelope
         container_id: str | None = None
         sidecar_id: str | None = None
+        seen_egress_events: list[tuple[str, dict[str, Any]]] = []
         started_at = time.monotonic()
+
+        def probe_egress_halt() -> _RuntimeHaltSignal | None:
+            if sidecar_id is None or egress_manifest is None:
+                return None
+            events = self._drain_egress_sidecar_events(
+                sidecar_id=sidecar_id,
+                manifest=egress_manifest,
+                sink=egress_audit_sink,
+                seen_events=seen_egress_events,
+            )
+            if any(event_type == "egress.exfil_hard_halt" for event_type, _ in events):
+                return _RuntimeHaltSignal(
+                    reason="exfil_hard_limit",
+                    dimensions=("exfil_bytes",),
+                    source="egress-sidecar-byte-meter",
+                )
+            return None
+
         try:
             self._ensure_docker_api_runtime_available(security_spec)
             if self._egress_sidecar_config is not None and egress_manifest is not None:
@@ -4612,6 +4670,7 @@ class DockerSandboxSupervisor:
                 started_at=started_at,
                 meter_sample_sink=meter_sample_sink,
                 runtime_halt_probe=runtime_halt_probe,
+                pre_state_halt_probe=probe_egress_halt if sidecar_id is not None else None,
                 halt_telemetry_sink=halt_telemetry_sink,
             )
             if partial_result is None:
@@ -4651,6 +4710,7 @@ class DockerSandboxSupervisor:
                         sidecar_id=sidecar_id,
                         manifest=egress_manifest,
                         sink=egress_audit_sink,
+                        seen_events=seen_egress_events,
                     )
                 except Exception as exc:
                     cleanup_errors.append(exc)
@@ -4878,9 +4938,14 @@ class DockerSandboxSupervisor:
         sidecar_id: str,
         manifest: EgressProxyManifest,
         sink: Callable[[str, dict[str, Any]], None] | None,
+        seen_events: list[tuple[str, dict[str, Any]]],
     ) -> None:
-        capture = self._docker_api_logs(sidecar_id)
-        events = self._parse_egress_sidecar_events(capture, manifest)
+        self._drain_egress_sidecar_events(
+            sidecar_id=sidecar_id,
+            manifest=manifest,
+            sink=sink,
+            seen_events=seen_events,
+        )
         inspected = self._docker_api_request(
             "GET",
             f"/containers/{sidecar_id}/json",
@@ -4888,8 +4953,8 @@ class DockerSandboxSupervisor:
         )
         state = inspected.get("State") if isinstance(inspected, dict) else None
         if isinstance(state, dict) and not state.get("Running", False):
-            events.append(
-                (
+            if sink is not None:
+                sink(
                     "egress.proxy_crashed",
                     {
                         "sandbox_id": manifest.sandbox_id,
@@ -4900,10 +4965,25 @@ class DockerSandboxSupervisor:
                         "exit_code": state.get("ExitCode"),
                     },
                 )
-            )
+
+    def _drain_egress_sidecar_events(
+        self,
+        *,
+        sidecar_id: str,
+        manifest: EgressProxyManifest,
+        sink: Callable[[str, dict[str, Any]], None] | None,
+        seen_events: list[tuple[str, dict[str, Any]]],
+    ) -> list[tuple[str, dict[str, Any]]]:
+        capture = self._docker_api_logs(sidecar_id)
+        events = self._parse_egress_sidecar_events(capture, manifest)
+        if events[: len(seen_events)] != seen_events:
+            raise SandboxRuntimeUnavailableError("egress sidecar audit stream changed after ingestion")
+        new_events = events[len(seen_events) :]
+        seen_events[:] = events
         if sink is not None:
-            for event_type, payload in events:
+            for event_type, payload in new_events:
                 sink(event_type, payload)
+        return new_events
 
     @staticmethod
     def _parse_egress_sidecar_events(
@@ -4931,6 +5011,8 @@ class DockerSandboxSupervisor:
             for field_name, expected in (
                 ("sandbox_id", manifest.sandbox_id),
                 ("job_id", manifest.job_id),
+                ("scope_id", manifest.scope_id),
+                ("policy_bundle_version", manifest.policy_bundle_version),
                 ("manifest_hash", manifest.manifest_hash),
             ):
                 if payload.get(field_name) != expected:
@@ -4947,6 +5029,46 @@ class DockerSandboxSupervisor:
                     },
                 )
             )
+        threshold_events = [
+            (index, event_type, payload)
+            for index, (event_type, payload) in enumerate(events)
+            if event_type in {"egress.exfil_soft_alert", "egress.exfil_hard_halt"}
+        ]
+        threshold_types = [event_type for _, event_type, _ in threshold_events]
+        if len(threshold_types) != len(set(threshold_types)):
+            raise SandboxRuntimeUnavailableError("egress sidecar emitted duplicate exfil threshold events")
+        if "egress.exfil_hard_halt" in threshold_types:
+            if "egress.exfil_soft_alert" not in threshold_types or threshold_types.index(
+                "egress.exfil_soft_alert"
+            ) > threshold_types.index("egress.exfil_hard_halt"):
+                raise SandboxRuntimeUnavailableError("egress sidecar hard threshold preceded its soft alert")
+        for _, event_type, payload in threshold_events:
+            expected_threshold = (
+                manifest.exfil_thresholds.soft_bytes
+                if event_type == "egress.exfil_soft_alert"
+                else manifest.exfil_thresholds.hard_bytes
+            )
+            expected_action = "alert" if event_type == "egress.exfil_soft_alert" else "drop_and_halt"
+            bytes_to_upstream = payload.get("bytes_to_upstream")
+            attempted_bytes = payload.get("attempted_bytes")
+            dropped_bytes = payload.get("dropped_bytes")
+            if (
+                isinstance(bytes_to_upstream, bool)
+                or not isinstance(bytes_to_upstream, int)
+                or bytes_to_upstream < expected_threshold
+                or bytes_to_upstream > manifest.exfil_thresholds.hard_bytes
+                or payload.get("threshold_bytes") != expected_threshold
+                or payload.get("action") != expected_action
+                or isinstance(dropped_bytes, bool)
+                or not isinstance(dropped_bytes, int)
+                or dropped_bytes < 0
+                or isinstance(attempted_bytes, bool)
+                or not isinstance(attempted_bytes, int)
+                or attempted_bytes < bytes_to_upstream + dropped_bytes
+            ):
+                raise SandboxRuntimeUnavailableError("egress sidecar emitted invalid exfil threshold evidence")
+            if event_type == "egress.exfil_hard_halt" and bytes_to_upstream != expected_threshold:
+                raise SandboxRuntimeUnavailableError("egress sidecar hard threshold byte count differs from policy")
         return events
 
     def _ensure_docker_api_runtime_available(self, security_spec: SandboxSecuritySpec) -> None:
@@ -5039,6 +5161,7 @@ class DockerSandboxSupervisor:
         started_at: float,
         meter_sample_sink: Callable[[ResourceMeterSample], None] | None,
         runtime_halt_probe: Callable[[], _RuntimeHaltSignal | tuple[str, tuple[str, ...]] | None] | None = None,
+        pre_state_halt_probe: Callable[[], _RuntimeHaltSignal | tuple[str, tuple[str, ...]] | None] | None = None,
         halt_telemetry_sink: Callable[[SandboxHaltTelemetry], None] | None = None,
     ) -> tuple[int | None, bool, str, BudgetUsage, SandboxPartialResult | None]:
         envelope = request.requested_envelope
@@ -5053,6 +5176,47 @@ class DockerSandboxSupervisor:
             last_sample_at = time.monotonic()
             if meter_sample_sink is not None:
                 meter_sample_sink(sample)
+
+        def halt_from_signal(
+            signal_value: _RuntimeHaltSignal | tuple[str, tuple[str, ...]],
+            *,
+            now: float,
+            elapsed_s: float,
+            default_source: str,
+        ) -> tuple[int | None, bool, str, BudgetUsage, SandboxPartialResult]:
+            nonlocal sample_seq
+            if isinstance(signal_value, _RuntimeHaltSignal):
+                reason = signal_value.reason
+                dimensions = signal_value.dimensions
+                revocation_acknowledged_at = signal_value.revocation_acknowledged_at
+                source = signal_value.source
+            else:
+                reason, dimensions = signal_value
+                revocation_acknowledged_at = None
+                source = default_source
+            sample_seq += 1
+            sample = ResourceMeterSample(
+                sample_seq=sample_seq,
+                elapsed_s=elapsed_s,
+                cadence_s=0.0 if last_sample_at is None else max(now - last_sample_at, 0.0),
+                usage=_runtime_budget_usage(envelope, elapsed_s),
+                source=source,
+                **self._gpu_telemetry_sample_fields(),
+                breached_dimensions=dimensions or (reason,),
+                halted=True,
+            )
+            emit(sample)
+            return self._kill_metered_container(
+                container_id=container_id,
+                request=request,
+                started_at=started_at,
+                reason=reason,
+                last_sample=sample,
+                sample_seq=sample_seq,
+                meter_sample_sink=meter_sample_sink,
+                halt_telemetry_sink=halt_telemetry_sink,
+                revocation_acknowledged_at=revocation_acknowledged_at,
+            )
 
         while True:
             now = time.monotonic()
@@ -5083,6 +5247,15 @@ class DockerSandboxSupervisor:
                     halt_telemetry_sink=halt_telemetry_sink,
                 )
 
+            pre_state_halt = pre_state_halt_probe() if pre_state_halt_probe is not None else None
+            if pre_state_halt is not None:
+                return halt_from_signal(
+                    pre_state_halt,
+                    now=now,
+                    elapsed_s=elapsed_s,
+                    default_source="runtime-security-probe",
+                )
+
             state = self._docker_api_request("GET", f"/containers/{container_id}/json", expected=(200,), timeout=1)
             container_state = state.get("State") or {}
             if not container_state.get("Running", False):
@@ -5107,35 +5280,11 @@ class DockerSandboxSupervisor:
 
             runtime_halt = runtime_halt_probe() if runtime_halt_probe is not None else None
             if runtime_halt is not None:
-                if isinstance(runtime_halt, _RuntimeHaltSignal):
-                    reason = runtime_halt.reason
-                    dimensions = runtime_halt.dimensions
-                    revocation_acknowledged_at = runtime_halt.revocation_acknowledged_at
-                else:
-                    reason, dimensions = runtime_halt
-                    revocation_acknowledged_at = None
-                sample_seq += 1
-                sample = ResourceMeterSample(
-                    sample_seq=sample_seq,
+                return halt_from_signal(
+                    runtime_halt,
+                    now=now,
                     elapsed_s=elapsed_s,
-                    cadence_s=0.0 if last_sample_at is None else max(now - last_sample_at, 0.0),
-                    usage=_runtime_budget_usage(envelope, elapsed_s),
-                    source="runtime-token-verifier",
-                    **self._gpu_telemetry_sample_fields(),
-                    breached_dimensions=dimensions or (reason,),
-                    halted=True,
-                )
-                emit(sample)
-                return self._kill_metered_container(
-                    container_id=container_id,
-                    request=request,
-                    started_at=started_at,
-                    reason=reason,
-                    last_sample=sample,
-                    sample_seq=sample_seq,
-                    meter_sample_sink=meter_sample_sink,
-                    halt_telemetry_sink=halt_telemetry_sink,
-                    revocation_acknowledged_at=revocation_acknowledged_at,
+                    default_source="runtime-token-verifier",
                 )
 
             if now >= next_sample_at:
@@ -5872,6 +6021,7 @@ def _launch_exec_environment(
             asdict(rule)
             for rule in sorted(verdict.egress_acl, key=lambda item: (item.host, item.port, item.proto))
         ],
+        "exfil_thresholds": asdict(policy_bundle.exfil_thresholds),
         "cgroup_limits": asdict(request.requested_envelope),
         "policy_bundle_version": policy_bundle.bundle_version,
         "seccomp_profile_hash": policy_bundle.seccomp_profile_hash,

@@ -12,7 +12,7 @@ pub use c1::{Acceptance, CostEstimate as C1CostEstimate, LifecycleEvent, Lifecyc
 pub use c4::{ArtifactRecord, ClaimTier, Lineage, Producer, RetentionPolicy, C4_SCHEMA_SHA256};
 pub use hash::{hash_blob, hash_blob_stream, hash_bytes, BlobHasher, HashBlob, HashBlobError, BLAKE3_PREFIX, CANON_VERSION};
 pub use ledger::{ArtifactRecordDraft, MerkleCheckpoint, PostgresLedgerWriter};
-pub use s10::{AuditEvent, BudgetCaps, BudgetToken, BudgetUsage, EgressDecision, EgressRule, LaunchEnvelope, LaunchRequest, PolicyBundle, PolicyVerdict, QuotaState, ResourceCeilings, S8CheckpointSignature, SandboxExecutionResult, SandboxHandle, SandboxPartialResult, ScopeGrant, ScopeToken, StoreBrokerHandle, C10_SCHEMA_SHA256};
+pub use s10::{AuditEvent, BudgetCaps, BudgetToken, BudgetUsage, EgressDecision, EgressRule, ExfilThresholds, LaunchEnvelope, LaunchRequest, PolicyBundle, PolicyVerdict, QuotaState, ResourceCeilings, S8CheckpointSignature, SandboxExecutionResult, SandboxHandle, SandboxPartialResult, ScopeGrant, ScopeToken, StoreBrokerHandle, C10_SCHEMA_SHA256};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Contract {
@@ -27,7 +27,7 @@ pub struct Contract {
 
 pub const CONTRACTS: &[Contract] = &[
     Contract { id: "C1", name: "Subagent Contract", owner: "S1", version: "1.0.0", schema: "c1.subagent.schema.json", schema_sha256: "sha256:70de039b4c9687e9ce83ed5dc0ff444c681dd068cf79b8c1d6138bfd9c4b56d5", consumers: &["S2", "S3", "S4", "S5", "S11", "S12"] },
-    Contract { id: "C10", name: "S10 Runtime Wire Models", owner: "S10", version: "4.0.0", schema: "c10.s10-runtime.schema.json", schema_sha256: "sha256:44d35c3706762b4b6d1aa7d83598d6dceacaa0e6ee14c940ef92b582f9353523", consumers: &["S1", "S2", "S3", "S4", "S5", "S6", "S7", "S8", "S9", "S11", "S12"] },
+    Contract { id: "C10", name: "S10 Runtime Wire Models", owner: "S10", version: "5.0.0", schema: "c10.s10-runtime.schema.json", schema_sha256: "sha256:9024e26bed52046bf608ea972937683e796d79220fbdce5b4933c479ae7f044f", consumers: &["S1", "S2", "S3", "S4", "S5", "S6", "S7", "S8", "S9", "S11", "S12"] },
     Contract { id: "C2", name: "Task Job Envelope", owner: "S5", version: "1.0.0", schema: "c2.job-envelope.schema.json", schema_sha256: "sha256:62695e9f6e4cda8ab9f9089d595f36ca3cf395e0f40100be35938a838b334360", consumers: &["S1", "S2", "S3", "S4", "S7", "S9", "S10", "S11", "S12"] },
     Contract { id: "C3", name: "Verifier Interface and Validation Report", owner: "S3", version: "2.0.0", schema: "c3.validation-report.schema.json", schema_sha256: "sha256:cb69e705e30999d11bab218710ae45ead928be617cab2d2148b8ec01d3892ac5", consumers: &["S1", "S2", "S4", "S5", "S7", "S8", "S9", "S11", "S12"] },
     Contract { id: "C4", name: "Artifact and Provenance Record", owner: "S8", version: "1.0.0", schema: "c4.artifact-record.schema.json", schema_sha256: "sha256:32d5caf1f5f57b4c1da2eb7dc81e31f7423c834f6945e3839ffc6356fc4d35de", consumers: &["S1", "S2", "S3", "S4", "S5", "S6", "S7", "S9", "S10", "S11", "S12"] },

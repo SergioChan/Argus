@@ -31,7 +31,7 @@ EXPECTED_CONTRACT_VERSIONS = {
     "C4": "1.0.0",
     "C5": "2.0.0",
     "C6": "2.3.0",
-    "C10": "4.0.0",
+    "C10": "5.0.0",
 }
 
 C3_V11_FIELDS = {
@@ -94,6 +94,7 @@ C10_REQUIRED_DEFS = {
     "BudgetUsage",
     "EgressDecision",
     "EgressRule",
+    "ExfilThresholds",
     "LaunchEnvelope",
     "LaunchRequest",
     "PolicyBundle",
@@ -342,6 +343,8 @@ def validate_contract_schema(entry: dict) -> None:
         policy_bundle = definitions.get("PolicyBundle", {})
         if policy_bundle.get("properties", {}).get("signature", {}).get("$ref") != "#/$defs/Signature":
             fail("C10 PolicyBundle.signature must reference Signature")
+        if policy_bundle.get("properties", {}).get("exfil_thresholds", {}).get("$ref") != "#/$defs/ExfilThresholds":
+            fail("C10 PolicyBundle.exfil_thresholds must reference ExfilThresholds")
         for token_def in ("BudgetToken", "ScopeToken"):
             token_signature = definitions.get(token_def, {}).get("properties", {}).get("signature", {})
             if token_signature.get("$ref") != "#/$defs/TokenSignature":

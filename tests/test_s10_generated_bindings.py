@@ -27,6 +27,7 @@ from argus_contracts import (  # noqa: E402
     CONTRACT_BY_ID,
     EgressDecision,
     EgressRule,
+    ExfilThresholds,
     LaunchEnvelope,
     LaunchRequest,
     PolicyBundle,
@@ -57,6 +58,7 @@ C10_RUNTIME_FIELD_GUARDS = (
     ("BudgetUsage", runtime_s10.BudgetUsage, BudgetUsage),
     ("EgressDecision", runtime_s10.EgressDecision, EgressDecision),
     ("EgressRule", runtime_s10.EgressRule, EgressRule),
+    ("ExfilThresholds", runtime_s10.ExfilThresholds, ExfilThresholds),
     ("LaunchEnvelope", runtime_s10.LaunchEnvelope, LaunchEnvelope),
     ("LaunchRequest", runtime_s10.LaunchRequest, LaunchRequest),
     ("PolicyBundle", runtime_s10.PolicyBundle, PolicyBundle),
@@ -84,6 +86,7 @@ class S10GeneratedBindingsTests(unittest.TestCase):
         self.assertEqual(launch_request.image, self.launch_request["image"])
         self.assertEqual(launch_request.budget_token.job_id, "job-s10-golden")
         self.assertEqual(policy_bundle.risk_to_runtime["standard"], "gvisor")
+        self.assertEqual(policy_bundle.exfil_thresholds.hard_bytes, 134_217_728)
         self.assertEqual(C10_SCHEMA_SHA256, CONTRACT_BY_ID["C10"].schema_sha256)
 
     def test_c10_python_binding_rejects_schema_violations(self) -> None:
@@ -91,6 +94,8 @@ class S10GeneratedBindingsTests(unittest.TestCase):
         duplicate_allowlist = copy.deepcopy(self.launch_request)
         duplicate_allowlist["env_allowlist"] = ["ARGUS_MODE", "ARGUS_MODE"]
         bad_policy_signature = {**copy.deepcopy(self.policy_bundle), "signature": "hmac-sha256:bad"}
+        reversed_exfil_thresholds = copy.deepcopy(self.policy_bundle)
+        reversed_exfil_thresholds["exfil_thresholds"] = {"soft_bytes": 2_048, "hard_bytes": 1_024}
 
         with self.assertRaises(ValidationError):
             validate_launch_request(tag_only_image)
@@ -98,6 +103,8 @@ class S10GeneratedBindingsTests(unittest.TestCase):
             validate_launch_request(duplicate_allowlist)
         with self.assertRaises(ValidationError):
             validate_policy_bundle(bad_policy_signature)
+        with self.assertRaises(ValidationError):
+            validate_policy_bundle(reversed_exfil_thresholds)
 
     def test_c10_python_binding_accepts_ed25519_tokens_only(self) -> None:
         ed25519_launch = copy.deepcopy(self.launch_request)

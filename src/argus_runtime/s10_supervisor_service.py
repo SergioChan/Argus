@@ -22,6 +22,7 @@ from argus_core import (
     DockerSandboxOrchestrator,
     DockerSandboxSupervisor,
     Ed25519KmsTokenSigner,
+    ExfilThresholds,
     FileTokenRevocationStore,
     FirecrackerRuntimeConfig,
     FirecrackerSandboxSupervisor,
@@ -336,6 +337,8 @@ class S10SupervisorApp:
                 "status": "ok",
                 "policy_bundle_version": self.policy.bundle_version,
                 "policy_signer_key_id": self.policy.signer_key_id,
+                "exfil_soft_bytes": self.policy.exfil_thresholds.soft_bytes,
+                "exfil_hard_bytes": self.policy.exfil_thresholds.hard_bytes,
                 "checkpoint_signer": self.checkpoint_signer.kind if self.checkpoint_signer is not None else "unconfigured",
                 "verifier_key_provider": "s10-kms" if self.verifier_key_provider is not None else "unconfigured",
                 "verifier_key_epoch": self.verifier_key_provider.epoch if self.verifier_key_provider is not None else None,
@@ -938,6 +941,10 @@ def _default_policy_bundle() -> PolicyBundle:
     return PolicyBundle(
         bundle_version="argus-m0-dev",
         egress_allowlist=(),
+        exfil_thresholds=ExfilThresholds(
+            soft_bytes=int(os.environ.get("ARGUS_S10_EXFIL_SOFT_BYTES", str(64 * 1024 * 1024))),
+            hard_bytes=int(os.environ.get("ARGUS_S10_EXFIL_HARD_BYTES", str(128 * 1024 * 1024))),
+        ),
         resource_ceilings=ResourceCeilings(
             cpu_m=1_000,
             mem_bytes=128 * 1024 * 1024,

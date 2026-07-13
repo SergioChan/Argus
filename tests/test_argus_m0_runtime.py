@@ -2001,6 +2001,8 @@ class ArgusM0RuntimeServiceTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(payload["policy_bundle_version"], "argus-m0-dev")
         self.assertEqual(payload["policy_signer_key_id"], "argus-m0-policy")
+        self.assertEqual(payload["exfil_soft_bytes"], 64 * 1024 * 1024)
+        self.assertEqual(payload["exfil_hard_bytes"], 128 * 1024 * 1024)
         self.assertEqual(payload["checkpoint_signer"], "s10-kms")
         self.assertEqual(payload["token_signer"], "local-hmac")
         self.assertEqual(payload["token_signature_algorithm"], "hmac-sha256")
@@ -2052,6 +2054,49 @@ class ArgusM0RuntimeServiceTests(unittest.TestCase):
                 build_s10_app_from_env()
         with patch.dict(os.environ, {**base_env, "ARGUS_S10_METER_GAP_HALT_S": "not-a-number"}, clear=True):
             with self.assertRaisesRegex(RuntimeError, "ARGUS_S10_METER_GAP_HALT_S"):
+                build_s10_app_from_env()
+
+    def test_s10_env_build_exposes_signed_exfil_thresholds_and_rejects_invalid_order(self) -> None:
+        base_env = {
+            "ARGUS_S10_SIGNING_KEY": "test-s10-signing-key",
+            "ARGUS_RUNTIME_BOOTSTRAP_TOKEN": BOOTSTRAP_TOKEN,
+            "ARGUS_RUNTIME_IDENTITY_SIGNING_KEY": IDENTITY_SIGNING_KEY.decode("utf-8"),
+            "ARGUS_RUNTIME_IDENTITY_MINT_POLICY_JSON": _runtime_identity_mint_policy_json(),
+            "ARGUS_M0_HEALTH_TOKEN": HEALTH_TOKEN,
+            "ARGUS_S10_POLICY_SIGNING_KEY": POLICY_SIGNING_KEY,
+            "ARGUS_S10_CHECKPOINT_SIGNING_KEY": CHECKPOINT_SIGNING_KEY,
+            "ARGUS_S10_CHECKPOINT_SIGNER_AUTH_TOKEN": CHECKPOINT_SIGNER_AUTH_TOKEN,
+        }
+        with patch.dict(
+            os.environ,
+            {
+                **base_env,
+                "ARGUS_S10_EXFIL_SOFT_BYTES": "1024",
+                "ARGUS_S10_EXFIL_HARD_BYTES": "2048",
+            },
+            clear=True,
+        ):
+            app = build_s10_app_from_env()
+            status, payload = app.http.handle(
+                JsonRequest(method="GET", path="/healthz", query={}, body=None, headers=_auth_headers(HEALTH_TOKEN))
+            )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(app.policy.exfil_thresholds.soft_bytes, 1024)
+        self.assertEqual(app.policy.exfil_thresholds.hard_bytes, 2048)
+        self.assertEqual(payload["exfil_soft_bytes"], 1024)
+        self.assertEqual(payload["exfil_hard_bytes"], 2048)
+
+        with patch.dict(
+            os.environ,
+            {
+                **base_env,
+                "ARGUS_S10_EXFIL_SOFT_BYTES": "2048",
+                "ARGUS_S10_EXFIL_HARD_BYTES": "2048",
+            },
+            clear=True,
+        ):
+            with self.assertRaisesRegex(ValueError, "greater than soft_bytes"):
                 build_s10_app_from_env()
 
     def test_s10_env_build_can_use_ed25519_token_signer_and_public_verifier(self) -> None:
@@ -2797,6 +2842,14 @@ class ArgusM0ComposeTests(unittest.TestCase):
         self.assertEqual(
             services["s10-supervisor"]["environment"]["ARGUS_S10_DEFAULT_RUNTIME_CLASS"],
             "docker",
+        )
+        self.assertEqual(
+            services["s10-supervisor"]["environment"]["ARGUS_S10_EXFIL_SOFT_BYTES"],
+            "67108864",
+        )
+        self.assertEqual(
+            services["s10-supervisor"]["environment"]["ARGUS_S10_EXFIL_HARD_BYTES"],
+            "134217728",
         )
         self.assertEqual(
             services["s10-supervisor"]["environment"]["ARGUS_S10_GVISOR_KUBERNETES_RUNTIME_CLASS"],

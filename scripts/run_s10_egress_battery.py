@@ -22,6 +22,8 @@ from typing import Any
 
 
 FIXTURE_PORT = 8443
+TC33_SOFT_BYTES = 16 * 1024
+TC33_HARD_BYTES = 32 * 1024
 FIREWALL_BINARIES = ("iptables", "ip6tables")
 FIREWALL_IPV4_BIN, FIREWALL_IPV6_BIN = FIREWALL_BINARIES
 
@@ -206,6 +208,46 @@ def _run_sandbox_fixture() -> None:
     print(json.dumps({"sandbox_results": results}, sort_keys=True), flush=True)
     print("PHASE post-crash-complete", flush=True)
     wait_for_release(phase_release_event, "post-crash-complete")
+
+
+def _run_exfil_sandbox_fixture() -> None:
+    proxy_host, proxy_port = _proxy_address(os.environ["ARGUS_EGRESS_PROXY"])
+    release_event = threading.Event()
+    signal.signal(signal.SIGUSR1, lambda _signum, _frame: release_event.set())
+    print("PHASE exfil-ready", flush=True)
+    if not release_event.wait(timeout=10):
+        raise RuntimeError("host did not release the exfiltration stream")
+
+    connection, backend_label = _open_tls_tunnel(
+        proxy_host,
+        proxy_port,
+        "allowed.test",
+        FIXTURE_PORT,
+    )
+    streamed_bytes = 0
+    payload = b"argus-tc33-exfil" * 256
+    try:
+        while streamed_bytes < TC33_HARD_BYTES * 2:
+            connection.sendall(payload)
+            streamed_bytes += len(payload)
+            _readline(connection)
+    except (BrokenPipeError, ConnectionError, OSError, RuntimeError, TimeoutError):
+        pass
+    finally:
+        connection.close()
+    print(
+        json.dumps(
+            {
+                "exfil_stream": {
+                    "backend": backend_label,
+                    "attempted_payload_bytes": streamed_bytes,
+                }
+            },
+            sort_keys=True,
+        ),
+        flush=True,
+    )
+    time.sleep(10)
 
 
 def _proxy_address(proxy_url: str) -> tuple[str, int]:
@@ -659,6 +701,16 @@ def _execute_host_battery(repo: Path) -> dict[str, Any]:
                     + json.dumps(failure_detail, sort_keys=True, separators=(",", ":"))
                 )
 
+            tc33 = _run_tc33_case(
+                repo=repo,
+                job_id=f"{job_id}-tc33",
+                sidecar_image=sidecar_image,
+                probe_image=probe_image,
+                network_name=network_name,
+                dns_ip=dns_ip,
+                backend_container=fixture_names["backend_b"],
+            )
+
             cases = {
                 "S10-TC03": {
                     "status": "PASS",
@@ -689,6 +741,7 @@ def _execute_host_battery(repo: Path) -> dict[str, Any]:
                     "default_drop_v6": "-P OUTPUT DROP" in post_firewall_v6,
                     "network_interface_removed": post_capture.interface_disappeared,
                 },
+                "S10-TC33": tc33,
             }
             return {
                 "images": {
@@ -702,8 +755,8 @@ def _execute_host_battery(repo: Path) -> dict[str, Any]:
                     "backend_ips": [backend_a_ip, backend_b_ip],
                 },
                 "cases": cases,
-                "pass_count": 3,
-                "total_count": 3,
+                "pass_count": 4,
+                "total_count": 4,
                 "audit": {
                     "chain_valid": True,
                     "egress_event_types": [event.event_type for event in egress_events],
@@ -785,6 +838,9 @@ def _build_runtime(
     dns_ip: str,
     backend_a_ip: str,
     backend_b_ip: str,
+    fixture: str = "sandbox",
+    exfil_soft_bytes: int = 64 * 1024 * 1024,
+    exfil_hard_bytes: int = 128 * 1024 * 1024,
 ) -> dict[str, Any]:
     from argus_core import (
         BudgetCaps,
@@ -792,6 +848,7 @@ def _build_runtime(
         DockerSandboxSupervisor,
         EgressRule,
         EgressSidecarRuntimeConfig,
+        ExfilThresholds,
         InMemoryArtifactStore,
         InMemoryAuditLedger,
         InMemoryPolicyBundleTrustStore,
@@ -813,6 +870,10 @@ def _build_runtime(
         PolicyBundle(
             bundle_version="2.0.0",
             egress_allowlist=(rule,),
+            exfil_thresholds=ExfilThresholds(
+                soft_bytes=exfil_soft_bytes,
+                hard_bytes=exfil_hard_bytes,
+            ),
             resource_ceilings=ResourceCeilings(
                 cpu_m=500,
                 mem_bytes=128 * 1024 * 1024,
@@ -845,7 +906,7 @@ def _build_runtime(
         scope_token=scope,
         image=probe_image,
         entrypoint=("python",),
-        args=("/opt/argus/run_s10_egress_battery.py", "--fixture", "sandbox"),
+        args=("/opt/argus/run_s10_egress_battery.py", "--fixture", fixture),
         env={
             "ARGUS_EGRESS_TEST_DNS_IP": dns_ip,
             "ARGUS_EGRESS_TEST_BACKEND_A_IP": backend_a_ip,
@@ -886,6 +947,162 @@ def _build_runtime(
         supervisor=supervisor,
     )
     return {"audit": audit, "orchestrator": orchestrator, "request": request}
+
+
+def _run_tc33_case(
+    *,
+    repo: Path,
+    job_id: str,
+    sidecar_image: str,
+    probe_image: str,
+    network_name: str,
+    dns_ip: str,
+    backend_container: str,
+) -> dict[str, Any]:
+    before_backend_events = _container_events(backend_container, cwd=repo)
+    state = _build_runtime(
+        job_id=job_id,
+        sidecar_image=sidecar_image,
+        probe_image=probe_image,
+        network_name=network_name,
+        dns_ip=dns_ip,
+        backend_a_ip="unused",
+        backend_b_ip="unused",
+        fixture="exfil-sandbox",
+        exfil_soft_bytes=TC33_SOFT_BYTES,
+        exfil_hard_bytes=TC33_HARD_BYTES,
+    )
+    runtime_thread: threading.Thread | None = None
+
+    def launch() -> None:
+        try:
+            state["result"] = state["orchestrator"].launch_and_wait(state["request"])
+        except BaseException as exc:
+            state["error"] = exc
+
+    try:
+        runtime_thread = threading.Thread(target=launch, name="s10-tc33-runtime", daemon=True)
+        runtime_thread.start()
+        sandbox_name = _wait_for_role_container(
+            job_id,
+            "sandbox",
+            cwd=repo,
+            timeout=10,
+            thread=runtime_thread,
+            state=state,
+        )
+        _wait_for_role_container(
+            job_id,
+            "egress-sidecar",
+            cwd=repo,
+            timeout=10,
+            thread=runtime_thread,
+            state=state,
+        )
+        _wait_for_log(
+            sandbox_name,
+            "PHASE exfil-ready",
+            cwd=repo,
+            timeout=10,
+            thread=runtime_thread,
+            state=state,
+        )
+        _command(["docker", "kill", "--signal", "USR1", sandbox_name], cwd=repo)
+        runtime_thread.join(timeout=30)
+        if runtime_thread.is_alive():
+            raise RuntimeError("TC33 runtime did not halt after the hard exfil threshold")
+        if "error" in state:
+            raise state["error"]
+
+        result = state["result"]
+        partial = result.partial_result
+        audit = state["audit"]
+        if not audit.verify_chain().valid:
+            raise RuntimeError("TC33 audit chain failed verification")
+        audit_events = audit.events()
+        event_types = [event.event_type for event in audit_events]
+        soft_events = [event for event in audit_events if event.event_type == "egress.exfil_soft_alert"]
+        hard_events = [event for event in audit_events if event.event_type == "egress.exfil_hard_halt"]
+        new_backend_events = _container_events(backend_container, cwd=repo)[len(before_backend_events) :]
+        backend_byte_events = [event for event in new_backend_events if event["event_type"] == "backend.bytes"]
+        backend_bytes = sum(int(event["payload"]["count"]) for event in backend_byte_events)
+        accepted_connections = sum(
+            event["event_type"] == "backend.accepted" for event in new_backend_events
+        )
+        required_order = [
+            "egress.exfil_soft_alert",
+            "egress.exfil_hard_halt",
+            "meter.halt",
+            "sandbox.freeze",
+            "sandbox.terminate",
+        ]
+        ordered = all(event_type in event_types for event_type in required_order) and all(
+            event_types.index(left) < event_types.index(right)
+            for left, right in zip(required_order, required_order[1:])
+        )
+        meter_halts = [event for event in audit_events if event.event_type == "meter.halt"]
+        soft_payload = soft_events[0].payload if soft_events else {}
+        hard_payload = hard_events[0].payload if hard_events else {}
+        meter_payload = meter_halts[0].payload if meter_halts else {}
+        passed = all(
+            (
+                result.timed_out,
+                partial is not None,
+                partial is not None and partial.reason == "exfil_hard_limit",
+                partial is not None and partial.freeze_succeeded,
+                partial is not None and partial.terminate_succeeded,
+                len(soft_events) == 1,
+                len(hard_events) == 1,
+                soft_payload.get("threshold_bytes") == TC33_SOFT_BYTES,
+                soft_payload.get("action") == "alert",
+                TC33_SOFT_BYTES
+                <= int(soft_payload.get("bytes_to_upstream", 0))
+                <= TC33_HARD_BYTES,
+                hard_payload.get("threshold_bytes") == TC33_HARD_BYTES,
+                hard_payload.get("bytes_to_upstream") == TC33_HARD_BYTES,
+                hard_payload.get("action") == "drop_and_halt",
+                int(hard_payload.get("dropped_bytes", 0)) > 0,
+                accepted_connections == 1,
+                TC33_SOFT_BYTES <= backend_bytes <= TC33_HARD_BYTES,
+                ordered,
+                len(meter_halts) == 1,
+                meter_payload.get("source") == "egress-sidecar-byte-meter",
+            )
+        )
+        detail = {
+            "status": "PASS" if passed else "FAIL",
+            "soft_threshold_bytes": TC33_SOFT_BYTES,
+            "hard_threshold_bytes": TC33_HARD_BYTES,
+            "backend_bytes_received": backend_bytes,
+            "backend_connection_count": accepted_connections,
+            "soft_alert_count": len(soft_events),
+            "hard_halt_count": len(hard_events),
+            "soft_alert_bytes": soft_payload.get("bytes_to_upstream"),
+            "soft_action": soft_payload.get("action"),
+            "hard_halt_bytes": hard_payload.get("bytes_to_upstream"),
+            "hard_drop_bytes": hard_payload.get("dropped_bytes"),
+            "hard_action": hard_payload.get("action"),
+            "meter_source": meter_payload.get("source"),
+            "runtime_timed_out": result.timed_out,
+            "partial_reason": partial.reason if partial is not None else None,
+            "freeze_succeeded": partial.freeze_succeeded if partial is not None else False,
+            "terminate_succeeded": partial.terminate_succeeded if partial is not None else False,
+            "ordered_audit": ordered,
+            "audit_event_types": event_types,
+            "audit_chain_valid": True,
+        }
+        if not passed:
+            raise RuntimeError(
+                "TC33 exfiltration threshold acceptance failed: "
+                + json.dumps(detail, sort_keys=True, separators=(",", ":"))
+            )
+        return detail
+    finally:
+        if runtime_thread is not None and runtime_thread.is_alive():
+            for role in ("sandbox", "egress-sidecar"):
+                for name in _role_containers(job_id, role, cwd=repo, all_states=True):
+                    _command(["docker", "rm", "--force", name], cwd=repo, check=False)
+            runtime_thread.join(timeout=5)
 
 
 def _start_fixture(
@@ -1167,7 +1384,7 @@ def _write_evidence(path: Path, evidence: dict[str, Any]) -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--evidence-file", type=Path)
-    parser.add_argument("--fixture", choices=("dns", "backend", "sandbox"))
+    parser.add_argument("--fixture", choices=("dns", "backend", "sandbox", "exfil-sandbox"))
     parser.add_argument("--answer-a")
     parser.add_argument("--answer-b")
     parser.add_argument("--backend-label")
@@ -1188,6 +1405,9 @@ def main(argv: list[str] | None = None) -> None:
         return
     if args.fixture == "sandbox":
         _run_sandbox_fixture()
+        return
+    if args.fixture == "exfil-sandbox":
+        _run_exfil_sandbox_fixture()
         return
     if args.evidence_file is None:
         raise SystemExit("host battery requires --evidence-file")

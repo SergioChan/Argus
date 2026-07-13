@@ -1002,6 +1002,10 @@ def _battery_runtime_auth_required(
         raise AssertionError(f"S10 did not activate the signed M0 price table: {s10_health}")
     if s10_health.get("price_table_signer_key_id") != "argus-m0-price-table":
         raise AssertionError(f"S10 did not report the M0 price table signer: {s10_health}")
+    if s10_health.get("exfil_soft_bytes") != 64 * 1024 * 1024:
+        raise AssertionError(f"S10 did not activate the default signed soft exfil threshold: {s10_health}")
+    if s10_health.get("exfil_hard_bytes") != 128 * 1024 * 1024:
+        raise AssertionError(f"S10 did not activate the default signed hard exfil threshold: {s10_health}")
     if s10_health.get("resource_meter") != "docker-api-cgroup":
         raise AssertionError(f"S10 did not activate the Docker API cgroup resource meter: {s10_health}")
     if float(s10_health.get("meter_interval_s", 999)) > 5:
@@ -1045,6 +1049,8 @@ def _battery_runtime_auth_required(
             "s10_quota_ledger": s10_health["quota_ledger"],
             "s10_price_table": s10_health["price_table"],
             "s10_price_table_signer_key_id": s10_health["price_table_signer_key_id"],
+            "s10_exfil_soft_bytes": s10_health["exfil_soft_bytes"],
+            "s10_exfil_hard_bytes": s10_health["exfil_hard_bytes"],
             "s10_resource_meter": s10_health["resource_meter"],
             "s10_meter_interval_s": s10_health["meter_interval_s"],
             "s10_meter_gap_halt_s": s10_health["meter_gap_halt_s"],

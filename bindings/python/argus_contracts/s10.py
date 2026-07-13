@@ -4,10 +4,10 @@ from __future__ import annotations
 
 from typing import Annotated, Any, Literal, Mapping
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
-C10_SCHEMA_SHA256 = "sha256:44d35c3706762b4b6d1aa7d83598d6dceacaa0e6ee14c940ef92b582f9353523"
+C10_SCHEMA_SHA256 = "sha256:9024e26bed52046bf608ea972937683e796d79220fbdce5b4933c479ae7f044f"
 
 ArtifactRef = Annotated[str, Field(pattern=r"^c4://[A-Za-z0-9._:/-]+$")]
 HashRef = Annotated[str, Field(pattern=r"^blake3:[a-f0-9]{64}$")]
@@ -126,11 +126,25 @@ class ResourceCeilings(BaseModel):
     max_cost_usd: float = Field(ge=0)
 
 
+class ExfilThresholds(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    soft_bytes: int = Field(ge=1)
+    hard_bytes: int = Field(ge=2)
+
+    @model_validator(mode="after")
+    def _hard_exceeds_soft(self) -> "ExfilThresholds":
+        if self.hard_bytes <= self.soft_bytes:
+            raise ValueError("hard_bytes must be greater than soft_bytes")
+        return self
+
+
 class PolicyBundle(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     bundle_version: Annotated[str, Field(pattern=r"^\d+\.\d+\.\d+$")]
     egress_allowlist: list[EgressRule]
+    exfil_thresholds: ExfilThresholds
     resource_ceilings: ResourceCeilings
     risk_to_runtime: dict[RiskClass, RuntimeClass]
     seccomp_profile_hash: HashRef

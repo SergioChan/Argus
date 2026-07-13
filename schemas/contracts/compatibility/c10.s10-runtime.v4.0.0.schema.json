@@ -6,7 +6,7 @@
   "x-argus-contract": {
     "id": "C10",
     "owner": "S10",
-    "version": "5.0.0"
+    "version": "4.0.0"
   },
   "oneOf": [
     { "$ref": "#/$defs/BudgetToken" },
@@ -208,21 +208,11 @@
         "max_cost_usd": { "type": "number", "minimum": 0 }
       }
     },
-    "ExfilThresholds": {
-      "type": "object",
-      "required": ["soft_bytes", "hard_bytes"],
-      "additionalProperties": false,
-      "properties": {
-        "soft_bytes": { "type": "integer", "minimum": 1 },
-        "hard_bytes": { "type": "integer", "minimum": 2 }
-      }
-    },
     "PolicyBundle": {
       "type": "object",
       "required": [
         "bundle_version",
         "egress_allowlist",
-        "exfil_thresholds",
         "resource_ceilings",
         "risk_to_runtime",
         "seccomp_profile_hash",
@@ -237,7 +227,6 @@
           "items": { "$ref": "#/$defs/EgressRule" },
           "uniqueItems": true
         },
-        "exfil_thresholds": { "$ref": "#/$defs/ExfilThresholds" },
         "resource_ceilings": { "$ref": "#/$defs/ResourceCeilings" },
         "risk_to_runtime": {
           "type": "object",

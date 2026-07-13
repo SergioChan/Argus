@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-pub const C10_SCHEMA_SHA256: &str = "sha256:44d35c3706762b4b6d1aa7d83598d6dceacaa0e6ee14c940ef92b582f9353523";
+pub const C10_SCHEMA_SHA256: &str = "sha256:9024e26bed52046bf608ea972937683e796d79220fbdce5b4933c479ae7f044f";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -131,10 +131,26 @@ pub struct ResourceCeilings {
     pub max_cost_usd: f64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExfilThresholds {
+    pub soft_bytes: u64,
+    pub hard_bytes: u64,
+}
+
+impl ExfilThresholds {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.soft_bytes == 0 || self.hard_bytes <= self.soft_bytes {
+            return Err("exfil hard_bytes must be greater than positive soft_bytes");
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PolicyBundle {
     pub bundle_version: String,
     pub egress_allowlist: Vec<EgressRule>,
+    pub exfil_thresholds: ExfilThresholds,
     pub resource_ceilings: ResourceCeilings,
     pub risk_to_runtime: BTreeMap<String, RuntimeClass>,
     pub seccomp_profile_hash: String,
@@ -153,6 +169,7 @@ impl PolicyBundle {
         if self.risk_to_runtime.is_empty() {
             return Err("risk_to_runtime must not be empty");
         }
+        self.exfil_thresholds.validate()?;
         Ok(())
     }
 }
@@ -429,6 +446,10 @@ mod tests {
                                     "proto": "https"
                         }
             ],
+            "exfil_thresholds": {
+                        "soft_bytes": 67108864,
+                        "hard_bytes": 134217728
+            },
             "resource_ceilings": {
                         "cpu_m": 1000,
                         "mem_bytes": 536870912,

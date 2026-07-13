@@ -28,13 +28,14 @@ class C10ContractSchemaTests(unittest.TestCase):
         Draft202012Validator.check_schema(cls.schema)
         cls.validator = Draft202012Validator(cls.schema)
 
-    def test_schema_is_canonical_c10_v4(self) -> None:
+    def test_schema_is_canonical_c10_v5(self) -> None:
         definitions = self.schema["$defs"]
 
-        self.assertEqual(self.schema["x-argus-contract"], {"id": "C10", "owner": "S10", "version": "4.0.0"})
+        self.assertEqual(self.schema["x-argus-contract"], {"id": "C10", "owner": "S10", "version": "5.0.0"})
         for name in (
             "BudgetToken",
             "ScopeToken",
+            "ExfilThresholds",
             "PolicyBundle",
             "LaunchRequest",
             "PolicyVerdict",
@@ -80,10 +81,22 @@ class C10ContractSchemaTests(unittest.TestCase):
         policy["signature"] = "ed25519:" + "a" * 128
         self._assert_invalid(policy)
 
+    def test_policy_bundle_requires_positive_exfil_thresholds(self) -> None:
+        policy = json.loads((EXAMPLES / "c10.policy-bundle.example.json").read_text(encoding="utf-8"))
+        self.assertEqual(policy["exfil_thresholds"], {"soft_bytes": 67_108_864, "hard_bytes": 134_217_728})
+
+        missing = dict(policy)
+        missing.pop("exfil_thresholds")
+        self._assert_invalid(missing)
+
+        zero_soft = json.loads(json.dumps(policy))
+        zero_soft["exfil_thresholds"]["soft_bytes"] = 0
+        self._assert_invalid(zero_soft)
+
     def test_generated_python_binding_points_to_exact_c10_schema_digest(self) -> None:
         contract = CONTRACT_BY_ID["C10"]
 
-        self.assertEqual(contract.version, "4.0.0")
+        self.assertEqual(contract.version, "5.0.0")
         self.assertEqual(contract.schema, "c10.s10-runtime.schema.json")
         self.assertEqual(contract.schema_sha256, self._schema_sha256(self.schema))
 

@@ -300,6 +300,7 @@ def render_python_init() -> str:
             "    C10_SCHEMA_SHA256,",
             "    EgressDecision,",
             "    EgressRule,",
+            "    ExfilThresholds,",
             "    LaunchEnvelope,",
             "    LaunchRequest,",
             "    PolicyBundle,",
@@ -343,6 +344,7 @@ def render_python_init() -> str:
             '    "LaunchRequest",',
             '    "EgressDecision",',
             '    "EgressRule",',
+            '    "ExfilThresholds",',
             '    "PolicyBundle",',
             '    "PolicyVerdict",',
             '    "Producer",',
@@ -1674,7 +1676,7 @@ from __future__ import annotations
 
 from typing import Annotated, Any, Literal, Mapping
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 C10_SCHEMA_SHA256 = "{c10_schema_sha256}"
@@ -1796,11 +1798,25 @@ class ResourceCeilings(BaseModel):
     max_cost_usd: float = Field(ge=0)
 
 
+class ExfilThresholds(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    soft_bytes: int = Field(ge=1)
+    hard_bytes: int = Field(ge=2)
+
+    @model_validator(mode="after")
+    def _hard_exceeds_soft(self) -> "ExfilThresholds":
+        if self.hard_bytes <= self.soft_bytes:
+            raise ValueError("hard_bytes must be greater than soft_bytes")
+        return self
+
+
 class PolicyBundle(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     bundle_version: Annotated[str, Field(pattern=r"^\\d+\\.\\d+\\.\\d+$")]
     egress_allowlist: list[EgressRule]
+    exfil_thresholds: ExfilThresholds
     resource_ceilings: ResourceCeilings
     risk_to_runtime: dict[RiskClass, RuntimeClass]
     seccomp_profile_hash: HashRef
@@ -2034,9 +2050,15 @@ export interface ResourceCeilings {{
   max_cost_usd: number;
 }}
 
+export interface ExfilThresholds {{
+  soft_bytes: number;
+  hard_bytes: number;
+}}
+
 export interface PolicyBundle {{
   bundle_version: string;
   egress_allowlist: readonly EgressRule[];
+  exfil_thresholds: ExfilThresholds;
   resource_ceilings: ResourceCeilings;
   risk_to_runtime: Record<string, RuntimeClass>;
   seccomp_profile_hash: string;
@@ -2219,6 +2241,7 @@ export function assertPolicyBundle(payload: unknown): asserts payload is PolicyB
   assertKeys(record, [
     "bundle_version",
     "egress_allowlist",
+    "exfil_thresholds",
     "resource_ceilings",
     "risk_to_runtime",
     "seccomp_profile_hash",
@@ -2227,6 +2250,7 @@ export function assertPolicyBundle(payload: unknown): asserts payload is PolicyB
   ], "policy_bundle");
   assertPattern(record.bundle_version, semverPattern, "policy_bundle.bundle_version");
   assertEgressRuleArray(record.egress_allowlist, "policy_bundle.egress_allowlist");
+  assertExfilThresholds(record.exfil_thresholds, "policy_bundle.exfil_thresholds");
   assertResourceCeilings(record.resource_ceilings, "policy_bundle.resource_ceilings");
   assertRuntimeMapping(record.risk_to_runtime, "policy_bundle.risk_to_runtime");
   assertPattern(record.seccomp_profile_hash, hashRefPattern, "policy_bundle.seccomp_profile_hash");
@@ -2304,6 +2328,16 @@ function assertResourceCeilings(value: unknown, path: string): void {{
   assertNonNegativeInteger(record.gpu_count, path + ".gpu_count");
   assertPositiveInteger(record.wallclock_s, path + ".wallclock_s");
   assertNonNegativeNumber(record.max_cost_usd, path + ".max_cost_usd");
+}}
+
+function assertExfilThresholds(value: unknown, path: string): void {{
+  const record = assertRecord(value, path);
+  assertKeys(record, ["soft_bytes", "hard_bytes"], path);
+  assertPositiveInteger(record.soft_bytes, path + ".soft_bytes");
+  assertPositiveInteger(record.hard_bytes, path + ".hard_bytes");
+  if ((record.hard_bytes as number) <= (record.soft_bytes as number)) {{
+    throw new TypeError(path + ".hard_bytes must be greater than soft_bytes");
+  }}
 }}
 
 function assertRuntimeMapping(value: unknown, path: string): void {{
@@ -2478,6 +2512,13 @@ assert.doesNotThrow(() => assertLaunchRequest(launchRequest));
 assert.doesNotThrow(() => assertBudgetToken(launchRequest.budget_token));
 assert.doesNotThrow(() => assertScopeToken(launchRequest.scope_token));
 assert.doesNotThrow(() => assertPolicyBundle(policyBundle));
+assert.throws(
+  () => assertPolicyBundle({{
+    ...policyBundle,
+    exfil_thresholds: {{ soft_bytes: 2048, hard_bytes: 1024 }},
+  }}),
+  /hard_bytes/,
+);
 
 assert.throws(
   () => assertLaunchRequest({{
@@ -2958,7 +2999,7 @@ def render_rust_lib(items: list[dict]) -> str:
             "pub use c4::{ArtifactRecord, ClaimTier, Lineage, Producer, RetentionPolicy, C4_SCHEMA_SHA256};",
             "pub use hash::{hash_blob, hash_blob_stream, hash_bytes, BlobHasher, HashBlob, HashBlobError, BLAKE3_PREFIX, CANON_VERSION};",
             "pub use ledger::{ArtifactRecordDraft, MerkleCheckpoint, PostgresLedgerWriter};",
-            "pub use s10::{AuditEvent, BudgetCaps, BudgetToken, BudgetUsage, EgressDecision, EgressRule, LaunchEnvelope, LaunchRequest, PolicyBundle, PolicyVerdict, QuotaState, ResourceCeilings, S8CheckpointSignature, SandboxExecutionResult, SandboxHandle, SandboxPartialResult, ScopeGrant, ScopeToken, StoreBrokerHandle, C10_SCHEMA_SHA256};",
+            "pub use s10::{AuditEvent, BudgetCaps, BudgetToken, BudgetUsage, EgressDecision, EgressRule, ExfilThresholds, LaunchEnvelope, LaunchRequest, PolicyBundle, PolicyVerdict, QuotaState, ResourceCeilings, S8CheckpointSignature, SandboxExecutionResult, SandboxHandle, SandboxPartialResult, ScopeGrant, ScopeToken, StoreBrokerHandle, C10_SCHEMA_SHA256};",
             "",
             "#[derive(Debug, Clone, Copy, PartialEq, Eq)]",
             "pub struct Contract {",
@@ -3258,10 +3299,26 @@ pub struct ResourceCeilings {{
     pub max_cost_usd: f64,
 }}
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExfilThresholds {{
+    pub soft_bytes: u64,
+    pub hard_bytes: u64,
+}}
+
+impl ExfilThresholds {{
+    pub fn validate(&self) -> Result<(), &'static str> {{
+        if self.soft_bytes == 0 || self.hard_bytes <= self.soft_bytes {{
+            return Err("exfil hard_bytes must be greater than positive soft_bytes");
+        }}
+        Ok(())
+    }}
+}}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PolicyBundle {{
     pub bundle_version: String,
     pub egress_allowlist: Vec<EgressRule>,
+    pub exfil_thresholds: ExfilThresholds,
     pub resource_ceilings: ResourceCeilings,
     pub risk_to_runtime: BTreeMap<String, RuntimeClass>,
     pub seccomp_profile_hash: String,
@@ -3280,6 +3337,7 @@ impl PolicyBundle {{
         if self.risk_to_runtime.is_empty() {{
             return Err("risk_to_runtime must not be empty");
         }}
+        self.exfil_thresholds.validate()?;
         Ok(())
     }}
 }}

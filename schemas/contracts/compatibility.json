@@ -54,6 +54,11 @@
       "id": "C10",
       "baseline_version": "3.0.0",
       "baseline_schema": "compatibility/c10.s10-runtime.v3.0.0.schema.json"
+    },
+    {
+      "id": "C10",
+      "baseline_version": "4.0.0",
+      "baseline_schema": "compatibility/c10.s10-runtime.v4.0.0.schema.json"
     }
   ]
 }

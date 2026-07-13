@@ -33,7 +33,7 @@ export const contracts = [
     "id": "C10",
     "name": "S10 Runtime Wire Models",
     "owner": "S10",
-    "version": "4.0.0",
+    "version": "5.0.0",
     "schema": "c10.s10-runtime.schema.json",
     "consumers": [
       "S1",
@@ -48,7 +48,7 @@ export const contracts = [
       "S11",
       "S12"
     ],
-    "schema_sha256": "sha256:44d35c3706762b4b6d1aa7d83598d6dceacaa0e6ee14c940ef92b582f9353523"
+    "schema_sha256": "sha256:9024e26bed52046bf608ea972937683e796d79220fbdce5b4933c479ae7f044f"
   },
   {
     "id": "C2",

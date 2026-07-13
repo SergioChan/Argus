@@ -27,6 +27,26 @@ class EgressRule:
 
 
 @dataclass(frozen=True)
+class ExfilThresholds:
+    soft_bytes: int
+    hard_bytes: int
+
+    def validate(self) -> None:
+        if (
+            isinstance(self.soft_bytes, bool)
+            or not isinstance(self.soft_bytes, int)
+            or self.soft_bytes < 1
+        ):
+            raise EgressProxyManifestError("egress soft byte threshold is invalid")
+        if (
+            isinstance(self.hard_bytes, bool)
+            or not isinstance(self.hard_bytes, int)
+            or self.hard_bytes <= self.soft_bytes
+        ):
+            raise EgressProxyManifestError("egress hard byte threshold is invalid")
+
+
+@dataclass(frozen=True)
 class EgressProxyManifest:
     schema_version: int
     sandbox_id: str
@@ -35,6 +55,7 @@ class EgressProxyManifest:
     policy_bundle_version: str
     policy_bundle_hash: str
     scope_token_hash: str
+    exfil_thresholds: ExfilThresholds
     rules: tuple[EgressRule, ...]
     manifest_hash: str
 
@@ -56,6 +77,7 @@ class EgressProxyManifest:
             "policy_bundle_version",
             "policy_bundle_hash",
             "scope_token_hash",
+            "exfil_thresholds",
             "rules",
             "manifest_hash",
         }
@@ -82,6 +104,14 @@ class EgressProxyManifest:
             )
             validate_egress_rule(rule)
             rules.append(rule)
+        raw_thresholds = parsed.get("exfil_thresholds")
+        if not isinstance(raw_thresholds, dict) or set(raw_thresholds) != {"soft_bytes", "hard_bytes"}:
+            raise EgressProxyManifestError("egress proxy manifest exfil thresholds are invalid")
+        thresholds = ExfilThresholds(
+            soft_bytes=raw_thresholds["soft_bytes"],
+            hard_bytes=raw_thresholds["hard_bytes"],
+        )
+        thresholds.validate()
         scalar_fields = (
             "sandbox_id",
             "job_id",
@@ -103,6 +133,7 @@ class EgressProxyManifest:
             policy_bundle_version=parsed["policy_bundle_version"],
             policy_bundle_hash=parsed["policy_bundle_hash"],
             scope_token_hash=parsed["scope_token_hash"],
+            exfil_thresholds=thresholds,
             rules=tuple(rules),
             manifest_hash=parsed["manifest_hash"],
         )
@@ -123,12 +154,13 @@ class EgressProxyManifest:
                 "policy_bundle_version": self.policy_bundle_version,
                 "policy_bundle_hash": self.policy_bundle_hash,
                 "scope_token_hash": self.scope_token_hash,
+                "exfil_thresholds": asdict(self.exfil_thresholds),
                 "rules": [asdict(rule) for rule in self.rules],
             }
         )
 
     def validate(self) -> None:
-        if self.schema_version != 1:
+        if self.schema_version != 2:
             raise EgressProxyManifestError("unsupported egress proxy manifest schema version")
         if not all((self.sandbox_id, self.job_id, self.scope_id, self.policy_bundle_version)):
             raise EgressProxyManifestError("egress proxy manifest identity fields are required")
@@ -136,6 +168,7 @@ class EgressProxyManifest:
             raise EgressProxyManifestError("egress proxy manifest policy hash is invalid")
         if not self.scope_token_hash.startswith(BLAKE3_PREFIX):
             raise EgressProxyManifestError("egress proxy manifest scope hash is invalid")
+        self.exfil_thresholds.validate()
         if tuple(sorted(self.rules, key=lambda rule: (rule.host, rule.port, rule.proto))) != self.rules:
             raise EgressProxyManifestError("egress proxy manifest rules must be sorted")
         if len(set(self.rules)) != len(self.rules):

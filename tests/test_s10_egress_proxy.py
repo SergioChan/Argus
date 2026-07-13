@@ -20,6 +20,7 @@ from argus_core import (
     EgressProxyManifestError,
     EgressRule,
     EgressSidecarRuntimeConfig,
+    ExfilThresholds,
     InMemoryTokenService,
     LaunchEnvelope,
     LaunchRequest,
@@ -34,7 +35,9 @@ from argus_egress import EgressProxyManifest as SidecarEgressProxyManifest
 from argus_runtime.s10_egress_proxy_service import (
     EgressConnectProxy,
     LinuxEgressFirewall,
+    _ExfiltrationByteMeter,
     _relay_bidirectional,
+    _send_metered_payload,
 )
 from argus_runtime.s10_supervisor_service import _egress_sidecar_runtime_config_from_env
 from scripts import run_s10_egress_battery as egress_battery
@@ -77,7 +80,31 @@ class EgressProxyManifestTests(unittest.TestCase):
         self.assertEqual(manifest.rules, (self.allowed,))
         self.assertEqual(manifest.scope_id, self.scope.scope_id)
         self.assertEqual(manifest.policy_bundle_version, "2.0.0")
+        self.assertEqual(manifest.schema_version, 2)
+        self.assertEqual(manifest.exfil_thresholds, self.bundle.exfil_thresholds)
         self.assertTrue(manifest.manifest_hash.startswith("blake3:"))
+
+    def test_exfil_thresholds_are_content_bound_and_ordered(self) -> None:
+        thresholds = ExfilThresholds(soft_bytes=1_024, hard_bytes=2_048)
+        bundle = PolicyBundleSigner(key_id="policy-key", secret=b"policy-secret").sign(
+            replace(self.bundle, exfil_thresholds=thresholds, signer_key_id="", signature="")
+        )
+        manifest = EgressProxyManifest.materialize(
+            sandbox_id="sandbox-1",
+            scope_token=self.scope,
+            policy_bundle=bundle,
+        )
+        payload = json.loads(manifest.to_json())
+
+        self.assertEqual(payload["exfil_thresholds"], {"soft_bytes": 1_024, "hard_bytes": 2_048})
+        payload["exfil_thresholds"]["hard_bytes"] = 4_096
+        with self.assertRaisesRegex(EgressProxyManifestError, "hash"):
+            EgressProxyManifest.from_json(json.dumps(payload), expected_hash=manifest.manifest_hash)
+
+        for soft_bytes, hard_bytes in ((0, 2), (2, 2), (3, 2)):
+            with self.subTest(soft_bytes=soft_bytes, hard_bytes=hard_bytes):
+                with self.assertRaises(ValueError):
+                    ExfilThresholds(soft_bytes=soft_bytes, hard_bytes=hard_bytes)
 
     def test_expected_hash_rejects_manifest_drift(self) -> None:
         manifest = EgressProxyManifest.materialize(
@@ -107,6 +134,8 @@ class EgressProxyManifestTests(unittest.TestCase):
         self.assertEqual(parsed.sandbox_id, manifest.sandbox_id)
         self.assertEqual(parsed.job_id, manifest.job_id)
         self.assertEqual(parsed.scope_id, manifest.scope_id)
+        self.assertEqual(parsed.exfil_thresholds.soft_bytes, manifest.exfil_thresholds.soft_bytes)
+        self.assertEqual(parsed.exfil_thresholds.hard_bytes, manifest.exfil_thresholds.hard_bytes)
         self.assertEqual(
             tuple((rule.host, rule.port, rule.proto) for rule in parsed.rules),
             tuple((rule.host, rule.port, rule.proto) for rule in manifest.rules),
@@ -267,6 +296,198 @@ class EgressConnectProxyTests(unittest.TestCase):
         self.assertEqual(sender_errors, [])
         self.assertEqual(relay_errors, [])
         self.assertEqual(bytes(received), payload)
+
+    def test_signed_soft_and_hard_thresholds_alert_then_truncate_and_drop(self) -> None:
+        hello = _client_hello("allowed.test")
+        thresholds = ExfilThresholds(
+            soft_bytes=len(hello) + 4,
+            hard_bytes=len(hello) + 8,
+        )
+        unsigned_manifest = replace(
+            self.manifest,
+            exfil_thresholds=thresholds,
+            manifest_hash="",
+        )
+        manifest = replace(unsigned_manifest, manifest_hash=unsigned_manifest.computed_hash())
+        events: list[tuple[str, dict[str, object]]] = []
+        proxy = EgressConnectProxy(
+            manifest=SidecarEgressProxyManifest.from_json(
+                manifest.to_json(),
+                expected_hash=manifest.manifest_hash,
+            ),
+            resolver=self.resolver,
+            connector=self.connector,
+            audit_sink=lambda event_type, payload: events.append((event_type, payload)),
+            handshake_timeout_s=0.5,
+        )
+        client, accepted = socket.socketpair()
+        client.settimeout(1)
+        worker = threading.Thread(
+            target=proxy.handle_connection,
+            args=(accepted, ("local", 0)),
+            daemon=True,
+        )
+        worker.start()
+
+        client.sendall(b"CONNECT allowed.test:443 HTTP/1.1\r\nHost: allowed.test:443\r\n\r\n")
+        self.assertIn(b"200", _read_headers(client))
+        client.sendall(hello)
+        upstream = self.connector.wait_for_peer()
+        self.assertEqual(_recv_exact(upstream, len(hello)), hello)
+        client.sendall(b"0123456789abcdef")
+
+        self.assertEqual(_recv_exact(upstream, 8), b"01234567")
+        worker.join(timeout=1)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(client.recv(1), b"")
+        client.close()
+        upstream.close()
+
+        threshold_events = [item for item in events if item[0].startswith("egress.exfil_")]
+        self.assertEqual(
+            [event_type for event_type, _ in threshold_events],
+            ["egress.exfil_soft_alert", "egress.exfil_hard_halt"],
+        )
+        soft_payload = threshold_events[0][1]
+        hard_payload = threshold_events[1][1]
+        self.assertEqual(soft_payload["threshold_bytes"], thresholds.soft_bytes)
+        self.assertGreaterEqual(soft_payload["bytes_to_upstream"], thresholds.soft_bytes)
+        self.assertEqual(soft_payload["action"], "alert")
+        self.assertEqual(hard_payload["threshold_bytes"], thresholds.hard_bytes)
+        self.assertEqual(hard_payload["bytes_to_upstream"], thresholds.hard_bytes)
+        self.assertEqual(hard_payload["dropped_bytes"], 8)
+        self.assertEqual(hard_payload["action"], "drop_and_halt")
+
+    def test_exfil_meter_enforces_one_aggregate_hard_cap_under_concurrency(self) -> None:
+        meter = _ExfiltrationByteMeter(soft_bytes=16, hard_bytes=32)
+        barrier = threading.Barrier(8)
+        reservations = []
+        lock = threading.Lock()
+
+        def reserve() -> None:
+            barrier.wait()
+            result = meter.reserve(8)
+            with lock:
+                reservations.append(result)
+
+        workers = [threading.Thread(target=reserve, daemon=True) for _ in range(8)]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join(timeout=1)
+
+        self.assertFalse(any(worker.is_alive() for worker in workers))
+        self.assertEqual(sum(item.permitted_bytes for item in reservations), 32)
+        self.assertEqual(sum(item.dropped_bytes for item in reservations), 32)
+        observations = [
+            meter.commit(item.permitted_bytes)
+            for item in reservations
+            if item.permitted_bytes
+        ]
+        self.assertEqual(sum(item.soft_alert for item in observations), 1)
+        self.assertEqual(sum(item.hard_halt for item in observations), 1)
+        self.assertEqual(meter.bytes_to_upstream, 32)
+
+    def test_concurrent_threshold_callbacks_publish_soft_before_hard(self) -> None:
+        thresholds = ExfilThresholds(soft_bytes=16, hard_bytes=32)
+        unsigned_manifest = replace(
+            self.manifest,
+            exfil_thresholds=thresholds,
+            manifest_hash="",
+        )
+        manifest = replace(unsigned_manifest, manifest_hash=unsigned_manifest.computed_hash())
+        events: list[tuple[str, dict[str, object]]] = []
+        proxy = EgressConnectProxy(
+            manifest=SidecarEgressProxyManifest.from_json(
+                manifest.to_json(),
+                expected_hash=manifest.manifest_hash,
+            ),
+            resolver=self.resolver,
+            connector=self.connector,
+            audit_sink=lambda event_type, payload: events.append((event_type, payload)),
+        )
+        meter = _ExfiltrationByteMeter(soft_bytes=16, hard_bytes=32)
+        soft_committed = threading.Event()
+        release_soft_callback = threading.Event()
+        worker_errors: list[BaseException] = []
+
+        def publish(observation: object) -> None:
+            proxy._emit_exfil_events(  # type: ignore[arg-type]
+                observation,
+                host="allowed.test",
+                port=443,
+                proto="https",
+                sni="allowed.test",
+                resolved_ip="127.0.0.2",
+            )
+
+        def cross_soft_threshold() -> None:
+            try:
+                reservation = meter.reserve(16)
+                observation = meter.commit(reservation.permitted_bytes)
+                soft_committed.set()
+                if not release_soft_callback.wait(timeout=1):
+                    raise TimeoutError("hard threshold callback did not complete")
+                publish(observation)
+            except BaseException as exc:
+                worker_errors.append(exc)
+
+        def cross_hard_threshold() -> None:
+            try:
+                if not soft_committed.wait(timeout=1):
+                    raise TimeoutError("soft threshold was not committed")
+                reservation = meter.reserve(16)
+                observation = meter.commit(reservation.permitted_bytes)
+                publish(observation)
+            except BaseException as exc:
+                worker_errors.append(exc)
+            finally:
+                release_soft_callback.set()
+
+        soft_worker = threading.Thread(target=cross_soft_threshold, daemon=True)
+        hard_worker = threading.Thread(target=cross_hard_threshold, daemon=True)
+        soft_worker.start()
+        hard_worker.start()
+        soft_worker.join(timeout=2)
+        hard_worker.join(timeout=2)
+
+        self.assertFalse(soft_worker.is_alive())
+        self.assertFalse(hard_worker.is_alive())
+        self.assertEqual(worker_errors, [])
+        self.assertEqual(
+            [event_type for event_type, _ in events],
+            ["egress.exfil_soft_alert", "egress.exfil_hard_halt"],
+        )
+
+    def test_meter_releases_unsent_capacity_after_partial_upstream_failure(self) -> None:
+        class PartialSendSocket:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def send(self, payload: memoryview) -> int:
+                self.calls += 1
+                if self.calls == 1:
+                    return min(len(payload), 8)
+                raise BrokenPipeError("fixture upstream closed")
+
+        meter = _ExfiltrationByteMeter(soft_bytes=16, hard_bytes=32)
+        observations = []
+        with self.assertRaises(BrokenPipeError):
+            _send_metered_payload(
+                PartialSendSocket(),  # type: ignore[arg-type]
+                b"x" * 32,
+                meter=meter,
+                event_sink=observations.append,
+            )
+
+        self.assertEqual(meter.bytes_to_upstream, 8)
+        self.assertFalse(any(item.soft_alert or item.hard_halt for item in observations))
+        retry = meter.reserve(32)
+        self.assertEqual(retry.permitted_bytes, 24)
+        final = meter.commit(retry.permitted_bytes)
+        self.assertTrue(final.soft_alert)
+        self.assertTrue(final.hard_halt)
+        self.assertEqual(final.bytes_to_upstream, 32)
 
     def _start_handler(self) -> tuple[socket.socket, threading.Thread]:
         client, accepted = socket.socketpair()
@@ -708,6 +929,69 @@ class DockerEgressSidecarTests(unittest.TestCase):
             any("sandbox cleanup failed" in note for note in getattr(raised.exception, "__notes__", ()))
         )
 
+    def test_live_hard_limit_event_is_ingested_once_before_freeze_and_terminate(self) -> None:
+        supervisor = _CapturingEgressDockerSupervisor(self.config, emit_exfil_halt=True)
+        events: list[tuple[str, dict[str, object]]] = []
+        samples = []
+        halt_telemetry = []
+
+        result = supervisor.run(
+            handle=self.handle,
+            request=self.request,
+            materialized_env={},
+            policy_bundle=self.bundle,
+            egress_audit_sink=lambda event_type, payload: events.append((event_type, payload)),
+            meter_sample_sink=samples.append,
+            halt_telemetry_sink=halt_telemetry.append,
+        )
+
+        self.assertTrue(result.timed_out)
+        self.assertIsNotNone(result.partial_result)
+        assert result.partial_result is not None
+        self.assertEqual(result.partial_result.reason, "exfil_hard_limit")
+        self.assertTrue(result.partial_result.freeze_succeeded)
+        self.assertTrue(result.partial_result.terminate_succeeded)
+        self.assertEqual(
+            [event_type for event_type, _ in events],
+            ["egress.ready", "egress.exfil_soft_alert", "egress.exfil_hard_halt"],
+        )
+        self.assertEqual(sum(event_type == "egress.exfil_hard_halt" for event_type, _ in events), 1)
+        hard_payload = events[-1][1]
+        self.assertEqual(hard_payload["bytes_to_upstream"], self.bundle.exfil_thresholds.hard_bytes)
+        self.assertTrue(any(sample.source == "egress-sidecar-byte-meter" for sample in samples))
+        self.assertTrue(any("exfil_bytes" in sample.breached_dimensions for sample in samples))
+        self.assertEqual(len(halt_telemetry), 1)
+        self.assertEqual(halt_telemetry[0].reason, "exfil_hard_limit")
+
+        paths = [(method, path) for method, path, _ in supervisor.calls]
+        pause_index = paths.index(("POST", "/containers/sandbox-container-id/pause"))
+        kill_index = paths.index(("POST", "/containers/sandbox-container-id/kill"))
+        self.assertLess(pause_index, kill_index)
+
+    def test_malformed_hard_limit_evidence_cannot_trigger_a_trusted_halt(self) -> None:
+        malformed_cases = (
+            {"hard_event_byte_delta": -1},
+            {"hard_event_attempted_delta": 0},
+        )
+        for overrides in malformed_cases:
+            with self.subTest(overrides=overrides):
+                supervisor = _CapturingEgressDockerSupervisor(
+                    self.config,
+                    emit_exfil_halt=True,
+                    **overrides,
+                )
+
+                with self.assertRaisesRegex(SandboxRuntimeUnavailableError, "exfil threshold"):
+                    supervisor.run(
+                        handle=self.handle,
+                        request=self.request,
+                        materialized_env={},
+                        policy_bundle=self.bundle,
+                    )
+
+                paths = [(method, path) for method, path, _ in supervisor.calls]
+                self.assertNotIn(("POST", "/containers/sandbox-container-id/pause"), paths)
+
 
 class _CapturingEgressDockerSupervisor(DockerSandboxSupervisor):
     def __init__(
@@ -720,6 +1004,9 @@ class _CapturingEgressDockerSupervisor(DockerSandboxSupervisor):
         sandbox_delete_error: bool = False,
         ready_effective_capabilities: str = "0000000000000000",
         runtime_error: Exception | None = None,
+        emit_exfil_halt: bool = False,
+        hard_event_byte_delta: int = 0,
+        hard_event_attempted_delta: int = 1,
     ) -> None:
         super().__init__(docker_bin="/usr/bin/docker", egress_sidecar_config=config)
         self._docker_socket_path = "/tmp/fake-docker.sock"
@@ -730,8 +1017,12 @@ class _CapturingEgressDockerSupervisor(DockerSandboxSupervisor):
         self.sandbox_delete_error = sandbox_delete_error
         self.ready_effective_capabilities = ready_effective_capabilities
         self.runtime_error = runtime_error
+        self.emit_exfil_halt = emit_exfil_halt
+        self.hard_event_byte_delta = hard_event_byte_delta
+        self.hard_event_attempted_delta = hard_event_attempted_delta
         self.sidecar_payload: dict[str, object] = {}
         self.sandbox_payload: dict[str, object] = {}
+        self.sidecar_log_reads = 0
 
     def _docker_api_request(
         self,
@@ -776,7 +1067,7 @@ class _CapturingEgressDockerSupervisor(DockerSandboxSupervisor):
                     "Env": self.sandbox_payload["Env"],
                 },
                 "HostConfig": self.sandbox_payload["HostConfig"],
-                "State": {"Running": False, "ExitCode": 0},
+                "State": {"Running": self.emit_exfil_halt, "ExitCode": 0},
             }
         return {}
 
@@ -784,6 +1075,7 @@ class _CapturingEgressDockerSupervisor(DockerSandboxSupervisor):
         from argus_core import s10 as s10_module
 
         if container_id == "egress-sidecar-id":
+            self.sidecar_log_reads += 1
             manifest = json.loads(
                 next(
                     item.removeprefix("ARGUS_S10_EGRESS_MANIFEST_JSON=")
@@ -799,6 +1091,8 @@ class _CapturingEgressDockerSupervisor(DockerSandboxSupervisor):
                         "payload": {
                             "sandbox_id": manifest["sandbox_id"],
                             "job_id": manifest["job_id"],
+                            "scope_id": manifest["scope_id"],
+                            "policy_bundle_version": manifest["policy_bundle_version"],
                             "manifest_hash": manifest["manifest_hash"],
                             "effective_capabilities": self.ready_effective_capabilities,
                             "listen_host": "127.0.0.1",
@@ -808,6 +1102,50 @@ class _CapturingEgressDockerSupervisor(DockerSandboxSupervisor):
                         },
                     }
                 ) + "\n"
+                if self.emit_exfil_halt and self.sidecar_log_reads > 1:
+                    common = {
+                        "sandbox_id": manifest["sandbox_id"],
+                        "job_id": manifest["job_id"],
+                        "scope_id": manifest["scope_id"],
+                        "policy_bundle_version": manifest["policy_bundle_version"],
+                        "manifest_hash": manifest["manifest_hash"],
+                        "host": "allowed.test",
+                        "port": 443,
+                        "proto": "https",
+                        "sni": "allowed.test",
+                        "resolved_ip": "192.0.2.10",
+                    }
+                    stdout += json.dumps(
+                        {
+                            "event_type": "egress.exfil_soft_alert",
+                            "payload": {
+                                **common,
+                                "bytes_to_upstream": manifest["exfil_thresholds"]["soft_bytes"],
+                                "attempted_bytes": manifest["exfil_thresholds"]["soft_bytes"],
+                                "threshold_bytes": manifest["exfil_thresholds"]["soft_bytes"],
+                                "dropped_bytes": 0,
+                                "action": "alert",
+                            },
+                        }
+                    ) + "\n"
+                    stdout += json.dumps(
+                        {
+                            "event_type": "egress.exfil_hard_halt",
+                            "payload": {
+                                **common,
+                                "bytes_to_upstream": (
+                                    manifest["exfil_thresholds"]["hard_bytes"] + self.hard_event_byte_delta
+                                ),
+                                "attempted_bytes": (
+                                    manifest["exfil_thresholds"]["hard_bytes"]
+                                    + self.hard_event_attempted_delta
+                                ),
+                                "threshold_bytes": manifest["exfil_thresholds"]["hard_bytes"],
+                                "dropped_bytes": 1,
+                                "action": "drop_and_halt",
+                            },
+                        }
+                    ) + "\n"
         else:
             stdout = "ok\n"
         return s10_module._DockerLogCapture(
