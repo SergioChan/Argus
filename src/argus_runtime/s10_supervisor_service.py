@@ -43,16 +43,19 @@ from argus_core import (
     PriceTableSigner,
     PriceTableTrustStore,
     ResourceCeilings,
+    GvisorRuntimeConfig,
     SandboxRuntimeUnavailableError,
     ScopeDeniedError,
     ScopeGrant,
     ScopeToken,
     StoreWriterBroker,
+    TrustMount,
     TokenInvalidError,
     TokenSignatureTrustStore,
     WriteOnceViolationError,
     IncompleteLineageError,
     canonical_json_bytes,
+    hash_bytes,
 )
 
 from .auth import (
@@ -352,6 +355,8 @@ class S10SupervisorApp:
                 "gpu_telemetry_source": self._docker_supervisor.gpu_telemetry_source,
                 "dcgm_metric_sampler_enabled": self._docker_supervisor.dcgm_metric_sampler_enabled,
                 "dcgm_metric_fields": list(self._docker_supervisor.dcgm_metric_fields),
+                "gvisor_configured": self._docker_supervisor.gvisor_configured,
+                "gvisor_docker_runtime": self._docker_supervisor.gvisor_docker_runtime or "unconfigured",
                 "audit_events": len(self.audit.events()),
             }
 
@@ -710,7 +715,56 @@ def _docker_supervisor_from_env() -> DockerSandboxSupervisor:
     return DockerSandboxSupervisor(
         meter_interval_s=_positive_float_env("ARGUS_S10_METER_INTERVAL_S", 1.0),
         meter_gap_halt_s=_positive_float_env("ARGUS_S10_METER_GAP_HALT_S", 5.0),
+        gvisor_config=_gvisor_runtime_config_from_env(),
     )
+
+
+def _gvisor_runtime_config_from_env() -> GvisorRuntimeConfig | None:
+    runtime_name = os.environ.get("ARGUS_S10_GVISOR_RUNTIME_NAME")
+    profile_path = os.environ.get("ARGUS_S10_GVISOR_SECCOMP_PROFILE_PATH")
+    trust_mounts_raw = os.environ.get("ARGUS_S10_GVISOR_TRUST_MOUNTS_JSON")
+    configured_values = (runtime_name, profile_path, trust_mounts_raw)
+    if all(value is None or value.strip() == "" for value in configured_values):
+        return None
+    if any(value is None or value.strip() == "" for value in configured_values):
+        raise RuntimeError(
+            "ARGUS_S10_GVISOR_RUNTIME_NAME, ARGUS_S10_GVISOR_SECCOMP_PROFILE_PATH, and "
+            "ARGUS_S10_GVISOR_TRUST_MOUNTS_JSON must be configured together"
+        )
+    assert runtime_name is not None and profile_path is not None and trust_mounts_raw is not None
+    try:
+        parsed = json.loads(trust_mounts_raw)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("ARGUS_S10_GVISOR_TRUST_MOUNTS_JSON must be valid JSON") from exc
+    if not isinstance(parsed, list) or not parsed:
+        raise RuntimeError("ARGUS_S10_GVISOR_TRUST_MOUNTS_JSON must be a non-empty array")
+    mounts: list[TrustMount] = []
+    for item in parsed:
+        if not isinstance(item, dict):
+            raise RuntimeError("ARGUS_S10_GVISOR_TRUST_MOUNTS_JSON entries must be objects")
+        try:
+            mounts.append(
+                TrustMount(
+                    name=str(item["name"]),
+                    source=str(item["source"]),
+                    target=str(item["target"]),
+                )
+            )
+        except (KeyError, ValueError) as exc:
+            raise RuntimeError(f"invalid gVisor trust mount: {exc}") from exc
+    try:
+        return GvisorRuntimeConfig(
+            docker_runtime=runtime_name,
+            seccomp_profile_path=profile_path,
+            kubernetes_runtime_class=os.environ.get("ARGUS_S10_GVISOR_KUBERNETES_RUNTIME_CLASS", "gvisor"),
+            kubernetes_seccomp_profile=os.environ.get(
+                "ARGUS_S10_GVISOR_KUBERNETES_SECCOMP_PROFILE",
+                "argus/argus-gvisor-seccomp.json",
+            ),
+            trust_mounts=tuple(mounts),
+        )
+    except ValueError as exc:
+        raise RuntimeError(f"invalid gVisor runtime configuration: {exc}") from exc
 
 
 def _positive_float_env(name: str, default: float) -> float:
@@ -785,6 +839,18 @@ def _read_hex_secret(*, value_name: str, file_name: str, expected_bytes: int) ->
 
 
 def _default_policy_bundle() -> PolicyBundle:
+    runtime_class = os.environ.get("ARGUS_S10_DEFAULT_RUNTIME_CLASS", "docker")
+    if runtime_class not in {"docker", "gvisor"}:
+        raise RuntimeError("ARGUS_S10_DEFAULT_RUNTIME_CLASS must be docker or gvisor")
+    seccomp_profile_hash = "blake3:" + "0" * 64
+    if runtime_class == "gvisor":
+        profile_path = os.environ.get("ARGUS_S10_GVISOR_SECCOMP_PROFILE_PATH")
+        if not profile_path:
+            raise RuntimeError("gVisor default runtime requires ARGUS_S10_GVISOR_SECCOMP_PROFILE_PATH")
+        try:
+            seccomp_profile_hash = hash_bytes(Path(profile_path).read_bytes())
+        except OSError as exc:
+            raise RuntimeError("gVisor seccomp profile is unavailable") from exc
     return PolicyBundle(
         bundle_version="argus-m0-dev",
         egress_allowlist=(),
@@ -795,8 +861,8 @@ def _default_policy_bundle() -> PolicyBundle:
             wallclock_s=30,
             max_cost_usd=1,
         ),
-        risk_to_runtime={"standard": "docker"},
-        seccomp_profile_hash="blake3:" + "0" * 64,
+        risk_to_runtime={"standard": runtime_class},
+        seccomp_profile_hash=seccomp_profile_hash,
         signer_key_id="",
         signature="",
     )

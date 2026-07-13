@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import http.client as http_client
 import hmac
+import inspect
 import json
 import math
 import os
@@ -17,6 +18,7 @@ import time
 from dataclasses import asdict, dataclass, field, replace
 from decimal import Decimal
 from hashlib import sha256
+from pathlib import Path
 from typing import Any, Callable, Iterable, Literal, Mapping, NoReturn, Protocol
 from uuid import uuid4
 from weakref import ref
@@ -28,7 +30,7 @@ from argusverify import canonical_c3_json_bytes
 
 from .canonical import canonical_json_bytes
 from .c3 import C3_SIGNATURE_PREFIX, SIGNATURE_VERIFICATION_ACCEPTED, VerifierKey
-from .hashing import BLAKE3_PREFIX, hash_json
+from .hashing import BLAKE3_PREFIX, hash_bytes, hash_json
 from .s8 import ArtifactRecord, InMemoryArtifactStore, Lineage, Producer
 
 
@@ -472,6 +474,205 @@ class _DockerLogCapture:
     stderr_bytes: int
     log_capture_limit_bytes: int
     truncated: bool
+
+
+@dataclass(frozen=True)
+class TrustMount:
+    """Operator-owned host path exposed read-only inside a sandbox."""
+
+    name: str
+    source: str
+    target: str
+
+    def __post_init__(self) -> None:
+        if not re.fullmatch(r"[a-z0-9](?:[-a-z0-9]*[a-z0-9])?", self.name):
+            raise ValueError("trust mount name must be a lowercase DNS label")
+        if "," in self.source or "," in self.target:
+            raise ValueError("trust mount paths cannot contain commas")
+        if not os.path.isabs(self.source):
+            raise ValueError("trust mount source must be an absolute host path")
+        if not os.path.isabs(self.target):
+            raise ValueError("trust mount target must be an absolute sandbox path")
+        if not self.target.startswith("/opt/argus/trust/"):
+            raise ValueError("trust mount target must be under /opt/argus/trust")
+
+
+@dataclass(frozen=True)
+class GvisorRuntimeConfig:
+    """Operator configuration required to materialize a gVisor launch."""
+
+    docker_runtime: str
+    seccomp_profile_path: str
+    kubernetes_runtime_class: str
+    kubernetes_seccomp_profile: str
+    trust_mounts: tuple[TrustMount, ...]
+
+    def __post_init__(self) -> None:
+        if re.fullmatch(r"runsc(?:[-._][A-Za-z0-9]+)*", self.docker_runtime) is None:
+            raise ValueError("gVisor Docker runtime name must identify runsc")
+        if not os.path.isabs(self.seccomp_profile_path):
+            raise ValueError("gVisor seccomp profile path must be absolute")
+        if not self.kubernetes_runtime_class.strip():
+            raise ValueError("gVisor Kubernetes RuntimeClass is required")
+        if not self.kubernetes_seccomp_profile.strip() or os.path.isabs(self.kubernetes_seccomp_profile):
+            raise ValueError("Kubernetes seccomp profile must be a non-empty kubelet-relative path")
+        names = [mount.name for mount in self.trust_mounts]
+        targets = [mount.target for mount in self.trust_mounts]
+        if len(names) != len(set(names)):
+            raise ValueError("trust mount names must be unique")
+        if len(targets) != len(set(targets)):
+            raise ValueError("trust mount targets must be unique")
+        required_mounts = {"verifier-code", "provenance-ledger"}
+        if not required_mounts.issubset(names):
+            raise ValueError("gVisor config requires verifier-code and provenance-ledger trust mounts")
+
+
+@dataclass(frozen=True)
+class SandboxSecuritySpec:
+    runtime_class: RuntimeClass
+    docker_runtime: str | None = None
+    seccomp_profile_hash: str | None = None
+    seccomp_profile_path: str | None = None
+    seccomp_profile_json: str | None = None
+    trust_mounts: tuple[TrustMount, ...] = ()
+
+
+@dataclass(frozen=True)
+class DockerRuntimeLaunchEvidence:
+    sandbox_id: str
+    container_id: str
+    runtime_class: RuntimeClass
+    docker_runtime: str
+    seccomp_profile_hash: str
+    trust_mounts: tuple[TrustMount, ...]
+    attestation_source: Literal["docker-api-inspect", "docker-cli-command"]
+
+
+def materialize_gvisor_pod_spec(
+    *,
+    handle: SandboxHandle,
+    request: LaunchRequest,
+    policy_bundle: PolicyBundle,
+    config: GvisorRuntimeConfig,
+) -> dict[str, Any]:
+    """Materialize the Kubernetes security boundary for a policy-selected gVisor launch."""
+
+    security_spec = _materialize_gvisor_security_spec(handle, policy_bundle, config)
+    materialized_env = materialize_sandbox_env(request.env, request.env_allowlist)
+    envelope = request.requested_envelope
+    trust_volumes = [
+        {"name": mount.name, "hostPath": {"path": mount.source}}
+        for mount in security_spec.trust_mounts
+    ]
+    trust_volume_mounts = [
+        {"name": mount.name, "mountPath": mount.target, "readOnly": True}
+        for mount in security_spec.trust_mounts
+    ]
+    return {
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": {
+            "name": _kubernetes_name(f"argus-{handle.sandbox_id}"),
+            "labels": {
+                "app.kubernetes.io/name": "argus-sandbox",
+                "argus.dev/job-id": request.job_id,
+            },
+            "annotations": {
+                "argus.dev/policy-bundle-version": policy_bundle.bundle_version,
+                "argus.dev/seccomp-profile-hash": policy_bundle.seccomp_profile_hash,
+            },
+        },
+        "spec": {
+            "runtimeClassName": config.kubernetes_runtime_class,
+            "restartPolicy": "Never",
+            "automountServiceAccountToken": False,
+            "enableServiceLinks": False,
+            "hostUsers": False,
+            "containers": [
+                {
+                    "name": "sandbox",
+                    "image": request.image,
+                    "imagePullPolicy": "IfNotPresent",
+                    "command": list(request.entrypoint),
+                    "args": list(request.args),
+                    "env": [{"name": key, "value": value} for key, value in sorted(materialized_env.items())],
+                    "securityContext": {
+                        "allowPrivilegeEscalation": False,
+                        "privileged": False,
+                        "readOnlyRootFilesystem": True,
+                        "runAsNonRoot": True,
+                        "runAsUser": 65532,
+                        "runAsGroup": 65532,
+                        "capabilities": {"drop": ["ALL"]},
+                        "seccompProfile": {
+                            "type": "Localhost",
+                            "localhostProfile": config.kubernetes_seccomp_profile,
+                        },
+                    },
+                    "resources": {
+                        "requests": {
+                            "cpu": f"{max(envelope.cpu_m, 1)}m",
+                            "memory": str(max(envelope.mem_bytes, 4 * 1024 * 1024)),
+                        },
+                        "limits": {
+                            "cpu": f"{max(envelope.cpu_m, 1)}m",
+                            "memory": str(max(envelope.mem_bytes, 4 * 1024 * 1024)),
+                        },
+                    },
+                    "volumeMounts": trust_volume_mounts
+                    + [{"name": "scratch", "mountPath": "/tmp", "readOnly": False}],
+                }
+            ],
+            "volumes": trust_volumes
+            + [{"name": "scratch", "emptyDir": {"sizeLimit": str(max(envelope.scratch_bytes, 0))}}],
+        },
+    }
+
+
+def _materialize_gvisor_security_spec(
+    handle: SandboxHandle,
+    policy_bundle: PolicyBundle,
+    config: GvisorRuntimeConfig,
+) -> SandboxSecuritySpec:
+    if handle.runtime_class != "gvisor":
+        raise SandboxRuntimeUnavailableError("gVisor security spec requires runtime_class=gvisor")
+    if handle.policy_bundle_version != policy_bundle.bundle_version:
+        raise SandboxRuntimeUnavailableError("sandbox policy bundle version does not match the pinned bundle")
+    profile_path = Path(config.seccomp_profile_path)
+    try:
+        profile_bytes = profile_path.read_bytes()
+    except OSError as exc:
+        raise SandboxRuntimeUnavailableError(f"gVisor seccomp profile is unavailable: {profile_path}") from exc
+    actual_hash = hash_bytes(profile_bytes)
+    if actual_hash != policy_bundle.seccomp_profile_hash:
+        raise SandboxRuntimeUnavailableError(
+            "gVisor seccomp profile hash mismatch: "
+            f"expected {policy_bundle.seccomp_profile_hash}, got {actual_hash}"
+        )
+    try:
+        profile = json.loads(profile_bytes)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise SandboxRuntimeUnavailableError("gVisor seccomp profile must be valid UTF-8 JSON") from exc
+    if not isinstance(profile, dict) or not isinstance(profile.get("defaultAction"), str):
+        raise SandboxRuntimeUnavailableError("gVisor seccomp profile must define defaultAction")
+    if not isinstance(profile.get("syscalls"), list):
+        raise SandboxRuntimeUnavailableError("gVisor seccomp profile must define syscall rules")
+    for mount in config.trust_mounts:
+        if not Path(mount.source).exists():
+            raise SandboxRuntimeUnavailableError(f"gVisor trust mount source is unavailable: {mount.source}")
+    return SandboxSecuritySpec(
+        runtime_class="gvisor",
+        docker_runtime=config.docker_runtime,
+        seccomp_profile_hash=policy_bundle.seccomp_profile_hash,
+        seccomp_profile_path=str(profile_path),
+        seccomp_profile_json=json.dumps(profile, sort_keys=True, separators=(",", ":")),
+        trust_mounts=config.trust_mounts,
+    )
+
+
+def _kubernetes_name(value: str) -> str:
+    normalized = re.sub(r"[^a-z0-9-]+", "-", value.lower()).strip("-")
+    return normalized[:63].rstrip("-") or "argus-sandbox"
 
 
 @dataclass(frozen=True)
@@ -2000,6 +2201,12 @@ class InMemoryPolicyService:
     def active_bundle(self) -> PolicyBundle:
         return self._bundles[self._active_version]
 
+    def bundle(self, bundle_version: str) -> PolicyBundle:
+        try:
+            return self._bundles[bundle_version]
+        except KeyError as exc:
+            raise PolicyDeniedError(f"policy bundle is unavailable: {bundle_version}") from exc
+
     def publish(self, bundle: PolicyBundle, *, initial: bool = False) -> None:
         verification = self._trust_store.verify(bundle)
         if not verification.valid:
@@ -2028,6 +2235,11 @@ class _StaticPolicyService:
 
     @property
     def active_bundle(self) -> PolicyBundle:
+        return self._bundle
+
+    def bundle(self, bundle_version: str) -> PolicyBundle:
+        if bundle_version != self._bundle.bundle_version:
+            raise PolicyDeniedError(f"policy bundle is unavailable: {bundle_version}")
         return self._bundle
 
     def decide(self, request: LaunchRequest) -> PolicyVerdict:
@@ -2290,6 +2502,7 @@ class DockerSandboxSupervisor:
         meter_gap_halt_s: float = 5.0,
         gpu_telemetry: GpuTelemetrySnapshot | None = None,
         dcgm_metric_sampler: Callable[[], DcgmMetricSnapshot] | None = None,
+        gvisor_config: GvisorRuntimeConfig | None = None,
     ) -> None:
         self._docker_bin = docker_bin or shutil.which("docker") or "docker"
         self._meter_interval_s = min(max(float(meter_interval_s), 0.1), 5.0)
@@ -2299,6 +2512,7 @@ class DockerSandboxSupervisor:
         self._dcgm_metric_sampler = dcgm_metric_sampler or (
             lambda: collect_dcgm_metric_sample(gpu_telemetry=self._gpu_telemetry)
         )
+        self._gvisor_config = gvisor_config
 
     @property
     def resource_meter_kind(self) -> str:
@@ -2348,6 +2562,29 @@ class DockerSandboxSupervisor:
     def dcgm_metric_fields(self) -> tuple[str, ...]:
         return DCGM_DMON_METRIC_FIELDS
 
+    @property
+    def gvisor_configured(self) -> bool:
+        return self._gvisor_config is not None
+
+    @property
+    def gvisor_docker_runtime(self) -> str | None:
+        return self._gvisor_config.docker_runtime if self._gvisor_config is not None else None
+
+    def materialize_security_spec(
+        self,
+        handle: SandboxHandle,
+        policy_bundle: PolicyBundle | None,
+    ) -> SandboxSecuritySpec:
+        if handle.runtime_class == "docker":
+            return SandboxSecuritySpec(runtime_class="docker")
+        if handle.runtime_class == "gvisor":
+            if policy_bundle is None:
+                raise SandboxRuntimeUnavailableError("gVisor launch requires its pinned policy bundle")
+            if self._gvisor_config is None:
+                raise SandboxRuntimeUnavailableError("gVisor runtime is not configured")
+            return _materialize_gvisor_security_spec(handle, policy_bundle, self._gvisor_config)
+        raise SandboxRuntimeUnavailableError(f"sandbox runtime class is unavailable: {handle.runtime_class}")
+
     def _gpu_telemetry_sample_fields(self) -> dict[str, Any]:
         return {
             "dcgm_available": self._gpu_telemetry.dcgm_available,
@@ -2393,11 +2630,14 @@ class DockerSandboxSupervisor:
         meter_sample_sink: Callable[[ResourceMeterSample], None] | None = None,
         runtime_halt_probe: Callable[[], _RuntimeHaltSignal | tuple[str, tuple[str, ...]] | None] | None = None,
         halt_telemetry_sink: Callable[[SandboxHaltTelemetry], None] | None = None,
+        policy_bundle: PolicyBundle | None = None,
+        runtime_evidence_sink: Callable[[DockerRuntimeLaunchEvidence], None] | None = None,
     ) -> SandboxExecutionResult:
         if not _is_digest_pinned_image(request.image):
             raise PolicyDeniedError("image must be digest-pinned")
         if not request.entrypoint:
             raise PolicyDeniedError("entrypoint is required")
+        security_spec = self.materialize_security_spec(handle, policy_bundle)
         if self._docker_socket_path is not None:
             try:
                 return self._run_via_docker_api(
@@ -2407,15 +2647,29 @@ class DockerSandboxSupervisor:
                     meter_sample_sink=meter_sample_sink,
                     runtime_halt_probe=runtime_halt_probe,
                     halt_telemetry_sink=halt_telemetry_sink,
+                    security_spec=security_spec,
+                    runtime_evidence_sink=runtime_evidence_sink,
                 )
             except SandboxRuntimeUnavailableError:
+                if security_spec.runtime_class != "docker":
+                    raise
                 if shutil.which(self._docker_bin) is None and "/" not in self._docker_bin:
                     raise
         if shutil.which(self._docker_bin) is None and "/" not in self._docker_bin:
             raise SandboxRuntimeUnavailableError("docker runtime is unavailable")
 
         container_name = f"argus-{handle.sandbox_id.replace('-', '')[:24]}"
-        command = self._docker_command(container_name, request, materialized_env)
+        self._ensure_cli_runtime_available(security_spec)
+        command = self._docker_command(container_name, request, materialized_env, security_spec)
+        if runtime_evidence_sink is not None and security_spec.runtime_class == "gvisor":
+            runtime_evidence_sink(
+                self._runtime_launch_evidence(
+                    handle=handle,
+                    container_id=container_name,
+                    security_spec=security_spec,
+                    attestation_source="docker-cli-command",
+                )
+            )
         started_at = time.monotonic()
         try:
             completed = _run_subprocess_bounded(
@@ -2437,7 +2691,13 @@ class DockerSandboxSupervisor:
         except FileNotFoundError as exc:
             raise SandboxRuntimeUnavailableError("docker runtime is unavailable") from exc
 
-    def _docker_command(self, container_name: str, request: LaunchRequest, env: dict[str, str]) -> list[str]:
+    def _docker_command(
+        self,
+        container_name: str,
+        request: LaunchRequest,
+        env: dict[str, str],
+        security_spec: SandboxSecuritySpec,
+    ) -> list[str]:
         envelope = request.requested_envelope
         command = [
             self._docker_bin,
@@ -2464,6 +2724,19 @@ class DockerSandboxSupervisor:
             "--tmpfs",
             f"/tmp:rw,noexec,nosuid,nodev,size={max(envelope.scratch_bytes, 1024 * 1024)}",
         ]
+        if security_spec.runtime_class == "gvisor":
+            assert security_spec.docker_runtime is not None
+            assert security_spec.seccomp_profile_path is not None
+            command.extend(("--runtime", security_spec.docker_runtime))
+            command.extend(("--security-opt", f"seccomp={security_spec.seccomp_profile_path}"))
+            for mount in security_spec.trust_mounts:
+                command.extend(
+                    (
+                        "--mount",
+                        "type=bind,"
+                        f"src={mount.source},dst={mount.target},readonly,bind-propagation=rprivate",
+                    )
+                )
         for key in sorted(env):
             command.extend(("--env", f"{key}={env[key]}"))
         command.extend(("--entrypoint", request.entrypoint[0]))
@@ -2471,6 +2744,30 @@ class DockerSandboxSupervisor:
         command.extend(request.entrypoint[1:])
         command.extend(request.args)
         return command
+
+    def _ensure_cli_runtime_available(self, security_spec: SandboxSecuritySpec) -> None:
+        if security_spec.runtime_class != "gvisor":
+            return
+        completed = subprocess.run(
+            [self._docker_bin, "info", "--format", "{{json .Runtimes}}"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if completed.returncode != 0:
+            raise SandboxRuntimeUnavailableError("Docker runtime inventory is unavailable")
+        try:
+            runtimes = json.loads(completed.stdout)
+        except json.JSONDecodeError as exc:
+            raise SandboxRuntimeUnavailableError("Docker runtime inventory is invalid") from exc
+        if not isinstance(runtimes, dict) or security_spec.docker_runtime not in runtimes:
+            raise SandboxRuntimeUnavailableError(
+                f"gVisor Docker runtime {security_spec.docker_runtime!r} is unavailable"
+            )
+        self._verify_gvisor_runtime_inventory_entry(
+            security_spec.docker_runtime,
+            runtimes[security_spec.docker_runtime],
+        )
 
     def _force_remove(self, container_name: str) -> None:
         subprocess.run(
@@ -2489,12 +2786,43 @@ class DockerSandboxSupervisor:
         meter_sample_sink: Callable[[ResourceMeterSample], None] | None = None,
         runtime_halt_probe: Callable[[], _RuntimeHaltSignal | tuple[str, tuple[str, ...]] | None] | None = None,
         halt_telemetry_sink: Callable[[SandboxHaltTelemetry], None] | None = None,
+        security_spec: SandboxSecuritySpec,
+        runtime_evidence_sink: Callable[[DockerRuntimeLaunchEvidence], None] | None = None,
     ) -> SandboxExecutionResult:
         container_name = f"argus-{handle.sandbox_id.replace('-', '')[:24]}"
         envelope = request.requested_envelope
         container_id: str | None = None
         started_at = time.monotonic()
         try:
+            self._ensure_docker_api_runtime_available(security_spec)
+            host_config: dict[str, Any] = {
+                "AutoRemove": False,
+                "ReadonlyRootfs": True,
+                "CapDrop": ["ALL"],
+                "SecurityOpt": ["no-new-privileges"],
+                "NetworkMode": "none",
+                "PidsLimit": max(envelope.pids, 1),
+                "Memory": max(envelope.mem_bytes, 4 * 1024 * 1024),
+                "NanoCpus": max(envelope.cpu_m, 1) * 1_000_000,
+                "Tmpfs": {
+                    "/tmp": f"rw,noexec,nosuid,nodev,size={max(envelope.scratch_bytes, 1024 * 1024)}"
+                },
+            }
+            if security_spec.runtime_class == "gvisor":
+                assert security_spec.docker_runtime is not None
+                assert security_spec.seccomp_profile_json is not None
+                host_config["Runtime"] = security_spec.docker_runtime
+                host_config["SecurityOpt"].append(f"seccomp={security_spec.seccomp_profile_json}")
+                host_config["Mounts"] = [
+                    {
+                        "Type": "bind",
+                        "Source": mount.source,
+                        "Target": mount.target,
+                        "ReadOnly": True,
+                        "BindOptions": {"Propagation": "rprivate"},
+                    }
+                    for mount in security_spec.trust_mounts
+                ]
             create_response = self._docker_api_request(
                 "POST",
                 f"/containers/create?name={container_name}",
@@ -2505,25 +2833,29 @@ class DockerSandboxSupervisor:
                     "Env": [f"{key}={value}" for key, value in sorted(materialized_env.items())],
                     "User": DOCKER_SANDBOX_USER,
                     "NetworkDisabled": True,
-                    "HostConfig": {
-                        "AutoRemove": False,
-                        "ReadonlyRootfs": True,
-                        "CapDrop": ["ALL"],
-                        "SecurityOpt": ["no-new-privileges"],
-                        "NetworkMode": "none",
-                        "PidsLimit": max(envelope.pids, 1),
-                        "Memory": max(envelope.mem_bytes, 4 * 1024 * 1024),
-                        "NanoCpus": max(envelope.cpu_m, 1) * 1_000_000,
-                        "Tmpfs": {
-                            "/tmp": f"rw,noexec,nosuid,nodev,size={max(envelope.scratch_bytes, 1024 * 1024)}"
-                        },
-                    },
+                    "HostConfig": host_config,
                 },
                 expected=(201,),
             )
             container_id = str(create_response.get("Id") or "")
             if not container_id:
                 raise SandboxRuntimeUnavailableError("docker runtime did not return a container id")
+            if security_spec.runtime_class == "gvisor":
+                inspected = self._docker_api_request(
+                    "GET",
+                    f"/containers/{container_id}/json",
+                    expected=(200,),
+                )
+                self._verify_docker_api_security_attestation(inspected, security_spec)
+                if runtime_evidence_sink is not None:
+                    runtime_evidence_sink(
+                        self._runtime_launch_evidence(
+                            handle=handle,
+                            container_id=container_id,
+                            security_spec=security_spec,
+                            attestation_source="docker-api-inspect",
+                        )
+                    )
             self._docker_api_request("POST", f"/containers/{container_id}/start", expected=(204, 304))
             exit_code, timed_out, runtime_stderr, budget_usage, partial_result = self._wait_for_container_with_meter(
                 container_id=container_id,
@@ -2554,6 +2886,88 @@ class DockerSandboxSupervisor:
         finally:
             if container_id:
                 self._docker_api_request("DELETE", f"/containers/{container_id}?force=true", expected=(204, 404))
+
+    def _ensure_docker_api_runtime_available(self, security_spec: SandboxSecuritySpec) -> None:
+        if security_spec.runtime_class != "gvisor":
+            return
+        info = self._docker_api_request("GET", "/info", expected=(200,))
+        runtimes = info.get("Runtimes")
+        if not isinstance(runtimes, dict) or security_spec.docker_runtime not in runtimes:
+            raise SandboxRuntimeUnavailableError(
+                f"gVisor Docker runtime {security_spec.docker_runtime!r} is unavailable"
+            )
+        self._verify_gvisor_runtime_inventory_entry(
+            security_spec.docker_runtime,
+            runtimes[security_spec.docker_runtime],
+        )
+
+    @staticmethod
+    def _verify_gvisor_runtime_inventory_entry(runtime_name: str | None, entry: Any) -> None:
+        if not isinstance(entry, dict):
+            return
+        runtime_path = entry.get("path", entry.get("Path"))
+        if isinstance(runtime_path, str) and runtime_path and Path(runtime_path).name != "runsc":
+            raise SandboxRuntimeUnavailableError(
+                f"gVisor Docker runtime {runtime_name!r} is not backed by runsc"
+            )
+        runtime_args = entry.get("args", entry.get("Args", entry.get("runtimeArgs")))
+        if isinstance(runtime_args, list) and runtime_args and "--oci-seccomp" not in runtime_args:
+            raise SandboxRuntimeUnavailableError(
+                f"gVisor Docker runtime {runtime_name!r} does not enable --oci-seccomp"
+            )
+
+    @staticmethod
+    def _verify_docker_api_security_attestation(
+        inspected: dict[str, Any],
+        security_spec: SandboxSecuritySpec,
+    ) -> None:
+        host_config = inspected.get("HostConfig")
+        if not isinstance(host_config, dict):
+            raise SandboxRuntimeUnavailableError("Docker inspect omitted HostConfig runtime evidence")
+        if host_config.get("Runtime") != security_spec.docker_runtime:
+            raise SandboxRuntimeUnavailableError("Docker did not bind the requested gVisor runtime")
+        security_opts = host_config.get("SecurityOpt")
+        expected_seccomp = f"seccomp={security_spec.seccomp_profile_json}"
+        if not isinstance(security_opts, list) or expected_seccomp not in security_opts:
+            raise SandboxRuntimeUnavailableError("Docker did not bind the verified seccomp profile")
+        inspected_mounts = host_config.get("Mounts")
+        if not isinstance(inspected_mounts, list):
+            raise SandboxRuntimeUnavailableError("Docker inspect omitted trust mount evidence")
+        expected_mounts = {
+            (mount.source, mount.target): mount
+            for mount in security_spec.trust_mounts
+        }
+        observed_mounts: dict[tuple[str, str], dict[str, Any]] = {}
+        for mount in inspected_mounts:
+            if isinstance(mount, dict):
+                source = mount.get("Source")
+                target = mount.get("Target")
+                if isinstance(source, str) and isinstance(target, str):
+                    observed_mounts[(source, target)] = mount
+        if set(observed_mounts) != set(expected_mounts):
+            raise SandboxRuntimeUnavailableError("Docker trust mount set differs from the operator-owned spec")
+        if any(not observed_mounts[key].get("ReadOnly", False) for key in expected_mounts):
+            raise SandboxRuntimeUnavailableError("Docker trust mount is not read-only")
+
+    @staticmethod
+    def _runtime_launch_evidence(
+        *,
+        handle: SandboxHandle,
+        container_id: str,
+        security_spec: SandboxSecuritySpec,
+        attestation_source: Literal["docker-api-inspect", "docker-cli-command"],
+    ) -> DockerRuntimeLaunchEvidence:
+        assert security_spec.docker_runtime is not None
+        assert security_spec.seccomp_profile_hash is not None
+        return DockerRuntimeLaunchEvidence(
+            sandbox_id=handle.sandbox_id,
+            container_id=container_id,
+            runtime_class=security_spec.runtime_class,
+            docker_runtime=security_spec.docker_runtime,
+            seccomp_profile_hash=security_spec.seccomp_profile_hash,
+            trust_mounts=security_spec.trust_mounts,
+            attestation_source=attestation_source,
+        )
 
     def _wait_for_container_with_meter(
         self,
@@ -3084,7 +3498,7 @@ class InMemorySandboxOrchestrator:
     def launch(self, request: LaunchRequest) -> SandboxHandle:
         self._verify_tokens_for_launch(request)
         policy_bundle = self._policy_service.active_bundle
-        verdict = self._policy_service.decide(request)
+        verdict = decide_policy(policy_bundle, request)
         if not verdict.allowed:
             ceiling_violations = _policy_ceiling_violations(policy_bundle, request)
             if ceiling_violations:
@@ -3398,6 +3812,7 @@ def _launch_exec_environment(
         ],
         "cgroup_limits": asdict(request.requested_envelope),
         "policy_bundle_version": policy_bundle.bundle_version,
+        "seccomp_profile_hash": policy_bundle.seccomp_profile_hash,
         "risk_class": request.scope_token.scopes.sandbox_risk_class,
         "seed_material": [request.trace_id],
         "node_kernel_caps_dropped": ["ALL"],
@@ -3441,12 +3856,25 @@ class DockerSandboxOrchestrator(InMemorySandboxOrchestrator):
         self._price_table_model_id = price_table_model_id
         self._halt_telemetry_by_sandbox: dict[str, SandboxHaltTelemetry] = {}
 
+    def _run_supervisor(self, **kwargs: Any) -> SandboxExecutionResult:
+        parameters = inspect.signature(self._supervisor.run).parameters
+        accepts_arbitrary_keywords = any(
+            parameter.kind == inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters.values()
+        )
+        if accepts_arbitrary_keywords:
+            return self._supervisor.run(**kwargs)
+        supported = {key: value for key, value in kwargs.items() if key in parameters}
+        return self._supervisor.run(**supported)
+
     def launch_and_wait(self, request: LaunchRequest) -> SandboxExecutionResult:
         handle = super().launch(request)
+        policy_bundle = self._policy_service.bundle(handle.policy_bundle_version)
         materialized_env = materialize_sandbox_env(request.env, request.env_allowlist)
         reserved_usage = request.requested_envelope.budget_usage()
         meter_samples: list[ResourceMeterSample] = []
         halt_telemetry_items: list[SandboxHaltTelemetry] = []
+        runtime_evidence_items: list[DockerRuntimeLaunchEvidence] = []
         meter_halt_recorded = False
         token_revocation_halt_recorded = False
 
@@ -3484,59 +3912,76 @@ class DockerSandboxOrchestrator(InMemorySandboxOrchestrator):
         def record_halt_telemetry(telemetry: SandboxHaltTelemetry) -> None:
             halt_telemetry_items.append(telemetry)
 
+        def record_runtime_evidence(evidence: DockerRuntimeLaunchEvidence) -> None:
+            if evidence.sandbox_id != handle.sandbox_id:
+                raise SandboxRuntimeUnavailableError("runtime evidence sandbox_id mismatch")
+            if evidence.runtime_class != handle.runtime_class:
+                raise SandboxRuntimeUnavailableError("runtime evidence class mismatch")
+            if evidence.seccomp_profile_hash != policy_bundle.seccomp_profile_hash:
+                raise SandboxRuntimeUnavailableError("runtime evidence seccomp hash mismatch")
+            runtime_evidence_items.append(evidence)
+            self._audit_ledger.append(
+                "runtime.attested",
+                {
+                    "sandbox_id": handle.sandbox_id,
+                    "job_id": request.job_id,
+                    "runtime_class": evidence.runtime_class,
+                    "docker_runtime": evidence.docker_runtime,
+                    "container_id": evidence.container_id,
+                    "attestation_source": evidence.attestation_source,
+                },
+            )
+            self._audit_ledger.append(
+                "seccomp.profile_applied",
+                {
+                    "sandbox_id": handle.sandbox_id,
+                    "job_id": request.job_id,
+                    "profile_hash": evidence.seccomp_profile_hash,
+                    "policy_bundle_version": handle.policy_bundle_version,
+                },
+            )
+            self._audit_ledger.append(
+                "trust.mounts_applied",
+                {
+                    "sandbox_id": handle.sandbox_id,
+                    "job_id": request.job_id,
+                    "mount_count": len(evidence.trust_mounts),
+                    "all_read_only": True,
+                    "mounts": [
+                        {"name": mount.name, "target": mount.target, "read_only": True}
+                        for mount in evidence.trust_mounts
+                    ],
+                },
+            )
+
         self._audit_ledger.append(
             "sandbox.started",
             {"sandbox_id": handle.sandbox_id, "job_id": request.job_id, "runtime_class": handle.runtime_class},
         )
         try:
-            try:
-                try:
-                    result = self._supervisor.run(
-                        handle=handle,
-                        request=request,
-                        materialized_env=materialized_env,
-                        meter_sample_sink=record_meter_sample,
-                        runtime_halt_probe=self._runtime_halt_probe(request),
-                        halt_telemetry_sink=record_halt_telemetry,
-                    )
-                except TypeError as telemetry_exc:
-                    if "halt_telemetry_sink" not in str(telemetry_exc):
-                        raise
-                    result = self._supervisor.run(
-                        handle=handle,
-                        request=request,
-                        materialized_env=materialized_env,
-                        meter_sample_sink=record_meter_sample,
-                        runtime_halt_probe=self._runtime_halt_probe(request),
-                    )
-            except TypeError as exc:
-                if "runtime_halt_probe" in str(exc):
-                    try:
-                        result = self._supervisor.run(
-                            handle=handle,
-                            request=request,
-                            materialized_env=materialized_env,
-                            meter_sample_sink=record_meter_sample,
-                        )
-                    except TypeError as meter_exc:
-                        if "meter_sample_sink" not in str(meter_exc):
-                            raise
-                        result = self._supervisor.run(
-                            handle=handle,
-                            request=request,
-                            materialized_env=materialized_env,
-                        )
-                elif "meter_sample_sink" in str(exc):
-                    result = self._supervisor.run(
-                        handle=handle,
-                        request=request,
-                        materialized_env=materialized_env,
-                    )
-                else:
-                    raise
+            result = self._run_supervisor(
+                handle=handle,
+                request=request,
+                materialized_env=materialized_env,
+                policy_bundle=policy_bundle,
+                meter_sample_sink=record_meter_sample,
+                runtime_halt_probe=self._runtime_halt_probe(request),
+                halt_telemetry_sink=record_halt_telemetry,
+                runtime_evidence_sink=record_runtime_evidence,
+            )
         except Exception as exc:
             self._record_runtime_failure(handle, request, reserved_usage, exc)
             raise
+
+        expected_runtime_evidence_count = 1 if handle.runtime_class == "gvisor" else 0
+        if len(runtime_evidence_items) != expected_runtime_evidence_count:
+            error = SandboxRuntimeUnavailableError(
+                "gVisor launch requires exactly one host-controlled runtime attestation"
+                if handle.runtime_class == "gvisor"
+                else "non-gVisor launch emitted unexpected gVisor runtime evidence"
+            )
+            self._record_runtime_failure(handle, request, reserved_usage, error)
+            raise error
 
         if len(halt_telemetry_items) > 1:
             self._record_runtime_failure(

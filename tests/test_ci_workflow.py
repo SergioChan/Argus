@@ -25,6 +25,18 @@ class CIWorkflowEvidenceTests(unittest.TestCase):
         self.assertIn('--evidence-file "$RUNNER_TEMP/m1-external-referee-evidence.json"', m1_run)
         self.assertIn("path: ${{ runner.temp }}/m1-external-referee-evidence.json", m1_upload)
 
+    def test_real_gvisor_job_is_pinned_unskippable_and_uploads_evidence(self) -> None:
+        self.assertIn("  gvisor-security:\n", self.workflow)
+        self.assertIn('GVISOR_RELEASE: "20260706"', self.workflow)
+        self.assertIn("runsc.sha512", self.workflow)
+        self.assertIn("runsc install --runtime runsc-argus -- --oci-seccomp", self.workflow)
+        self.assertIn(
+            'python3 scripts/run_s10_gvisor_battery.py --evidence-file "$RUNNER_TEMP/s10-gvisor-evidence.json"',
+            self.workflow,
+        )
+        self.assertIn("name: s10-gvisor-evidence", self.workflow)
+        self.assertNotIn("ARGUS_REQUIRE_GVISOR_TESTS", self.workflow)
+
     def _step(self, name: str) -> str:
         marker = f"      - name: {name}\n"
         start = self.workflow.index(marker)

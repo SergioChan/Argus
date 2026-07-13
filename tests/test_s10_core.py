@@ -913,7 +913,7 @@ class S10OrchestratorAndAuditTests(unittest.TestCase):
         self.assertEqual(exec_environment["runtime_user"], "65532:65532")
         self.assertEqual(exec_environment["cgroup_limits"], asdict(request.requested_envelope))
         self.assertEqual(exec_environment["egress_acl"], [asdict(EgressRule("store.local", 443, "https"))])
-        self.assertNotIn("seccomp_profile_hash", exec_environment)
+        self.assertEqual(exec_environment["seccomp_profile_hash"], self.bundle.seccomp_profile_hash)
         self.assertEqual(payload["launch"]["budget_id"], request.budget_token.budget_id)
 
         replacement_budget = self.tokens.mint_budget(
@@ -2153,7 +2153,10 @@ class S10DockerOrchestratorTests(unittest.TestCase):
         self.assertEqual(provenance_record.kind, "container")
         self.assertEqual(provenance_payload["exec_environment"]["runtime_class"], "docker")
         self.assertEqual(provenance_payload["exec_environment"]["runtime_user"], "65532:65532")
-        self.assertNotIn("seccomp_profile_hash", provenance_payload["exec_environment"])
+        self.assertEqual(
+            provenance_payload["exec_environment"]["seccomp_profile_hash"],
+            self.bundle.seccomp_profile_hash,
+        )
         self.assertFalse(hasattr(result.handle, "seccomp_profile_hash"))
         self.assertEqual(
             provenance_payload["exec_environment_digest"],

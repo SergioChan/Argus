@@ -2780,9 +2780,28 @@ class ArgusM0ComposeTests(unittest.TestCase):
         s10_volumes = services["s10-supervisor"].get("volumes", [])
         self.assertEqual(
             sorted(volume["target"] for volume in s10_volumes),
-            ["/var/lib/argus/s10", "/var/run/docker.sock"],
+            [
+                "/etc/argus/s10/argus-gvisor-seccomp.json",
+                "/var/lib/argus/s10",
+                "/var/run/docker.sock",
+            ],
         )
         self.assertEqual(s10_volumes[0]["source"], "/var/run/docker.sock")
+        profile_mount = next(
+            volume
+            for volume in s10_volumes
+            if volume["target"] == "/etc/argus/s10/argus-gvisor-seccomp.json"
+        )
+        self.assertTrue(profile_mount["read_only"])
+        self.assertTrue(profile_mount["source"].endswith("/deploy/argus-m0/security/argus-gvisor-seccomp.json"))
+        self.assertEqual(
+            services["s10-supervisor"]["environment"]["ARGUS_S10_DEFAULT_RUNTIME_CLASS"],
+            "docker",
+        )
+        self.assertEqual(
+            services["s10-supervisor"]["environment"]["ARGUS_S10_GVISOR_KUBERNETES_RUNTIME_CLASS"],
+            "gvisor",
+        )
         self.assertIn("postgres", services["s10-supervisor"]["depends_on"])
         self.assertIn("s8-writer", services["s1-reference-demo"]["depends_on"])
         self.assertIn("s10-supervisor", services["s1-reference-demo"]["depends_on"])

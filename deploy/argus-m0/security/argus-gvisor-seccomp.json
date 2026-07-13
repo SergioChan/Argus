@@ -1,0 +1,18 @@
+{
+  "defaultAction": "SCMP_ACT_ALLOW",
+  "defaultErrnoRet": 1,
+  "syscalls": [
+    {
+      "names": [
+        "bpf",
+        "keyctl",
+        "kexec_load",
+        "mount",
+        "ptrace",
+        "unshare"
+      ],
+      "action": "SCMP_ACT_ERRNO",
+      "errnoRet": 1
+    }
+  ]
+}
