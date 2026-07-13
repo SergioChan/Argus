@@ -18,6 +18,7 @@ from argus_core import (
     BudgetExceededError,
     BudgetToken,
     EgressRule,
+    EgressSidecarRuntimeConfig,
     DockerSandboxOrchestrator,
     DockerSandboxSupervisor,
     Ed25519KmsTokenSigner,
@@ -364,6 +365,7 @@ class S10SupervisorApp:
                 "firecracker_resource_meter": (
                     self._docker_supervisor.firecracker_resource_meter_kind or "unconfigured"
                 ),
+                "egress_sidecar_configured": self._docker_supervisor.egress_sidecar_configured,
                 "audit_events": len(self.audit.events()),
             }
 
@@ -730,6 +732,31 @@ def _docker_supervisor_from_env() -> DockerSandboxSupervisor:
             if firecracker_config is not None
             else None
         ),
+        egress_sidecar_config=_egress_sidecar_runtime_config_from_env(),
+    )
+
+
+def _egress_sidecar_runtime_config_from_env() -> EgressSidecarRuntimeConfig | None:
+    image = os.environ.get("ARGUS_S10_EGRESS_SIDECAR_IMAGE")
+    if not image:
+        return None
+    dns_servers = tuple(
+        value.strip()
+        for value in os.environ.get("ARGUS_S10_EGRESS_DNS_SERVERS", "").split(",")
+        if value.strip()
+    )
+    return EgressSidecarRuntimeConfig(
+        image=image,
+        network_mode=os.environ.get("ARGUS_S10_EGRESS_NETWORK_MODE", "bridge"),
+        proxy_port=int(os.environ.get("ARGUS_S10_EGRESS_LISTEN_PORT", "15001")),
+        proxy_uid=int(os.environ.get("ARGUS_S10_EGRESS_PROXY_UID", "65531")),
+        proxy_gid=int(os.environ.get("ARGUS_S10_EGRESS_PROXY_GID", "65531")),
+        sandbox_uid=int(os.environ.get("ARGUS_S10_SANDBOX_UID", "65532")),
+        dns_servers=dns_servers,
+        dns_port=int(os.environ.get("ARGUS_S10_EGRESS_DNS_PORT", "53")),
+        startup_timeout_s=_positive_float_env("ARGUS_S10_EGRESS_STARTUP_TIMEOUT_S", 5.0),
+        memory_bytes=int(os.environ.get("ARGUS_S10_EGRESS_MEMORY_BYTES", str(64 * 1024 * 1024))),
+        pids=int(os.environ.get("ARGUS_S10_EGRESS_PIDS", "64")),
     )
 
 

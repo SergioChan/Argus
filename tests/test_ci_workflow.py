@@ -55,6 +55,19 @@ class CIWorkflowEvidenceTests(unittest.TestCase):
         self.assertIn("name: s10-firecracker-evidence", self.workflow)
         self.assertNotIn("ARGUS_REQUIRE_FIRECRACKER_TESTS", self.workflow)
 
+    def test_real_egress_job_is_unskippable_and_uploads_evidence(self) -> None:
+        self.assertIn("  egress-security:\n", self.workflow)
+        run_step = self._step("Run real egress sidecar security battery")
+        upload_step = self._step("Upload egress sidecar security evidence")
+
+        self.assertIn('test -z "$(git status --porcelain)"', run_step)
+        self.assertIn("sudo -E env", run_step)
+        self.assertIn("scripts/run_s10_egress_battery.py", run_step)
+        self.assertIn('--evidence-file "$RUNNER_TEMP/s10-egress-evidence.json"', run_step)
+        self.assertIn("if: always()", upload_step)
+        self.assertIn("name: s10-egress-evidence", upload_step)
+        self.assertNotIn("ARGUS_REQUIRE_EGRESS_TESTS", self.workflow)
+
     def _step(self, name: str) -> str:
         marker = f"      - name: {name}\n"
         start = self.workflow.index(marker)

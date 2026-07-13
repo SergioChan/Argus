@@ -113,6 +113,39 @@ jobs:
           name: m1-pilot-console-evidence
           path: ${{ runner.temp }}/m1-pilot-console-evidence.json
 
+  egress-security:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python and network-test dependencies
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install -e .
+          sudo apt-get update
+          sudo apt-get install --yes iproute2 iptables tcpdump
+
+      - name: Run real egress sidecar security battery
+        run: |
+          test -z "$(git status --porcelain)"
+          sudo git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          sudo -E env PYTHONPATH="$GITHUB_WORKSPACE/src:$GITHUB_WORKSPACE" \
+            "$(command -v python3)" scripts/run_s10_egress_battery.py \
+            --evidence-file "$RUNNER_TEMP/s10-egress-evidence.json"
+
+      - name: Upload egress sidecar security evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: s10-egress-evidence
+          path: ${{ runner.temp }}/s10-egress-evidence.json
+
   gvisor-security:
     runs-on: ubuntu-latest
     env:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import http.client as http_client
 import hmac
+import ipaddress
 import inspect
 import json
 import math
@@ -15,6 +16,7 @@ import shutil
 import signal
 import socket
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -94,6 +96,10 @@ class PolicyDeniedError(S10Error):
 
 class PolicyBundleSignatureError(S10Error):
     """Raised when a policy bundle signature cannot be trusted."""
+
+
+class EgressProxyManifestError(S10Error):
+    """Raised when a materialized egress sidecar manifest is invalid or has drifted."""
 
 
 class PriceTableSignatureError(S10Error):
@@ -529,6 +535,52 @@ class GvisorRuntimeConfig:
         required_mounts = {"verifier-code", "provenance-ledger"}
         if not required_mounts.issubset(names):
             raise ValueError("gVisor config requires verifier-code and provenance-ledger trust mounts")
+
+
+@dataclass(frozen=True)
+class EgressSidecarRuntimeConfig:
+    """Operator configuration for the Docker egress proxy sidecar."""
+
+    image: str
+    network_mode: str = "bridge"
+    proxy_port: int = 15001
+    proxy_uid: int = 65531
+    proxy_gid: int = 65531
+    sandbox_uid: int = 65532
+    dns_servers: tuple[str, ...] = ()
+    dns_port: int = 53
+    startup_timeout_s: float = 5.0
+    memory_bytes: int = 64 * 1024 * 1024
+    pids: int = 64
+
+    def __post_init__(self) -> None:
+        if not _is_digest_pinned_image(self.image):
+            raise ValueError("egress sidecar image must be digest-pinned")
+        if (
+            not self.network_mode
+            or self.network_mode in {"none", "host"}
+            or self.network_mode.startswith("container:")
+        ):
+            raise ValueError("egress sidecar requires an operator-owned routed network")
+        if not 1 <= self.proxy_port <= 65535 or not 1 <= self.dns_port <= 65535:
+            raise ValueError("egress sidecar port is invalid")
+        if min(self.proxy_uid, self.proxy_gid, self.sandbox_uid) < 1:
+            raise ValueError("egress sidecar users must be non-root")
+        if self.proxy_uid == self.sandbox_uid:
+            raise ValueError("egress proxy and sandbox UIDs must differ")
+        for nameserver in self.dns_servers:
+            try:
+                ipaddress.ip_address(nameserver)
+            except ValueError as exc:
+                raise ValueError("egress DNS servers must be numeric IP addresses") from exc
+        if self.startup_timeout_s <= 0:
+            raise ValueError("egress sidecar startup timeout must be positive")
+        if self.memory_bytes < 16 * 1024 * 1024 or self.pids < 8:
+            raise ValueError("egress sidecar resource limits are too small")
+
+    @property
+    def proxy_url(self) -> str:
+        return f"http://127.0.0.1:{self.proxy_port}"
 
 
 @dataclass(frozen=True)
@@ -2090,6 +2142,161 @@ class EgressDecision:
 
 
 @dataclass(frozen=True)
+class EgressProxyManifest:
+    schema_version: int
+    sandbox_id: str
+    job_id: str
+    scope_id: str
+    policy_bundle_version: str
+    policy_bundle_hash: str
+    scope_token_hash: str
+    rules: tuple[EgressRule, ...]
+    manifest_hash: str
+
+    @classmethod
+    def materialize(
+        cls,
+        *,
+        sandbox_id: str,
+        scope_token: ScopeToken,
+        policy_bundle: PolicyBundle,
+    ) -> "EgressProxyManifest":
+        if not sandbox_id:
+            raise EgressProxyManifestError("sandbox_id is required")
+        rules = tuple(
+            sorted(
+                set(scope_token.scopes.egress_allowlist) & set(policy_bundle.egress_allowlist),
+                key=lambda rule: (rule.host, rule.port, rule.proto),
+            )
+        )
+        for rule in rules:
+            _validate_egress_rule(rule)
+        manifest = cls(
+            schema_version=1,
+            sandbox_id=sandbox_id,
+            job_id=scope_token.job_id,
+            scope_id=scope_token.scope_id,
+            policy_bundle_version=policy_bundle.bundle_version,
+            policy_bundle_hash=hash_json(asdict(policy_bundle)),
+            scope_token_hash=hash_json(asdict(scope_token)),
+            rules=rules,
+            manifest_hash="",
+        )
+        return replace(manifest, manifest_hash=manifest.computed_hash())
+
+    @classmethod
+    def from_json(cls, raw: str, *, expected_hash: str) -> "EgressProxyManifest":
+        if not expected_hash.startswith(BLAKE3_PREFIX):
+            raise EgressProxyManifestError("expected manifest hash is missing or unsupported")
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise EgressProxyManifestError("egress proxy manifest is not valid JSON") from exc
+        if not isinstance(parsed, dict):
+            raise EgressProxyManifestError("egress proxy manifest must be an object")
+        expected_fields = {
+            "schema_version",
+            "sandbox_id",
+            "job_id",
+            "scope_id",
+            "policy_bundle_version",
+            "policy_bundle_hash",
+            "scope_token_hash",
+            "rules",
+            "manifest_hash",
+        }
+        if set(parsed) != expected_fields:
+            raise EgressProxyManifestError("egress proxy manifest fields are invalid")
+        raw_rules = parsed.get("rules")
+        if not isinstance(raw_rules, list):
+            raise EgressProxyManifestError("egress proxy manifest rules must be an array")
+        rules: list[EgressRule] = []
+        for raw_rule in raw_rules:
+            if not isinstance(raw_rule, dict) or set(raw_rule) != {"host", "port", "proto"}:
+                raise EgressProxyManifestError("egress proxy manifest rule is invalid")
+            if (
+                not isinstance(raw_rule["host"], str)
+                or isinstance(raw_rule["port"], bool)
+                or not isinstance(raw_rule["port"], int)
+                or not isinstance(raw_rule["proto"], str)
+            ):
+                raise EgressProxyManifestError("egress proxy manifest rule is invalid")
+            rule = EgressRule(
+                host=raw_rule["host"],
+                port=raw_rule["port"],
+                proto=raw_rule["proto"],
+            )
+            _validate_egress_rule(rule)
+            rules.append(rule)
+        scalar_fields = (
+            "sandbox_id",
+            "job_id",
+            "scope_id",
+            "policy_bundle_version",
+            "policy_bundle_hash",
+            "scope_token_hash",
+            "manifest_hash",
+        )
+        if isinstance(parsed["schema_version"], bool) or not isinstance(parsed["schema_version"], int):
+            raise EgressProxyManifestError("egress proxy manifest values are invalid")
+        if any(not isinstance(parsed[field_name], str) for field_name in scalar_fields):
+            raise EgressProxyManifestError("egress proxy manifest values are invalid")
+        manifest = cls(
+            schema_version=parsed["schema_version"],
+            sandbox_id=parsed["sandbox_id"],
+            job_id=parsed["job_id"],
+            scope_id=parsed["scope_id"],
+            policy_bundle_version=parsed["policy_bundle_version"],
+            policy_bundle_hash=parsed["policy_bundle_hash"],
+            scope_token_hash=parsed["scope_token_hash"],
+            rules=tuple(rules),
+            manifest_hash=parsed["manifest_hash"],
+        )
+        manifest._validate()
+        if not hmac.compare_digest(manifest.manifest_hash, expected_hash):
+            raise EgressProxyManifestError("egress proxy manifest expected hash mismatch")
+        if not hmac.compare_digest(manifest.computed_hash(), manifest.manifest_hash):
+            raise EgressProxyManifestError("egress proxy manifest content hash mismatch")
+        return manifest
+
+    def computed_hash(self) -> str:
+        return hash_json(
+            {
+                "schema_version": self.schema_version,
+                "sandbox_id": self.sandbox_id,
+                "job_id": self.job_id,
+                "scope_id": self.scope_id,
+                "policy_bundle_version": self.policy_bundle_version,
+                "policy_bundle_hash": self.policy_bundle_hash,
+                "scope_token_hash": self.scope_token_hash,
+                "rules": [asdict(rule) for rule in self.rules],
+            }
+        )
+
+    def to_json(self) -> str:
+        self._validate()
+        if not hmac.compare_digest(self.computed_hash(), self.manifest_hash):
+            raise EgressProxyManifestError("egress proxy manifest content hash mismatch")
+        return canonical_json_bytes(asdict(self)).decode("utf-8")
+
+    def _validate(self) -> None:
+        if self.schema_version != 1:
+            raise EgressProxyManifestError("unsupported egress proxy manifest schema version")
+        if not all((self.sandbox_id, self.job_id, self.scope_id, self.policy_bundle_version)):
+            raise EgressProxyManifestError("egress proxy manifest identity fields are required")
+        if not self.policy_bundle_hash.startswith(BLAKE3_PREFIX):
+            raise EgressProxyManifestError("egress proxy manifest policy hash is invalid")
+        if not self.scope_token_hash.startswith(BLAKE3_PREFIX):
+            raise EgressProxyManifestError("egress proxy manifest scope hash is invalid")
+        if tuple(sorted(self.rules, key=lambda rule: (rule.host, rule.port, rule.proto))) != self.rules:
+            raise EgressProxyManifestError("egress proxy manifest rules must be sorted")
+        if len(set(self.rules)) != len(self.rules):
+            raise EgressProxyManifestError("egress proxy manifest rules must be unique")
+        for rule in self.rules:
+            _validate_egress_rule(rule)
+
+
+@dataclass(frozen=True)
 class AuditEvent:
     sequence: int
     event_type: str
@@ -3486,14 +3693,56 @@ class EgressProxy:
     def __init__(self, bundle: PolicyBundle) -> None:
         self._bundle = bundle
 
+    def allowed_rules(self, scope_token: ScopeToken) -> tuple[EgressRule, ...]:
+        rules = set(scope_token.scopes.egress_allowlist) & set(self._bundle.egress_allowlist)
+        return tuple(sorted(rules, key=lambda rule: (rule.host, rule.port, rule.proto)))
+
     def decide(self, scope_token: ScopeToken, *, host: str, port: int, proto: str, sni: str) -> EgressDecision:
-        requested = EgressRule(host=host, port=port, proto=proto)
-        allowed = requested in set(scope_token.scopes.egress_allowlist) & set(self._bundle.egress_allowlist)
+        try:
+            requested = EgressRule(host=normalize_egress_host(host), port=int(port), proto=proto)
+            _validate_egress_rule(requested)
+            normalized_sni = normalize_egress_host(sni)
+        except (EgressProxyManifestError, TypeError, ValueError):
+            return EgressDecision(False, "invalid_destination")
+        allowed = requested in self.allowed_rules(scope_token)
         if not allowed:
             return EgressDecision(False, "egress_denied")
-        if sni != host:
+        if normalized_sni != requested.host:
             return EgressDecision(False, "sni_mismatch")
         return EgressDecision(True, "allowed")
+
+
+def normalize_egress_host(host: str) -> str:
+    if not isinstance(host, str) or not host or host != host.strip():
+        raise EgressProxyManifestError("egress host is invalid")
+    try:
+        return str(ipaddress.ip_address(host))
+    except ValueError:
+        pass
+    if host.endswith(".") or "*" in host or len(host) > 253:
+        raise EgressProxyManifestError("egress host is invalid")
+    try:
+        normalized = host.encode("idna").decode("ascii").lower()
+    except UnicodeError as exc:
+        raise EgressProxyManifestError("egress host is invalid") from exc
+    labels = normalized.split(".")
+    if any(
+        not label
+        or len(label) > 63
+        or re.fullmatch(r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?", label) is None
+        for label in labels
+    ):
+        raise EgressProxyManifestError("egress host is invalid")
+    return normalized
+
+
+def _validate_egress_rule(rule: EgressRule) -> None:
+    if normalize_egress_host(rule.host) != rule.host:
+        raise EgressProxyManifestError("egress rule host must be canonical")
+    if isinstance(rule.port, bool) or not isinstance(rule.port, int) or not 1 <= rule.port <= 65535:
+        raise EgressProxyManifestError("egress rule port is invalid")
+    if rule.proto not in {"https", "grpc", "tcp"}:
+        raise EgressProxyManifestError("egress rule protocol is invalid")
 
 
 class InMemoryAuditLedger:
@@ -3902,6 +4151,7 @@ class DockerSandboxSupervisor:
         dcgm_metric_sampler: Callable[[], DcgmMetricSnapshot] | None = None,
         gvisor_config: GvisorRuntimeConfig | None = None,
         firecracker_supervisor: FirecrackerSandboxSupervisor | None = None,
+        egress_sidecar_config: EgressSidecarRuntimeConfig | None = None,
     ) -> None:
         self._docker_bin = docker_bin or shutil.which("docker") or "docker"
         self._meter_interval_s = min(max(float(meter_interval_s), 0.1), 5.0)
@@ -3913,6 +4163,7 @@ class DockerSandboxSupervisor:
         )
         self._gvisor_config = gvisor_config
         self._firecracker_supervisor = firecracker_supervisor
+        self._egress_sidecar_config = egress_sidecar_config
 
     @property
     def resource_meter_kind(self) -> str:
@@ -3986,6 +4237,10 @@ class DockerSandboxSupervisor:
             else None
         )
 
+    @property
+    def egress_sidecar_configured(self) -> bool:
+        return self._egress_sidecar_config is not None
+
     def materialize_security_spec(
         self,
         handle: SandboxHandle,
@@ -4048,6 +4303,7 @@ class DockerSandboxSupervisor:
         halt_telemetry_sink: Callable[[SandboxHaltTelemetry], None] | None = None,
         policy_bundle: PolicyBundle | None = None,
         runtime_evidence_sink: Callable[[RuntimeLaunchEvidence], None] | None = None,
+        egress_audit_sink: Callable[[str, dict[str, Any]], None] | None = None,
     ) -> SandboxExecutionResult:
         if not _is_digest_pinned_image(request.image):
             raise PolicyDeniedError("image must be digest-pinned")
@@ -4067,6 +4323,8 @@ class DockerSandboxSupervisor:
                 runtime_evidence_sink=runtime_evidence_sink,
             )
         security_spec = self.materialize_security_spec(handle, policy_bundle)
+        egress_manifest = self._materialize_egress_manifest(handle, request, policy_bundle)
+        sidecar_required = self._egress_sidecar_config is not None and egress_manifest is not None
         if self._docker_socket_path is not None:
             try:
                 return self._run_via_docker_api(
@@ -4078,12 +4336,16 @@ class DockerSandboxSupervisor:
                     halt_telemetry_sink=halt_telemetry_sink,
                     security_spec=security_spec,
                     runtime_evidence_sink=runtime_evidence_sink,
+                    egress_manifest=egress_manifest,
+                    egress_audit_sink=egress_audit_sink,
                 )
             except SandboxRuntimeUnavailableError:
-                if security_spec.runtime_class != "docker":
+                if security_spec.runtime_class != "docker" or sidecar_required:
                     raise
                 if shutil.which(self._docker_bin) is None and "/" not in self._docker_bin:
                     raise
+        if sidecar_required:
+            raise SandboxRuntimeUnavailableError("egress sidecar launch requires the Docker Engine API")
         if shutil.which(self._docker_bin) is None and "/" not in self._docker_bin:
             raise SandboxRuntimeUnavailableError("docker runtime is unavailable")
 
@@ -4119,6 +4381,22 @@ class DockerSandboxSupervisor:
             )
         except FileNotFoundError as exc:
             raise SandboxRuntimeUnavailableError("docker runtime is unavailable") from exc
+
+    @staticmethod
+    def _materialize_egress_manifest(
+        handle: SandboxHandle,
+        request: LaunchRequest,
+        policy_bundle: PolicyBundle | None,
+    ) -> EgressProxyManifest | None:
+        if policy_bundle is None:
+            return None
+        if policy_bundle.bundle_version != handle.policy_bundle_version:
+            raise SandboxRuntimeUnavailableError("egress policy bundle version differs from the admitted handle")
+        return EgressProxyManifest.materialize(
+            sandbox_id=handle.sandbox_id,
+            scope_token=request.scope_token,
+            policy_bundle=policy_bundle,
+        )
 
     def _docker_command(
         self,
@@ -4217,19 +4495,44 @@ class DockerSandboxSupervisor:
         halt_telemetry_sink: Callable[[SandboxHaltTelemetry], None] | None = None,
         security_spec: SandboxSecuritySpec,
         runtime_evidence_sink: Callable[[DockerRuntimeLaunchEvidence], None] | None = None,
+        egress_manifest: EgressProxyManifest | None = None,
+        egress_audit_sink: Callable[[str, dict[str, Any]], None] | None = None,
     ) -> SandboxExecutionResult:
         container_name = f"argus-{handle.sandbox_id.replace('-', '')[:24]}"
         envelope = request.requested_envelope
         container_id: str | None = None
+        sidecar_id: str | None = None
         started_at = time.monotonic()
         try:
             self._ensure_docker_api_runtime_available(security_spec)
+            if self._egress_sidecar_config is not None and egress_manifest is not None:
+                sidecar_id = self._start_egress_sidecar(handle=handle, manifest=egress_manifest)
+            effective_env = dict(materialized_env)
+            sandbox_user = DOCKER_SANDBOX_USER
+            if sidecar_id is not None:
+                assert self._egress_sidecar_config is not None
+                proxy_url = self._egress_sidecar_config.proxy_url
+                sandbox_user = (
+                    f"{self._egress_sidecar_config.sandbox_uid}:"
+                    f"{self._egress_sidecar_config.sandbox_uid}"
+                )
+                effective_env.update(
+                    {
+                        "ALL_PROXY": proxy_url,
+                        "HTTPS_PROXY": proxy_url,
+                        "all_proxy": proxy_url,
+                        "https_proxy": proxy_url,
+                        "ARGUS_EGRESS_PROXY": proxy_url,
+                        "NO_PROXY": "",
+                        "no_proxy": "",
+                    }
+                )
             host_config: dict[str, Any] = {
                 "AutoRemove": False,
                 "ReadonlyRootfs": True,
                 "CapDrop": ["ALL"],
                 "SecurityOpt": ["no-new-privileges"],
-                "NetworkMode": "none",
+                "NetworkMode": f"container:{sidecar_id}" if sidecar_id is not None else "none",
                 "PidsLimit": max(envelope.pids, 1),
                 "Memory": max(envelope.mem_bytes, 4 * 1024 * 1024),
                 "NanoCpus": max(envelope.cpu_m, 1) * 1_000_000,
@@ -4257,11 +4560,16 @@ class DockerSandboxSupervisor:
                 f"/containers/create?name={container_name}",
                 {
                     "Image": request.image,
+                    "Labels": {
+                        "argus.dev/job-id": request.job_id,
+                        "argus.dev/role": "sandbox",
+                        "argus.dev/sandbox-id": handle.sandbox_id,
+                    },
                     "Entrypoint": [request.entrypoint[0]],
                     "Cmd": list(request.entrypoint[1:]) + list(request.args),
-                    "Env": [f"{key}={value}" for key, value in sorted(materialized_env.items())],
-                    "User": DOCKER_SANDBOX_USER,
-                    "NetworkDisabled": True,
+                    "Env": [f"{key}={value}" for key, value in sorted(effective_env.items())],
+                    "User": sandbox_user,
+                    "NetworkDisabled": sidecar_id is None,
                     "HostConfig": host_config,
                 },
                 expected=(201,),
@@ -4269,12 +4577,24 @@ class DockerSandboxSupervisor:
             container_id = str(create_response.get("Id") or "")
             if not container_id:
                 raise SandboxRuntimeUnavailableError("docker runtime did not return a container id")
-            if security_spec.runtime_class == "gvisor":
+            inspected: dict[str, Any] | None = None
+            if security_spec.runtime_class == "gvisor" or sidecar_id is not None:
                 inspected = self._docker_api_request(
                     "GET",
                     f"/containers/{container_id}/json",
                     expected=(200,),
                 )
+            if sidecar_id is not None:
+                assert inspected is not None
+                assert self._egress_sidecar_config is not None
+                self._verify_sandbox_egress_attestation(
+                    inspected,
+                    sidecar_id=sidecar_id,
+                    proxy_url=self._egress_sidecar_config.proxy_url,
+                    sandbox_user=sandbox_user,
+                )
+            if security_spec.runtime_class == "gvisor":
+                assert inspected is not None
                 self._verify_docker_api_security_attestation(inspected, security_spec)
                 if runtime_evidence_sink is not None:
                     runtime_evidence_sink(
@@ -4313,8 +4633,321 @@ class DockerSandboxSupervisor:
                 partial_result=partial_result,
             )
         finally:
+            active_error = sys.exception()
+            cleanup_errors: list[Exception] = []
             if container_id:
-                self._docker_api_request("DELETE", f"/containers/{container_id}?force=true", expected=(204, 404))
+                try:
+                    self._docker_api_request(
+                        "DELETE",
+                        f"/containers/{container_id}?force=true",
+                        expected=(204, 404),
+                    )
+                except Exception as exc:
+                    cleanup_errors.append(exc)
+            if sidecar_id:
+                try:
+                    assert egress_manifest is not None
+                    self._collect_egress_sidecar_events(
+                        sidecar_id=sidecar_id,
+                        manifest=egress_manifest,
+                        sink=egress_audit_sink,
+                    )
+                except Exception as exc:
+                    cleanup_errors.append(exc)
+                try:
+                    self._docker_api_request(
+                        "DELETE",
+                        f"/containers/{sidecar_id}?force=true",
+                        expected=(204, 404),
+                    )
+                except Exception as exc:
+                    cleanup_errors.append(exc)
+            if cleanup_errors:
+                if active_error is not None:
+                    for cleanup_error in cleanup_errors:
+                        active_error.add_note(
+                            "egress cleanup failure: "
+                            f"{type(cleanup_error).__name__}: {cleanup_error}"
+                        )
+                else:
+                    primary = cleanup_errors[0]
+                    for additional in cleanup_errors[1:]:
+                        primary.add_note(
+                            "additional egress cleanup failure: "
+                            f"{type(additional).__name__}: {additional}"
+                        )
+                    raise primary
+
+    def _start_egress_sidecar(
+        self,
+        *,
+        handle: SandboxHandle,
+        manifest: EgressProxyManifest,
+    ) -> str:
+        config = self._egress_sidecar_config
+        if config is None:
+            raise SandboxRuntimeUnavailableError("egress sidecar is not configured")
+        sidecar_name = f"argus-egress-{handle.sandbox_id.replace('-', '')[:20]}"
+        environment = {
+            "ARGUS_S10_EGRESS_DNS_PORT": str(config.dns_port),
+            "ARGUS_S10_EGRESS_DNS_SERVERS": ",".join(config.dns_servers),
+            "ARGUS_S10_EGRESS_LISTEN_HOST": "127.0.0.1",
+            "ARGUS_S10_EGRESS_LISTEN_PORT": str(config.proxy_port),
+            "ARGUS_S10_EGRESS_MANIFEST_HASH": manifest.manifest_hash,
+            "ARGUS_S10_EGRESS_MANIFEST_JSON": manifest.to_json(),
+            "ARGUS_S10_EGRESS_PROXY_GID": str(config.proxy_gid),
+            "ARGUS_S10_EGRESS_PROXY_UID": str(config.proxy_uid),
+            "ARGUS_S10_SANDBOX_UID": str(config.sandbox_uid),
+        }
+        response = self._docker_api_request(
+            "POST",
+            f"/containers/create?name={sidecar_name}",
+            {
+                "Image": config.image,
+                "Labels": {
+                    "argus.dev/job-id": manifest.job_id,
+                    "argus.dev/role": "egress-sidecar",
+                    "argus.dev/sandbox-id": manifest.sandbox_id,
+                },
+                "Entrypoint": ["python", "-m", "argus_runtime.s10_egress_proxy_service"],
+                "Cmd": ["--apply-firewall"],
+                "Env": [f"{key}={value}" for key, value in sorted(environment.items())],
+                "User": "0:0",
+                "NetworkDisabled": False,
+                "HostConfig": {
+                    "AutoRemove": False,
+                    "ReadonlyRootfs": True,
+                    "CapDrop": ["ALL"],
+                    "CapAdd": ["NET_ADMIN", "NET_RAW", "SETGID", "SETUID"],
+                    "SecurityOpt": ["no-new-privileges"],
+                    "NetworkMode": config.network_mode,
+                    "PidsLimit": config.pids,
+                    "Memory": config.memory_bytes,
+                    "NanoCpus": 250_000_000,
+                    "Tmpfs": {"/run": "rw,noexec,nosuid,nodev,size=16777216"},
+                },
+            },
+            expected=(201,),
+        )
+        sidecar_id = str(response.get("Id") or "")
+        if not sidecar_id:
+            raise SandboxRuntimeUnavailableError("docker runtime did not return an egress sidecar id")
+        try:
+            inspected = self._docker_api_request(
+                "GET",
+                f"/containers/{sidecar_id}/json",
+                expected=(200,),
+            )
+            self._verify_egress_sidecar_attestation(inspected, config, manifest)
+            self._docker_api_request("POST", f"/containers/{sidecar_id}/start", expected=(204, 304))
+            self._wait_for_egress_sidecar_ready(
+                sidecar_id=sidecar_id,
+                manifest=manifest,
+                timeout_s=config.startup_timeout_s,
+            )
+        except Exception as primary:
+            try:
+                self._docker_api_request(
+                    "DELETE",
+                    f"/containers/{sidecar_id}?force=true",
+                    expected=(204, 404),
+                )
+            except Exception as cleanup_error:
+                primary.add_note(
+                    "egress sidecar startup cleanup failure: "
+                    f"{type(cleanup_error).__name__}: {cleanup_error}"
+                )
+            raise
+        return sidecar_id
+
+    @staticmethod
+    def _verify_egress_sidecar_attestation(
+        inspected: dict[str, Any],
+        config: EgressSidecarRuntimeConfig,
+        manifest: EgressProxyManifest,
+    ) -> None:
+        container_config = inspected.get("Config")
+        host_config = inspected.get("HostConfig")
+        if not isinstance(container_config, dict) or container_config.get("Image") != config.image:
+            raise SandboxRuntimeUnavailableError("Docker did not bind the digest-pinned egress sidecar image")
+        if container_config.get("User") != "0:0":
+            raise SandboxRuntimeUnavailableError("egress sidecar bootstrap user differs from policy")
+        if container_config.get("Entrypoint") != ["python", "-m", "argus_runtime.s10_egress_proxy_service"]:
+            raise SandboxRuntimeUnavailableError("egress sidecar entrypoint differs from policy")
+        if container_config.get("Cmd") != ["--apply-firewall"]:
+            raise SandboxRuntimeUnavailableError("egress sidecar omitted fail-closed firewall setup")
+        environment = container_config.get("Env")
+        if not isinstance(environment, list) or (
+            f"ARGUS_S10_EGRESS_MANIFEST_HASH={manifest.manifest_hash}" not in environment
+        ):
+            raise SandboxRuntimeUnavailableError("egress sidecar manifest hash binding is absent")
+        if not isinstance(host_config, dict):
+            raise SandboxRuntimeUnavailableError("Docker inspect omitted egress sidecar HostConfig")
+        if host_config.get("NetworkMode") != config.network_mode:
+            raise SandboxRuntimeUnavailableError("Docker changed the egress sidecar network")
+        if not host_config.get("ReadonlyRootfs"):
+            raise SandboxRuntimeUnavailableError("egress sidecar rootfs is not read-only")
+        if host_config.get("CapDrop") != ["ALL"] or host_config.get("CapAdd") != [
+            "NET_ADMIN",
+            "NET_RAW",
+            "SETGID",
+            "SETUID",
+        ]:
+            raise SandboxRuntimeUnavailableError("egress sidecar capability boundary differs from policy")
+        if "no-new-privileges" not in (host_config.get("SecurityOpt") or []):
+            raise SandboxRuntimeUnavailableError("egress sidecar omitted no-new-privileges")
+
+    @staticmethod
+    def _verify_sandbox_egress_attestation(
+        inspected: dict[str, Any],
+        *,
+        sidecar_id: str,
+        proxy_url: str,
+        sandbox_user: str,
+    ) -> None:
+        container_config = inspected.get("Config")
+        host_config = inspected.get("HostConfig")
+        if not isinstance(container_config, dict) or not isinstance(host_config, dict):
+            raise SandboxRuntimeUnavailableError("Docker inspect omitted sandbox egress evidence")
+        if host_config.get("NetworkMode") != f"container:{sidecar_id}":
+            raise SandboxRuntimeUnavailableError("sandbox did not join the egress sidecar network namespace")
+        if container_config.get("User") != sandbox_user:
+            raise SandboxRuntimeUnavailableError("sandbox user differs from the firewall owner rule")
+        environment = container_config.get("Env")
+        required = {
+            f"ALL_PROXY={proxy_url}",
+            f"HTTPS_PROXY={proxy_url}",
+            f"ARGUS_EGRESS_PROXY={proxy_url}",
+        }
+        if not isinstance(environment, list) or not required.issubset(environment):
+            raise SandboxRuntimeUnavailableError("sandbox proxy environment differs from the sidecar binding")
+
+    def _wait_for_egress_sidecar_ready(
+        self,
+        *,
+        sidecar_id: str,
+        manifest: EgressProxyManifest,
+        timeout_s: float,
+    ) -> None:
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            inspected = self._docker_api_request(
+                "GET",
+                f"/containers/{sidecar_id}/json",
+                expected=(200,),
+                timeout=1,
+            )
+            state = inspected.get("State")
+            if not isinstance(state, dict) or not state.get("Running", False):
+                capture = self._docker_api_logs(sidecar_id)
+                detail = " ".join((capture.stderr or capture.stdout).strip().split())[:1024]
+                suffix = f": {detail}" if detail else ""
+                raise SandboxRuntimeUnavailableError(
+                    f"egress sidecar exited before it became ready{suffix}"
+                )
+            capture = self._docker_api_logs(sidecar_id)
+            events = self._parse_egress_sidecar_events(capture, manifest)
+            ready_payloads = [payload for event_type, payload in events if event_type == "egress.ready"]
+            if len(ready_payloads) > 1:
+                raise SandboxRuntimeUnavailableError("egress sidecar emitted multiple ready events")
+            if ready_payloads:
+                config = self._egress_sidecar_config
+                if config is None:
+                    raise SandboxRuntimeUnavailableError("egress sidecar readiness has no runtime config")
+                payload = ready_payloads[0]
+                expected = {
+                    "effective_capabilities": "0000000000000000",
+                    "listen_host": "127.0.0.1",
+                    "listen_port": config.proxy_port,
+                    "proxy_uid": config.proxy_uid,
+                    "rule_count": len(manifest.rules),
+                }
+                for field_name, expected_value in expected.items():
+                    if payload.get(field_name) != expected_value:
+                        label = field_name.replace("_", " ")
+                        raise SandboxRuntimeUnavailableError(
+                            f"egress sidecar ready {label} differs from policy"
+                        )
+                return
+            time.sleep(0.05)
+        raise SandboxRuntimeUnavailableError("egress sidecar did not become ready before its deadline")
+
+    def _collect_egress_sidecar_events(
+        self,
+        *,
+        sidecar_id: str,
+        manifest: EgressProxyManifest,
+        sink: Callable[[str, dict[str, Any]], None] | None,
+    ) -> None:
+        capture = self._docker_api_logs(sidecar_id)
+        events = self._parse_egress_sidecar_events(capture, manifest)
+        inspected = self._docker_api_request(
+            "GET",
+            f"/containers/{sidecar_id}/json",
+            expected=(200, 404),
+        )
+        state = inspected.get("State") if isinstance(inspected, dict) else None
+        if isinstance(state, dict) and not state.get("Running", False):
+            events.append(
+                (
+                    "egress.proxy_crashed",
+                    {
+                        "sandbox_id": manifest.sandbox_id,
+                        "job_id": manifest.job_id,
+                        "scope_id": manifest.scope_id,
+                        "policy_bundle_version": manifest.policy_bundle_version,
+                        "manifest_hash": manifest.manifest_hash,
+                        "exit_code": state.get("ExitCode"),
+                    },
+                )
+            )
+        if sink is not None:
+            for event_type, payload in events:
+                sink(event_type, payload)
+
+    @staticmethod
+    def _parse_egress_sidecar_events(
+        capture: _DockerLogCapture,
+        manifest: EgressProxyManifest,
+    ) -> list[tuple[str, dict[str, Any]]]:
+        if capture.truncated:
+            raise SandboxRuntimeUnavailableError("egress sidecar audit log exceeded its bounded capture")
+        events: list[tuple[str, dict[str, Any]]] = []
+        for line in capture.stdout.splitlines():
+            if not line.strip():
+                continue
+            try:
+                raw_event = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise SandboxRuntimeUnavailableError("egress sidecar emitted invalid audit JSON") from exc
+            if not isinstance(raw_event, dict) or set(raw_event) != {"event_type", "payload"}:
+                raise SandboxRuntimeUnavailableError("egress sidecar emitted an invalid audit envelope")
+            event_type = raw_event.get("event_type")
+            payload = raw_event.get("payload")
+            if not isinstance(event_type, str) or not event_type.startswith("egress."):
+                raise SandboxRuntimeUnavailableError("egress sidecar emitted an invalid event type")
+            if not isinstance(payload, dict):
+                raise SandboxRuntimeUnavailableError("egress sidecar emitted an invalid event payload")
+            for field_name, expected in (
+                ("sandbox_id", manifest.sandbox_id),
+                ("job_id", manifest.job_id),
+                ("manifest_hash", manifest.manifest_hash),
+            ):
+                if payload.get(field_name) != expected:
+                    raise SandboxRuntimeUnavailableError(
+                        f"egress sidecar event {field_name} differs from the admitted manifest"
+                    )
+            events.append(
+                (
+                    event_type,
+                    {
+                        "scope_id": manifest.scope_id,
+                        "policy_bundle_version": manifest.policy_bundle_version,
+                        **payload,
+                    },
+                )
+            )
+        return events
 
     def _ensure_docker_api_runtime_available(self, security_spec: SandboxSecuritySpec) -> None:
         if security_spec.runtime_class != "gvisor":
@@ -5451,6 +6084,17 @@ class DockerSandboxOrchestrator(InMemorySandboxOrchestrator):
                 },
             )
 
+        def record_egress_event(event_type: str, payload: dict[str, Any]) -> None:
+            if not event_type.startswith("egress."):
+                raise SandboxRuntimeUnavailableError("egress sidecar emitted a non-egress audit event")
+            if payload.get("sandbox_id") != handle.sandbox_id or payload.get("job_id") != request.job_id:
+                raise SandboxRuntimeUnavailableError("egress sidecar audit identity mismatch")
+            if payload.get("scope_id") != request.scope_token.scope_id:
+                raise SandboxRuntimeUnavailableError("egress sidecar audit scope mismatch")
+            if payload.get("policy_bundle_version") != handle.policy_bundle_version:
+                raise SandboxRuntimeUnavailableError("egress sidecar audit policy version mismatch")
+            self._audit_ledger.append(event_type, payload)
+
         self._audit_ledger.append(
             "sandbox.started",
             {"sandbox_id": handle.sandbox_id, "job_id": request.job_id, "runtime_class": handle.runtime_class},
@@ -5465,6 +6109,7 @@ class DockerSandboxOrchestrator(InMemorySandboxOrchestrator):
                 runtime_halt_probe=self._runtime_halt_probe(request),
                 halt_telemetry_sink=record_halt_telemetry,
                 runtime_evidence_sink=record_runtime_evidence,
+                egress_audit_sink=record_egress_event,
             )
         except Exception as exc:
             self._record_runtime_failure(handle, request, reserved_usage, exc)
