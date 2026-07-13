@@ -38,6 +38,7 @@ CHECKS = (
             "scripts/run_m1_pilot_console_battery.py",
             "scripts/run_m1_s2_reference_builder_battery.py",
             "scripts/run_s10_gvisor_battery.py",
+            "scripts/run_s10_firecracker_battery.py",
             "scripts/roadmap_audit.py",
             "scripts/schema_compatibility.py",
             "scripts/validate_docs.py",
@@ -83,6 +84,7 @@ CHECKS = (
             "tests/test_s3_statistics_library.py",
             "tests/test_s3_trust_store_key_management.py",
             "tests/test_s10_gvisor_runtime.py",
+            "tests/test_s10_firecracker_runtime.py",
         ),
     ),
 )

@@ -37,6 +37,24 @@ class CIWorkflowEvidenceTests(unittest.TestCase):
         self.assertIn("name: s10-gvisor-evidence", self.workflow)
         self.assertNotIn("ARGUS_REQUIRE_GVISOR_TESTS", self.workflow)
 
+    def test_real_firecracker_job_is_pinned_unskippable_and_uploads_evidence(self) -> None:
+        self.assertIn("  firecracker-security:\n", self.workflow)
+        self.assertIn('FIRECRACKER_VERSION: "1.15.1"', self.workflow)
+        self.assertIn(
+            'FIRECRACKER_TARBALL_SHA256: "d4a32ab2322d887ca1bc4a4e7afa9cc35393e6362dfc2b3becb389d362e4275a"',
+            self.workflow,
+        )
+        self.assertIn("firecracker-v${FIRECRACKER_VERSION}-x86_64.tgz.sha256.txt", self.workflow)
+        self.assertIn("sudo test -c /dev/kvm", self.workflow)
+        self.assertIn("sudo test -r /dev/kvm", self.workflow)
+        self.assertIn("sudo test -w /dev/kvm", self.workflow)
+        self.assertIn(
+            'scripts/run_s10_firecracker_battery.py --evidence-file "$RUNNER_TEMP/s10-firecracker-evidence.json"',
+            self.workflow,
+        )
+        self.assertIn("name: s10-firecracker-evidence", self.workflow)
+        self.assertNotIn("ARGUS_REQUIRE_FIRECRACKER_TESTS", self.workflow)
+
     def _step(self, name: str) -> str:
         marker = f"      - name: {name}\n"
         start = self.workflow.index(marker)

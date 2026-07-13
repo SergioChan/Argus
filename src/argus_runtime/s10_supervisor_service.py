@@ -22,6 +22,8 @@ from argus_core import (
     DockerSandboxSupervisor,
     Ed25519KmsTokenSigner,
     FileTokenRevocationStore,
+    FirecrackerRuntimeConfig,
+    FirecrackerSandboxSupervisor,
     FileSystemArtifactStore,
     InMemoryArtifactStore,
     InMemoryAuditLedger,
@@ -357,6 +359,11 @@ class S10SupervisorApp:
                 "dcgm_metric_fields": list(self._docker_supervisor.dcgm_metric_fields),
                 "gvisor_configured": self._docker_supervisor.gvisor_configured,
                 "gvisor_docker_runtime": self._docker_supervisor.gvisor_docker_runtime or "unconfigured",
+                "firecracker_configured": self._docker_supervisor.firecracker_configured,
+                "firecracker_version": self._docker_supervisor.firecracker_version or "unconfigured",
+                "firecracker_resource_meter": (
+                    self._docker_supervisor.firecracker_resource_meter_kind or "unconfigured"
+                ),
                 "audit_events": len(self.audit.events()),
             }
 
@@ -712,10 +719,17 @@ def _token_revocation_store_from_env() -> FileTokenRevocationStore | None:
 
 
 def _docker_supervisor_from_env() -> DockerSandboxSupervisor:
+    meter_interval_s = _positive_float_env("ARGUS_S10_METER_INTERVAL_S", 1.0)
+    firecracker_config = _firecracker_runtime_config_from_env()
     return DockerSandboxSupervisor(
-        meter_interval_s=_positive_float_env("ARGUS_S10_METER_INTERVAL_S", 1.0),
+        meter_interval_s=meter_interval_s,
         meter_gap_halt_s=_positive_float_env("ARGUS_S10_METER_GAP_HALT_S", 5.0),
         gvisor_config=_gvisor_runtime_config_from_env(),
+        firecracker_supervisor=(
+            FirecrackerSandboxSupervisor(config=firecracker_config, meter_interval_s=meter_interval_s)
+            if firecracker_config is not None
+            else None
+        ),
     )
 
 
@@ -765,6 +779,49 @@ def _gvisor_runtime_config_from_env() -> GvisorRuntimeConfig | None:
         )
     except ValueError as exc:
         raise RuntimeError(f"invalid gVisor runtime configuration: {exc}") from exc
+
+
+def _firecracker_runtime_config_from_env() -> FirecrackerRuntimeConfig | None:
+    names = (
+        "ARGUS_S10_FIRECRACKER_VERSION",
+        "ARGUS_S10_FIRECRACKER_KUBERNETES_RUNTIME_CLASS",
+        "ARGUS_S10_FIRECRACKER_BIN",
+        "ARGUS_S10_FIRECRACKER_JAILER_BIN",
+        "ARGUS_S10_FIRECRACKER_KERNEL_PATH",
+        "ARGUS_S10_FIRECRACKER_KERNEL_HASH",
+        "ARGUS_S10_FIRECRACKER_ROOTFS_PATH",
+        "ARGUS_S10_FIRECRACKER_ROOTFS_HASH",
+        "ARGUS_S10_FIRECRACKER_ROOTFS_IMAGE_REF",
+        "ARGUS_S10_FIRECRACKER_CHROOT_BASE",
+        "ARGUS_S10_FIRECRACKER_JAILER_UID",
+        "ARGUS_S10_FIRECRACKER_JAILER_GID",
+    )
+    values = {name: os.environ.get(name) for name in names}
+    configured = {name: value for name, value in values.items() if value is not None and value.strip()}
+    if not configured:
+        return None
+    if len(configured) != len(names):
+        missing = ", ".join(name for name in names if name not in configured)
+        raise RuntimeError(f"Firecracker runtime variables must be configured together; missing: {missing}")
+    try:
+        return FirecrackerRuntimeConfig(
+            expected_version=str(values["ARGUS_S10_FIRECRACKER_VERSION"]),
+            kubernetes_runtime_class=str(
+                values["ARGUS_S10_FIRECRACKER_KUBERNETES_RUNTIME_CLASS"]
+            ),
+            firecracker_bin=str(values["ARGUS_S10_FIRECRACKER_BIN"]),
+            jailer_bin=str(values["ARGUS_S10_FIRECRACKER_JAILER_BIN"]),
+            kernel_image_path=str(values["ARGUS_S10_FIRECRACKER_KERNEL_PATH"]),
+            kernel_image_hash=str(values["ARGUS_S10_FIRECRACKER_KERNEL_HASH"]),
+            rootfs_image_path=str(values["ARGUS_S10_FIRECRACKER_ROOTFS_PATH"]),
+            rootfs_image_hash=str(values["ARGUS_S10_FIRECRACKER_ROOTFS_HASH"]),
+            rootfs_image_ref=str(values["ARGUS_S10_FIRECRACKER_ROOTFS_IMAGE_REF"]),
+            chroot_base_dir=str(values["ARGUS_S10_FIRECRACKER_CHROOT_BASE"]),
+            jailer_uid=int(str(values["ARGUS_S10_FIRECRACKER_JAILER_UID"])),
+            jailer_gid=int(str(values["ARGUS_S10_FIRECRACKER_JAILER_GID"])),
+        )
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(f"invalid Firecracker runtime configuration: {exc}") from exc
 
 
 def _positive_float_env(name: str, default: float) -> float:

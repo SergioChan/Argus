@@ -154,3 +154,80 @@ jobs:
         with:
           name: s10-gvisor-evidence
           path: ${{ runner.temp }}/s10-gvisor-evidence.json
+
+  firecracker-security:
+    runs-on: ubuntu-latest
+    env:
+      FIRECRACKER_VERSION: "1.15.1"
+      FIRECRACKER_TARBALL_SHA256: "d4a32ab2322d887ca1bc4a4e7afa9cc35393e6362dfc2b3becb389d362e4275a"
+      FIRECRACKER_KERNEL_SHA256: "e20e46d0c36c55c0d1014eb20576171b3f3d922260d9f792017aeff53af3d4f2"
+      FIRECRACKER_ROOTFS_SHA256: "68321e0482baeb3844dafe8a6b08a6902401a7afc41fbfd8c3d9ea08aadd244f"
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python dependencies
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install -e .
+
+      - name: Require KVM and install Firecracker host tools
+        run: |
+          sudo test -c /dev/kvm
+          sudo test -r /dev/kvm
+          sudo test -w /dev/kvm
+          test -f /sys/fs/cgroup/cgroup.controllers
+          sudo apt-get update
+          sudo apt-get install --yes e2fsprogs squashfs-tools util-linux
+
+      - name: Install pinned same-version Firecracker and jailer
+        run: |
+          RELEASE_DIR="$RUNNER_TEMP/firecracker-release"
+          mkdir -p "$RELEASE_DIR"
+          cd "$RELEASE_DIR"
+          RELEASE_BASE="https://github.com/firecracker-microvm/firecracker/releases/download/v${FIRECRACKER_VERSION}"
+          curl --fail --silent --show-error --location --output "firecracker-v${FIRECRACKER_VERSION}-x86_64.tgz" \
+            "${RELEASE_BASE}/firecracker-v${FIRECRACKER_VERSION}-x86_64.tgz"
+          curl --fail --silent --show-error --location --output "firecracker-v${FIRECRACKER_VERSION}-x86_64.tgz.sha256.txt" \
+            "${RELEASE_BASE}/firecracker-v${FIRECRACKER_VERSION}-x86_64.tgz.sha256.txt"
+          echo "${FIRECRACKER_TARBALL_SHA256}  firecracker-v${FIRECRACKER_VERSION}-x86_64.tgz" | sha256sum --check
+          sha256sum --check "firecracker-v${FIRECRACKER_VERSION}-x86_64.tgz.sha256.txt"
+          tar --extract --gzip --file "firecracker-v${FIRECRACKER_VERSION}-x86_64.tgz"
+          RELEASE_ROOT="release-v${FIRECRACKER_VERSION}-x86_64"
+          (cd "$RELEASE_ROOT" && sha256sum --check SHA256SUMS)
+          sudo install --mode 0755 \
+            "$RELEASE_ROOT/firecracker-v${FIRECRACKER_VERSION}-x86_64" /usr/local/bin/firecracker
+          sudo install --mode 0755 \
+            "$RELEASE_ROOT/jailer-v${FIRECRACKER_VERSION}-x86_64" /usr/local/bin/jailer
+          /usr/local/bin/firecracker --version
+          /usr/local/bin/jailer --version
+
+      - name: Download pinned official Firecracker kernel and rootfs
+        run: |
+          curl --fail --silent --show-error --location \
+            --output "$RUNNER_TEMP/firecracker-vmlinux-6.1.155" \
+            "https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.15/x86_64/vmlinux-6.1.155"
+          curl --fail --silent --show-error --location \
+            --output "$RUNNER_TEMP/firecracker-ubuntu-24.04.squashfs" \
+            "https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.15/x86_64/ubuntu-24.04.squashfs"
+          echo "${FIRECRACKER_KERNEL_SHA256}  $RUNNER_TEMP/firecracker-vmlinux-6.1.155" | sha256sum --check
+          echo "${FIRECRACKER_ROOTFS_SHA256}  $RUNNER_TEMP/firecracker-ubuntu-24.04.squashfs" | sha256sum --check
+
+      - name: Run real Firecracker security battery
+        run: |
+          sudo git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          sudo -E "$(command -v python3)" scripts/run_s10_firecracker_battery.py --evidence-file "$RUNNER_TEMP/s10-firecracker-evidence.json" \
+            --kernel "$RUNNER_TEMP/firecracker-vmlinux-6.1.155" \
+            --rootfs-squashfs "$RUNNER_TEMP/firecracker-ubuntu-24.04.squashfs"
+
+      - name: Upload Firecracker security evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: s10-firecracker-evidence
+          path: ${{ runner.temp }}/s10-firecracker-evidence.json

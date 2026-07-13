@@ -10,9 +10,12 @@ import math
 import os
 import re
 import selectors
+import shlex
 import shutil
+import signal
 import socket
 import subprocess
+import tempfile
 import threading
 import time
 from dataclasses import asdict, dataclass, field, replace
@@ -23,6 +26,7 @@ from typing import Any, Callable, Iterable, Literal, Mapping, NoReturn, Protocol
 from uuid import uuid4
 from weakref import ref
 
+from blake3 import blake3
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
@@ -528,6 +532,57 @@ class GvisorRuntimeConfig:
 
 
 @dataclass(frozen=True)
+class FirecrackerRuntimeConfig:
+    """Operator-owned artifacts and jailer constraints for Firecracker launches."""
+
+    expected_version: str
+    kubernetes_runtime_class: str
+    firecracker_bin: str
+    jailer_bin: str
+    kernel_image_path: str
+    kernel_image_hash: str
+    rootfs_image_path: str
+    rootfs_image_hash: str
+    rootfs_image_ref: str
+    chroot_base_dir: str
+    jailer_uid: int
+    jailer_gid: int
+
+    def __post_init__(self) -> None:
+        if re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", self.expected_version) is None:
+            raise ValueError("Firecracker expected version must be an exact semantic version")
+        if (
+            len(self.kubernetes_runtime_class) > 253
+            or re.fullmatch(
+                r"[a-z0-9](?:[-a-z0-9.]*[a-z0-9])?",
+                self.kubernetes_runtime_class,
+            )
+            is None
+        ):
+            raise ValueError("Firecracker Kubernetes RuntimeClass must be a DNS subdomain")
+        path_fields = {
+            "firecracker binary": self.firecracker_bin,
+            "jailer binary": self.jailer_bin,
+            "kernel image": self.kernel_image_path,
+            "rootfs image": self.rootfs_image_path,
+            "jailer chroot base": self.chroot_base_dir,
+        }
+        for label, value in path_fields.items():
+            if not os.path.isabs(value):
+                raise ValueError(f"Firecracker {label} path must be absolute")
+        for label, value in (
+            ("kernel image", self.kernel_image_hash),
+            ("rootfs image", self.rootfs_image_hash),
+        ):
+            if re.fullmatch(r"blake3:[0-9a-f]{64}", value) is None:
+                raise ValueError(f"Firecracker {label} hash must be a BLAKE3 digest")
+        if not _is_digest_pinned_image(self.rootfs_image_ref):
+            raise ValueError("Firecracker rootfs image reference must be digest-pinned")
+        if self.jailer_uid <= 0 or self.jailer_gid <= 0:
+            raise ValueError("Firecracker jailer uid and gid must be non-root")
+
+
+@dataclass(frozen=True)
 class SandboxSecuritySpec:
     runtime_class: RuntimeClass
     docker_runtime: str | None = None
@@ -546,6 +601,34 @@ class DockerRuntimeLaunchEvidence:
     seccomp_profile_hash: str
     trust_mounts: tuple[TrustMount, ...]
     attestation_source: Literal["docker-api-inspect", "docker-cli-command"]
+
+
+@dataclass(frozen=True)
+class FirecrackerRuntimeLaunchEvidence:
+    sandbox_id: str
+    microvm_id: str
+    runtime_class: Literal["firecracker"]
+    firecracker_version: str
+    jailer_version: str
+    kernel_image_hash: str
+    rootfs_image_hash: str
+    request_drive_hash: str
+    scratch_bytes: int
+    network_interface_count: int
+    jailer_uid: int
+    jailer_gid: int
+    pid_namespace_init: bool
+    cgroup_v2_path: str
+    seccomp_enabled: bool
+    seccomp_filter_mode: Literal["default-built-in"]
+    seccomp_filter_count: int
+    read_only_rootfs: bool
+    federated_extra_access: bool
+    trust_mount_count: int
+    attestation_source: Literal["firecracker-api+jailer-pid"]
+
+
+RuntimeLaunchEvidence = DockerRuntimeLaunchEvidence | FirecrackerRuntimeLaunchEvidence
 
 
 def materialize_gvisor_pod_spec(
@@ -668,6 +751,1302 @@ def _materialize_gvisor_security_spec(
         seccomp_profile_json=json.dumps(profile, sort_keys=True, separators=(",", ":")),
         trust_mounts=config.trust_mounts,
     )
+
+
+def materialize_firecracker_vm_spec(
+    *,
+    handle: SandboxHandle,
+    request: LaunchRequest,
+    policy_bundle: PolicyBundle,
+    config: FirecrackerRuntimeConfig,
+) -> dict[str, Any]:
+    """Materialize a policy-bound Firecracker microVM specification before launch."""
+
+    if handle.runtime_class != "firecracker":
+        raise SandboxRuntimeUnavailableError("Firecracker VM spec requires runtime_class=firecracker")
+    if handle.policy_bundle_version != policy_bundle.bundle_version:
+        raise SandboxRuntimeUnavailableError("sandbox policy bundle version does not match the pinned bundle")
+    risk_class = request.scope_token.scopes.sandbox_risk_class
+    if policy_bundle.risk_to_runtime.get(risk_class) != "firecracker":
+        raise SandboxRuntimeUnavailableError("signed policy does not select Firecracker for the requested risk class")
+    if request.image != config.rootfs_image_ref:
+        raise SandboxRuntimeUnavailableError("Firecracker rootfs image reference mismatch")
+    _verify_firecracker_artifact_hash(
+        label="kernel image",
+        path=config.kernel_image_path,
+        expected_hash=config.kernel_image_hash,
+    )
+    _verify_firecracker_artifact_hash(
+        label="rootfs image",
+        path=config.rootfs_image_path,
+        expected_hash=config.rootfs_image_hash,
+    )
+    for label, path in (
+        ("Firecracker binary", config.firecracker_bin),
+        ("Firecracker jailer", config.jailer_bin),
+        ("Firecracker chroot base", config.chroot_base_dir),
+    ):
+        if not Path(path).exists():
+            raise SandboxRuntimeUnavailableError(f"{label} is unavailable: {path}")
+    materialize_sandbox_env(request.env, request.env_allowlist)
+    envelope = request.requested_envelope
+    if envelope.scratch_bytes < 1024 * 1024:
+        raise PolicyDeniedError("Firecracker scratch_bytes must be at least 1048576")
+    min_guest_memory_bytes = 64 * 1024 * 1024
+    vmm_headroom_bytes = 64 * 1024 * 1024
+    min_host_memory_bytes = min_guest_memory_bytes + vmm_headroom_bytes
+    if envelope.mem_bytes < min_host_memory_bytes:
+        raise PolicyDeniedError(
+            f"Firecracker mem_bytes must be at least {min_host_memory_bytes} bytes"
+        )
+    mem_size_mib = (envelope.mem_bytes - vmm_headroom_bytes) // (1024 * 1024)
+    vcpu_count = max(math.ceil(envelope.cpu_m / 1000), 1)
+    return {
+        "microvm_id": handle.sandbox_id,
+        "runtime_class": "firecracker",
+        "risk_class": risk_class,
+        "trust_class": risk_class,
+        "federated_extra_access": False,
+        "kernel_image_path": config.kernel_image_path,
+        "kernel_image_hash": config.kernel_image_hash,
+        "rootfs_image_ref": config.rootfs_image_ref,
+        "rootfs_image_hash": config.rootfs_image_hash,
+        "vmm_memory_headroom_bytes": vmm_headroom_bytes,
+        "jailer": {
+            "binary": config.jailer_bin,
+            "firecracker_binary": config.firecracker_bin,
+            "chroot_base_dir": config.chroot_base_dir,
+            "uid": config.jailer_uid,
+            "gid": config.jailer_gid,
+            "cgroup_version": 2,
+            "new_pid_namespace": True,
+            "seccomp_enabled": True,
+            "seccomp_filter_mode": "default-built-in",
+            "resource_limits": {
+                "memory.max": max(envelope.mem_bytes, 4 * 1024 * 1024),
+                "pids.max": max(envelope.pids, 1),
+                "cpu.max": f"{max(envelope.cpu_m, 1) * 100} 100000",
+            },
+        },
+        "machine_config": {
+            "vcpu_count": vcpu_count,
+            "mem_size_mib": mem_size_mib,
+            "smt": False,
+            "track_dirty_pages": False,
+        },
+        "boot_source": {
+            "kernel_image_path": config.kernel_image_path,
+            "boot_args": "console=ttyS0 reboot=k panic=1 pci=off quiet loglevel=3 init=/sbin/argus-init",
+        },
+        "drives": [
+            {
+                "drive_id": "rootfs",
+                "path_on_host": config.rootfs_image_path,
+                "is_root_device": True,
+                "is_read_only": True,
+            },
+            {
+                "drive_id": "argus-input",
+                "path_on_host": None,
+                "is_root_device": False,
+                "is_read_only": True,
+            },
+            {
+                "drive_id": "scratch",
+                "path_on_host": None,
+                "is_root_device": False,
+                "is_read_only": False,
+                "size_limit_bytes": max(envelope.scratch_bytes, 0),
+            },
+        ],
+        "network_interfaces": [],
+    }
+
+
+def materialize_firecracker_pod_spec(
+    *,
+    handle: SandboxHandle,
+    request: LaunchRequest,
+    policy_bundle: PolicyBundle,
+    config: FirecrackerRuntimeConfig,
+) -> dict[str, Any]:
+    """Materialize the Kubernetes placement contract for a Firecracker launch."""
+
+    vm_spec = materialize_firecracker_vm_spec(
+        handle=handle,
+        request=request,
+        policy_bundle=policy_bundle,
+        config=config,
+    )
+    materialized_env = materialize_sandbox_env(request.env, request.env_allowlist)
+    envelope = request.requested_envelope
+    return {
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": {
+            "name": _kubernetes_name(f"argus-{handle.sandbox_id}"),
+            "labels": {
+                "app.kubernetes.io/name": "argus-sandbox",
+                "argus.dev/job-id": request.job_id,
+                "argus.dev/runtime-class": "firecracker",
+            },
+            "annotations": {
+                "argus.dev/policy-bundle-version": policy_bundle.bundle_version,
+                "argus.dev/risk-class": str(vm_spec["risk_class"]),
+                "argus.dev/firecracker-kernel-hash": config.kernel_image_hash,
+                "argus.dev/firecracker-rootfs-hash": config.rootfs_image_hash,
+                "argus.dev/firecracker-network-interfaces": "0",
+                "argus.dev/federated-extra-access": "false",
+            },
+        },
+        "spec": {
+            "runtimeClassName": config.kubernetes_runtime_class,
+            "restartPolicy": "Never",
+            "automountServiceAccountToken": False,
+            "enableServiceLinks": False,
+            "hostNetwork": False,
+            "hostPID": False,
+            "hostIPC": False,
+            "hostUsers": False,
+            "shareProcessNamespace": False,
+            "dnsPolicy": "None",
+            "dnsConfig": {"nameservers": ["127.0.0.1"]},
+            "containers": [
+                {
+                    "name": "sandbox",
+                    "image": request.image,
+                    "imagePullPolicy": "IfNotPresent",
+                    "command": list(request.entrypoint),
+                    "args": list(request.args),
+                    "env": [
+                        {"name": key, "value": value}
+                        for key, value in sorted(materialized_env.items())
+                    ],
+                    "securityContext": {
+                        "allowPrivilegeEscalation": False,
+                        "privileged": False,
+                        "readOnlyRootFilesystem": True,
+                        "runAsNonRoot": True,
+                        "runAsUser": config.jailer_uid,
+                        "runAsGroup": config.jailer_gid,
+                        "capabilities": {"drop": ["ALL"]},
+                        "seccompProfile": {"type": "RuntimeDefault"},
+                    },
+                    "resources": {
+                        "requests": {
+                            "cpu": f"{max(envelope.cpu_m, 1)}m",
+                            "memory": str(max(envelope.mem_bytes, 4 * 1024 * 1024)),
+                        },
+                        "limits": {
+                            "cpu": f"{max(envelope.cpu_m, 1)}m",
+                            "memory": str(max(envelope.mem_bytes, 4 * 1024 * 1024)),
+                        },
+                    },
+                    "volumeMounts": [
+                        {"name": "scratch", "mountPath": "/tmp", "readOnly": False},
+                    ],
+                }
+            ],
+            "volumes": [
+                {
+                    "name": "scratch",
+                    "emptyDir": {"sizeLimit": str(max(envelope.scratch_bytes, 0))},
+                }
+            ],
+        },
+    }
+
+
+def _verify_firecracker_artifact_hash(*, label: str, path: str, expected_hash: str) -> None:
+    artifact_path = Path(path)
+    try:
+        digest = blake3()
+        with artifact_path.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+        actual_hash = f"{BLAKE3_PREFIX}{digest.hexdigest()}"
+    except OSError as exc:
+        raise SandboxRuntimeUnavailableError(f"Firecracker {label} is unavailable: {artifact_path}") from exc
+    if actual_hash != expected_hash:
+        raise SandboxRuntimeUnavailableError(
+            f"Firecracker {label} hash mismatch: expected {expected_hash}, got {actual_hash}"
+        )
+
+
+@dataclass(frozen=True)
+class _FirecrackerProcessIdentity:
+    pid: int
+    start_time_ticks: int
+    pid_namespace_ids: tuple[int, ...]
+    cgroup_v2_path: str
+
+
+@dataclass(frozen=True)
+class _FirecrackerJailResources:
+    jail_root: Path
+    api_socket: Path
+    pid_file: Path
+    kernel_path: Path
+    rootfs_path: Path
+    request_drive_path: Path
+    request_drive_hash: str
+    scratch_path: Path
+    scratch_bytes: int
+    serial_path: Path
+    log_path: Path
+
+
+class FirecrackerSandboxSupervisor:
+    """Node-level Firecracker supervisor using the same-version production jailer."""
+
+    _API_SOCKET_IN_JAIL = "/run/firecracker.socket"
+    _CGROUP_PARENT = "argus-firecracker"
+
+    def __init__(
+        self,
+        *,
+        config: FirecrackerRuntimeConfig,
+        meter_interval_s: float = 1.0,
+        kvm_path: str = "/dev/kvm",
+        mke2fs_bin: str | None = None,
+    ) -> None:
+        self._config = config
+        self._meter_interval_s = min(max(float(meter_interval_s), 0.1), 5.0)
+        self._kvm_path = kvm_path
+        self._mke2fs_bin = mke2fs_bin or shutil.which("mke2fs") or "mke2fs"
+
+    @property
+    def config(self) -> FirecrackerRuntimeConfig:
+        return self._config
+
+    @property
+    def expected_version(self) -> str:
+        return self._config.expected_version
+
+    @property
+    def resource_meter_kind(self) -> str:
+        return "firecracker-host-cgroup-v2"
+
+    def materialize_vm_spec(
+        self,
+        *,
+        handle: SandboxHandle,
+        request: LaunchRequest,
+        policy_bundle: PolicyBundle,
+    ) -> dict[str, Any]:
+        return materialize_firecracker_vm_spec(
+            handle=handle,
+            request=request,
+            policy_bundle=policy_bundle,
+            config=self._config,
+        )
+
+    def materialize_pod_spec(
+        self,
+        *,
+        handle: SandboxHandle,
+        request: LaunchRequest,
+        policy_bundle: PolicyBundle,
+    ) -> dict[str, Any]:
+        return materialize_firecracker_pod_spec(
+            handle=handle,
+            request=request,
+            policy_bundle=policy_bundle,
+            config=self._config,
+        )
+
+    def verify_runtime_versions(self) -> tuple[str, str]:
+        firecracker_version = self._binary_version("firecracker", self._config.firecracker_bin)
+        jailer_version = self._binary_version("jailer", self._config.jailer_bin)
+        expected = self._config.expected_version
+        if firecracker_version != expected:
+            raise SandboxRuntimeUnavailableError(
+                f"firecracker version mismatch: expected {expected}, got {firecracker_version}"
+            )
+        if jailer_version != expected:
+            raise SandboxRuntimeUnavailableError(
+                f"jailer version mismatch: expected {expected}, got {jailer_version}"
+            )
+        if firecracker_version != jailer_version:
+            raise SandboxRuntimeUnavailableError("Firecracker and jailer versions differ")
+        return firecracker_version, jailer_version
+
+    def jailer_command(self, spec: Mapping[str, Any]) -> list[str]:
+        jailer = spec["jailer"]
+        limits = jailer["resource_limits"]
+        return [
+            self._config.jailer_bin,
+            "--id",
+            str(spec["microvm_id"]),
+            "--exec-file",
+            self._config.firecracker_bin,
+            "--uid",
+            str(jailer["uid"]),
+            "--gid",
+            str(jailer["gid"]),
+            "--chroot-base-dir",
+            self._config.chroot_base_dir,
+            "--cgroup-version",
+            "2",
+            "--parent-cgroup",
+            self._CGROUP_PARENT,
+            "--cgroup",
+            f"memory.max={limits['memory.max']}",
+            "--cgroup",
+            f"pids.max={limits['pids.max']}",
+            "--cgroup",
+            f"cpu.max={limits['cpu.max']}",
+            "--resource-limit",
+            "no-file=1024",
+            "--resource-limit",
+            f"fsize={max(int(limits['memory.max']), PARTIAL_RESULT_LOG_CAPTURE_LIMIT_BYTES)}",
+            "--daemonize",
+            "--new-pid-ns",
+            "--",
+            "--api-sock",
+            self._API_SOCKET_IN_JAIL,
+        ]
+
+    def expected_api_configuration(self, spec: Mapping[str, Any]) -> dict[str, Any]:
+        drives_by_id = {str(drive["drive_id"]): drive for drive in spec["drives"]}
+        return {
+            "machine-config": dict(spec["machine_config"]),
+            "boot-source": {
+                "kernel_image_path": "/vmlinux",
+                "boot_args": str(spec["boot_source"]["boot_args"]),
+            },
+            "drives": [
+                {
+                    "drive_id": "rootfs",
+                    "path_on_host": "/rootfs.ext4",
+                    "is_root_device": True,
+                    "is_read_only": bool(drives_by_id["rootfs"]["is_read_only"]),
+                },
+                {
+                    "drive_id": "argus-input",
+                    "path_on_host": "/argus-input.ext4",
+                    "is_root_device": False,
+                    "is_read_only": bool(drives_by_id["argus-input"]["is_read_only"]),
+                },
+                {
+                    "drive_id": "scratch",
+                    "path_on_host": "/scratch.ext4",
+                    "is_root_device": False,
+                    "is_read_only": bool(drives_by_id["scratch"]["is_read_only"]),
+                },
+            ],
+            "network-interfaces": [],
+        }
+
+    def verify_api_attestation(self, *, spec: Mapping[str, Any], observed: Mapping[str, Any]) -> None:
+        expected = self.expected_api_configuration(spec)
+        if observed.get("network-interfaces") != []:
+            raise SandboxRuntimeUnavailableError("Firecracker attestation reported a network interface")
+        for device_key in ("vsock", "balloon", "mmds-config", "pmem"):
+            if observed.get(device_key) not in (None, [], {}):
+                raise SandboxRuntimeUnavailableError(
+                    f"Firecracker attestation reported unexpected {device_key} access"
+                )
+        observed_machine = observed.get("machine-config")
+        if not isinstance(observed_machine, Mapping) or any(
+            observed_machine.get(key) != value
+            for key, value in expected["machine-config"].items()
+        ):
+            raise SandboxRuntimeUnavailableError("Firecracker machine configuration attestation mismatch")
+        observed_boot = observed.get("boot-source")
+        if not isinstance(observed_boot, Mapping) or any(
+            observed_boot.get(key) != value for key, value in expected["boot-source"].items()
+        ):
+            raise SandboxRuntimeUnavailableError("Firecracker boot source attestation mismatch")
+        observed_drives = observed.get("drives")
+        if not isinstance(observed_drives, list):
+            raise SandboxRuntimeUnavailableError("Firecracker attestation omitted drive configuration")
+        expected_drives = {
+            drive["drive_id"]: {
+                key: drive[key]
+                for key in ("drive_id", "path_on_host", "is_root_device", "is_read_only")
+            }
+            for drive in expected["drives"]
+        }
+        normalized_observed: dict[str, dict[str, Any]] = {}
+        for drive in observed_drives:
+            if not isinstance(drive, Mapping) or not isinstance(drive.get("drive_id"), str):
+                raise SandboxRuntimeUnavailableError("Firecracker drive configuration attestation is invalid")
+            normalized_observed[str(drive["drive_id"])] = {
+                key: drive.get(key)
+                for key in ("drive_id", "path_on_host", "is_root_device", "is_read_only")
+            }
+        if normalized_observed != expected_drives:
+            raise SandboxRuntimeUnavailableError("Firecracker drive configuration attestation mismatch")
+
+    def run(
+        self,
+        *,
+        handle: SandboxHandle,
+        request: LaunchRequest,
+        materialized_env: dict[str, str],
+        meter_sample_sink: Callable[[ResourceMeterSample], None] | None = None,
+        runtime_halt_probe: Callable[[], _RuntimeHaltSignal | tuple[str, tuple[str, ...]] | None] | None = None,
+        halt_telemetry_sink: Callable[[SandboxHaltTelemetry], None] | None = None,
+        policy_bundle: PolicyBundle | None = None,
+        runtime_evidence_sink: Callable[[RuntimeLaunchEvidence], None] | None = None,
+    ) -> SandboxExecutionResult:
+        if policy_bundle is None:
+            raise SandboxRuntimeUnavailableError("Firecracker launch requires its pinned policy bundle")
+        if not request.entrypoint:
+            raise PolicyDeniedError("entrypoint is required")
+        expected_env = materialize_sandbox_env(request.env, request.env_allowlist)
+        if materialized_env != expected_env:
+            raise PolicyDeniedError("Firecracker materialized environment differs from the allowlisted request")
+        spec = self.materialize_vm_spec(handle=handle, request=request, policy_bundle=policy_bundle)
+        self._verify_host_runtime()
+        firecracker_version, jailer_version = self.verify_runtime_versions()
+        jail_root = self._jail_root(str(spec["microvm_id"]))
+        microvm_dir = jail_root.parent
+        if microvm_dir.exists():
+            raise SandboxRuntimeUnavailableError(f"Firecracker jail already exists: {microvm_dir}")
+
+        process_identity: _FirecrackerProcessIdentity | None = None
+        resources: _FirecrackerJailResources | None = None
+        try:
+            with tempfile.TemporaryDirectory(prefix="argus-firecracker-") as temp_dir:
+                request_drive, request_hash, scratch_drive = self._create_drive_images(
+                    Path(temp_dir), request, materialized_env
+                )
+                self._launch_jailer(spec)
+                process_identity = self._wait_for_jailer_ready(str(spec["microvm_id"]), timeout_s=10.0)
+                resources = self._stage_jail_resources(
+                    microvm_id=str(spec["microvm_id"]),
+                    request_drive=request_drive,
+                    request_drive_hash=request_hash,
+                    scratch_drive=scratch_drive,
+                    scratch_bytes=request.requested_envelope.scratch_bytes,
+                )
+                evidence = self._configure_and_attest(
+                    spec=spec,
+                    resources=resources,
+                    process_identity=process_identity,
+                    firecracker_version=firecracker_version,
+                    jailer_version=jailer_version,
+                )
+                self._firecracker_api_request(
+                    resources.api_socket,
+                    "PUT",
+                    "/actions",
+                    {"action_type": "InstanceStart"},
+                    expected=(204,),
+                )
+                seccomp_filter_count = self._wait_for_process_seccomp(
+                    process_identity,
+                    timeout_s=2.0,
+                )
+                evidence = replace(evidence, seccomp_filter_count=seccomp_filter_count)
+                if runtime_evidence_sink is not None:
+                    runtime_evidence_sink(evidence)
+                return self._wait_for_microvm(
+                    handle=handle,
+                    request=request,
+                    resources=resources,
+                    process_identity=process_identity,
+                    meter_sample_sink=meter_sample_sink,
+                    runtime_halt_probe=runtime_halt_probe,
+                    halt_telemetry_sink=halt_telemetry_sink,
+                )
+        finally:
+            if process_identity is not None and self._process_identity_is_alive(process_identity):
+                self._signal_microvm(process_identity, signal.SIGKILL)
+                self._wait_for_process_exit(process_identity, timeout_s=2.0)
+            self._cleanup_microvm(str(spec["microvm_id"]), microvm_dir)
+
+    def _binary_version(self, label: str, binary_path: str) -> str:
+        if not os.access(binary_path, os.X_OK):
+            raise SandboxRuntimeUnavailableError(f"{label} binary is not executable: {binary_path}")
+        try:
+            completed = subprocess.run(
+                [binary_path, "--version"],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise SandboxRuntimeUnavailableError(f"{label} version probe failed") from exc
+        output = f"{completed.stdout}\n{completed.stderr}"
+        match = re.search(r"\bv?([0-9]+\.[0-9]+\.[0-9]+)\b", output)
+        if completed.returncode != 0 or match is None:
+            raise SandboxRuntimeUnavailableError(f"{label} version probe returned invalid output")
+        return match.group(1)
+
+    def _verify_host_runtime(self) -> None:
+        if os.uname().sysname != "Linux":
+            raise SandboxRuntimeUnavailableError("Firecracker requires a Linux host")
+        if os.geteuid() != 0:
+            raise SandboxRuntimeUnavailableError("Firecracker jailer must run with root privileges")
+        if not os.path.exists(self._kvm_path) or not os.access(self._kvm_path, os.R_OK | os.W_OK):
+            raise SandboxRuntimeUnavailableError(f"Firecracker KVM device is unavailable: {self._kvm_path}")
+        if not Path("/sys/fs/cgroup/cgroup.controllers").is_file():
+            raise SandboxRuntimeUnavailableError("Firecracker requires a cgroup v2 host")
+        if shutil.which(self._mke2fs_bin) is None and "/" not in self._mke2fs_bin:
+            raise SandboxRuntimeUnavailableError("mke2fs is required for Firecracker request drives")
+        if not os.access(self._config.chroot_base_dir, os.W_OK | os.X_OK):
+            raise SandboxRuntimeUnavailableError("Firecracker jailer chroot base is not writable")
+
+    def _jail_root(self, microvm_id: str) -> Path:
+        return (
+            Path(self._config.chroot_base_dir)
+            / Path(self._config.firecracker_bin).name
+            / microvm_id
+            / "root"
+        )
+
+    def _launch_jailer(self, spec: Mapping[str, Any]) -> None:
+        try:
+            completed = subprocess.run(
+                self.jailer_command(spec),
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise SandboxRuntimeUnavailableError("Firecracker jailer launch failed") from exc
+        if completed.returncode != 0:
+            message = (completed.stderr or completed.stdout).strip()
+            raise SandboxRuntimeUnavailableError(
+                f"Firecracker jailer launch failed with {completed.returncode}: {message}"
+            )
+
+    def _create_drive_images(
+        self,
+        temp_dir: Path,
+        request: LaunchRequest,
+        materialized_env: Mapping[str, str],
+    ) -> tuple[Path, str, Path]:
+        request_dir = temp_dir / "request"
+        request_dir.mkdir(mode=0o700)
+        manifest = {
+            "schema": "argus.firecracker.request.v1",
+            "job_id": request.job_id,
+            "subagent_id": request.subagent_id,
+            "trace_id": request.trace_id,
+            "risk_class": request.scope_token.scopes.sandbox_risk_class,
+            "entrypoint": list(request.entrypoint),
+            "args": list(request.args),
+            "env": dict(sorted(materialized_env.items())),
+        }
+        (request_dir / "request.json").write_bytes(canonical_json_bytes(manifest))
+        script = request_dir / "entrypoint.sh"
+        script.write_text(
+            self._guest_entrypoint_script(request, materialized_env),
+            encoding="utf-8",
+        )
+        script.chmod(0o444)
+
+        request_drive = temp_dir / "argus-input.ext4"
+        self._make_ext4_image(request_drive, size_bytes=4 * 1024 * 1024, source_dir=request_dir)
+        request_hash = hash_bytes(request_drive.read_bytes())
+        scratch_drive = temp_dir / "scratch.ext4"
+        self._make_ext4_image(
+            scratch_drive,
+            size_bytes=request.requested_envelope.scratch_bytes,
+            source_dir=None,
+        )
+        return request_drive, request_hash, scratch_drive
+
+    @staticmethod
+    def _guest_entrypoint_script(request: LaunchRequest, materialized_env: Mapping[str, str]) -> str:
+        lines = ["#!/bin/sh", "set +e"]
+        for key, value in sorted(materialized_env.items()):
+            if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key) is None:
+                raise PolicyDeniedError(f"invalid Firecracker env key: {key}")
+            lines.append(f"export {key}={shlex.quote(value)}")
+        command = shlex.join([*request.entrypoint, *request.args])
+        lines.extend(
+            (
+                command,
+                "exit $?",
+            )
+        )
+        return "\n".join(lines) + "\n"
+
+    def _make_ext4_image(self, path: Path, *, size_bytes: int, source_dir: Path | None) -> None:
+        if size_bytes < 1024 * 1024:
+            raise PolicyDeniedError("Firecracker scratch_bytes must be at least 1048576")
+        with path.open("wb") as image:
+            image.truncate(size_bytes)
+        command = [
+            self._mke2fs_bin,
+            "-q",
+            "-F",
+            "-t",
+            "ext4",
+            "-b",
+            "1024",
+            "-I",
+            "128",
+            "-m",
+            "0",
+            "-N",
+            "128",
+            "-O",
+            "^has_journal,^metadata_csum,^64bit",
+        ]
+        if source_dir is not None:
+            command.extend(("-d", str(source_dir)))
+        command.append(str(path))
+        try:
+            completed = subprocess.run(command, check=False, capture_output=True, text=True, timeout=20)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise SandboxRuntimeUnavailableError("Firecracker ext4 drive creation failed") from exc
+        if completed.returncode != 0:
+            raise SandboxRuntimeUnavailableError(
+                f"Firecracker ext4 drive creation failed: {(completed.stderr or completed.stdout).strip()}"
+            )
+        if path.stat().st_size != size_bytes:
+            raise SandboxRuntimeUnavailableError("Firecracker ext4 drive size changed during creation")
+
+    def _wait_for_jailer_ready(self, microvm_id: str, *, timeout_s: float) -> _FirecrackerProcessIdentity:
+        jail_root = self._jail_root(microvm_id)
+        api_socket = jail_root / self._API_SOCKET_IN_JAIL.lstrip("/")
+        pid_file = jail_root / f"{Path(self._config.firecracker_bin).name}.pid"
+        deadline = time.monotonic() + timeout_s
+        last_error = "jailer resources not created"
+        last_verified_identity: _FirecrackerProcessIdentity | None = None
+        while time.monotonic() < deadline:
+            try:
+                pid = int(pid_file.read_text(encoding="utf-8").strip())
+                identity = self._verify_microvm_process(pid, microvm_id)
+                last_verified_identity = identity
+                if api_socket.is_socket():
+                    return identity
+                last_error = "API socket not ready"
+            except (OSError, ValueError, SandboxRuntimeUnavailableError) as exc:
+                last_error = str(exc)
+            time.sleep(0.05)
+        if last_verified_identity is not None and self._process_identity_is_alive(last_verified_identity):
+            try:
+                self._signal_microvm(last_verified_identity, signal.SIGKILL)
+                self._wait_for_process_exit(last_verified_identity, timeout_s=2.0)
+            except SandboxRuntimeUnavailableError as exc:
+                last_error = f"{last_error}; cleanup failed: {exc}"
+        raise SandboxRuntimeUnavailableError(f"Firecracker jailer did not become ready: {last_error}")
+
+    def _stage_jail_resources(
+        self,
+        *,
+        microvm_id: str,
+        request_drive: Path,
+        request_drive_hash: str,
+        scratch_drive: Path,
+        scratch_bytes: int,
+    ) -> _FirecrackerJailResources:
+        jail_root = self._jail_root(microvm_id)
+        resources = _FirecrackerJailResources(
+            jail_root=jail_root,
+            api_socket=jail_root / self._API_SOCKET_IN_JAIL.lstrip("/"),
+            pid_file=jail_root / f"{Path(self._config.firecracker_bin).name}.pid",
+            kernel_path=jail_root / "vmlinux",
+            rootfs_path=jail_root / "rootfs.ext4",
+            request_drive_path=jail_root / "argus-input.ext4",
+            request_drive_hash=request_drive_hash,
+            scratch_path=jail_root / "scratch.ext4",
+            scratch_bytes=scratch_bytes,
+            serial_path=jail_root / "serial.log",
+            log_path=jail_root / "firecracker.log",
+        )
+        for source, destination, mode in (
+            (Path(self._config.kernel_image_path), resources.kernel_path, 0o400),
+            (Path(self._config.rootfs_image_path), resources.rootfs_path, 0o400),
+            (request_drive, resources.request_drive_path, 0o400),
+            (scratch_drive, resources.scratch_path, 0o600),
+        ):
+            shutil.copyfile(source, destination)
+            os.chown(destination, self._config.jailer_uid, self._config.jailer_gid)
+            destination.chmod(mode)
+        for destination in (resources.serial_path, resources.log_path):
+            destination.touch(mode=0o600, exist_ok=False)
+            os.chown(destination, self._config.jailer_uid, self._config.jailer_gid)
+        _verify_firecracker_artifact_hash(
+            label="jailed kernel image",
+            path=str(resources.kernel_path),
+            expected_hash=self._config.kernel_image_hash,
+        )
+        _verify_firecracker_artifact_hash(
+            label="jailed rootfs image",
+            path=str(resources.rootfs_path),
+            expected_hash=self._config.rootfs_image_hash,
+        )
+        _verify_firecracker_artifact_hash(
+            label="jailed request drive",
+            path=str(resources.request_drive_path),
+            expected_hash=request_drive_hash,
+        )
+        if resources.scratch_path.stat().st_size != scratch_bytes:
+            raise SandboxRuntimeUnavailableError("Firecracker scratch drive exceeds the requested cap")
+        return resources
+
+    def _configure_and_attest(
+        self,
+        *,
+        spec: Mapping[str, Any],
+        resources: _FirecrackerJailResources,
+        process_identity: _FirecrackerProcessIdentity,
+        firecracker_version: str,
+        jailer_version: str,
+    ) -> FirecrackerRuntimeLaunchEvidence:
+        expected = self.expected_api_configuration(spec)
+        self._firecracker_api_request(
+            resources.api_socket, "PUT", "/machine-config", expected["machine-config"], expected=(204,)
+        )
+        self._firecracker_api_request(
+            resources.api_socket, "PUT", "/boot-source", expected["boot-source"], expected=(204,)
+        )
+        for drive in expected["drives"]:
+            self._firecracker_api_request(
+                resources.api_socket,
+                "PUT",
+                f"/drives/{drive['drive_id']}",
+                drive,
+                expected=(204,),
+            )
+        self._firecracker_api_request(
+            resources.api_socket,
+            "PUT",
+            "/serial",
+            {"serial_out_path": "/serial.log"},
+            expected=(204,),
+        )
+        self._firecracker_api_request(
+            resources.api_socket,
+            "PUT",
+            "/logger",
+            {"level": "Warning", "log_path": "/firecracker.log", "show_level": True},
+            expected=(204,),
+        )
+        observed = self._firecracker_api_request(
+            resources.api_socket, "GET", "/vm/config", expected=(200,)
+        )
+        self.verify_api_attestation(spec=spec, observed=observed)
+        version_payload = self._firecracker_api_request(
+            resources.api_socket, "GET", "/version", expected=(200,)
+        )
+        if version_payload.get("firecracker_version") != firecracker_version:
+            raise SandboxRuntimeUnavailableError("Firecracker API version differs from the verified binary")
+        instance = self._firecracker_api_request(resources.api_socket, "GET", "/", expected=(200,))
+        if instance.get("id") != spec["microvm_id"] or instance.get("state") != "Not started":
+            raise SandboxRuntimeUnavailableError("Firecracker instance identity/state attestation mismatch")
+        if instance.get("vmm_version") != firecracker_version:
+            raise SandboxRuntimeUnavailableError("Firecracker instance version attestation mismatch")
+        self._verify_microvm_process(process_identity.pid, str(spec["microvm_id"]), process_identity)
+        return FirecrackerRuntimeLaunchEvidence(
+            sandbox_id=str(spec["microvm_id"]),
+            microvm_id=str(spec["microvm_id"]),
+            runtime_class="firecracker",
+            firecracker_version=firecracker_version,
+            jailer_version=jailer_version,
+            kernel_image_hash=self._config.kernel_image_hash,
+            rootfs_image_hash=self._config.rootfs_image_hash,
+            request_drive_hash=resources.request_drive_hash,
+            scratch_bytes=resources.scratch_bytes,
+            network_interface_count=0,
+            jailer_uid=self._config.jailer_uid,
+            jailer_gid=self._config.jailer_gid,
+            pid_namespace_init=process_identity.pid_namespace_ids[-1] == 1,
+            cgroup_v2_path=process_identity.cgroup_v2_path,
+            seccomp_enabled=True,
+            seccomp_filter_mode="default-built-in",
+            seccomp_filter_count=0,
+            read_only_rootfs=True,
+            federated_extra_access=False,
+            trust_mount_count=0,
+            attestation_source="firecracker-api+jailer-pid",
+        )
+
+    def _firecracker_api_request(
+        self,
+        socket_path: Path,
+        method: str,
+        path: str,
+        body: Mapping[str, Any] | None = None,
+        *,
+        expected: tuple[int, ...],
+        timeout: float = 5.0,
+    ) -> dict[str, Any]:
+        encoded = None if body is None else json.dumps(body, sort_keys=True).encode("utf-8")
+        connection = _UnixSocketHTTPConnection(str(socket_path), timeout=timeout)
+        response: http_client.HTTPResponse | None = None
+        payload = b""
+        try:
+            connection.request(
+                method,
+                path,
+                body=encoded,
+                headers={"Content-Type": "application/json"} if encoded is not None else {},
+            )
+            response = connection.getresponse()
+            payload = response.read(PARTIAL_RESULT_LOG_CAPTURE_LIMIT_BYTES + 1)
+        except socket.timeout as exc:
+            raise TimeoutError(f"Firecracker API {method} {path} timed out") from exc
+        except OSError as exc:
+            raise SandboxRuntimeUnavailableError("Firecracker API socket is unavailable") from exc
+        finally:
+            connection.close()
+        if response is None:
+            raise SandboxRuntimeUnavailableError("Firecracker API returned no response")
+        if len(payload) > PARTIAL_RESULT_LOG_CAPTURE_LIMIT_BYTES:
+            raise SandboxRuntimeUnavailableError("Firecracker API response exceeded the control-plane limit")
+        if response.status not in expected:
+            raise SandboxRuntimeUnavailableError(
+                f"Firecracker API {method} {path} returned {response.status}: "
+                f"{payload.decode('utf-8', errors='replace')}"
+            )
+        if not payload:
+            return {}
+        try:
+            decoded = json.loads(payload)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise SandboxRuntimeUnavailableError("Firecracker API returned invalid JSON") from exc
+        if not isinstance(decoded, dict):
+            raise SandboxRuntimeUnavailableError("Firecracker API returned a non-object payload")
+        return decoded
+
+    def _wait_for_microvm(
+        self,
+        *,
+        handle: SandboxHandle,
+        request: LaunchRequest,
+        resources: _FirecrackerJailResources,
+        process_identity: _FirecrackerProcessIdentity,
+        meter_sample_sink: Callable[[ResourceMeterSample], None] | None,
+        runtime_halt_probe: Callable[[], _RuntimeHaltSignal | tuple[str, tuple[str, ...]] | None] | None,
+        halt_telemetry_sink: Callable[[SandboxHaltTelemetry], None] | None,
+    ) -> SandboxExecutionResult:
+        started_at = time.monotonic()
+        next_sample_at = started_at
+        last_sample_at: float | None = None
+        last_sample: ResourceMeterSample | None = None
+        sample_seq = 0
+        while self._process_identity_is_alive(process_identity):
+            now = time.monotonic()
+            elapsed_s = now - started_at
+            runtime_halt = runtime_halt_probe() if runtime_halt_probe is not None else None
+            if runtime_halt is not None:
+                if isinstance(runtime_halt, _RuntimeHaltSignal):
+                    reason = runtime_halt.reason
+                    dimensions = runtime_halt.dimensions
+                    acknowledged_at = runtime_halt.revocation_acknowledged_at
+                else:
+                    reason, dimensions = runtime_halt
+                    acknowledged_at = None
+                return self._halt_microvm(
+                    handle=handle,
+                    request=request,
+                    resources=resources,
+                    process_identity=process_identity,
+                    started_at=started_at,
+                    reason=reason,
+                    dimensions=dimensions or (reason,),
+                    meter_sample_sink=meter_sample_sink,
+                    halt_telemetry_sink=halt_telemetry_sink,
+                    revocation_acknowledged_at=acknowledged_at,
+                    last_sample=last_sample,
+                    sample_seq=sample_seq,
+                )
+            if now >= next_sample_at:
+                sample_seq += 1
+                sample = self._firecracker_resource_sample(
+                    request=request,
+                    microvm_id=handle.sandbox_id,
+                    started_at=started_at,
+                    sample_seq=sample_seq,
+                    previous_sample_at=last_sample_at,
+                )
+                dimensions = _budget_usage_breach_dimensions(request.budget_token.caps, sample.usage)
+                wallclock_exceeded = request.requested_envelope.wallclock_s > 0 and (
+                    sample.elapsed_s >= request.requested_envelope.wallclock_s
+                )
+                sample = replace(sample, breached_dimensions=dimensions, halted=bool(dimensions) or wallclock_exceeded)
+                if meter_sample_sink is not None:
+                    meter_sample_sink(sample)
+                last_sample = sample
+                last_sample_at = time.monotonic()
+                if sample.halted:
+                    reason = "budget_caps" if dimensions else "wallclock_timeout"
+                    return self._halt_microvm(
+                        handle=handle,
+                        request=request,
+                        resources=resources,
+                        process_identity=process_identity,
+                        started_at=started_at,
+                        reason=reason,
+                        dimensions=dimensions or ("wallclock_s",),
+                        meter_sample_sink=meter_sample_sink,
+                        halt_telemetry_sink=halt_telemetry_sink,
+                        last_sample=sample,
+                        sample_seq=sample_seq,
+                    )
+                next_sample_at = time.monotonic() + self._meter_interval_s
+            time.sleep(min(self._meter_interval_s / 4, 0.05))
+
+        duration_s = time.monotonic() - started_at
+        usage = _max_budget_usage(
+            last_sample.usage if last_sample is not None else BudgetUsage(),
+            _runtime_budget_usage(request.requested_envelope, duration_s),
+        )
+        if last_sample is None:
+            sample_seq += 1
+            if meter_sample_sink is not None:
+                meter_sample_sink(
+                    ResourceMeterSample(
+                        sample_seq=sample_seq,
+                        elapsed_s=duration_s,
+                        cadence_s=0.0,
+                        usage=usage,
+                        source="firecracker-host-cgroup-v2-final",
+                    )
+                )
+        stdout, stdout_truncated = self._read_bounded_file(resources.serial_path)
+        stderr, stderr_truncated = self._read_bounded_file(resources.log_path)
+        exit_match = re.findall(r"ARGUS_FIRECRACKER_EXIT_CODE=([0-9]{1,3})", stdout)
+        exit_code = int(exit_match[-1]) if exit_match and int(exit_match[-1]) <= 255 else 1
+        if not exit_match:
+            message = "Firecracker guest exited without an Argus exit marker"
+            stderr = f"{stderr}\n{message}".strip()
+        if stdout_truncated or stderr_truncated:
+            stderr = f"{stderr}\nArgus bounded Firecracker log capture was truncated".strip()
+        return SandboxExecutionResult(
+            handle=handle,
+            exit_code=exit_code,
+            stdout=stdout,
+            stderr=stderr,
+            timed_out=False,
+            duration_s=duration_s,
+            budget_usage=usage,
+        )
+
+    def _firecracker_resource_sample(
+        self,
+        *,
+        request: LaunchRequest,
+        microvm_id: str,
+        started_at: float,
+        sample_seq: int,
+        previous_sample_at: float | None,
+    ) -> ResourceMeterSample:
+        now = time.monotonic()
+        elapsed_s = now - started_at
+        cgroup = Path("/sys/fs/cgroup") / self._CGROUP_PARENT / microvm_id
+        memory_bytes = 0
+        cpu_seconds = 0.0
+        source = "firecracker-host-cgroup-v2"
+        try:
+            memory_bytes = int((cgroup / "memory.current").read_text(encoding="utf-8").strip())
+            cpu_fields = {
+                key: int(value)
+                for key, value in (
+                    line.split(maxsplit=1)
+                    for line in (cgroup / "cpu.stat").read_text(encoding="utf-8").splitlines()
+                    if " " in line
+                )
+            }
+            cpu_seconds = cpu_fields.get("usage_usec", 0) / 1_000_000.0
+        except (OSError, ValueError):
+            source = "firecracker-host-cgroup-v2-unavailable"
+        conservative = _runtime_budget_usage(request.requested_envelope, elapsed_s)
+        usage = replace(conservative, compute_units=max(conservative.compute_units, cpu_seconds))
+        return ResourceMeterSample(
+            sample_seq=sample_seq,
+            elapsed_s=elapsed_s,
+            cadence_s=0.0 if previous_sample_at is None else max(now - previous_sample_at, 0.0),
+            usage=usage,
+            memory_bytes=memory_bytes,
+            source=source,
+        )
+
+    def _halt_microvm(
+        self,
+        *,
+        handle: SandboxHandle,
+        request: LaunchRequest,
+        resources: _FirecrackerJailResources,
+        process_identity: _FirecrackerProcessIdentity,
+        started_at: float,
+        reason: str,
+        dimensions: tuple[str, ...],
+        meter_sample_sink: Callable[[ResourceMeterSample], None] | None,
+        halt_telemetry_sink: Callable[[SandboxHaltTelemetry], None] | None,
+        last_sample: ResourceMeterSample | None,
+        sample_seq: int,
+        revocation_acknowledged_at: float | None = None,
+    ) -> SandboxExecutionResult:
+        detected_at = time.monotonic()
+        freeze_at: float | None = None
+        terminate_at: float | None = None
+        freeze_succeeded = False
+        terminate_succeeded = False
+        capture_error: str | None = None
+        try:
+            self._freeze_microvm(handle.sandbox_id)
+            freeze_succeeded = True
+            freeze_at = time.monotonic()
+        except SandboxRuntimeUnavailableError as exc:
+            capture_error = f"freeze_failed:{exc}"
+        stdout, stdout_truncated = self._read_bounded_file(resources.serial_path)
+        stderr, stderr_truncated = self._read_bounded_file(resources.log_path)
+        try:
+            if freeze_succeeded:
+                self._unfreeze_microvm(handle.sandbox_id)
+            self._signal_microvm(process_identity, signal.SIGKILL)
+            terminate_succeeded = self._wait_for_process_exit(process_identity, timeout_s=2.0)
+            terminate_at = time.monotonic() if terminate_succeeded else None
+        except SandboxRuntimeUnavailableError as exc:
+            message = f"terminate_failed:{exc}"
+            capture_error = message if capture_error is None else f"{capture_error};{message}"
+        if halt_telemetry_sink is not None:
+            halt_telemetry_sink(
+                SandboxHaltTelemetry(
+                    reason=reason,
+                    halt_detected_elapsed_s=max(detected_at - started_at, 0.0),
+                    freeze_completed_elapsed_s=max(freeze_at - started_at, 0.0) if freeze_at else None,
+                    terminate_completed_elapsed_s=max(terminate_at - started_at, 0.0) if terminate_at else None,
+                    revocation_ack_to_detect_s=(
+                        max(detected_at - revocation_acknowledged_at, 0.0)
+                        if revocation_acknowledged_at is not None
+                        else None
+                    ),
+                    revocation_ack_to_freeze_s=(
+                        max(freeze_at - revocation_acknowledged_at, 0.0)
+                        if freeze_at is not None and revocation_acknowledged_at is not None
+                        else None
+                    ),
+                    revocation_ack_to_terminate_s=(
+                        max(terminate_at - revocation_acknowledged_at, 0.0)
+                        if terminate_at is not None and revocation_acknowledged_at is not None
+                        else None
+                    ),
+                )
+            )
+        duration_s = time.monotonic() - started_at
+        usage = _max_budget_usage(
+            last_sample.usage if last_sample is not None else BudgetUsage(),
+            _runtime_budget_usage(request.requested_envelope, duration_s),
+        )
+        sample_seq += 1
+        final_sample = ResourceMeterSample(
+            sample_seq=sample_seq,
+            elapsed_s=duration_s,
+            cadence_s=max(duration_s - (last_sample.elapsed_s if last_sample else 0.0), 0.0),
+            usage=usage,
+            source="firecracker-host-cgroup-v2-halt",
+            breached_dimensions=dimensions,
+            halted=True,
+        )
+        if meter_sample_sink is not None:
+            meter_sample_sink(final_sample)
+        partial = SandboxPartialResult(
+            reason=reason,
+            stdout=stdout,
+            stderr=stderr,
+            captured_after_freeze=freeze_succeeded,
+            freeze_succeeded=freeze_succeeded,
+            terminate_succeeded=terminate_succeeded,
+            stdout_bytes=len(stdout.encode("utf-8")),
+            stderr_bytes=len(stderr.encode("utf-8")),
+            capture_error=capture_error,
+            logs_truncated=stdout_truncated or stderr_truncated,
+        )
+        return SandboxExecutionResult(
+            handle=handle,
+            exit_code=None,
+            stdout=stdout,
+            stderr=f"{stderr}\nargus meter halted Firecracker microVM: {reason}".strip(),
+            timed_out=True,
+            duration_s=duration_s,
+            budget_usage=usage,
+            partial_result=partial,
+        )
+
+    @staticmethod
+    def _read_bounded_file(path: Path) -> tuple[str, bool]:
+        try:
+            with path.open("rb") as stream:
+                stream.seek(0, os.SEEK_END)
+                size = stream.tell()
+                truncated = size > PARTIAL_RESULT_LOG_CAPTURE_LIMIT_BYTES
+                if truncated:
+                    stream.seek(-PARTIAL_RESULT_LOG_CAPTURE_LIMIT_BYTES, os.SEEK_END)
+                else:
+                    stream.seek(0)
+                raw = stream.read(PARTIAL_RESULT_LOG_CAPTURE_LIMIT_BYTES)
+        except OSError:
+            return "", False
+        return raw.decode("utf-8", errors="replace"), truncated
+
+    def _verify_microvm_process(
+        self,
+        pid: int,
+        microvm_id: str,
+        expected_identity: _FirecrackerProcessIdentity | None = None,
+    ) -> _FirecrackerProcessIdentity:
+        if pid <= 1:
+            raise SandboxRuntimeUnavailableError("Firecracker jailer returned an invalid PID")
+        try:
+            cmdline = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
+            start_time_ticks = self._proc_start_time_ticks(pid)
+            status = self._proc_status(pid)
+            cgroup_v2_path = self._proc_cgroup_v2_path(pid)
+        except (OSError, ValueError) as exc:
+            raise SandboxRuntimeUnavailableError("Firecracker PID is not live") from exc
+        decoded = [item.decode("utf-8", errors="replace") for item in cmdline if item]
+        if f"--id={microvm_id}" not in decoded:
+            raise SandboxRuntimeUnavailableError("Firecracker PID identity does not match the jail")
+        if any(
+            item == "--no-seccomp"
+            or item == "--seccomp-filter"
+            or item.startswith("--seccomp-filter=")
+            for item in decoded
+        ):
+            raise SandboxRuntimeUnavailableError(
+                "Firecracker PID disabled or replaced the pinned built-in seccomp filter"
+            )
+        try:
+            pid_namespace_ids = tuple(int(value) for value in status["NSpid"].split())
+        except (KeyError, ValueError) as exc:
+            raise SandboxRuntimeUnavailableError(
+                "Firecracker PID namespace evidence is unavailable"
+            ) from exc
+        if len(pid_namespace_ids) < 2 or pid_namespace_ids[-1] != 1:
+            raise SandboxRuntimeUnavailableError(
+                "Firecracker process is not PID 1 in a dedicated PID namespace"
+            )
+        expected_cgroup = f"/{self._CGROUP_PARENT}/{microvm_id}"
+        if cgroup_v2_path != expected_cgroup:
+            raise SandboxRuntimeUnavailableError(
+                "Firecracker process is not in the dedicated cgroup v2 path"
+            )
+        identity = _FirecrackerProcessIdentity(
+            pid=pid,
+            start_time_ticks=start_time_ticks,
+            pid_namespace_ids=pid_namespace_ids,
+            cgroup_v2_path=cgroup_v2_path,
+        )
+        if expected_identity is not None and identity != expected_identity:
+            raise SandboxRuntimeUnavailableError("Firecracker PID identity changed before attestation")
+        return identity
+
+    @staticmethod
+    def _proc_start_time_ticks(pid: int) -> int:
+        stat_payload = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+        _, separator, suffix = stat_payload.rpartition(")")
+        if not separator:
+            raise ValueError("invalid proc stat")
+        fields = suffix.strip().split()
+        return int(fields[19])
+
+    @staticmethod
+    def _proc_status(pid: int) -> dict[str, str]:
+        fields: dict[str, str] = {}
+        for line in Path(f"/proc/{pid}/status").read_text(encoding="utf-8").splitlines():
+            key, separator, value = line.partition(":")
+            if separator:
+                fields[key] = value.strip()
+        return fields
+
+    @staticmethod
+    def _proc_cgroup_v2_path(pid: int) -> str:
+        for line in Path(f"/proc/{pid}/cgroup").read_text(encoding="utf-8").splitlines():
+            hierarchy, controllers, path = line.split(":", 2)
+            if hierarchy == "0" and controllers == "":
+                return path
+        raise ValueError("cgroup v2 process path is unavailable")
+
+    def _wait_for_process_seccomp(
+        self,
+        identity: _FirecrackerProcessIdentity,
+        *,
+        timeout_s: float,
+    ) -> int:
+        deadline = time.monotonic() + timeout_s
+        last_mode = "unavailable"
+        last_filter_count = 0
+        while time.monotonic() < deadline:
+            if not self._process_identity_is_alive(identity):
+                raise SandboxRuntimeUnavailableError(
+                    "Firecracker process exited before seccomp attestation"
+                )
+            try:
+                status = self._proc_status(identity.pid)
+                last_mode = status.get("Seccomp", "unavailable")
+                last_filter_count = int(status.get("Seccomp_filters", "0"))
+            except (OSError, ValueError):
+                last_mode = "unavailable"
+                last_filter_count = 0
+            if last_mode == "2" and last_filter_count >= 1:
+                return last_filter_count
+            time.sleep(0.01)
+        raise SandboxRuntimeUnavailableError(
+            "Firecracker built-in seccomp filter was not active after InstanceStart: "
+            f"mode={last_mode}, filters={last_filter_count}"
+        )
+
+    def _process_identity_is_alive(self, identity: _FirecrackerProcessIdentity) -> bool:
+        try:
+            return self._proc_start_time_ticks(identity.pid) == identity.start_time_ticks
+        except (OSError, ValueError):
+            return False
+
+    def _signal_microvm(self, identity: _FirecrackerProcessIdentity, sig: int) -> None:
+        if not self._process_identity_is_alive(identity):
+            raise SandboxRuntimeUnavailableError("Firecracker process identity is no longer live")
+        try:
+            os.kill(identity.pid, sig)
+        except OSError as exc:
+            raise SandboxRuntimeUnavailableError("Firecracker process signal failed") from exc
+
+    def _freeze_microvm(self, microvm_id: str) -> None:
+        cgroup = Path("/sys/fs/cgroup") / self._CGROUP_PARENT / microvm_id
+        try:
+            (cgroup / "cgroup.freeze").write_text("1\n", encoding="utf-8")
+        except OSError as exc:
+            raise SandboxRuntimeUnavailableError("Firecracker cgroup freeze failed") from exc
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            try:
+                events = dict(
+                    line.split(maxsplit=1)
+                    for line in (cgroup / "cgroup.events").read_text(encoding="utf-8").splitlines()
+                    if " " in line
+                )
+            except OSError as exc:
+                raise SandboxRuntimeUnavailableError("Firecracker cgroup freeze evidence is unavailable") from exc
+            if events.get("frozen") == "1":
+                return
+            time.sleep(0.01)
+        raise SandboxRuntimeUnavailableError("Firecracker cgroup did not attest a frozen state")
+
+    def _unfreeze_microvm(self, microvm_id: str) -> None:
+        cgroup = Path("/sys/fs/cgroup") / self._CGROUP_PARENT / microvm_id
+        try:
+            (cgroup / "cgroup.freeze").write_text("0\n", encoding="utf-8")
+        except OSError as exc:
+            raise SandboxRuntimeUnavailableError("Firecracker cgroup unfreeze failed") from exc
+
+    def _wait_for_process_exit(self, identity: _FirecrackerProcessIdentity, *, timeout_s: float) -> bool:
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            if not self._process_identity_is_alive(identity):
+                return True
+            time.sleep(0.02)
+        return not self._process_identity_is_alive(identity)
+
+    def _cleanup_microvm(self, microvm_id: str, microvm_dir: Path) -> None:
+        if microvm_dir.exists():
+            shutil.rmtree(microvm_dir, ignore_errors=True)
+        cgroup_dir = Path("/sys/fs/cgroup") / self._CGROUP_PARENT / microvm_id
+        try:
+            cgroup_dir.rmdir()
+        except OSError:
+            pass
 
 
 def _kubernetes_name(value: str) -> str:
@@ -2503,6 +3882,7 @@ class DockerSandboxSupervisor:
         gpu_telemetry: GpuTelemetrySnapshot | None = None,
         dcgm_metric_sampler: Callable[[], DcgmMetricSnapshot] | None = None,
         gvisor_config: GvisorRuntimeConfig | None = None,
+        firecracker_supervisor: FirecrackerSandboxSupervisor | None = None,
     ) -> None:
         self._docker_bin = docker_bin or shutil.which("docker") or "docker"
         self._meter_interval_s = min(max(float(meter_interval_s), 0.1), 5.0)
@@ -2513,6 +3893,7 @@ class DockerSandboxSupervisor:
             lambda: collect_dcgm_metric_sample(gpu_telemetry=self._gpu_telemetry)
         )
         self._gvisor_config = gvisor_config
+        self._firecracker_supervisor = firecracker_supervisor
 
     @property
     def resource_meter_kind(self) -> str:
@@ -2569,6 +3950,22 @@ class DockerSandboxSupervisor:
     @property
     def gvisor_docker_runtime(self) -> str | None:
         return self._gvisor_config.docker_runtime if self._gvisor_config is not None else None
+
+    @property
+    def firecracker_configured(self) -> bool:
+        return self._firecracker_supervisor is not None
+
+    @property
+    def firecracker_version(self) -> str | None:
+        return self._firecracker_supervisor.expected_version if self._firecracker_supervisor is not None else None
+
+    @property
+    def firecracker_resource_meter_kind(self) -> str | None:
+        return (
+            self._firecracker_supervisor.resource_meter_kind
+            if self._firecracker_supervisor is not None
+            else None
+        )
 
     def materialize_security_spec(
         self,
@@ -2631,12 +4028,25 @@ class DockerSandboxSupervisor:
         runtime_halt_probe: Callable[[], _RuntimeHaltSignal | tuple[str, tuple[str, ...]] | None] | None = None,
         halt_telemetry_sink: Callable[[SandboxHaltTelemetry], None] | None = None,
         policy_bundle: PolicyBundle | None = None,
-        runtime_evidence_sink: Callable[[DockerRuntimeLaunchEvidence], None] | None = None,
+        runtime_evidence_sink: Callable[[RuntimeLaunchEvidence], None] | None = None,
     ) -> SandboxExecutionResult:
         if not _is_digest_pinned_image(request.image):
             raise PolicyDeniedError("image must be digest-pinned")
         if not request.entrypoint:
             raise PolicyDeniedError("entrypoint is required")
+        if handle.runtime_class == "firecracker":
+            if self._firecracker_supervisor is None:
+                raise SandboxRuntimeUnavailableError("Firecracker runtime is not configured")
+            return self._firecracker_supervisor.run(
+                handle=handle,
+                request=request,
+                materialized_env=materialized_env,
+                meter_sample_sink=meter_sample_sink,
+                runtime_halt_probe=runtime_halt_probe,
+                halt_telemetry_sink=halt_telemetry_sink,
+                policy_bundle=policy_bundle,
+                runtime_evidence_sink=runtime_evidence_sink,
+            )
         security_spec = self.materialize_security_spec(handle, policy_bundle)
         if self._docker_socket_path is not None:
             try:
@@ -3874,7 +5284,7 @@ class DockerSandboxOrchestrator(InMemorySandboxOrchestrator):
         reserved_usage = request.requested_envelope.budget_usage()
         meter_samples: list[ResourceMeterSample] = []
         halt_telemetry_items: list[SandboxHaltTelemetry] = []
-        runtime_evidence_items: list[DockerRuntimeLaunchEvidence] = []
+        runtime_evidence_items: list[RuntimeLaunchEvidence] = []
         meter_halt_recorded = False
         token_revocation_halt_recorded = False
 
@@ -3912,45 +5322,113 @@ class DockerSandboxOrchestrator(InMemorySandboxOrchestrator):
         def record_halt_telemetry(telemetry: SandboxHaltTelemetry) -> None:
             halt_telemetry_items.append(telemetry)
 
-        def record_runtime_evidence(evidence: DockerRuntimeLaunchEvidence) -> None:
+        def record_runtime_evidence(evidence: RuntimeLaunchEvidence) -> None:
             if evidence.sandbox_id != handle.sandbox_id:
                 raise SandboxRuntimeUnavailableError("runtime evidence sandbox_id mismatch")
             if evidence.runtime_class != handle.runtime_class:
                 raise SandboxRuntimeUnavailableError("runtime evidence class mismatch")
-            if evidence.seccomp_profile_hash != policy_bundle.seccomp_profile_hash:
-                raise SandboxRuntimeUnavailableError("runtime evidence seccomp hash mismatch")
             runtime_evidence_items.append(evidence)
+            if isinstance(evidence, DockerRuntimeLaunchEvidence):
+                if evidence.seccomp_profile_hash != policy_bundle.seccomp_profile_hash:
+                    raise SandboxRuntimeUnavailableError("runtime evidence seccomp hash mismatch")
+                self._audit_ledger.append(
+                    "runtime.attested",
+                    {
+                        "sandbox_id": handle.sandbox_id,
+                        "job_id": request.job_id,
+                        "runtime_class": evidence.runtime_class,
+                        "docker_runtime": evidence.docker_runtime,
+                        "container_id": evidence.container_id,
+                        "attestation_source": evidence.attestation_source,
+                    },
+                )
+                self._audit_ledger.append(
+                    "seccomp.profile_applied",
+                    {
+                        "sandbox_id": handle.sandbox_id,
+                        "job_id": request.job_id,
+                        "profile_hash": evidence.seccomp_profile_hash,
+                        "policy_bundle_version": handle.policy_bundle_version,
+                    },
+                )
+                self._audit_ledger.append(
+                    "trust.mounts_applied",
+                    {
+                        "sandbox_id": handle.sandbox_id,
+                        "job_id": request.job_id,
+                        "mount_count": len(evidence.trust_mounts),
+                        "all_read_only": True,
+                        "mounts": [
+                            {"name": mount.name, "target": mount.target, "read_only": True}
+                            for mount in evidence.trust_mounts
+                        ],
+                    },
+                )
+                return
+            if evidence.network_interface_count != 0:
+                raise SandboxRuntimeUnavailableError("Firecracker runtime evidence reported a guest network interface")
+            if not evidence.read_only_rootfs:
+                raise SandboxRuntimeUnavailableError("Firecracker runtime evidence reported a writable rootfs")
+            if not evidence.pid_namespace_init:
+                raise SandboxRuntimeUnavailableError(
+                    "Firecracker runtime evidence did not attest a dedicated PID namespace"
+                )
+            expected_cgroup_path = f"/{FirecrackerSandboxSupervisor._CGROUP_PARENT}/{handle.sandbox_id}"
+            if evidence.cgroup_v2_path != expected_cgroup_path:
+                raise SandboxRuntimeUnavailableError(
+                    "Firecracker runtime evidence did not attest the dedicated cgroup v2 path"
+                )
+            if (
+                not evidence.seccomp_enabled
+                or evidence.seccomp_filter_mode != "default-built-in"
+                or evidence.seccomp_filter_count < 1
+            ):
+                raise SandboxRuntimeUnavailableError(
+                    "Firecracker runtime evidence did not attest the built-in seccomp filter"
+                )
+            if evidence.federated_extra_access or evidence.trust_mount_count != 0:
+                raise SandboxRuntimeUnavailableError("Firecracker federated runtime received elevated trust access")
             self._audit_ledger.append(
                 "runtime.attested",
                 {
                     "sandbox_id": handle.sandbox_id,
                     "job_id": request.job_id,
                     "runtime_class": evidence.runtime_class,
-                    "docker_runtime": evidence.docker_runtime,
-                    "container_id": evidence.container_id,
+                    "microvm_id": evidence.microvm_id,
+                    "firecracker_version": evidence.firecracker_version,
+                    "jailer_version": evidence.jailer_version,
                     "attestation_source": evidence.attestation_source,
                 },
             )
             self._audit_ledger.append(
-                "seccomp.profile_applied",
+                "microvm.security_applied",
                 {
                     "sandbox_id": handle.sandbox_id,
                     "job_id": request.job_id,
-                    "profile_hash": evidence.seccomp_profile_hash,
+                    "kernel_image_hash": evidence.kernel_image_hash,
+                    "rootfs_image_hash": evidence.rootfs_image_hash,
+                    "request_drive_hash": evidence.request_drive_hash,
+                    "scratch_bytes": evidence.scratch_bytes,
+                    "network_interface_count": evidence.network_interface_count,
+                    "jailer_uid": evidence.jailer_uid,
+                    "jailer_gid": evidence.jailer_gid,
+                    "pid_namespace_init": evidence.pid_namespace_init,
+                    "cgroup_v2_path": evidence.cgroup_v2_path,
+                    "seccomp_enabled": evidence.seccomp_enabled,
+                    "seccomp_filter_mode": evidence.seccomp_filter_mode,
+                    "seccomp_filter_count": evidence.seccomp_filter_count,
+                    "read_only_rootfs": evidence.read_only_rootfs,
                     "policy_bundle_version": handle.policy_bundle_version,
                 },
             )
             self._audit_ledger.append(
-                "trust.mounts_applied",
+                "trust.boundary_applied",
                 {
                     "sandbox_id": handle.sandbox_id,
                     "job_id": request.job_id,
-                    "mount_count": len(evidence.trust_mounts),
-                    "all_read_only": True,
-                    "mounts": [
-                        {"name": mount.name, "target": mount.target, "read_only": True}
-                        for mount in evidence.trust_mounts
-                    ],
+                    "trust_class": request.scope_token.scopes.sandbox_risk_class,
+                    "federated_extra_access": evidence.federated_extra_access,
+                    "trust_mount_count": evidence.trust_mount_count,
                 },
             )
 
@@ -3973,12 +5451,16 @@ class DockerSandboxOrchestrator(InMemorySandboxOrchestrator):
             self._record_runtime_failure(handle, request, reserved_usage, exc)
             raise
 
-        expected_runtime_evidence_count = 1 if handle.runtime_class == "gvisor" else 0
+        expected_runtime_evidence_count = 1 if handle.runtime_class in {"gvisor", "firecracker"} else 0
         if len(runtime_evidence_items) != expected_runtime_evidence_count:
+            if handle.runtime_class == "firecracker":
+                message = "Firecracker launch requires exactly one host-controlled runtime attestation"
+            elif handle.runtime_class == "gvisor":
+                message = "gVisor launch requires exactly one host-controlled runtime attestation"
+            else:
+                message = "Docker launch emitted unexpected runtime attestation"
             error = SandboxRuntimeUnavailableError(
-                "gVisor launch requires exactly one host-controlled runtime attestation"
-                if handle.runtime_class == "gvisor"
-                else "non-gVisor launch emitted unexpected gVisor runtime evidence"
+                message
             )
             self._record_runtime_failure(handle, request, reserved_usage, error)
             raise error
