@@ -846,7 +846,7 @@ def materialize_firecracker_vm_spec(
                 "is_read_only": True,
             },
             {
-                "drive_id": "argus-input",
+                "drive_id": "argus_input",
                 "path_on_host": None,
                 "is_root_device": False,
                 "is_read_only": True,
@@ -1124,10 +1124,10 @@ class FirecrackerSandboxSupervisor:
                     "is_read_only": bool(drives_by_id["rootfs"]["is_read_only"]),
                 },
                 {
-                    "drive_id": "argus-input",
+                    "drive_id": "argus_input",
                     "path_on_host": "/argus-input.ext4",
                     "is_root_device": False,
-                    "is_read_only": bool(drives_by_id["argus-input"]["is_read_only"]),
+                    "is_read_only": bool(drives_by_id["argus_input"]["is_read_only"]),
                 },
                 {
                     "drive_id": "scratch",

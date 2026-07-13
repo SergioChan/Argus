@@ -111,6 +111,10 @@ class S10FirecrackerRuntimeTests(unittest.TestCase):
         self.assertEqual(spec["jailer"]["resource_limits"]["memory.max"], 128 * 1024 * 1024)
         self.assertEqual(spec["machine_config"]["mem_size_mib"], 64)
         self.assertEqual(spec["network_interfaces"], [])
+        self.assertEqual(
+            [drive["drive_id"] for drive in spec["drives"]],
+            ["rootfs", "argus_input", "scratch"],
+        )
         self.assertTrue(spec["drives"][0]["is_root_device"])
         self.assertTrue(spec["drives"][0]["is_read_only"])
         self.assertTrue(spec["drives"][1]["is_read_only"])
@@ -333,7 +337,7 @@ class S10FirecrackerRuntimeTests(unittest.TestCase):
         observed = {
             **expected,
             "drives": [
-                {**drive, "is_read_only": False} if drive["drive_id"] == "argus-input" else drive
+                {**drive, "is_read_only": False} if drive["drive_id"] == "argus_input" else drive
                 for drive in expected["drives"]
             ],
         }
