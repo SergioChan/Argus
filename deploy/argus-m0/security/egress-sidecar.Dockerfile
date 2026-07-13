@@ -4,8 +4,6 @@ WORKDIR /app
 
 RUN apt-get update \
     && apt-get install --yes --no-install-recommends iproute2 iptables \
-    && update-alternatives --set iptables /usr/sbin/iptables-legacy \
-    && update-alternatives --set ip6tables /usr/sbin/ip6tables-legacy \
     && rm -rf /var/lib/apt/lists/*
 
 RUN pip install --no-cache-dir "blake3>=0.4,<2" "dnspython>=2.6,<3"

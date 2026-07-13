@@ -310,14 +310,32 @@ class LinuxEgressFirewall:
         return tuple(commands)
 
     def apply(self) -> None:
+        self._preflight()
         for command in self.commands():
-            completed = subprocess.run(command, check=False, capture_output=True, text=True)
-            if completed.returncode != 0:
-                message = completed.stderr.strip() or completed.stdout.strip() or "unknown error"
-                raise RuntimeError(
-                    f"failed to apply egress firewall command {command!r}: {message}; "
-                    f"euid={os.geteuid()} cap_eff={_effective_capabilities()}"
-                )
+            self._run(command, phase="apply")
+
+    def _preflight(self) -> None:
+        backends: dict[str, str] = {}
+        for binary in (self.iptables_bin, self.ip6tables_bin):
+            completed = self._run((binary, "--version"), phase="preflight")
+            version = f"{completed.stdout}\n{completed.stderr}"
+            backends[binary] = _iptables_backend(version)
+        if len(set(backends.values())) != 1:
+            detail = ", ".join(f"{binary}={backend}" for binary, backend in backends.items())
+            raise RuntimeError(f"egress firewall requires one coherent dual-stack backend: {detail}")
+        for binary in (self.iptables_bin, self.ip6tables_bin):
+            self._run((binary, "-S", "OUTPUT"), phase="preflight")
+
+    @staticmethod
+    def _run(command: tuple[str, ...], *, phase: str) -> subprocess.CompletedProcess[str]:
+        completed = subprocess.run(command, check=False, capture_output=True, text=True)
+        if completed.returncode != 0:
+            message = completed.stderr.strip() or completed.stdout.strip() or "unknown error"
+            raise RuntimeError(
+                f"failed to {phase} egress firewall command {command!r}: {message}; "
+                f"euid={os.geteuid()} cap_eff={_effective_capabilities()}"
+            )
+        return completed
 
     def _family_rules(self, binary: str) -> tuple[tuple[str, ...], ...]:
         proxy_uid = str(self.proxy_uid)
@@ -372,6 +390,13 @@ class LinuxEgressFirewall:
                 "ACCEPT",
             ),
         )
+
+
+def _iptables_backend(version: str) -> str:
+    for backend in ("nf_tables", "legacy"):
+        if f"({backend})" in version:
+            return backend
+    raise RuntimeError(f"egress firewall could not identify iptables backend: {version.strip()[:160]}")
 
 
 def _read_connect_request(client: socket.socket) -> tuple[str, int]:

@@ -339,6 +339,98 @@ class LinuxEgressFirewallTests(unittest.TestCase):
         self.assertEqual(len(proxy_udp_accepts), 2)
         self.assertTrue(all(command[command.index("--dport") + 1] == "5353" for command in proxy_udp_accepts))
 
+    def test_apply_preflights_coherent_dual_stack_backend_before_mutation(self) -> None:
+        commands: list[tuple[str, ...]] = []
+
+        def run(command: tuple[str, ...], **_kwargs: object) -> SimpleNamespace:
+            normalized = tuple(command)
+            commands.append(normalized)
+            version = "iptables v1.8.11 (nf_tables)\n" if normalized[0] == "iptables" else "ip6tables v1.8.11 (nf_tables)\n"
+            return SimpleNamespace(
+                returncode=0,
+                stdout=version if normalized[1:] == ("--version",) else "",
+                stderr="",
+            )
+
+        with patch("argus_runtime.s10_egress_proxy_service.subprocess.run", side_effect=run):
+            LinuxEgressFirewall(proxy_port=15001, proxy_uid=65531, sandbox_uid=65532).apply()
+
+        self.assertEqual(
+            commands[:4],
+            [
+                ("iptables", "--version"),
+                ("ip6tables", "--version"),
+                ("iptables", "-S", "OUTPUT"),
+                ("ip6tables", "-S", "OUTPUT"),
+            ],
+        )
+        self.assertEqual(commands[4], ("iptables", "-F", "OUTPUT"))
+
+    def test_apply_rejects_mismatched_backends_before_mutation(self) -> None:
+        commands: list[tuple[str, ...]] = []
+
+        def run(command: tuple[str, ...], **_kwargs: object) -> SimpleNamespace:
+            normalized = tuple(command)
+            commands.append(normalized)
+            backend = "nf_tables" if normalized[0] == "iptables" else "legacy"
+            return SimpleNamespace(
+                returncode=0,
+                stdout=f"{normalized[0]} v1.8.11 ({backend})\n",
+                stderr="",
+            )
+
+        with (
+            patch("argus_runtime.s10_egress_proxy_service.subprocess.run", side_effect=run),
+            self.assertRaisesRegex(RuntimeError, "coherent"),
+        ):
+            LinuxEgressFirewall(proxy_port=15001, proxy_uid=65531, sandbox_uid=65532).apply()
+
+        self.assertEqual(commands, [("iptables", "--version"), ("ip6tables", "--version")])
+
+    def test_apply_rejects_unavailable_ipv6_table_before_mutation(self) -> None:
+        commands: list[tuple[str, ...]] = []
+
+        def run(command: tuple[str, ...], **_kwargs: object) -> SimpleNamespace:
+            normalized = tuple(command)
+            commands.append(normalized)
+            if normalized[1:] == ("--version",):
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout=f"{normalized[0]} v1.8.11 (nf_tables)\n",
+                    stderr="",
+                )
+            if normalized == ("ip6tables", "-S", "OUTPUT"):
+                return SimpleNamespace(returncode=1, stdout="", stderr="table unavailable")
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        with (
+            patch("argus_runtime.s10_egress_proxy_service.subprocess.run", side_effect=run),
+            patch(
+                "argus_runtime.s10_egress_proxy_service._effective_capabilities",
+                return_value="00000000000030c0",
+            ),
+            self.assertRaisesRegex(RuntimeError, "preflight"),
+        ):
+            LinuxEgressFirewall(proxy_port=15001, proxy_uid=65531, sandbox_uid=65532).apply()
+
+        self.assertFalse(any(command[1] in {"-F", "-A", "-P"} for command in commands))
+
+
+class EgressFirewallBackendContractTests(unittest.TestCase):
+    def test_images_and_battery_use_the_system_coherent_backend(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        dockerfile = (root / "deploy/argus-m0/security/egress-sidecar.Dockerfile").read_text(
+            encoding="utf-8"
+        )
+        battery = (root / "scripts/run_s10_egress_battery.py").read_text(encoding="utf-8")
+
+        self.assertEqual(egress_battery.FIREWALL_BINARIES, ("iptables", "ip6tables"))
+        self.assertNotIn("update-alternatives --set", dockerfile)
+        self.assertNotIn("iptables-legacy", dockerfile)
+        self.assertNotIn("ip6tables-legacy", dockerfile)
+        self.assertNotIn("iptables-legacy", battery)
+        self.assertNotIn("ip6tables-legacy", battery)
+
 
 class EgressBatteryCaptureTests(unittest.TestCase):
     def test_packet_capture_observes_only_traffic_leaving_the_sandbox_namespace(self) -> None:

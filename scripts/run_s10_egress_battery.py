@@ -22,6 +22,8 @@ from typing import Any
 
 
 FIXTURE_PORT = 8443
+FIREWALL_BINARIES = ("iptables", "ip6tables")
+FIREWALL_IPV4_BIN, FIREWALL_IPV6_BIN = FIREWALL_BINARIES
 
 
 def _json_line(event_type: str, payload: dict[str, Any]) -> None:
@@ -336,8 +338,7 @@ def _execute_host_battery(repo: Path) -> dict[str, Any]:
         "docker",
         "nsenter",
         "tcpdump",
-        "iptables-legacy",
-        "ip6tables-legacy",
+        *FIREWALL_BINARIES,
     ):
         if shutil.which(command) is None:
             raise RuntimeError(f"required host command is unavailable: {command}")
@@ -516,14 +517,31 @@ def _execute_host_battery(repo: Path) -> dict[str, Any]:
             )
             pre_firewall_v4 = _namespace_command(
                 sandbox_name,
-                ["iptables-legacy", "-S", "OUTPUT"],
+                [FIREWALL_IPV4_BIN, "-S", "OUTPUT"],
                 cwd=repo,
             ).stdout
             pre_firewall_v6 = _namespace_command(
                 sandbox_name,
-                ["ip6tables-legacy", "-S", "OUTPUT"],
+                [FIREWALL_IPV6_BIN, "-S", "OUTPUT"],
                 cwd=repo,
             ).stdout
+            firewall_version_v4 = _namespace_command(
+                sandbox_name,
+                [FIREWALL_IPV4_BIN, "--version"],
+                cwd=repo,
+            ).stdout.strip()
+            firewall_version_v6 = _namespace_command(
+                sandbox_name,
+                [FIREWALL_IPV6_BIN, "--version"],
+                cwd=repo,
+            ).stdout.strip()
+            firewall_backend_v4 = _iptables_backend(firewall_version_v4)
+            firewall_backend_v6 = _iptables_backend(firewall_version_v6)
+            if firewall_backend_v4 != firewall_backend_v6:
+                raise RuntimeError(
+                    "egress battery observed incoherent firewall backends: "
+                    f"IPv4={firewall_backend_v4} IPv6={firewall_backend_v6}"
+                )
             pre_capture.stop()
             post_capture = _start_capture(sandbox_name, post_capture_path, cwd=repo)
             captures.append(post_capture)
@@ -539,12 +557,12 @@ def _execute_host_battery(repo: Path) -> dict[str, Any]:
             )
             post_firewall_v4 = _namespace_command(
                 sandbox_name,
-                ["iptables-legacy", "-S", "OUTPUT"],
+                [FIREWALL_IPV4_BIN, "-S", "OUTPUT"],
                 cwd=repo,
             ).stdout
             post_firewall_v6 = _namespace_command(
                 sandbox_name,
-                ["ip6tables-legacy", "-S", "OUTPUT"],
+                [FIREWALL_IPV6_BIN, "-S", "OUTPUT"],
                 cwd=repo,
             ).stdout
             post_capture.stop()
@@ -697,6 +715,9 @@ def _execute_host_battery(repo: Path) -> dict[str, Any]:
                     "post_crash_packet_count": len(post_egress_packets),
                 },
                 "firewall": {
+                    "backend": firewall_backend_v4,
+                    "ipv4_version": firewall_version_v4,
+                    "ipv6_version": firewall_version_v6,
                     "pre_crash_ipv4": pre_firewall_v4.splitlines(),
                     "pre_crash_ipv6": pre_firewall_v6.splitlines(),
                     "post_crash_ipv4": post_firewall_v4.splitlines(),
@@ -1077,6 +1098,13 @@ def _start_capture(container: str, output_path: Path, *, cwd: Path) -> _Capture:
 def _namespace_command(container: str, command: list[str], *, cwd: Path) -> subprocess.CompletedProcess[str]:
     pid = _command(["docker", "inspect", container, "--format", "{{.State.Pid}}"], cwd=cwd).stdout.strip()
     return _command(["nsenter", "-t", pid, "-n", *command], cwd=cwd)
+
+
+def _iptables_backend(version: str) -> str:
+    for backend in ("nf_tables", "legacy"):
+        if f"({backend})" in version:
+            return backend
+    raise RuntimeError(f"could not identify iptables backend: {version.strip()[:160]}")
 
 
 def _sandbox_result(stdout: str) -> dict[str, Any]:
