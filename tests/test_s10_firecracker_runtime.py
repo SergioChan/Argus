@@ -349,7 +349,7 @@ class S10FirecrackerRuntimeTests(unittest.TestCase):
         supervisor = FirecrackerSandboxSupervisor(config=self.config)
         microvm_id = "sandbox-proc-attestation"
         command = (
-            f"/firecracker\0--id={microvm_id}\0--api-sock\0/run/firecracker.socket\0"
+            f"/firecracker\0--id\0{microvm_id}\0--api-sock\0/run/firecracker.socket\0"
         ).encode("utf-8")
         with (
             patch.object(Path, "read_bytes", return_value=command),
@@ -390,6 +390,20 @@ class S10FirecrackerRuntimeTests(unittest.TestCase):
             ),
         ):
             with self.assertRaisesRegex(SandboxRuntimeUnavailableError, "disabled or replaced"):
+                supervisor._verify_microvm_process(4321, microvm_id)
+
+        wrong_binary = command.replace(b"/firecracker\0", b"/not-firecracker\0")
+        with (
+            patch.object(Path, "read_bytes", return_value=wrong_binary),
+            patch.object(supervisor, "_proc_start_time_ticks", return_value=99),
+            patch.object(supervisor, "_proc_status", return_value={"NSpid": "4321 1"}),
+            patch.object(
+                supervisor,
+                "_proc_cgroup_v2_path",
+                return_value=f"/argus-firecracker/{microvm_id}",
+            ),
+        ):
+            with self.assertRaisesRegex(SandboxRuntimeUnavailableError, "identity does not match"):
                 supervisor._verify_microvm_process(4321, microvm_id)
 
     def test_docker_supervisor_delegates_firecracker_before_docker(self) -> None:

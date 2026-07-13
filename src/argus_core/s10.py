@@ -1898,7 +1898,12 @@ class FirecrackerSandboxSupervisor:
         except (OSError, ValueError) as exc:
             raise SandboxRuntimeUnavailableError("Firecracker PID is not live") from exc
         decoded = [item.decode("utf-8", errors="replace") for item in cmdline if item]
-        if f"--id={microvm_id}" not in decoded:
+        expected_binary = Path(self._config.firecracker_bin).name
+        if (
+            len(decoded) < 3
+            or Path(decoded[0]).name != expected_binary
+            or decoded[1:3] != ["--id", microvm_id]
+        ):
             raise SandboxRuntimeUnavailableError("Firecracker PID identity does not match the jail")
         if any(
             item == "--no-seccomp"
