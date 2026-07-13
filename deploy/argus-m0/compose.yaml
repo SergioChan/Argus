@@ -3,12 +3,14 @@ name: argus-m0
 services:
   postgres:
     image: postgres@sha256:7c688148e5e156d0e86df7ba8ae5a05a2386aaec1e2ad8e6d11bdf10504b1fb7
+    networks:
+      - argus-data
     environment:
       POSTGRES_DB: argus
       POSTGRES_USER: argus
       POSTGRES_PASSWORD: argus-dev-password
     ports:
-      - "${ARGUS_M0_POSTGRES_PORT:-55432}:5432"
+      - "127.0.0.1:${ARGUS_M0_POSTGRES_PORT:-55432}:5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U argus -d argus"]
       interval: 5s
@@ -19,13 +21,12 @@ services:
 
   minio:
     image: minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e
+    networks:
+      - argus-data
     command: ["server", "/data", "--console-address", ":9001"]
     environment:
       MINIO_ROOT_USER: argus
       MINIO_ROOT_PASSWORD: argus-dev-password
-    ports:
-      - "${ARGUS_M0_MINIO_PORT:-59000}:9000"
-      - "${ARGUS_M0_MINIO_CONSOLE_PORT:-59001}:9001"
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:9000/minio/health/ready"]
       interval: 5s
@@ -38,6 +39,9 @@ services:
     build:
       context: ../..
       dockerfile: deploy/argus-m0/python-service.Dockerfile
+    networks:
+      - argus-data
+      - argus-services
     command: ["python", "-m", "argus_runtime.s8_writer_service"]
     environment:
       ARGUS_S8_HOST: "0.0.0.0"
@@ -82,6 +86,9 @@ services:
     build:
       context: ../..
       dockerfile: deploy/argus-m0/python-service.Dockerfile
+    networks:
+      - argus-data
+      - argus-services
     command: ["python", "-m", "argus_runtime.s10_supervisor_service"]
     environment:
       ARGUS_S10_HOST: "0.0.0.0"
@@ -131,6 +138,8 @@ services:
       ARGUS_RUNTIME_IDENTITY_MINT_POLICY_JSON: ${ARGUS_RUNTIME_IDENTITY_MINT_POLICY_JSON:?ARGUS_RUNTIME_IDENTITY_MINT_POLICY_JSON is required}
       ARGUS_S8_BROKER_URL: http://s8-writer:8080/v1/internal/brokered-artifacts
       ARGUS_S8_BROKER_WRITE_KEY: ${ARGUS_S8_BROKER_WRITE_KEY:?ARGUS_S8_BROKER_WRITE_KEY is required}
+      ARGUS_S10_ADAPTER_TARGETS_JSON: '{"gw_spectrum":{"endpoint_url":"http://s7-reference-adapter:8080/v1/reference-adapter/evaluate","credential_env":"ARGUS_S10_GW_SPECTRUM_BROKER_CREDENTIAL","credential_header":"X-Argus-Adapter-Credential"}}'
+      ARGUS_S10_GW_SPECTRUM_BROKER_CREDENTIAL: ${ARGUS_S10_GW_SPECTRUM_BROKER_CREDENTIAL:?ARGUS_S10_GW_SPECTRUM_BROKER_CREDENTIAL is required}
       ARGUS_M0_HEALTH_TOKEN: ${ARGUS_M0_HEALTH_TOKEN:?ARGUS_M0_HEALTH_TOKEN is required}
     ports:
       - "127.0.0.1:${ARGUS_M0_S10_PORT:-58081}:8080"
@@ -155,6 +164,8 @@ services:
     build:
       context: ../..
       dockerfile: deploy/argus-m0/python-service.Dockerfile
+    networks:
+      - argus-services
     command: ["python", "-m", "argus_runtime.s3_reference_referee_service"]
     environment:
       ARGUS_S3_REFERENCE_REFEREE_HOST: "0.0.0.0"
@@ -190,6 +201,8 @@ services:
     build:
       context: ../..
       dockerfile: deploy/argus-m0/python-service.Dockerfile
+    networks:
+      - argus-services
     command: ["python", "-m", "argus_runtime.s7_reference_adapter_service"]
     environment:
       ARGUS_S7_REFERENCE_ADAPTER_HOST: "0.0.0.0"
@@ -199,6 +212,7 @@ services:
       ARGUS_S7_REFERENCE_ADAPTER_CALLER_ID: m1-reference-s7
       ARGUS_S7_REFERENCE_ADAPTER_JOB_ID: m1-reference-job
       ARGUS_S7_REFERENCE_ADAPTER_ACCESS_TOKEN: ${ARGUS_S7_REFERENCE_ADAPTER_ACCESS_TOKEN:?ARGUS_S7_REFERENCE_ADAPTER_ACCESS_TOKEN is required}
+      ARGUS_S7_REFERENCE_ADAPTER_BROKER_CREDENTIAL: ${ARGUS_S10_GW_SPECTRUM_BROKER_CREDENTIAL:?ARGUS_S10_GW_SPECTRUM_BROKER_CREDENTIAL is required}
     depends_on:
       s8-writer:
         condition: service_healthy
@@ -216,6 +230,8 @@ services:
     build:
       context: ../..
       dockerfile: deploy/argus-m0/python-service.Dockerfile
+    networks:
+      - argus-services
     command: ["python", "-m", "argus_runtime.s2_reference_builder_service"]
     environment:
       ARGUS_S2_REFERENCE_BUILDER_HOST: "0.0.0.0"
@@ -246,6 +262,8 @@ services:
     build:
       context: ../..
       dockerfile: deploy/argus-m0/python-service.Dockerfile
+    networks:
+      - argus-services
     command: ["python", "-m", "argus_runtime.s11_reference_observatory_service"]
     environment:
       ARGUS_S11_REFERENCE_OBSERVATORY_HOST: "0.0.0.0"
@@ -276,13 +294,15 @@ services:
     build:
       context: ../..
       dockerfile: deploy/argus-m0/python-service.Dockerfile
+    networks:
+      - argus-services
     command: ["python", "-m", "argus_runtime.s1_reference_demo_service", "--serve"]
     environment:
       ARGUS_S1_REFERENCE_DEMO_HOST: "0.0.0.0"
       ARGUS_S1_REFERENCE_DEMO_PORT: "8080"
       ARGUS_S1_REFERENCE_DEMO_S10_URL: http://s10-supervisor:8080
       ARGUS_S1_REFERENCE_DEMO_S8_URL: http://s8-writer:8080
-      ARGUS_S1_REFERENCE_DEMO_S7_URL: http://s7-reference-adapter:8080
+      ARGUS_S1_REFERENCE_DEMO_SECRETS_BROKER_URL: http://s10-supervisor:8080
       ARGUS_S1_REFERENCE_DEMO_S2_URL: http://s2-reference-builder:8080
       ARGUS_S1_REFERENCE_DEMO_S3_URL: http://s3-reference-referee:8080
       ARGUS_S1_REFERENCE_DEMO_S11_URL: http://s11-reference-observatory:8080
@@ -318,3 +338,7 @@ volumes:
   postgres-data:
   minio-data:
   s10-token-state:
+
+networks:
+  argus-data:
+  argus-services:

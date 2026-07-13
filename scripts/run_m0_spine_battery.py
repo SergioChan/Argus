@@ -9,7 +9,6 @@ from dataclasses import asdict, replace
 from decimal import Decimal
 from hashlib import sha256
 import hmac
-from io import BytesIO
 import json
 import math
 import os
@@ -56,6 +55,7 @@ M0_C3_VERIFIER_KEY_ID = "argus-m0-c3-verifier"
 M1_S3_REFERENCE_REFEREE_KEY_ID = "s3-reference-referee-key"
 HALT_LATENCY_TRIALS = 50
 HALT_LATENCY_LIMIT_S = 2.0
+HALT_LATENCY_RESPONSE_TIMEOUT_S = 30.0
 TOKEN_REVOCATION_PROPAGATION_SLO_S = 2.0
 INFLIGHT_REVOCATION_RESPONSE_TIMEOUT_S = TOKEN_REVOCATION_PROPAGATION_SLO_S + 8.0
 M1_REFERENCE_DEMO_E2E_TIMEOUT_S = 60.0
@@ -150,6 +150,17 @@ def main() -> int:
             service_access_token=reference_service_tokens["m1-reference-s7"],
         )
         auth_tokens = _mint_m0_runtime_identities(s10_url=s10_url, bootstrap_token=runtime_secrets["bootstrap_token"])
+        _battery_s10_secrets_broker(
+            evidence,
+            docker=docker,
+            compose_file=args.compose_file,
+            compose_env=env,
+            s10_url=s10_url,
+            s8_url=s8_url,
+            adapter_token=reference_service_tokens["m1-reference-s1"],
+            read_token=auth_tokens["read"],
+            broker_credential=runtime_secrets["s10_gw_spectrum_broker_credential"],
+        )
         _battery_s1_reference_physics_demo(
             evidence,
             s1_reference_demo_url,
@@ -256,7 +267,7 @@ def main() -> int:
             expected_state="SUCCEEDED",
         )
         model_record = _post_json(
-            f"{s10_url}/v1/store/artifacts",
+            f"{s10_url}/v1/broker/store/put",
             {
                 "scope_token": scope_json,
                 "kind": "model",
@@ -513,6 +524,9 @@ def main() -> int:
         _battery_real_persistence(
             evidence,
             ports,
+            docker=docker,
+            compose_file=args.compose_file,
+            compose_env=env,
             s8_url=s8_url,
             token=auth_tokens["read"],
             checkpoint_signing_key=runtime_secrets["s10_checkpoint_signing_key"].encode("utf-8"),
@@ -520,10 +534,12 @@ def main() -> int:
         )
         _battery_d_tamper_detected(
             evidence,
+            docker=docker,
+            compose_file=args.compose_file,
+            compose_env=env,
             s8_url=s8_url,
             token=auth_tokens["read"],
             health_token=runtime_secrets["health_token"],
-            minio_port=ports["ARGUS_M0_MINIO_PORT"],
             model_record=model_record,
             unrelated_ref=launch_result["launch_provenance_ref"],
         )
@@ -565,6 +581,7 @@ def _m0_runtime_secrets() -> dict[str, str]:
         "s10_verifier_key_auth_token": f"argus-s10-verifier-key-{uuid4().hex}",
         "s10_price_table_signing_key": f"argus-s10-price-table-key-{uuid4().hex}",
         "s8_broker_write_key": f"argus-s8-broker-key-{uuid4().hex}",
+        "s10_gw_spectrum_broker_credential": f"argus-s10-gw-broker-{uuid4().hex}",
         "c3_verifier_signing_key": f"argus-c3-verifier-key-{uuid4().hex}",
         "s3_reference_referee_signing_key": f"argus-s3-reference-referee-key-{uuid4().hex}",
         "m1_pilot_console_access_token": f"argus-m1-pilot-access-{uuid4().hex}",
@@ -692,7 +709,7 @@ def _m0_identity_requests() -> dict[str, dict[str, Any]]:
                 "allowed_datasets": ["c4://dataset/ewpt-reference/v1"],
                 "egress_allowlist": [
                     {"host": "store.local", "port": 443, "proto": "https"},
-                    {"host": "s7-reference-adapter", "port": 443, "proto": "https"},
+                    {"host": "s10-supervisor", "port": 443, "proto": "https"},
                 ],
                 "broker_audiences": ["store", "gw_spectrum"],
                 "capabilities": ["s8.read"],
@@ -796,6 +813,9 @@ def _compose_environment(
         "ARGUS_S10_PRICE_TABLE_ISSUED_AT": str(now - 60),
         "ARGUS_S10_PRICE_TABLE_EXPIRES_AT": str(now + 86_400),
         "ARGUS_S8_BROKER_WRITE_KEY": runtime_secrets["s8_broker_write_key"],
+        "ARGUS_S10_GW_SPECTRUM_BROKER_CREDENTIAL": runtime_secrets[
+            "s10_gw_spectrum_broker_credential"
+        ],
         "ARGUS_S3_REFERENCE_REFEREE_SIGNER_SECRET": runtime_secrets["s3_reference_referee_signing_key"],
         "ARGUS_S1_REFERENCE_DEMO_ACCESS_TOKEN": reference_service_tokens["m1-reference-s1"],
         "ARGUS_S1_REFERENCE_DEMO_PILOT_ACCESS_TOKEN": runtime_secrets["m1_pilot_console_access_token"],
@@ -938,6 +958,308 @@ def _mint_m0_runtime_identities(*, s10_url: str, bootstrap_token: str) -> dict[s
     return minted
 
 
+def _battery_s10_secrets_broker(
+    evidence: dict[str, Any],
+    *,
+    docker: str,
+    compose_file: str,
+    compose_env: dict[str, str],
+    s10_url: str,
+    s8_url: str,
+    adapter_token: str,
+    read_token: str,
+    broker_credential: str,
+) -> None:
+    eval_request = _s10_tc14_eval_request()
+    direct_probe_body = json.dumps(
+        {"job_id": "m1-reference-job", "eval_request": eval_request},
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    direct_probe_script = """\
+import json
+import os
+import socket
+import struct
+import sys
+import urllib.error
+import urllib.request
+
+payload = sys.argv[1].encode("utf-8")
+request = urllib.request.Request(
+    "http://s7-reference-adapter:8080/v1/reference-adapter/evaluate",
+    data=payload,
+    headers={"Content-Type": "application/json"},
+    method="POST",
+)
+try:
+    with urllib.request.urlopen(request, timeout=10) as response:
+        status = response.status
+        body = json.load(response)
+except urllib.error.HTTPError as exc:
+    status = exc.code
+    body = json.load(exc)
+def reachable(host, port):
+    try:
+        with socket.create_connection((host, port), timeout=2):
+            return True
+    except OSError:
+        return False
+
+routes = {
+    "service_dns": reachable("minio", 9000),
+    "host_docker_internal": reachable("host.docker.internal", int(sys.argv[2])),
+    "gateway_docker_internal": reachable("gateway.docker.internal", int(sys.argv[2])),
+}
+try:
+    with open("/proc/net/route", encoding="ascii") as routes_file:
+        default_route = next(
+            columns
+            for line in routes_file.read().splitlines()[1:]
+            if len(columns := line.split()) >= 3 and columns[1] == "00000000"
+        )
+    gateway = socket.inet_ntoa(struct.pack("<L", int(default_route[2], 16)))
+    routes["default_gateway"] = reachable(gateway, int(sys.argv[2]))
+except (OSError, StopIteration, ValueError):
+    routes["default_gateway"] = False
+direct_object_store_reachable = any(routes.values())
+print(json.dumps({
+    "broker_credential_env_present": "ARGUS_S10_GW_SPECTRUM_BROKER_CREDENTIAL" in os.environ,
+    "direct_status": status,
+    "direct_error": body.get("error"),
+    "direct_object_store_reachable": direct_object_store_reachable,
+    "direct_object_store_routes": routes,
+    "object_store_credential_env_present": any(
+        name in os.environ
+        for name in ("ARGUS_S8_MINIO_ACCESS_KEY", "ARGUS_S8_MINIO_SECRET_KEY")
+    ),
+}, sort_keys=True))
+"""
+    direct_probe_completed = _run(
+        [
+            docker,
+            "compose",
+            "-f",
+            compose_file,
+            "exec",
+            "-T",
+            "s1-reference-demo",
+            "python",
+            "-c",
+            direct_probe_script,
+            direct_probe_body,
+            compose_env.get("ARGUS_M0_MINIO_PORT", "59000"),
+        ],
+        env=compose_env,
+        timeout=30,
+    )
+    try:
+        direct_probe = json.loads(direct_probe_completed.stdout)
+    except json.JSONDecodeError as exc:
+        raise AssertionError("S1 direct-adapter probe did not return JSON") from exc
+    if not isinstance(direct_probe, dict):
+        raise AssertionError("S1 direct-adapter probe did not return a JSON object")
+    if direct_probe.get("broker_credential_env_present") is not False:
+        raise AssertionError("broker credential was exposed in the S1 runtime environment")
+    if direct_probe.get("direct_status") != 403 or direct_probe.get("direct_error") != "broker_credential_required":
+        raise AssertionError(f"direct S1-to-S7 adapter call was not denied: {direct_probe}")
+    if direct_probe.get("direct_object_store_reachable") is not False:
+        raise AssertionError(
+            "S1 could directly connect to the object-store data plane: "
+            f"{direct_probe.get('direct_object_store_routes')}"
+        )
+    if direct_probe.get("object_store_credential_env_present") is not False:
+        raise AssertionError("object-store credentials were exposed in the S1 runtime environment")
+
+    scope_token = _mint_store_scope(s10_url=s10_url, token=adapter_token)
+    s7_query_url = f"{s8_url}/v1/artifacts?producer_subsystem=S7&page_size=100"
+    before_denial = _get_json(s7_query_url, token=read_token)
+    denied = _post_json(
+        f"{s10_url}/v1/broker/adapter/gw_spectrum/evaluate",
+        {
+            "scope_token": scope_token,
+            "eval_request": {**eval_request, "adapter_id": "scope-mismatch"},
+        },
+        expected_status=403,
+        token=adapter_token,
+    )
+    after_denial = _get_json(s7_query_url, token=read_token)
+    before_records = before_denial.get("records")
+    after_records = after_denial.get("records")
+    if denied.get("error") != "ScopeDeniedError" or denied.get("message") != "adapter_id_mismatch":
+        raise AssertionError(f"scope-mismatched adapter call returned an unexpected denial: {denied}")
+    if not isinstance(before_records, list) or not isinstance(after_records, list):
+        raise AssertionError("S8 adapter provenance query did not return record lists")
+    if len(after_records) != len(before_records):
+        raise AssertionError("scope-mismatched adapter call reached the S7 upstream")
+
+    brokered = _post_json(
+        f"{s10_url}/v1/broker/adapter/gw_spectrum/evaluate",
+        {"scope_token": scope_token, "eval_request": eval_request},
+        expected_status=200,
+        token=adapter_token,
+    )
+    outputs = brokered.get("outputs")
+    omega = outputs.get("omega") if isinstance(outputs, dict) else None
+    uncertainty = omega.get("uncertainty") if isinstance(omega, dict) else None
+    provenance_ref = brokered.get("provenance_ref")
+    if brokered.get("adapter_id") != "gw_spectrum" or not isinstance(uncertainty, dict):
+        raise AssertionError(f"brokered adapter call did not return the expected C6 output: {brokered}")
+    if not isinstance(provenance_ref, str) or not provenance_ref.startswith("c4://"):
+        raise AssertionError(f"brokered adapter call did not return C4 provenance: {brokered}")
+    if not brokered.get("uncertainty_engine_version"):
+        raise AssertionError(f"brokered adapter call omitted uncertainty engine metadata: {brokered}")
+    provenance_record = _get_json(
+        f"{s8_url}/v1/artifacts/{parse.quote(provenance_ref, safe='')}/record",
+        token=read_token,
+    )
+    if provenance_record.get("producer", {}).get("subsystem") != "S7":
+        raise AssertionError(f"brokered adapter provenance was not emitted by S7: {provenance_record}")
+
+    store_payload = {"probe": "s10-tc15"}
+    stored = _post_json(
+        f"{s10_url}/v1/broker/store/put",
+        {
+            "scope_token": scope_token,
+            "kind": "log",
+            "payload": store_payload,
+            "producer": {"subsystem": "S1", "version": "0.0.0"},
+            "lineage": {
+                "input_refs": [],
+                "code_ref": "git:s10-tc15",
+                "environment_digest": "oci:s10-tc15",
+            },
+        },
+        expected_status=201,
+        token=adapter_token,
+    )
+    fetched = _post_json(
+        f"{s10_url}/v1/broker/store/get",
+        {
+            "scope_token": scope_token,
+            "artifact_ref": stored["artifact_ref"],
+            "representation": "payload",
+        },
+        expected_status=200,
+        token=adapter_token,
+    )
+    direct_store = _post_json(
+        f"{s8_url}/v1/artifacts",
+        {
+            "kind": "log",
+            "payload": {"bypass": True},
+            "producer": {"subsystem": "S1", "version": "0.0.0"},
+            "lineage": {
+                "input_refs": [],
+                "code_ref": "git:s10-tc15-bypass",
+                "environment_digest": "oci:s10-tc15-bypass",
+            },
+        },
+        expected_status=403,
+        token=adapter_token,
+    )
+    if fetched.get("artifact_ref") != stored.get("artifact_ref") or fetched.get("payload") != store_payload:
+        raise AssertionError(f"brokered store round trip did not preserve the payload: {fetched}")
+    if direct_store.get("error") != "DirectWriteDenied":
+        raise AssertionError(f"direct S8 write bypass was not denied: {direct_store}")
+
+    service_logs = _run(
+        [
+            docker,
+            "compose",
+            "-f",
+            compose_file,
+            "logs",
+            "--no-color",
+            "s10-supervisor",
+            "s7-reference-adapter",
+            "s1-reference-demo",
+        ],
+        env=compose_env,
+        timeout=30,
+    )
+    if broker_credential in service_logs.stdout or broker_credential in service_logs.stderr:
+        raise AssertionError("broker credential leaked into Compose service logs")
+    observed_payloads = json.dumps(
+        [direct_probe, denied, brokered, provenance_record, stored, fetched, direct_store],
+        sort_keys=True,
+    )
+    if broker_credential in observed_payloads:
+        raise AssertionError("broker credential leaked into a deployed API response")
+
+    tc14_detail = {
+        "direct_adapter_status": direct_probe["direct_status"],
+        "direct_adapter_error": direct_probe["direct_error"],
+        "broker_credential_env_present": direct_probe["broker_credential_env_present"],
+        "scope_mismatch_error": denied["error"],
+        "scope_mismatch_reached_upstream": False,
+        "adapter_id": brokered["adapter_id"],
+        "provenance_ref": provenance_ref,
+        "provenance_producer": provenance_record["producer"]["subsystem"],
+        "uncertainty_engine_version": brokered["uncertainty_engine_version"],
+        "credential_absent_from_responses_and_logs": True,
+    }
+    tc15_detail = {
+        "broker_store_route": "POST /v1/broker/store/put|get",
+        "artifact_ref": stored["artifact_ref"],
+        "payload_round_trip": fetched["payload"] == store_payload,
+        "direct_object_store_reachable": direct_probe["direct_object_store_reachable"],
+        "direct_object_store_routes": direct_probe["direct_object_store_routes"],
+        "object_store_credential_env_present": direct_probe["object_store_credential_env_present"],
+        "direct_store_status": 403,
+        "direct_store_error": direct_store["error"],
+    }
+    _record(
+        evidence,
+        "s10-tc14",
+        "S10-TC14 deployed Secrets Broker injected the adapter credential out of process and enforced scope",
+        tc14_detail,
+    )
+    _record(
+        evidence,
+        "s10-tc15",
+        "S10-TC15 deployed store proxy completed put/get while direct S8 write remained denied",
+        tc15_detail,
+    )
+    if broker_credential in json.dumps([tc14_detail, tc15_detail], sort_keys=True):
+        raise AssertionError("broker credential leaked into S10-TC14/TC15 evidence")
+
+
+def _s10_tc14_eval_request() -> dict[str, Any]:
+    return {
+        "adapter_id": "gw_spectrum",
+        "inputs": {
+            "T_n": {
+                "value": 100.0,
+                "units": "GeV",
+                "uncertainty": {"kind": "interval", "radius": 1.0},
+            },
+            "alpha": {
+                "value": 0.2,
+                "units": "dimensionless",
+                "uncertainty": {"kind": "interval", "radius": 0.01},
+            },
+            "beta_over_H": {
+                "value": 100.0,
+                "units": "dimensionless",
+                "uncertainty": {"kind": "interval", "radius": 5.0},
+            },
+            "v_w": {
+                "value": 0.7,
+                "units": "dimensionless",
+                "uncertainty": {"kind": "interval", "radius": 0.02},
+            },
+            "frequency": {
+                "value": 0.003,
+                "units": "Hz",
+                "uncertainty": {"kind": "interval", "radius": 0.0001},
+            },
+        },
+        "c6_version": "2.3.0",
+        "seed": 17,
+    }
+
+
 def _battery_runtime_auth_required(
     evidence: dict[str, Any],
     s8_url: str,
@@ -1077,7 +1399,7 @@ def _battery_forged_scope_token_denied(
 ) -> None:
     forged_scope = {**scope_json, "signature": "ed25519:" + "0" * 128}
     response = _post_json(
-        f"{s10_url}/v1/store/artifacts",
+        f"{s10_url}/v1/broker/store/put",
         {
             "scope_token": forged_scope,
             "kind": "model",
@@ -1108,7 +1430,7 @@ def _battery_revoked_scope_token_denied(
         token=token,
     )
     denied_response = _post_json(
-        f"{s10_url}/v1/store/artifacts",
+        f"{s10_url}/v1/broker/store/put",
         {
             "scope_token": scope_json,
             "kind": "model",
@@ -1139,7 +1461,7 @@ def _battery_revoked_scope_token_denied(
             "denial_message": denied_response.get("message"),
             "denied_after_s": round(denied_after_s, 6),
             "propagation_slo_s": TOKEN_REVOCATION_PROPAGATION_SLO_S,
-            "route": "POST /v1/store/artifacts",
+            "route": "POST /v1/broker/store/put",
         },
     )
 
@@ -1457,7 +1779,7 @@ def _battery_b_incomplete_lineage(
     token: str,
 ) -> None:
     response = _post_json(
-        f"{s10_url}/v1/store/artifacts",
+        f"{s10_url}/v1/broker/store/put",
         {
             "scope_token": scope_json,
             "kind": "model",
@@ -1488,9 +1810,9 @@ def _battery_c_write_once(
         "producer": {"subsystem": "S2", "version": "0.0.0"},
         "lineage": {"input_refs": [], "code_ref": "git:model", "environment_digest": "oci:model"},
     }
-    first = _post_json(f"{s10_url}/v1/store/artifacts", body, expected_status=201, token=token)
+    first = _post_json(f"{s10_url}/v1/broker/store/put", body, expected_status=201, token=token)
     second = _post_json(
-        f"{s10_url}/v1/store/artifacts",
+        f"{s10_url}/v1/broker/store/put",
         {**body, "payload": {"weights": [2]}},
         expected_status=400,
         token=token,
@@ -1519,7 +1841,7 @@ def _battery_dataset_registry_service(
     dataset_id = "m0-dataset-registry"
     version = "1.0.0"
     dataset_artifact = _post_json(
-        f"{s10_url}/v1/store/artifacts",
+        f"{s10_url}/v1/broker/store/put",
         {
             "scope_token": dataset_scope_json,
             "kind": "dataset",
@@ -1691,7 +2013,7 @@ def _battery_deployed_report_verifier(
         verifier_key_auth_token=verifier_key_auth_token,
     )
     report_record = _post_json(
-        f"{s10_url}/v1/store/artifacts",
+        f"{s10_url}/v1/broker/store/put",
         {
             "scope_token": verifier_scope_json,
             "kind": "report",
@@ -1703,7 +2025,7 @@ def _battery_deployed_report_verifier(
         token=verifier_token,
     )
     promoted = _post_json(
-        f"{s10_url}/v1/store/artifacts",
+        f"{s10_url}/v1/broker/store/put",
         {
             "scope_token": model_scope_json,
             "kind": "model",
@@ -1723,7 +2045,7 @@ def _battery_deployed_report_verifier(
     tampered = signer.sign(_m0_validation_report(claim_tier="recapitulated-known"))
     tampered["aggregate"]["score"] = 0.1
     tampered_rejected = _post_json(
-        f"{s10_url}/v1/store/artifacts",
+        f"{s10_url}/v1/broker/store/put",
         {
             "scope_token": verifier_scope_json,
             "kind": "report",
@@ -1735,7 +2057,7 @@ def _battery_deployed_report_verifier(
         token=verifier_token,
     )
     mismatch_rejected = _post_json(
-        f"{s10_url}/v1/store/artifacts",
+        f"{s10_url}/v1/broker/store/put",
         {
             "scope_token": model_scope_json,
             "kind": "model",
@@ -1957,13 +2279,15 @@ def _battery_real_persistence(
     evidence: dict[str, Any],
     ports: dict[str, str],
     *,
+    docker: str,
+    compose_file: str,
+    compose_env: dict[str, str],
     s8_url: str,
     token: str,
     checkpoint_signing_key: bytes,
     checkpoint_signer_provider_from_health: str,
 ) -> None:
     import psycopg
-    from minio import Minio
 
     dsn = f"postgresql://argus:argus-dev-password@127.0.0.1:{ports['ARGUS_M0_POSTGRES_PORT']}/argus"
     with psycopg.connect(dsn) as conn:
@@ -2041,13 +2365,26 @@ def _battery_real_persistence(
         s8_url=s8_url,
         token=token,
     )
-    minio = Minio(
-        f"127.0.0.1:{ports['ARGUS_M0_MINIO_PORT']}",
-        access_key="argus",
-        secret_key="argus-dev-password",
-        secure=False,
+    minio_snapshot = _compose_exec_json(
+        docker=docker,
+        compose_file=compose_file,
+        compose_env=compose_env,
+        service="s8-writer",
+        script="""\
+import json
+import os
+from minio import Minio
+
+client = Minio(
+    os.environ["ARGUS_S8_MINIO_ENDPOINT"],
+    access_key=os.environ["ARGUS_S8_MINIO_ACCESS_KEY"],
+    secret_key=os.environ["ARGUS_S8_MINIO_SECRET_KEY"],
+    secure=os.environ.get("ARGUS_S8_MINIO_SECURE", "0") == "1",
+)
+print(json.dumps({"object_count": sum(1 for _ in client.list_objects("argus-s8-objects", recursive=True))}))
+""",
     )
-    object_count = sum(1 for _ in minio.list_objects("argus-s8-objects", recursive=True))
+    object_count = int(minio_snapshot["object_count"])
     checkpoint_signature_valid = False
     checkpoint_sequence = 0
     checkpoint_signer_key_id = ""
@@ -2350,26 +2687,54 @@ def _postgres_statement_denied(dsn: str, sql: str, expected_message: str) -> boo
 def _battery_d_tamper_detected(
     evidence: dict[str, Any],
     *,
+    docker: str,
+    compose_file: str,
+    compose_env: dict[str, str],
     s8_url: str,
     token: str,
     health_token: str,
-    minio_port: str,
     model_record: dict[str, Any],
     unrelated_ref: str,
 ) -> None:
-    from minio import Minio
-
     payload_url = f"{s8_url}/v1/artifacts/{model_record['artifact_ref']}/payload"
     _get_json(payload_url, token=token)
-    minio = Minio(
-        f"127.0.0.1:{minio_port}",
-        access_key="argus",
-        secret_key="argus-dev-password",
-        secure=False,
+    _compose_exec_json(
+        docker=docker,
+        compose_file=compose_file,
+        compose_env=compose_env,
+        service="s8-writer",
+        script="""\
+import json
+import os
+import sys
+from io import BytesIO
+from minio import Minio
+
+content_hash = sys.argv[1]
+object_name = content_hash.removeprefix("blake3:") if content_hash.startswith("blake3:") else content_hash.replace(":", "_")
+client = Minio(
+    os.environ["ARGUS_S8_MINIO_ENDPOINT"],
+    access_key=os.environ["ARGUS_S8_MINIO_ACCESS_KEY"],
+    secret_key=os.environ["ARGUS_S8_MINIO_SECRET_KEY"],
+    secure=os.environ.get("ARGUS_S8_MINIO_SECURE", "0") == "1",
+)
+key = next(
+    item.object_name
+    for item in client.list_objects("argus-s8-objects", recursive=True)
+    if item.object_name and item.object_name.endswith("/" + object_name)
+)
+tampered = b'{"tampered":true}'
+client.put_object(
+    "argus-s8-objects",
+    key,
+    BytesIO(tampered),
+    length=len(tampered),
+    content_type="application/json",
+)
+print(json.dumps({"object_key": key}))
+""",
+        args=(model_record["content_hash"],),
     )
-    key = _minio_object_key(minio, "argus-s8-objects", model_record["content_hash"])
-    tampered = b'{"tampered":true}'
-    minio.put_object("argus-s8-objects", key, BytesIO(tampered), length=len(tampered), content_type="application/json")
     response = _get_json(payload_url, token=token, expected_status=404)
     if response["error"] != "HashMismatchError":
         raise AssertionError(f"unexpected tamper detection payload: {response}")
@@ -2395,16 +2760,6 @@ def _battery_d_tamper_detected(
             "health_record_count_after_tamper": health["record_count"],
         },
     )
-
-
-def _minio_object_key(minio: Any, bucket: str, content_hash: str) -> str:
-    object_name = content_hash.removeprefix("blake3:") if content_hash.startswith("blake3:") else content_hash.replace(":", "_")
-    for item in minio.list_objects(bucket, recursive=True):
-        if item.object_name and item.object_name.endswith("/" + object_name):
-            return item.object_name
-    raise KeyError(content_hash)
-
-
 def _battery_e_budget_halt(
     evidence: dict[str, Any],
     s10_url: str,
@@ -2847,6 +3202,7 @@ def _battery_halt_latency_trials(
             launch_body,
             expected_status=403,
             token=token,
+            timeout=HALT_LATENCY_RESPONSE_TIMEOUT_S,
         )
         if response.get("error") != "BudgetExceededError":
             raise AssertionError(f"halt latency trial {trial} did not fail with BudgetExceededError: {response}")
@@ -3636,6 +3992,42 @@ def _run(
             + f"\nstdout:\n{completed.stdout}\nstderr:\n{completed.stderr}"
         )
     return completed
+
+
+def _compose_exec_json(
+    *,
+    docker: str,
+    compose_file: str,
+    compose_env: dict[str, str],
+    service: str,
+    script: str,
+    args: tuple[str, ...] = (),
+    timeout: int = 60,
+) -> dict[str, Any]:
+    completed = _run(
+        [
+            docker,
+            "compose",
+            "-f",
+            compose_file,
+            "exec",
+            "-T",
+            service,
+            "python",
+            "-c",
+            script,
+            *args,
+        ],
+        env=compose_env,
+        timeout=timeout,
+    )
+    try:
+        payload = json.loads(completed.stdout)
+    except json.JSONDecodeError as exc:
+        raise AssertionError(f"Compose service {service} did not return JSON") from exc
+    if not isinstance(payload, dict):
+        raise AssertionError(f"Compose service {service} did not return a JSON object")
+    return payload
 
 
 def _record(evidence: dict[str, Any], item_id: str, summary: str, detail: Any | None = None) -> None:

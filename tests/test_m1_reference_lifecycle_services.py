@@ -35,7 +35,12 @@ from argus_runtime.m1_reference_runtime import (
     REFERENCE_SANDBOX_IMAGE,
 )
 from argus_runtime.m1_runtime_artifacts import RuntimeIdentitySession, S10S8ArtifactStore
-from argus_runtime.s10_supervisor_service import RuntimeIdentityMintPolicy, S10SupervisorApp, S8BrokeredArtifactStoreClient
+from argus_runtime.s10_supervisor_service import (
+    CredentialedAdapterTarget,
+    RuntimeIdentityMintPolicy,
+    S10SupervisorApp,
+    S8BrokeredArtifactStoreClient,
+)
 from argus_runtime.s11_reference_observatory_service import S11ReferenceObservatoryApp
 from argus_runtime.s3_reference_referee_service import S3_REFERENCE_REFEREE_ROUTE, S3ReferenceRefereeApp
 from argus_runtime.s2_reference_builder_service import (
@@ -51,6 +56,8 @@ from argus_runtime.s2_reference_builder_service import (
 )
 import argus_runtime.s2_reference_builder_service as s2_reference_builder_service
 from argus_runtime.s7_reference_adapter_service import (
+    S7_REFERENCE_ADAPTER_BROKER_CREDENTIAL_HEADER,
+    S7_REFERENCE_ADAPTER_ROUTE,
     S7ReferenceAdapterApp,
     build_app_from_env as build_s7_reference_adapter_app_from_env,
 )
@@ -64,7 +71,7 @@ class M1ReferenceLifecycleServiceTests(unittest.TestCase):
             s10_url="http://s10.example",
             s8_url="http://s8.example",
             access_token="m1-reference-s1-token",
-            s7_url="http://s7.example",
+            secrets_broker_url="http://s10-broker.example",
             s2_url="http://s2.example",
             s3_url="http://s3.example",
             s11_url="http://s11.example",
@@ -131,6 +138,7 @@ class M1ReferenceLifecycleServiceTests(unittest.TestCase):
                 "ARGUS_S7_REFERENCE_ADAPTER_S10_URL": "http://s10.example",
                 "ARGUS_S7_REFERENCE_ADAPTER_S8_URL": "http://s8.example",
                 "ARGUS_S7_REFERENCE_ADAPTER_ACCESS_TOKEN": "preprovisioned-s7-token",
+                "ARGUS_S7_REFERENCE_ADAPTER_BROKER_CREDENTIAL": "preprovisioned-broker-credential",
             },
             clear=True,
         ):
@@ -315,7 +323,7 @@ class M1ReferenceLifecycleServiceTests(unittest.TestCase):
                 allowed_datasets=("c4://dataset/ewpt-reference/v1",),
                 egress_allowlist=(
                     EgressRule("store.local", 443, "https"),
-                    EgressRule("s7-reference-adapter", 443, "https"),
+                    EgressRule("s10-supervisor", 443, "https"),
                 ),
                 broker_audiences=("store", "gw_spectrum"),
                 budget_caps=BudgetCaps(max_compute_units=10, max_wallclock_s=30, max_cost_usd=1),
@@ -349,6 +357,9 @@ class M1ReferenceLifecycleServiceTests(unittest.TestCase):
             )
             s8 = S8WriterApp(durable_store, auth=auth, broker_write_key=broker_write_key)
             s8_url = _start_json_server(s8)
+            adapter_credential = "m1-lifecycle-adapter-broker-credential"
+            s7_port = _free_port()
+            s7_url = f"http://127.0.0.1:{s7_port}"
             s10 = S10SupervisorApp(
                 signing_key=b"m1-lifecycle-s10-signing-key",
                 artifact_store=S8BrokeredArtifactStoreClient(
@@ -360,15 +371,24 @@ class M1ReferenceLifecycleServiceTests(unittest.TestCase):
                 verifier_key_provider=verifier_provider,
                 verifier_key_auth_token=verifier_key_token,
                 docker_supervisor=DockerSandboxSupervisor(docker_bin=docker),
+                adapter_targets={
+                    "gw_spectrum": CredentialedAdapterTarget(
+                        adapter_id="gw_spectrum",
+                        endpoint_url=f"{s7_url}{S7_REFERENCE_ADAPTER_ROUTE}",
+                        credential_header=S7_REFERENCE_ADAPTER_BROKER_CREDENTIAL_HEADER,
+                        credential=adapter_credential,
+                    )
+                },
             )
             s10_url = _start_json_server(s10)
             s7 = S7ReferenceAdapterApp(
                 s10_url=s10_url,
                 s8_url=s8_url,
                 access_token=access_tokens["m1-reference-s7"],
+                broker_credential=adapter_credential,
                 expected_job_id=M1_REFERENCE_JOB_ID,
             )
-            s7_url = _start_json_server(s7)
+            _start_json_server(s7, port=s7_port)
             s2 = S2ReferenceBuilderApp(
                 s10_url=s10_url,
                 s8_url=s8_url,
@@ -408,7 +428,7 @@ class M1ReferenceLifecycleServiceTests(unittest.TestCase):
                 s10_url=s10_url,
                 s8_url=s8_url,
                 access_token=access_tokens["m1-reference-s1"],
-                s7_url=s7_url,
+                secrets_broker_url=s10_url,
                 s2_url=s2_url,
                 s3_url=s3_url,
                 s11_url=s11_url,
@@ -661,20 +681,20 @@ def _require_reference_pipeline_image_or_skip(test_case: unittest.TestCase, dock
     return image_id
 
 
-def _start_json_server(app: object) -> str:
-    port = _free_port()
+def _start_json_server(app: object, *, port: int | None = None) -> str:
+    selected_port = port or _free_port()
     http = getattr(app, "http")
     thread = Thread(
         target=serve_json_app,
-        kwargs={"app": http, "host": "127.0.0.1", "port": port},
+        kwargs={"app": http, "host": "127.0.0.1", "port": selected_port},
         daemon=True,
     )
     thread.start()
     deadline = time.monotonic() + 5
     while True:
         try:
-            with socket.create_connection(("127.0.0.1", port), timeout=0.2):
-                return f"http://127.0.0.1:{port}"
+            with socket.create_connection(("127.0.0.1", selected_port), timeout=0.2):
+                return f"http://127.0.0.1:{selected_port}"
         except OSError:
             if time.monotonic() >= deadline:
                 raise

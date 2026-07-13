@@ -695,6 +695,50 @@ class S10StoreWriterBrokerTests(unittest.TestCase):
         self.assertEqual(self.artifacts.record_count, 1)
         self.assertEqual(self.audit.events()[-1].event_type, "store.put")
 
+    def test_sandbox_client_get_requires_read_scope_and_returns_payload_or_record(self) -> None:
+        scope = self.tokens.mint_scope(
+            job_id="job-1",
+            scopes=ScopeGrant(
+                broker_audiences=("store",),
+                capabilities=("s8.read",),
+                producer_subsystems=("S2",),
+            ),
+        )
+        client = self.broker.client_for(scope)
+        record = client.put_artifact(
+            kind="model",
+            payload={"weights": [1, 2, 3]},
+            producer=Producer(subsystem="S2", version="0.0.0"),
+            lineage=Lineage(input_refs=(), code_ref="git:model", environment_digest="oci:model"),
+        )
+
+        payload = client.get_artifact(artifact_ref=record.artifact_ref)
+        fetched_record = client.get_artifact(artifact_ref=record.artifact_ref, representation="record")
+
+        self.assertEqual(payload["payload"], {"weights": [1, 2, 3]})
+        self.assertEqual(fetched_record["record"]["artifact_ref"], record.artifact_ref)
+        self.assertEqual(self.audit.events()[-1].event_type, "store.get")
+
+    def test_store_get_rejects_missing_read_scope_and_tampered_token(self) -> None:
+        write_only_scope = self.tokens.mint_scope(
+            job_id="job-1",
+            scopes=ScopeGrant(broker_audiences=("store",), producer_subsystems=("S2",)),
+        )
+        with self.assertRaisesRegex(ScopeDeniedError, "read_scope_denied"):
+            self.broker.client_for(write_only_scope).get_artifact(
+                artifact_ref="c4://artifact/not-read",
+            )
+
+        readable_scope = self.tokens.mint_scope(
+            job_id="job-1",
+            scopes=ScopeGrant(broker_audiences=("store",), capabilities=("s8.read",)),
+        )
+        tampered_scope = replace(readable_scope, job_id="job-2")
+        with self.assertRaises(TokenInvalidError):
+            self.broker.client_for(tampered_scope).get_artifact(
+                artifact_ref="c4://artifact/not-read",
+            )
+
     def test_sandbox_client_write_once_conflict_still_goes_through_broker_scope(self) -> None:
         scope = self.tokens.mint_scope(
             job_id="job-1",

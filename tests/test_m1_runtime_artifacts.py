@@ -168,8 +168,24 @@ class M1RuntimeArtifactStoreTests(unittest.TestCase):
                         "signature": "ed25519:test",
                     }
                 )
-            if url.endswith("/v1/store/artifacts"):
+            if url.endswith("/v1/broker/store/put"):
                 return _HttpResponse(record)
+            if url.endswith("/v1/broker/store/get"):
+                if body["representation"] == "record":
+                    return _HttpResponse(
+                        {
+                            "artifact_ref": record["artifact_ref"],
+                            "representation": "record",
+                            "record": record,
+                        }
+                    )
+                return _HttpResponse(
+                    {
+                        "artifact_ref": record["artifact_ref"],
+                        "representation": "payload",
+                        "payload": {"weights": [1.0], "job_id": "m1-reference-job"},
+                    }
+                )
             if url.endswith("/record"):
                 return _HttpResponse(record)
             if url.endswith("/payload"):
@@ -216,10 +232,12 @@ class M1RuntimeArtifactStoreTests(unittest.TestCase):
         self.assertEqual(requests[0]["body"], {"caller_id": "m1-reference-s1", "ttl_s": 600})
         self.assertEqual(requests[1]["url"], "http://s10.example/v1/scope-tokens")
         self.assertEqual(requests[1]["body"], {"ttl_s": 600})
-        self.assertEqual(requests[2]["url"], "http://s10.example/v1/store/artifacts")
+        self.assertEqual(requests[2]["url"], "http://s10.example/v1/broker/store/put")
         self.assertEqual(requests[2]["body"]["scope_token"]["scope_id"], "scope-m1")
-        self.assertEqual(requests[3]["url"], "http://s8.example/v1/artifacts/c4://artifact/m1-runtime-model/record")
+        self.assertEqual(requests[3]["url"], "http://s10.example/v1/broker/store/get")
         self.assertEqual(requests[3]["headers"]["Authorization"], "Bearer m1-runtime-identity")
+        self.assertEqual(requests[4]["url"], "http://s10.example/v1/broker/store/get")
+        self.assertEqual(requests[5]["url"], "http://s8.example/v1/lineage/c4://artifact/m1-runtime-model?direction=ancestors")
 
     def test_session_rejects_policy_identity_for_the_wrong_job(self) -> None:
         def urlopen(_request: object, timeout: float) -> _HttpResponse:
@@ -263,7 +281,7 @@ class M1RuntimeArtifactStoreTests(unittest.TestCase):
                         "signature": "ed25519:test",
                     }
                 )
-            if url.endswith("/v1/store/artifacts"):
+            if url.endswith("/v1/broker/store/put"):
                 return _HttpResponse({"error": "DirectWriteDenied"})
             raise AssertionError(f"unexpected URL: {url}")
 

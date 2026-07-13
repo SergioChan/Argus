@@ -2,15 +2,15 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from hashlib import sha256
 import hmac
 import json
 import math
 import os
 from pathlib import Path
-from typing import Any
-from urllib import error, request
+from typing import Any, Mapping
+from urllib import error, parse, request
 
 from argus_core import (
     ArtifactRecord,
@@ -76,6 +76,36 @@ from .auth import (
 from .http_json import JsonHttpApp, JsonRequest, serve_json_app
 
 
+class AdapterBrokerUpstreamError(RuntimeError):
+    """Raised when a configured credentialed adapter cannot return a trusted C6 response."""
+
+
+@dataclass(frozen=True)
+class CredentialedAdapterTarget:
+    adapter_id: str
+    endpoint_url: str
+    credential_header: str
+    credential: str = field(repr=False)
+    timeout_s: float = 10.0
+
+    def __post_init__(self) -> None:
+        if not self.adapter_id or "/" in self.adapter_id:
+            raise ValueError("adapter target id must be a non-empty path segment")
+        endpoint = parse.urlparse(self.endpoint_url)
+        if endpoint.scheme not in {"http", "https"} or not endpoint.netloc:
+            raise ValueError("adapter target endpoint must be an absolute HTTP(S) URL")
+        if endpoint.username is not None or endpoint.password is not None:
+            raise ValueError("adapter target endpoint must not contain credentials")
+        if not self.credential_header.lower().startswith("x-argus-") or any(
+            char in self.credential_header for char in "\r\n:"
+        ):
+            raise ValueError("adapter credential header must be a valid X-Argus header name")
+        if not self.credential or any(char in self.credential for char in "\r\n"):
+            raise ValueError("adapter credential must be a non-empty single-line value")
+        if not math.isfinite(self.timeout_s) or self.timeout_s <= 0:
+            raise ValueError("adapter target timeout must be a positive finite number")
+
+
 @dataclass(frozen=True)
 class RuntimeIdentityMintPolicy:
     identities_by_caller: dict[str, RuntimeIdentity]
@@ -135,6 +165,7 @@ class S10SupervisorApp:
         docker_supervisor: DockerSandboxSupervisor | None = None,
         price_table: PriceTable | None = None,
         price_table_trust_store: PriceTableTrustStore | None = None,
+        adapter_targets: Mapping[str, CredentialedAdapterTarget] | None = None,
     ) -> None:
         self.tokens = token_service or InMemoryTokenService(signing_key=signing_key)
         self.quota = quota_ledger or InMemoryQuotaLedger()
@@ -153,6 +184,10 @@ class S10SupervisorApp:
         self._docker_supervisor = docker_supervisor or DockerSandboxSupervisor()
         self.price_table = price_table
         self.price_table_trust_store = price_table_trust_store
+        self._adapter_targets = dict(adapter_targets or {})
+        for adapter_id, target in self._adapter_targets.items():
+            if adapter_id != target.adapter_id:
+                raise ValueError("adapter target map key must match target.adapter_id")
         self.broker = StoreWriterBroker(
             token_service=self.tokens,
             artifact_store=self.artifacts,
@@ -222,11 +257,7 @@ class S10SupervisorApp:
         return asdict(record)
 
     def broker_put_artifact_for_identity(self, identity: RuntimeIdentity, body: dict[str, Any]) -> dict[str, Any]:
-        _require_runtime_identity(identity)
-        scope_token = _scope_token_from_dict(_required_dict(body, "scope_token"))
-        if scope_token.job_id != identity.job_id:
-            raise PermissionError("scope token is not bound to the authenticated runtime identity")
-        _require_scope_subset(scope_token.scopes, identity.scopes)
+        scope_token = self._verified_scope_for_identity(identity, body)
         self._refresh_artifacts()
         record = self.broker.client_for(scope_token).put_artifact(
             kind=_required_str(body, "kind"),
@@ -240,6 +271,130 @@ class S10SupervisorApp:
             else None,
         )
         return asdict(record)
+
+    def broker_get_artifact_for_identity(self, identity: RuntimeIdentity, body: dict[str, Any]) -> dict[str, Any]:
+        scope_token = self._verified_scope_for_identity(identity, body)
+        self._refresh_artifacts()
+        return self.broker.client_for(scope_token).get_artifact(
+            artifact_ref=_required_str(body, "artifact_ref"),
+            representation=_required_str(body, "representation"),
+        )
+
+    def broker_evaluate_adapter_for_identity(
+        self,
+        identity: RuntimeIdentity,
+        *,
+        adapter_id: str,
+        body: dict[str, Any],
+    ) -> dict[str, Any]:
+        scope_token = self._verified_scope_for_identity(identity, body)
+        eval_request = _required_dict(body, "eval_request")
+        requested_adapter_id = _required_str(eval_request, "adapter_id")
+        if requested_adapter_id != adapter_id:
+            self._deny_adapter(scope_token, adapter_id=adapter_id, reason="adapter_id_mismatch")
+        if adapter_id not in scope_token.scopes.allowed_adapters:
+            self._deny_adapter(scope_token, adapter_id=adapter_id, reason="adapter_not_allowlisted")
+        if adapter_id not in scope_token.scopes.broker_audiences:
+            self._deny_adapter(scope_token, adapter_id=adapter_id, reason="broker_audience_missing")
+        target = self._adapter_targets.get(adapter_id)
+        if target is None:
+            self._deny_adapter(scope_token, adapter_id=adapter_id, reason="adapter_not_configured")
+
+        result = self._call_credentialed_adapter(
+            target,
+            {"job_id": identity.job_id, "eval_request": eval_request},
+        )
+        if result.get("adapter_id") != adapter_id:
+            raise AdapterBrokerUpstreamError("adapter upstream response id does not match the broker target")
+        if not isinstance(result.get("outputs"), dict):
+            raise AdapterBrokerUpstreamError("adapter upstream response omits C6 outputs")
+        if not isinstance(result.get("provenance_ref"), str) or not result["provenance_ref"]:
+            raise AdapterBrokerUpstreamError("adapter upstream response omits C6 provenance")
+        if not isinstance(result.get("uncertainty_engine_version"), str) or not result[
+            "uncertainty_engine_version"
+        ]:
+            raise AdapterBrokerUpstreamError("adapter upstream response omits C6 uncertainty metadata")
+        self.audit.append(
+            "adapter.evaluate",
+            {
+                "audience": adapter_id,
+                "adapter_id": adapter_id,
+                "scope_id": scope_token.scope_id,
+                "job_id": scope_token.job_id,
+                "provenance_ref": result["provenance_ref"],
+                "request_hash": hash_bytes(canonical_json_bytes(eval_request)),
+            },
+        )
+        return result
+
+    def _verified_scope_for_identity(
+        self,
+        identity: RuntimeIdentity,
+        body: Mapping[str, Any],
+    ) -> ScopeToken:
+        _require_runtime_identity(identity)
+        scope_token = _scope_token_from_dict(_required_dict(body, "scope_token"))
+        verification = self.tokens.verify_scope(scope_token)
+        if not verification.valid:
+            self.audit.append(
+                "token.verify_fail",
+                {
+                    "token": "scope",
+                    "reason": verification.reason,
+                    "job_id": identity.job_id,
+                },
+            )
+            raise TokenInvalidError(verification.reason or "invalid scope token")
+        if scope_token.job_id != identity.job_id:
+            raise PermissionError("scope token is not bound to the authenticated runtime identity")
+        _require_scope_subset(scope_token.scopes, identity.scopes)
+        return scope_token
+
+    def _deny_adapter(self, scope_token: ScopeToken, *, adapter_id: str, reason: str) -> None:
+        self.audit.append(
+            "adapter.denied",
+            {
+                "audience": adapter_id,
+                "adapter_id": adapter_id,
+                "reason": reason,
+                "scope_id": scope_token.scope_id,
+                "job_id": scope_token.job_id,
+            },
+        )
+        raise ScopeDeniedError(reason)
+
+    @staticmethod
+    def _call_credentialed_adapter(
+        target: CredentialedAdapterTarget,
+        payload: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        outbound = request.Request(
+            target.endpoint_url,
+            data=canonical_json_bytes(payload),
+            method="POST",
+            headers={
+                "Content-Type": "application/json",
+                target.credential_header: target.credential,
+            },
+        )
+        try:
+            with request.urlopen(outbound, timeout=target.timeout_s) as response:
+                raw = response.read()
+        except error.HTTPError as exc:
+            raise AdapterBrokerUpstreamError(
+                f"adapter upstream rejected the broker request with HTTP {exc.code}"
+            ) from exc
+        except OSError as exc:
+            raise AdapterBrokerUpstreamError("adapter upstream is unavailable") from exc
+        try:
+            result = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise AdapterBrokerUpstreamError("adapter upstream returned invalid JSON") from exc
+        if not isinstance(result, dict):
+            raise AdapterBrokerUpstreamError("adapter upstream returned a non-object response")
+        if target.credential in json.dumps(result, sort_keys=True, ensure_ascii=False):
+            raise AdapterBrokerUpstreamError("adapter upstream response contained broker credential material")
+        return result
 
     def mint_runtime_identity_for_launcher(self, launcher: RuntimeIdentity, body: dict[str, Any]) -> dict[str, Any]:
         if not launcher.can_mint_runtime_identity:
@@ -369,6 +524,8 @@ class S10SupervisorApp:
                     self._docker_supervisor.firecracker_resource_meter_kind or "unconfigured"
                 ),
                 "egress_sidecar_configured": self._docker_supervisor.egress_sidecar_configured,
+                "secrets_broker_configured": bool(self._adapter_targets),
+                "adapter_broker_targets": sorted(self._adapter_targets),
                 "audit_events": len(self.audit.events()),
             }
 
@@ -498,6 +655,68 @@ class S10SupervisorApp:
             except Exception as exc:
                 return 400, {"error": type(exc).__name__, "message": str(exc)}
 
+        @self.http.route("POST", "/v1/broker/store/put")
+        def broker_store_put(request: JsonRequest) -> tuple[int, Any]:
+            try:
+                identity = self._authenticate(request)
+                if not isinstance(request.body, dict):
+                    return 400, {"error": "json_object_required"}
+                return 201, self.broker_put_artifact_for_identity(identity, request.body)
+            except UnauthorizedError as exc:
+                return 401, {"error": "Unauthorized", "message": str(exc)}
+            except TokenInvalidError as exc:
+                return 401, {"error": type(exc).__name__, "message": str(exc)}
+            except (PermissionError, ScopeDeniedError) as exc:
+                return 403, {"error": type(exc).__name__, "message": str(exc)}
+            except Exception as exc:
+                return 400, {"error": type(exc).__name__, "message": str(exc)}
+
+        @self.http.route("POST", "/v1/broker/store/get")
+        def broker_store_get(request: JsonRequest) -> tuple[int, Any]:
+            try:
+                identity = self._authenticate(request)
+                if not isinstance(request.body, dict):
+                    return 400, {"error": "json_object_required"}
+                return 200, self.broker_get_artifact_for_identity(identity, request.body)
+            except UnauthorizedError as exc:
+                return 401, {"error": "Unauthorized", "message": str(exc)}
+            except TokenInvalidError as exc:
+                return 401, {"error": type(exc).__name__, "message": str(exc)}
+            except (PermissionError, ScopeDeniedError) as exc:
+                return 403, {"error": type(exc).__name__, "message": str(exc)}
+            except KeyError as exc:
+                return 404, {"error": type(exc).__name__, "message": str(exc)}
+            except Exception as exc:
+                return 400, {"error": type(exc).__name__, "message": str(exc)}
+
+        @self.http.prefix("POST", "/v1/broker/adapter/")
+        def broker_adapter_evaluate(request: JsonRequest) -> tuple[int, Any]:
+            suffix = request.path.removeprefix("/v1/broker/adapter/")
+            if not suffix.endswith("/evaluate"):
+                return 404, {"error": "not_found"}
+            adapter_id = suffix.removesuffix("/evaluate")
+            if not adapter_id or "/" in adapter_id:
+                return 404, {"error": "not_found"}
+            try:
+                identity = self._authenticate(request)
+                if not isinstance(request.body, dict):
+                    return 400, {"error": "json_object_required"}
+                return 200, self.broker_evaluate_adapter_for_identity(
+                    identity,
+                    adapter_id=adapter_id,
+                    body=request.body,
+                )
+            except UnauthorizedError as exc:
+                return 401, {"error": "Unauthorized", "message": str(exc)}
+            except TokenInvalidError as exc:
+                return 401, {"error": type(exc).__name__, "message": str(exc)}
+            except (PermissionError, ScopeDeniedError) as exc:
+                return 403, {"error": type(exc).__name__, "message": str(exc)}
+            except AdapterBrokerUpstreamError as exc:
+                return 502, {"error": type(exc).__name__, "message": str(exc)}
+            except Exception as exc:
+                return 400, {"error": type(exc).__name__, "message": str(exc)}
+
         @self.http.route("POST", "/v1/tokens:revoke")
         def revoke_token(request: JsonRequest) -> tuple[int, Any]:
             try:
@@ -610,6 +829,7 @@ def build_app_from_env() -> S10SupervisorApp:
     checkpoint_signer_auth_token = _required_env("ARGUS_S10_CHECKPOINT_SIGNER_AUTH_TOKEN")
     verifier_key_provider = _verifier_key_provider_from_env()
     verifier_key_auth_token = os.environ.get("ARGUS_S10_VERIFIER_KEY_AUTH_TOKEN")
+    adapter_targets = _adapter_targets_from_env()
     if verifier_key_provider is not None and not verifier_key_auth_token:
         raise RuntimeError("ARGUS_S10_VERIFIER_KEY_AUTH_TOKEN is required when verifier keys are configured")
     if s8_broker_url:
@@ -633,6 +853,7 @@ def build_app_from_env() -> S10SupervisorApp:
             docker_supervisor=docker_supervisor,
             price_table=price_table,
             price_table_trust_store=price_table_trust_store,
+            adapter_targets=adapter_targets,
         )
     data_dir = os.environ.get("ARGUS_S8_DATA_DIR")
     if data_dir:
@@ -652,6 +873,7 @@ def build_app_from_env() -> S10SupervisorApp:
             docker_supervisor=docker_supervisor,
             price_table=price_table,
             price_table_trust_store=price_table_trust_store,
+            adapter_targets=adapter_targets,
         )
     return S10SupervisorApp(
         token_service=token_service,
@@ -667,6 +889,7 @@ def build_app_from_env() -> S10SupervisorApp:
         docker_supervisor=docker_supervisor,
         price_table=price_table,
         price_table_trust_store=price_table_trust_store,
+        adapter_targets=adapter_targets,
     )
 
 
@@ -714,6 +937,45 @@ def _token_service_from_env() -> InMemoryTokenService:
             revocation_store=revocation_store,
         )
     raise RuntimeError("ARGUS_S10_TOKEN_SIGNING_MODE must be hmac-sha256 or ed25519")
+
+
+def _adapter_targets_from_env() -> dict[str, CredentialedAdapterTarget]:
+    raw = os.environ.get("ARGUS_S10_ADAPTER_TARGETS_JSON")
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("ARGUS_S10_ADAPTER_TARGETS_JSON must be valid JSON") from exc
+    if not isinstance(parsed, dict):
+        raise RuntimeError("ARGUS_S10_ADAPTER_TARGETS_JSON must be an object map")
+    targets: dict[str, CredentialedAdapterTarget] = {}
+    for adapter_id, value in parsed.items():
+        if not isinstance(adapter_id, str) or not adapter_id or not isinstance(value, dict):
+            raise RuntimeError("adapter target entries must map non-empty ids to objects")
+        endpoint_url = value.get("endpoint_url")
+        credential_env = value.get("credential_env")
+        credential_header = value.get("credential_header", "X-Argus-Adapter-Credential")
+        if not isinstance(endpoint_url, str) or not endpoint_url:
+            raise RuntimeError(f"adapter target {adapter_id} requires endpoint_url")
+        if not isinstance(credential_env, str) or not credential_env:
+            raise RuntimeError(f"adapter target {adapter_id} requires credential_env")
+        credential = os.environ.get(credential_env)
+        if not credential:
+            raise RuntimeError(f"adapter target {adapter_id} credential env is unavailable: {credential_env}")
+        if not isinstance(credential_header, str):
+            raise RuntimeError(f"adapter target {adapter_id} credential_header must be a string")
+        try:
+            targets[adapter_id] = CredentialedAdapterTarget(
+                adapter_id=adapter_id,
+                endpoint_url=endpoint_url,
+                credential_header=credential_header,
+                credential=credential,
+                timeout_s=float(value.get("timeout_s", 10.0)),
+            )
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(f"invalid adapter target {adapter_id}: {exc}") from exc
+    return targets
 
 
 def _token_revocation_store_from_env() -> FileTokenRevocationStore | None:
@@ -1046,6 +1308,7 @@ def _verifier_key_items(value: Any, *, env_name: str) -> list[dict[str, Any]]:
 class S8BrokeredArtifactStoreClient:
     def __init__(self, *, endpoint_url: str, broker_write_key: bytes) -> None:
         self._endpoint_url = endpoint_url
+        self._read_endpoint_url = endpoint_url + ":get"
         self._broker_write_key = broker_write_key
 
     def create_brokered_artifact(
@@ -1093,6 +1356,44 @@ class S8BrokeredArtifactStoreClient:
             response_body = json.loads(exc.read().decode("utf-8"))
             _raise_s8_http_error(response_body)
         return _artifact_record_from_dict(response_body)
+
+    def get_brokered_artifact(
+        self,
+        *,
+        scope_token: ScopeToken,
+        artifact_ref: str,
+        representation: str,
+    ) -> dict[str, Any]:
+        body = {
+            "authorization": {
+                "audience": "store",
+                "scope_id": scope_token.scope_id,
+                "scope_job_id": scope_token.job_id,
+                "capabilities": list(scope_token.scopes.capabilities),
+            },
+            "artifact_ref": artifact_ref,
+            "representation": representation,
+        }
+        encoded = canonical_json_bytes(body)
+        signature = "hmac-sha256:" + hmac.new(self._broker_write_key, encoded, sha256).hexdigest()
+        http_request = request.Request(
+            self._read_endpoint_url,
+            data=encoded,
+            method="POST",
+            headers={
+                "Content-Type": "application/json",
+                "X-Argus-Store-Write-Signature": signature,
+            },
+        )
+        try:
+            with request.urlopen(http_request, timeout=10) as response:
+                response_body = json.loads(response.read().decode("utf-8"))
+        except error.HTTPError as exc:
+            response_body = json.loads(exc.read().decode("utf-8"))
+            _raise_s8_http_error(response_body)
+        if not isinstance(response_body, dict):
+            raise RuntimeError("s8 brokered read returned a non-object response")
+        return response_body
 
     def create_artifact(
         self,
@@ -1190,7 +1491,7 @@ def _artifact_scope_job_id(*, payload: Any, producer: Producer, lineage: Lineage
 
 def _raise_s8_http_error(payload: dict[str, Any]) -> None:
     error_name = payload.get("error")
-    message = str(payload.get("message", error_name or "s8 brokered write failed"))
+    message = str(payload.get("message", error_name or "s8 broker operation failed"))
     if error_name == "IncompleteLineageError":
         prefix = "incomplete lineage: "
         missing = tuple(part.strip() for part in message.removeprefix(prefix).split(",") if part.strip())
@@ -1199,6 +1500,8 @@ def _raise_s8_http_error(payload: dict[str, Any]) -> None:
         raise WriteOnceViolationError(message)
     if error_name == "PermissionError":
         raise ScopeDeniedError(message)
+    if error_name == "KeyError":
+        raise KeyError(message)
     raise RuntimeError(message)
 
 

@@ -142,6 +142,65 @@ class ArgusM0RuntimeServiceTests(unittest.TestCase):
         with self.assertRaisesRegex(AssertionError, "cannot be negative"):
             m0_battery._halt_latency_summary([0.01] * 49 + [-0.1])
 
+    def test_halt_latency_battery_keeps_response_timeout_separate_from_halt_slo(self) -> None:
+        evidence: dict[str, object] = {"results": []}
+        launch_timeouts: list[float] = []
+
+        def fake_post_json(
+            url: str,
+            body: dict[str, object],
+            *,
+            expected_status: int,
+            token: str | None = None,
+            timeout: float = 10,
+        ) -> dict[str, object]:
+            del body, expected_status, token
+            if url.endswith("/v1/budget-tokens"):
+                return {"budget_id": "budget-1"}
+            if url.endswith("/v1/scope-tokens"):
+                return {"scope_id": "scope-1"}
+            if url.endswith("/v1/sandboxes:launch"):
+                launch_timeouts.append(timeout)
+                return {
+                    "error": "BudgetExceededError",
+                    "audit_events": ["budget.halt", "spend.final"],
+                    "handle": {
+                        "state": "BUDGET_HALTED",
+                        "launch_provenance_ref": "c4://artifact/launch-1",
+                    },
+                }
+            raise AssertionError(f"unexpected POST: {url}")
+
+        with (
+            patch.object(m0_battery, "_post_json", side_effect=fake_post_json),
+            patch.object(m0_battery, "_launch_request_json", return_value={"launch": "request"}),
+            patch.object(m0_battery, "_get_json", return_value={"artifact_ref": "c4://artifact/launch-1"}),
+            patch.object(
+                m0_battery,
+                "_battery_spend_final",
+                return_value={
+                    "artifact_ref": "c4://artifact/spend-1",
+                    "meter_halt_latency_s": 0.1,
+                    "meter_freeze_capture_latency_s": 0.2,
+                    "meter_max_cadence_s": 0.1,
+                    "meter_sample_count": 2,
+                },
+            ),
+        ):
+            m0_battery._battery_halt_latency_trials(
+                evidence,
+                "http://s10",
+                "busybox@sha256:" + "1" * 64,
+                "http://s8",
+                token="runtime-token",
+                read_token="read-token",
+                trials=1,
+            )
+
+        self.assertEqual(len(launch_timeouts), 1)
+        self.assertGreaterEqual(launch_timeouts[0], 30)
+        self.assertEqual(evidence["results"][-1]["detail"]["limit_s"], 2.0)  # type: ignore[index]
+
     def test_spend_final_allows_slow_freeze_capture_when_halt_latency_is_within_slo(self) -> None:
         query = {
             "records": [
@@ -370,6 +429,127 @@ class ArgusM0RuntimeServiceTests(unittest.TestCase):
             self.assertEqual(identity.job_id, "m1-reference-job")
             self.assertEqual(identity.scopes.producer_subsystems, (producer,))
             self.assertFalse(identity.can_mint_runtime_identity)
+
+    def test_s10_secrets_broker_battery_proves_adapter_and_store_boundaries(self) -> None:
+        evidence: dict[str, object] = {"results": []}
+        run_commands: list[list[str]] = []
+        broker_credential = "broker-only-secret"
+
+        def fake_run(
+            command: list[str],
+            *,
+            env: dict[str, str] | None = None,
+            timeout: int = 60,
+            check: bool = True,
+        ) -> subprocess.CompletedProcess[str]:
+            del env, timeout, check
+            run_commands.append(command)
+            if "exec" in command:
+                return subprocess.CompletedProcess(
+                    command,
+                    0,
+                    json.dumps(
+                        {
+                            "broker_credential_env_present": False,
+                            "direct_status": 403,
+                            "direct_error": "broker_credential_required",
+                            "direct_object_store_reachable": False,
+                            "direct_object_store_routes": {
+                                "service_dns": False,
+                                "host_docker_internal": False,
+                                "gateway_docker_internal": False,
+                                "default_gateway": False,
+                            },
+                            "object_store_credential_env_present": False,
+                        }
+                    ),
+                    "",
+                )
+            if "logs" in command:
+                return subprocess.CompletedProcess(command, 0, "adapter and broker logs", "")
+            raise AssertionError(f"unexpected command: {command}")
+
+        adapter_record_queries = iter(
+            [
+                {"records": [{"artifact_ref": "c4://artifact/existing"}]},
+                {"records": [{"artifact_ref": "c4://artifact/existing"}]},
+                {"producer": {"subsystem": "S7"}},
+            ]
+        )
+
+        def fake_post_json(
+            url: str,
+            body: dict[str, object],
+            *,
+            expected_status: int = 200,
+            token: str | None = None,
+            timeout: float = 10,
+        ) -> dict[str, object]:
+            del token, timeout
+            if url.endswith("/v1/scope-tokens"):
+                self.assertEqual(expected_status, 201)
+                return {"scope_id": "scope-s1", "job_id": "m1-reference-job"}
+            if url.endswith("/v1/broker/adapter/gw_spectrum/evaluate"):
+                eval_request = body["eval_request"]
+                self.assertIsInstance(eval_request, dict)
+                if eval_request["adapter_id"] == "scope-mismatch":  # type: ignore[index]
+                    self.assertEqual(expected_status, 403)
+                    return {"error": "ScopeDeniedError", "message": "adapter_id_mismatch"}
+                self.assertEqual(expected_status, 200)
+                return {
+                    "adapter_id": "gw_spectrum",
+                    "outputs": {
+                        "omega": {
+                            "value": 1.2e-11,
+                            "units": "dimensionless",
+                            "uncertainty": {"kind": "interval", "radius": 1.0e-12},
+                        }
+                    },
+                    "provenance_ref": "c4://artifact/adapter-call",
+                    "uncertainty_engine_version": "1.0.0",
+                }
+            if url.endswith("/v1/broker/store/put"):
+                self.assertEqual(expected_status, 201)
+                return {"artifact_ref": "c4://artifact/broker-store"}
+            if url.endswith("/v1/broker/store/get"):
+                self.assertEqual(expected_status, 200)
+                return {
+                    "artifact_ref": "c4://artifact/broker-store",
+                    "representation": "payload",
+                    "payload": {"probe": "s10-tc15"},
+                }
+            if url.endswith("/v1/artifacts"):
+                self.assertEqual(expected_status, 403)
+                return {"error": "DirectWriteDenied"}
+            raise AssertionError(f"unexpected POST: {url}")
+
+        with (
+            patch.object(m0_battery, "_run", side_effect=fake_run),
+            patch.object(m0_battery, "_get_json", side_effect=lambda *args, **kwargs: next(adapter_record_queries)),
+            patch.object(m0_battery, "_post_json", side_effect=fake_post_json),
+        ):
+            m0_battery._battery_s10_secrets_broker(
+                evidence,
+                docker="docker",
+                compose_file="compose.yaml",
+                compose_env={"COMPOSE_PROJECT_NAME": "argus-s10-t13"},
+                s10_url="http://s10",
+                s8_url="http://s8",
+                adapter_token="s1-token",
+                read_token="read-token",
+                broker_credential=broker_credential,
+            )
+
+        results = evidence["results"]  # type: ignore[assignment]
+        self.assertEqual([result["item"] for result in results], ["s10-tc14", "s10-tc15"])
+        self.assertEqual(results[0]["detail"]["direct_adapter_status"], 403)
+        self.assertFalse(results[0]["detail"]["broker_credential_env_present"])
+        self.assertEqual(results[1]["detail"]["direct_store_error"], "DirectWriteDenied")
+        self.assertFalse(results[1]["detail"]["direct_object_store_reachable"])
+        self.assertFalse(any(results[1]["detail"]["direct_object_store_routes"].values()))
+        self.assertFalse(results[1]["detail"]["object_store_credential_env_present"])
+        self.assertNotIn(broker_credential, json.dumps(evidence, sort_keys=True))
+        self.assertTrue(all(broker_credential not in " ".join(command) for command in run_commands))
 
     def test_s1_reference_physics_demo_battery_requires_verified_http_face(self) -> None:
         evidence: dict[str, object] = {"results": []}
@@ -2056,6 +2236,43 @@ class ArgusM0RuntimeServiceTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "ARGUS_S10_METER_GAP_HALT_S"):
                 build_s10_app_from_env()
 
+    def test_s10_env_build_loads_adapter_target_without_exposing_credential(self) -> None:
+        base_env = {
+            "ARGUS_S10_SIGNING_KEY": "test-s10-signing-key",
+            "ARGUS_RUNTIME_BOOTSTRAP_TOKEN": BOOTSTRAP_TOKEN,
+            "ARGUS_RUNTIME_IDENTITY_SIGNING_KEY": IDENTITY_SIGNING_KEY.decode("utf-8"),
+            "ARGUS_RUNTIME_IDENTITY_MINT_POLICY_JSON": _runtime_identity_mint_policy_json(),
+            "ARGUS_M0_HEALTH_TOKEN": HEALTH_TOKEN,
+            "ARGUS_S10_POLICY_SIGNING_KEY": POLICY_SIGNING_KEY,
+            "ARGUS_S10_CHECKPOINT_SIGNING_KEY": CHECKPOINT_SIGNING_KEY,
+            "ARGUS_S10_CHECKPOINT_SIGNER_AUTH_TOKEN": CHECKPOINT_SIGNER_AUTH_TOKEN,
+            "ARGUS_S10_ADAPTER_TARGETS_JSON": json.dumps(
+                {
+                    "gw_spectrum": {
+                        "endpoint_url": "http://s7-reference-adapter:8080/v1/reference-adapter/evaluate",
+                        "credential_env": "ARGUS_TEST_ADAPTER_CREDENTIAL",
+                    }
+                }
+            ),
+        }
+        with patch.dict(
+            os.environ,
+            {**base_env, "ARGUS_TEST_ADAPTER_CREDENTIAL": "broker-only-test-credential"},
+            clear=True,
+        ):
+            app = build_s10_app_from_env()
+            status, health = app.http.handle(
+                JsonRequest(method="GET", path="/healthz", query={}, body=None, headers=_auth_headers(HEALTH_TOKEN))
+            )
+
+        self.assertEqual(status, 200)
+        self.assertTrue(health["secrets_broker_configured"])
+        self.assertEqual(health["adapter_broker_targets"], ["gw_spectrum"])
+        self.assertNotIn("broker-only-test-credential", repr(app._adapter_targets))
+        with patch.dict(os.environ, base_env, clear=True):
+            with self.assertRaisesRegex(RuntimeError, "credential env is unavailable"):
+                build_s10_app_from_env()
+
     def test_s10_env_build_exposes_signed_exfil_thresholds_and_rejects_invalid_order(self) -> None:
         base_env = {
             "ARGUS_S10_SIGNING_KEY": "test-s10-signing-key",
@@ -2554,6 +2771,7 @@ class ArgusM0ComposeTests(unittest.TestCase):
                 "ARGUS_S2_REFERENCE_PIPELINE_IMAGE": "sha256:" + "a" * 64,
                 "ARGUS_S3_REFERENCE_REFEREE_ACCESS_TOKEN": "s3-reference-token",
                 "ARGUS_S7_REFERENCE_ADAPTER_ACCESS_TOKEN": "s7-reference-token",
+                "ARGUS_S10_GW_SPECTRUM_BROKER_CREDENTIAL": "s10-t13-adapter-credential",
                 "ARGUS_S11_REFERENCE_OBSERVATORY_ACCESS_TOKEN": "s11-reference-token",
             },
         )
@@ -2562,6 +2780,22 @@ class ArgusM0ComposeTests(unittest.TestCase):
 
         rendered = json.loads(config.stdout)
         services = rendered["services"]
+        self.assertIn("argus-data", rendered["networks"])
+        self.assertIn("argus-services", rendered["networks"])
+        self.assertFalse(rendered["networks"]["argus-data"].get("internal", False))
+        self.assertEqual(set(services["postgres"]["networks"]), {"argus-data"})
+        self.assertEqual(set(services["minio"]["networks"]), {"argus-data"})
+        self.assertEqual(set(services["s1-reference-demo"]["networks"]), {"argus-services"})
+        self.assertTrue(services["postgres"]["ports"])
+        self.assertTrue(
+            all(port.get("host_ip") == "127.0.0.1" for port in services["postgres"]["ports"]),
+            services["postgres"]["ports"],
+        )
+        self.assertFalse(services["minio"].get("ports"), services["minio"].get("ports"))
+        self.assertEqual(
+            set(services["s8-writer"]["networks"]),
+            {"argus-data", "argus-services"},
+        )
         self.assertEqual(
             {
                 "postgres",
@@ -2646,8 +2880,8 @@ class ArgusM0ComposeTests(unittest.TestCase):
         self.assertEqual(services["s1-reference-demo"]["environment"]["ARGUS_S1_REFERENCE_DEMO_HOST"], "0.0.0.0")
         self.assertEqual(services["s1-reference-demo"]["environment"]["ARGUS_S1_REFERENCE_DEMO_PORT"], "8080")
         self.assertEqual(
-            services["s1-reference-demo"]["environment"]["ARGUS_S1_REFERENCE_DEMO_S7_URL"],
-            "http://s7-reference-adapter:8080",
+            services["s1-reference-demo"]["environment"]["ARGUS_S1_REFERENCE_DEMO_SECRETS_BROKER_URL"],
+            "http://s10-supervisor:8080",
         )
         self.assertEqual(
             services["s1-reference-demo"]["environment"]["ARGUS_S1_REFERENCE_DEMO_S2_URL"],
@@ -2703,6 +2937,18 @@ class ArgusM0ComposeTests(unittest.TestCase):
         self.assertEqual(
             services["s7-reference-adapter"]["environment"]["ARGUS_S7_REFERENCE_ADAPTER_S10_URL"],
             "http://s10-supervisor:8080",
+        )
+        self.assertEqual(
+            services["s7-reference-adapter"]["environment"]["ARGUS_S7_REFERENCE_ADAPTER_BROKER_CREDENTIAL"],
+            "s10-t13-adapter-credential",
+        )
+        self.assertEqual(
+            services["s10-supervisor"]["environment"]["ARGUS_S10_GW_SPECTRUM_BROKER_CREDENTIAL"],
+            "s10-t13-adapter-credential",
+        )
+        self.assertNotIn(
+            "ARGUS_S10_GW_SPECTRUM_BROKER_CREDENTIAL",
+            services["s1-reference-demo"]["environment"],
         )
         self.assertEqual(
             services["s11-reference-observatory"]["environment"]["ARGUS_S11_REFERENCE_OBSERVATORY_S8_URL"],

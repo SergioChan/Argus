@@ -225,7 +225,7 @@ class S10S8ArtifactStore:
             body["validation_report_ref"] = validation_report_ref
         response = _request_json(
             "POST",
-            _endpoint(self._session.s10_url, "/v1/store/artifacts"),
+            _endpoint(self._session.s10_url, "/v1/broker/store/put"),
             body=body,
             bearer_token=self._session.access_token,
             timeout_s=self._session.timeout_s,
@@ -233,14 +233,16 @@ class S10S8ArtifactStore:
         return _artifact_record_from_response(response, context="S10 broker response")
 
     def get_record(self, artifact_ref: str) -> ArtifactRecord:
-        response = self._s8_get(f"/v1/artifacts/{artifact_ref}/record")
+        response = self._broker_get(artifact_ref, representation="record")
+        response = _required_mapping(response, "record", context="S10 store broker response")
         return _artifact_record_from_response(response, context="S8 record response")
 
     def get_artifact_record(self, artifact_ref: str) -> ArtifactRecord:
         return self.get_record(artifact_ref)
 
     def get_artifact(self, artifact_ref: str) -> bytes:
-        payload = self._s8_get(f"/v1/artifacts/{artifact_ref}/payload")
+        response = self._broker_get(artifact_ref, representation="payload")
+        payload = response.get("payload")
         return canonical_json_bytes(payload)
 
     def get_lineage(self, artifact_ref: str, *, direction: str = "both") -> LineageGraph:
@@ -288,6 +290,19 @@ class S10S8ArtifactStore:
         if self._scope_token is None:
             self._scope_token = self._session.mint_scope(ttl_s=self._scope_ttl_s)
         return dict(self._scope_token)
+
+    def _broker_get(self, artifact_ref: str, *, representation: str) -> dict[str, Any]:
+        return _request_json(
+            "POST",
+            _endpoint(self._session.s10_url, "/v1/broker/store/get"),
+            body={
+                "scope_token": self._scope(),
+                "artifact_ref": artifact_ref,
+                "representation": representation,
+            },
+            bearer_token=self._session.access_token,
+            timeout_s=self._session.timeout_s,
+        )
 
     def _s8_get(self, path: str, *, query: Mapping[str, str] | None = None) -> dict[str, Any]:
         url = _endpoint(self._s8_url, path)

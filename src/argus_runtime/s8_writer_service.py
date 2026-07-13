@@ -98,6 +98,31 @@ class S8WriterApp:
             }
         )
 
+    def get_brokered_artifact(self, body: dict[str, Any]) -> dict[str, Any]:
+        authorization = _required_dict(body, "authorization")
+        if authorization.get("audience") != "store":
+            raise PermissionError("broker authorization audience must be store")
+        _required_str(authorization, "scope_id")
+        _required_str(authorization, "scope_job_id")
+        capabilities = tuple(authorization.get("capabilities") or ())
+        if S8_READ_CAPABILITY not in capabilities:
+            raise PermissionError("broker authorization does not allow artifact reads")
+        artifact_ref = _required_str(body, "artifact_ref")
+        representation = _required_str(body, "representation")
+        if representation == "record":
+            return {
+                "artifact_ref": artifact_ref,
+                "representation": representation,
+                "record": self.get_artifact_record(artifact_ref),
+            }
+        if representation == "payload":
+            return {
+                "artifact_ref": artifact_ref,
+                "representation": representation,
+                "payload": self.get_artifact_payload(artifact_ref),
+            }
+        raise ValueError("representation must be record or payload")
+
     def get_artifact_record(self, ref: str) -> dict[str, Any]:
         self._refresh_store()
         return asdict(self.store.get_artifact_record(ref))
@@ -360,6 +385,22 @@ class S8WriterApp:
                 return 201, self.create_brokered_artifact(request.body)
             except PermissionError as exc:
                 return 403, {"error": type(exc).__name__, "message": str(exc)}
+            except Exception as exc:
+                return 400, {"error": type(exc).__name__, "message": str(exc)}
+
+        @self.http.route("POST", "/v1/internal/brokered-artifacts:get")
+        def get_brokered(request: JsonRequest) -> tuple[int, Any]:
+            authenticated, error_response = self._authenticate_broker_write(request)
+            if not authenticated:
+                return 401, error_response
+            try:
+                if not isinstance(request.body, dict):
+                    return 400, {"error": "json_object_required"}
+                return 200, self.get_brokered_artifact(request.body)
+            except PermissionError as exc:
+                return 403, {"error": type(exc).__name__, "message": str(exc)}
+            except KeyError as exc:
+                return 404, {"error": type(exc).__name__, "message": str(exc)}
             except Exception as exc:
                 return 400, {"error": type(exc).__name__, "message": str(exc)}
 

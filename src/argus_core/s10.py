@@ -3937,7 +3937,7 @@ def _policy_bundle_signature_payload(bundle: PolicyBundle) -> bytes:
 
 
 class StoreWriterBroker:
-    """Brokered S8 write path for sandbox-origin artifacts."""
+    """Brokered S8 read/write path for sandbox-origin artifacts."""
 
     def __init__(
         self,
@@ -4022,6 +4022,61 @@ class StoreWriterBroker:
         )
         return record
 
+    def get_artifact(
+        self,
+        *,
+        scope_token: ScopeToken,
+        artifact_ref: str,
+        representation: str,
+    ) -> dict[str, Any]:
+        verification = self._token_service.verify_scope(scope_token)
+        if not verification.valid:
+            self._audit_ledger.append(
+                "token.verify_fail",
+                {"token": "scope", "reason": verification.reason, "audience": "store"},
+            )
+            raise TokenInvalidError(verification.reason or "invalid scope token")
+        if "store" not in scope_token.scopes.broker_audiences:
+            self._deny_store(scope_token=scope_token, reason="scope_denied")
+        if "s8.read" not in scope_token.scopes.capabilities:
+            self._deny_store(scope_token=scope_token, reason="read_scope_denied")
+        if not isinstance(artifact_ref, str) or not artifact_ref:
+            raise ValueError("artifact_ref must be a non-empty string")
+        if representation not in {"record", "payload"}:
+            raise ValueError("representation must be record or payload")
+
+        brokered_get = getattr(self._artifact_store, "get_brokered_artifact", None)
+        if callable(brokered_get):
+            response = brokered_get(
+                scope_token=scope_token,
+                artifact_ref=artifact_ref,
+                representation=representation,
+            )
+        elif representation == "record":
+            response = {
+                "artifact_ref": artifact_ref,
+                "representation": representation,
+                "record": asdict(self._artifact_store.get_artifact_record(artifact_ref)),
+            }
+        else:
+            response = {
+                "artifact_ref": artifact_ref,
+                "representation": representation,
+                "payload": json.loads(self._artifact_store.get_artifact(artifact_ref).decode("utf-8")),
+            }
+        self._audit_ledger.append(
+            "store.get",
+            {
+                "audience": "store",
+                "op": "get_artifact",
+                "artifact_ref": artifact_ref,
+                "representation": representation,
+                "scope_id": scope_token.scope_id,
+                "job_id": scope_token.job_id,
+            },
+        )
+        return dict(response)
+
     def deny_direct_write(self, *, scope_token: ScopeToken, op: str) -> None:
         self._audit_ledger.append(
             "store.direct_write_denied",
@@ -4050,6 +4105,19 @@ class StoreWriterBroker:
             artifact_ref=artifact_ref,
             claim_tier=claim_tier,
             validation_report_ref=validation_report_ref,
+        )
+
+    def _get_artifact_by_handle(
+        self,
+        *,
+        handle: StoreBrokerHandle,
+        artifact_ref: str,
+        representation: str,
+    ) -> dict[str, Any]:
+        return self.get_artifact(
+            scope_token=self._scope_for_handle(handle),
+            artifact_ref=artifact_ref,
+            representation=representation,
         )
 
     def _deny_direct_write_by_handle(self, *, handle: StoreBrokerHandle, op: str) -> NoReturn:
@@ -4135,6 +4203,19 @@ class _StoreBrokerEndpoint:
     def deny_direct_write(self, *, handle: StoreBrokerHandle, op: str) -> NoReturn:
         self._broker()._deny_direct_write_by_handle(handle=handle, op=op)
 
+    def get_artifact(
+        self,
+        *,
+        handle: StoreBrokerHandle,
+        artifact_ref: str,
+        representation: str,
+    ) -> dict[str, Any]:
+        return self._broker()._get_artifact_by_handle(
+            handle=handle,
+            artifact_ref=artifact_ref,
+            representation=representation,
+        )
+
     def _broker(self) -> StoreWriterBroker:
         broker = self._broker_ref()
         if broker is None:
@@ -4143,7 +4224,7 @@ class _StoreBrokerEndpoint:
 
 
 class BrokeredStoreClient:
-    """Sandbox-facing store client exposing only the brokered artifact put path."""
+    """Sandbox-facing store client exposing only brokered artifact operations."""
 
     __slots__ = ("_handle", "_endpoint")
 
@@ -4175,6 +4256,13 @@ class BrokeredStoreClient:
 
     def create_artifact(self, *args: Any, **kwargs: Any) -> NoReturn:
         self._endpoint.deny_direct_write(handle=self._handle, op="create_artifact")
+
+    def get_artifact(self, *, artifact_ref: str, representation: str = "payload") -> dict[str, Any]:
+        return self._endpoint.get_artifact(
+            handle=self._handle,
+            artifact_ref=artifact_ref,
+            representation=representation,
+        )
 
 
 class DockerSandboxSupervisor:

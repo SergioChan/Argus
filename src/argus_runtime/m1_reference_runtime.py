@@ -411,8 +411,8 @@ def _http_error_message(exc: urlerror.HTTPError) -> str:
 
 M1_REFERENCE_JOB_ID = "m1-reference-job"
 M1_REFERENCE_S1_CALLER_ID = "m1-reference-s1"
-M1_REFERENCE_ADAPTER_EGRESS_RULE = EgressRule("s7-reference-adapter", 443, "https")
-M1_REFERENCE_ADAPTER_ROUTE = "/v1/reference-adapter/evaluate"
+M1_REFERENCE_ADAPTER_EGRESS_RULE = EgressRule("s10-supervisor", 443, "https")
+M1_REFERENCE_ADAPTER_ROUTE = "/v1/broker/adapter/gw_spectrum/evaluate"
 M1_REFERENCE_BUILDER_ROUTE = S2_REFERENCE_BUILDER_ROUTE
 M1_REFERENCE_REFEREE_ROUTE = "/v1/reference-referee/validate"
 M1_REFERENCE_PROFILE_ROUTE = "/v1/reference-referee/profile"
@@ -424,14 +424,15 @@ M1_REFERENCE_OMEGA_SCALE = S2_REFERENCE_OMEGA_SCALE
 
 @dataclass(frozen=True)
 class HttpM1ReferenceAdapterClient:
-    """C6 client that exposes only the S7 reference adapter to S1."""
+    """C6 client that exposes only the S10-brokered reference adapter to S1."""
 
     endpoint_url: str
     session: RuntimeIdentitySession
+    scope_token: Mapping[str, Any]
 
     def evaluate(self, request: EvalRequest) -> EvalResult:
         payload = {
-            "job_id": self.session.job_id,
+            "scope_token": dict(self.scope_token),
             "eval_request": _m1_eval_request_payload(request),
         }
         try:
@@ -789,7 +790,7 @@ class M1ReferenceLifecycleRunner:
         s8_url: str,
         bootstrap_token: str | None = None,
         access_token: str | None = None,
-        s7_url: str,
+        secrets_broker_url: str,
         s2_url: str,
         s3_url: str,
         s11_url: str,
@@ -807,7 +808,7 @@ class M1ReferenceLifecycleRunner:
         self._s8_url = s8_url.rstrip("/")
         self._bootstrap_token = bootstrap_token
         self._access_token = access_token
-        self._s7_url = s7_url.rstrip("/")
+        self._secrets_broker_url = secrets_broker_url.rstrip("/")
         self._s2_url = s2_url.rstrip("/")
         self._s3_url = s3_url.rstrip("/")
         self._s11_url = s11_url.rstrip("/")
@@ -863,8 +864,9 @@ class M1ReferenceLifecycleRunner:
             detail={"dataset_ref": dataset_ref},
         )
         adapter_client = HttpM1ReferenceAdapterClient(
-            endpoint_url=f"{self._s7_url}{M1_REFERENCE_ADAPTER_ROUTE}",
+            endpoint_url=f"{self._secrets_broker_url}{M1_REFERENCE_ADAPTER_ROUTE}",
             session=session,
+            scope_token=session.mint_scope(),
         )
         builder_client = HttpM1ReferenceBuilderClient(
             endpoint_url=f"{self._s2_url}{M1_REFERENCE_BUILDER_ROUTE}",

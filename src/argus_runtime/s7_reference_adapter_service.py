@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict
+import hmac
 import os
 from typing import Any, Mapping
 
@@ -19,7 +20,6 @@ from argus_core import (
 )
 
 from .http_json import JsonHttpApp, JsonRequest, serve_json_app
-from .m1_reference_service_auth import M1RequesterUnauthorized, require_m1_s1_requester
 from .m1_runtime_artifacts import RuntimeIdentitySession, S10S8ArtifactStore, runtime_identity_session
 
 
@@ -29,6 +29,7 @@ S7_REFERENCE_ADAPTER_DEFAULT_CALLER_ID = "m1-reference-s7"
 S7_REFERENCE_ADAPTER_DEFAULT_JOB_ID = "m1-reference-job"
 S7_REFERENCE_ADAPTER_ID = "gw_spectrum"
 S7_REFERENCE_ADAPTER_DESCRIPTOR_SCHEMA = "argus.s7.adapter-descriptor.v1"
+S7_REFERENCE_ADAPTER_BROKER_CREDENTIAL_HEADER = "X-Argus-Adapter-Credential"
 
 
 class S7ReferenceAdapterApp:
@@ -41,6 +42,8 @@ class S7ReferenceAdapterApp:
         s8_url: str,
         bootstrap_token: str | None = None,
         access_token: str | None = None,
+        broker_credential: str,
+        broker_credential_header: str = S7_REFERENCE_ADAPTER_BROKER_CREDENTIAL_HEADER,
         caller_id: str = S7_REFERENCE_ADAPTER_DEFAULT_CALLER_ID,
         expected_job_id: str = S7_REFERENCE_ADAPTER_DEFAULT_JOB_ID,
     ) -> None:
@@ -50,6 +53,12 @@ class S7ReferenceAdapterApp:
         self._s8_url = s8_url
         self._bootstrap_token = bootstrap_token
         self._access_token = access_token
+        if not broker_credential or any(char in broker_credential for char in "\r\n"):
+            raise ValueError("S7 reference adapter broker credential must be a non-empty single-line value")
+        if not broker_credential_header.lower().startswith("x-argus-"):
+            raise ValueError("S7 reference adapter broker credential header must be an X-Argus header")
+        self._broker_credential = broker_credential
+        self._broker_credential_header = broker_credential_header.lower()
         self._caller_id = caller_id
         self._expected_job_id = expected_job_id
         self._session: RuntimeIdentitySession | None = None
@@ -133,16 +142,10 @@ class S7ReferenceAdapterApp:
             if not isinstance(request.body, Mapping):
                 return 400, {"error": "invalid_json_body"}
             try:
-                require_m1_s1_requester(
-                    request,
-                    s10_url=self._s10_url,
-                    expected_job_id=self._expected_job_id,
-                    required_adapters=(S7_REFERENCE_ADAPTER_ID,),
-                    required_broker_audiences=(S7_REFERENCE_ADAPTER_ID,),
-                )
+                supplied_credential = request.headers.get(self._broker_credential_header, "")
+                if not hmac.compare_digest(supplied_credential, self._broker_credential):
+                    raise PermissionError("broker_credential_required")
                 return 200, self.evaluate(request.body)
-            except M1RequesterUnauthorized as exc:
-                return 403, {"error": "requester_unauthorized", "message": str(exc)}
             except PermissionError as exc:
                 return 403, {"error": str(exc)}
             except S7Error as exc:
@@ -156,6 +159,7 @@ def build_app_from_env() -> S7ReferenceAdapterApp:
         s10_url=_required_env("ARGUS_S7_REFERENCE_ADAPTER_S10_URL"),
         s8_url=_required_env("ARGUS_S7_REFERENCE_ADAPTER_S8_URL"),
         access_token=_required_env("ARGUS_S7_REFERENCE_ADAPTER_ACCESS_TOKEN"),
+        broker_credential=_required_env("ARGUS_S7_REFERENCE_ADAPTER_BROKER_CREDENTIAL"),
         caller_id=os.environ.get("ARGUS_S7_REFERENCE_ADAPTER_CALLER_ID", S7_REFERENCE_ADAPTER_DEFAULT_CALLER_ID),
         expected_job_id=os.environ.get("ARGUS_S7_REFERENCE_ADAPTER_JOB_ID", S7_REFERENCE_ADAPTER_DEFAULT_JOB_ID),
     )
