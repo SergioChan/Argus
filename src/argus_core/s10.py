@@ -347,6 +347,8 @@ class QuotaLedger(Protocol):
 
     def consume(self, budget_id: str, usage: BudgetUsage) -> None: ...
 
+    def halt(self, budget_id: str, *, reason: str) -> None: ...
+
     def release(self, budget_id: str, usage: BudgetUsage | None = None) -> None: ...
 
     def remaining(self, budget_id: str) -> BudgetUsage: ...
@@ -3092,42 +3094,59 @@ class InMemoryQuotaLedger:
 
     def __init__(self) -> None:
         self._states: dict[str, QuotaState] = {}
+        self._lock = threading.RLock()
 
     def register_budget(self, token: BudgetToken) -> None:
-        self._states.setdefault(
-            token.budget_id,
-            QuotaState(caps=token.caps, reserved=BudgetUsage(), actual=BudgetUsage()),
-        )
+        with self._lock:
+            self._states.setdefault(
+                token.budget_id,
+                QuotaState(caps=token.caps, reserved=BudgetUsage(), actual=BudgetUsage()),
+            )
 
     def reserve(self, budget_id: str, usage: BudgetUsage) -> None:
-        state = self._require_state(budget_id)
-        self._assert_not_halted(budget_id, state)
-        next_reserved = self._add_usage(state.reserved, usage)
-        self._assert_within_caps(state.caps, next_reserved, state.actual, budget_id)
-        self._states[budget_id] = replace(state, reserved=next_reserved)
+        with self._lock:
+            state = self._require_state(budget_id)
+            self._assert_not_halted(budget_id, state)
+            next_reserved = self._add_usage(state.reserved, usage)
+            self._assert_within_caps(state.caps, next_reserved, state.actual, budget_id)
+            self._states[budget_id] = replace(state, reserved=next_reserved)
 
     def consume(self, budget_id: str, usage: BudgetUsage) -> None:
-        state = self._require_state(budget_id)
-        self._assert_not_halted(budget_id, state)
-        next_actual = self._add_usage(state.actual, usage)
-        try:
-            self._assert_actual_within_caps(state.caps, next_actual)
-        except BudgetExceededError:
-            self._states[budget_id] = replace(state, actual=next_actual, halted=True)
-            raise
-        self._states[budget_id] = replace(state, actual=next_actual)
+        with self._lock:
+            state = self._require_state(budget_id)
+            self._assert_not_halted(budget_id, state)
+            next_actual = self._add_usage(state.actual, usage)
+            try:
+                self._assert_actual_within_caps(state.caps, next_actual)
+            except BudgetExceededError:
+                self._states[budget_id] = replace(state, actual=next_actual, halted=True)
+                raise
+            self._states[budget_id] = replace(state, actual=next_actual)
+
+    def halt(self, budget_id: str, *, reason: str) -> None:
+        if not isinstance(reason, str) or not reason.strip():
+            raise ValueError("quota halt reason is required")
+        with self._lock:
+            state = self._require_state(budget_id)
+            self._states[budget_id] = replace(state, halted=True)
 
     def release(self, budget_id: str, usage: BudgetUsage | None = None) -> None:
-        state = self._require_state(budget_id)
-        released = usage or state.reserved
-        self._states[budget_id] = replace(state, reserved=self._subtract_usage(state.reserved, released))
+        with self._lock:
+            state = self._require_state(budget_id)
+            released = usage or state.reserved
+            self._states[budget_id] = replace(state, reserved=self._subtract_usage(state.reserved, released))
 
     def remaining(self, budget_id: str) -> BudgetUsage:
-        state = self._require_state(budget_id)
-        return self._subtract_usage(self._caps_to_usage(state.caps), self._add_usage(state.reserved, state.actual))
+        with self._lock:
+            state = self._require_state(budget_id)
+            return self._subtract_usage(
+                self._caps_to_usage(state.caps),
+                self._add_usage(state.reserved, state.actual),
+            )
 
     def state(self, budget_id: str) -> QuotaState:
-        return self._require_state(budget_id)
+        with self._lock:
+            return self._require_state(budget_id)
 
     def _require_state(self, budget_id: str) -> QuotaState:
         if budget_id not in self._states:

@@ -193,6 +193,28 @@ class S10PostgresQuotaLedgerTests(unittest.TestCase):
         with self.assertRaisesRegex(BudgetExceededError, "budget is halted"):
             ledger.reserve(token.budget_id, BudgetUsage(wallclock_s=1))
 
+    def test_explicit_halt_is_durable_without_debiting_above_the_cap(self) -> None:
+        token = self.tokens.mint_budget(
+            caps=BudgetCaps(max_model_tokens=1000, max_cost_usd=1),
+            job_id="job-model-halt",
+            root_request_id="root-model-halt",
+        )
+        ledger = PostgresQuotaLedger(dsn=self._postgres_dsn())
+        ledger.register_budget(token)
+        ledger.consume(token.budget_id, BudgetUsage(model_tokens=12, cost_usd=0.003))
+
+        ledger.halt(token.budget_id, reason="model_reservation_exceeded")
+
+        state = PostgresQuotaLedger(dsn=self._postgres_dsn()).state(token.budget_id)
+        self.assertTrue(state.halted)
+        self.assertEqual(state.actual, BudgetUsage(model_tokens=12, cost_usd=0.003))
+        self.assertEqual(
+            self._psql("SELECT entry_type FROM s10.quota_ledger_entry ORDER BY sequence DESC LIMIT 1;").stdout.strip(),
+            "halt",
+        )
+        with self.assertRaisesRegex(BudgetExceededError, "budget is halted"):
+            ledger.reserve(token.budget_id, BudgetUsage(model_tokens=1))
+
     def test_quota_ledger_entries_are_db_append_only_even_for_owner(self) -> None:
         token = self.tokens.mint_budget(
             caps=BudgetCaps(max_gpu_seconds=100),

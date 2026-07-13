@@ -9,6 +9,7 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 from typing import Any, Mapping
 from urllib import error, parse, request
 
@@ -17,6 +18,7 @@ from argus_core import (
     BudgetCaps,
     BudgetExceededError,
     BudgetToken,
+    BudgetUsage,
     EgressRule,
     EgressSidecarRuntimeConfig,
     DockerSandboxOrchestrator,
@@ -60,6 +62,8 @@ from argus_core import (
     IncompleteLineageError,
     canonical_json_bytes,
     hash_bytes,
+    hash_json,
+    roll_up_price_table_usage,
 )
 
 from .auth import (
@@ -78,6 +82,10 @@ from .http_json import JsonHttpApp, JsonRequest, serve_json_app
 
 class AdapterBrokerUpstreamError(RuntimeError):
     """Raised when a configured credentialed adapter cannot return a trusted C6 response."""
+
+
+class ModelBrokerUpstreamError(RuntimeError):
+    """Raised when a configured model provider violates the broker contract."""
 
 
 @dataclass(frozen=True)
@@ -104,6 +112,58 @@ class CredentialedAdapterTarget:
             raise ValueError("adapter credential must be a non-empty single-line value")
         if not math.isfinite(self.timeout_s) or self.timeout_s <= 0:
             raise ValueError("adapter target timeout must be a positive finite number")
+
+
+@dataclass(frozen=True)
+class CredentialedModelTarget:
+    model_id: str
+    completion_url: str
+    token_count_url: str
+    credential_header: str
+    credential: str = field(repr=False)
+    static_headers: Mapping[str, str] = field(default_factory=dict)
+    audience: str = "model"
+    timeout_s: float = 30.0
+
+    def __post_init__(self) -> None:
+        if not self.model_id or any(char.isspace() for char in self.model_id):
+            raise ValueError("model target id must be a non-empty token")
+        for field_name, endpoint_url in (
+            ("completion_url", self.completion_url),
+            ("token_count_url", self.token_count_url),
+        ):
+            endpoint = parse.urlparse(endpoint_url)
+            if endpoint.scheme not in {"http", "https"} or not endpoint.netloc:
+                raise ValueError(f"model target {field_name} must be an absolute HTTP(S) URL")
+            if endpoint.username is not None or endpoint.password is not None:
+                raise ValueError(f"model target {field_name} must not contain credentials")
+        _validate_outbound_header_name(self.credential_header, field="model credential_header")
+        if self.credential_header.lower() in {"content-type", "content-length", "host"}:
+            raise ValueError("model credential header cannot override an HTTP framing header")
+        if not self.credential or any(char in self.credential for char in "\r\n"):
+            raise ValueError("model credential must be a non-empty single-line value")
+        if (
+            not isinstance(self.audience, str)
+            or not self.audience
+            or any(char.isspace() for char in self.audience)
+        ):
+            raise ValueError("model broker audience must be a non-empty token")
+        normalized_static_headers: dict[str, str] = {}
+        for name, value in self.static_headers.items():
+            _validate_outbound_header_name(name, field="model static header")
+            if name.lower() in {
+                "content-type",
+                "content-length",
+                "host",
+                self.credential_header.lower(),
+            }:
+                raise ValueError("model static headers cannot override broker-owned headers")
+            if not isinstance(value, str) or not value or any(char in value for char in "\r\n"):
+                raise ValueError("model static header values must be non-empty single-line strings")
+            normalized_static_headers[name] = value
+        object.__setattr__(self, "static_headers", normalized_static_headers)
+        if not math.isfinite(self.timeout_s) or self.timeout_s <= 0:
+            raise ValueError("model target timeout must be a positive finite number")
 
 
 @dataclass(frozen=True)
@@ -166,11 +226,12 @@ class S10SupervisorApp:
         price_table: PriceTable | None = None,
         price_table_trust_store: PriceTableTrustStore | None = None,
         adapter_targets: Mapping[str, CredentialedAdapterTarget] | None = None,
+        model_targets: Mapping[str, CredentialedModelTarget] | None = None,
     ) -> None:
         self.tokens = token_service or InMemoryTokenService(signing_key=signing_key)
         self.quota = quota_ledger or InMemoryQuotaLedger()
         self.audit = InMemoryAuditLedger()
-        self.artifacts = artifact_store or InMemoryArtifactStore()
+        self.artifacts = artifact_store if artifact_store is not None else InMemoryArtifactStore()
         self._artifact_store_path = Path(artifact_store_path) if artifact_store_path is not None else None
         self.auth = auth
         self.runtime_identity_mint_policy = runtime_identity_mint_policy
@@ -188,6 +249,14 @@ class S10SupervisorApp:
         for adapter_id, target in self._adapter_targets.items():
             if adapter_id != target.adapter_id:
                 raise ValueError("adapter target map key must match target.adapter_id")
+        self._model_targets = dict(model_targets or {})
+        for model_id, target in self._model_targets.items():
+            if model_id != target.model_id:
+                raise ValueError("model target map key must match target.model_id")
+        if self._model_targets and (self.price_table is None or self.price_table_trust_store is None):
+            raise ValueError("model targets require a signed price table and trust store")
+        if self.price_table is not None and self.price_table_trust_store is not None:
+            self.price_table_trust_store.verify(self.price_table)
         self.broker = StoreWriterBroker(
             token_service=self.tokens,
             artifact_store=self.artifacts,
@@ -325,6 +394,342 @@ class S10SupervisorApp:
                 "request_hash": hash_bytes(canonical_json_bytes(eval_request)),
             },
         )
+        return result
+
+    def broker_complete_model_for_identity(
+        self,
+        identity: RuntimeIdentity,
+        body: dict[str, Any],
+    ) -> dict[str, Any]:
+        scope_token = self._verified_scope_for_identity(identity, body)
+        budget_token = self._verified_budget_for_identity(identity, body)
+        model_request = _validated_model_broker_request(_required_dict(body, "request"))
+        model_id = _required_str(model_request, "model")
+        target = self._model_targets.get(model_id)
+        if target is None:
+            self._deny_model(scope_token, model_id=model_id, reason="model_not_configured")
+        if target.audience not in scope_token.scopes.broker_audiences:
+            self._deny_model(scope_token, model_id=model_id, reason="broker_audience_missing")
+
+        self.quota.register_budget(budget_token)
+        state = self.quota.state(budget_token.budget_id)
+        if state.halted:
+            self._audit_model_budget_halt(
+                scope_token=scope_token,
+                budget_token=budget_token,
+                model_id=model_id,
+                reason="budget_already_halted",
+                requested_tokens=0,
+            )
+            raise BudgetExceededError(f"budget is halted: {budget_token.budget_id}")
+
+        count_request = _model_token_count_request(model_request)
+        try:
+            count_result = self._call_credentialed_model(
+                target,
+                endpoint_url=target.token_count_url,
+                payload=count_request,
+                operation="token count",
+            )
+            input_tokens = _model_input_token_count(count_result)
+        except ModelBrokerUpstreamError:
+            self.audit.append(
+                "model.upstream_error",
+                {
+                    "audience": target.audience,
+                    "model_id": model_id,
+                    "operation": "token_count",
+                    "scope_id": scope_token.scope_id,
+                    "budget_id": budget_token.budget_id,
+                    "job_id": identity.job_id,
+                },
+            )
+            raise
+
+        max_output_tokens = _positive_int(model_request.get("max_tokens"), "request.max_tokens")
+        reserved_tokens = input_tokens + max_output_tokens
+        reserved_rollup = self._model_price_rollup(model_id=model_id, token_count=reserved_tokens)
+        reserved_usage = reserved_rollup.usage
+        try:
+            self.quota.reserve(budget_token.budget_id, reserved_usage)
+        except BudgetExceededError as exc:
+            self.quota.halt(budget_token.budget_id, reason="model_reservation_exceeded")
+            self._audit_model_budget_halt(
+                scope_token=scope_token,
+                budget_token=budget_token,
+                model_id=model_id,
+                reason="model_reservation_exceeded",
+                requested_tokens=reserved_tokens,
+            )
+            raise BudgetExceededError("model call exceeds the remaining token or cost budget") from exc
+
+        try:
+            provider_response = self._call_credentialed_model(
+                target,
+                endpoint_url=target.completion_url,
+                payload=model_request,
+                operation="completion",
+            )
+            usage = _validated_model_usage(
+                provider_response,
+                expected_model_id=model_id,
+                expected_input_tokens=input_tokens,
+                max_output_tokens=max_output_tokens,
+            )
+        except ModelBrokerUpstreamError:
+            self.quota.release(budget_token.budget_id, reserved_usage)
+            self.quota.halt(budget_token.budget_id, reason="model_usage_untrusted")
+            self._audit_model_budget_halt(
+                scope_token=scope_token,
+                budget_token=budget_token,
+                model_id=model_id,
+                reason="model_usage_untrusted",
+                requested_tokens=reserved_tokens,
+            )
+            raise
+
+        actual_rollup = self._model_price_rollup(model_id=model_id, token_count=usage["total_tokens"])
+        try:
+            self.quota.consume(budget_token.budget_id, actual_rollup.usage)
+        except BudgetExceededError:
+            self.quota.release(budget_token.budget_id, reserved_usage)
+            self._audit_model_budget_halt(
+                scope_token=scope_token,
+                budget_token=budget_token,
+                model_id=model_id,
+                reason="provider_usage_exceeded_budget",
+                requested_tokens=usage["total_tokens"],
+            )
+            raise
+        self.quota.release(budget_token.budget_id, reserved_usage)
+
+        try:
+            provenance = self._persist_model_provenance(
+                identity=identity,
+                scope_token=scope_token,
+                budget_token=budget_token,
+                target=target,
+                model_request=model_request,
+                provider_response=provider_response,
+                usage=usage,
+                cost_usd_exact=actual_rollup.cost_usd_exact,
+                price_table_hash=actual_rollup.price_table_hash,
+            )
+        except Exception as exc:
+            self.quota.halt(budget_token.budget_id, reason="model_provenance_unavailable")
+            self.audit.append(
+                "model.provenance_error",
+                {
+                    "audience": target.audience,
+                    "model_id": model_id,
+                    "scope_id": scope_token.scope_id,
+                    "budget_id": budget_token.budget_id,
+                    "job_id": identity.job_id,
+                    "usage": usage,
+                    "budget_halted": True,
+                },
+            )
+            raise ModelBrokerUpstreamError("model usage was debited but provenance persistence failed") from exc
+
+        remaining = self.quota.remaining(budget_token.budget_id)
+        self.audit.append(
+            "model.complete",
+            {
+                "audience": target.audience,
+                "model_id": model_id,
+                "scope_id": scope_token.scope_id,
+                "budget_id": budget_token.budget_id,
+                "job_id": identity.job_id,
+                "tokens_used": usage["total_tokens"],
+                "input_tokens": usage["input_tokens"],
+                "output_tokens": usage["output_tokens"],
+                "cost_usd_exact": actual_rollup.cost_usd_exact,
+                "provenance_ref": provenance.artifact_ref,
+                "request_hash": hash_json(model_request),
+                "response_hash": hash_json(provider_response),
+            },
+        )
+        return {
+            "response": provider_response,
+            "usage": usage,
+            "tokens_used": usage["total_tokens"],
+            "cost_usd_exact": actual_rollup.cost_usd_exact,
+            "price_table_version": actual_rollup.price_table_version,
+            "price_table_hash": actual_rollup.price_table_hash,
+            "provenance_ref": provenance.artifact_ref,
+            "remaining": asdict(remaining),
+            "budget_halted": False,
+        }
+
+    def _verified_budget_for_identity(
+        self,
+        identity: RuntimeIdentity,
+        body: Mapping[str, Any],
+    ) -> BudgetToken:
+        _require_runtime_identity(identity)
+        budget_token = _budget_token_from_dict(_required_dict(dict(body), "budget_token"))
+        verification = self.tokens.verify_budget(budget_token)
+        if not verification.valid:
+            self.audit.append(
+                "token.verify_fail",
+                {
+                    "token": "budget",
+                    "reason": verification.reason,
+                    "job_id": identity.job_id,
+                },
+            )
+            raise TokenInvalidError(verification.reason or "invalid budget token")
+        if budget_token.job_id != identity.job_id:
+            raise PermissionError("budget token is not bound to the authenticated runtime identity")
+        if budget_token.root_request_id != identity.root_request_id:
+            raise PermissionError("budget token root request is not bound to the authenticated runtime identity")
+        if budget_token.risk_class != identity.scopes.sandbox_risk_class:
+            raise PermissionError("budget token risk class is not bound to the authenticated runtime identity")
+        _require_budget_caps_subset(budget_token.caps, identity.budget_caps)
+        return budget_token
+
+    def _model_price_rollup(self, *, model_id: str, token_count: int) -> Any:
+        if self.price_table is None or self.price_table_trust_store is None:
+            raise PriceTableSignatureError("model broker price table is unavailable")
+        self.price_table_trust_store.verify(self.price_table)
+        return roll_up_price_table_usage(
+            BudgetUsage(model_tokens=float(token_count)),
+            self.price_table,
+            model_id=model_id,
+        )
+
+    def _persist_model_provenance(
+        self,
+        *,
+        identity: RuntimeIdentity,
+        scope_token: ScopeToken,
+        budget_token: BudgetToken,
+        target: CredentialedModelTarget,
+        model_request: dict[str, Any],
+        provider_response: dict[str, Any],
+        usage: dict[str, int],
+        cost_usd_exact: str,
+        price_table_hash: str,
+    ) -> ArtifactRecord:
+        self._refresh_artifacts()
+        environment_digest = hash_json(
+            {
+                "schema": "argus.s10.llm-call-environment.v1",
+                "model_id": target.model_id,
+                "audience": target.audience,
+                "price_table_version": self.price_table.price_table_version if self.price_table else None,
+                "price_table_hash": price_table_hash,
+            }
+        )
+        return self.artifacts.create_artifact(
+            kind="llm_call",
+            payload={
+                "schema": "argus.s10.llm-call.v1",
+                "job_id": identity.job_id,
+                "scope_id": scope_token.scope_id,
+                "budget_id": budget_token.budget_id,
+                "budget_epoch": budget_token.budget_epoch,
+                "model_id": target.model_id,
+                "request": model_request,
+                "response": provider_response,
+                "usage": usage,
+                "tokens_used": usage["total_tokens"],
+                "cost_usd_exact": cost_usd_exact,
+                "price_table_version": self.price_table.price_table_version if self.price_table else None,
+                "price_table_hash": price_table_hash,
+                "request_hash": hash_json(model_request),
+                "response_hash": hash_json(provider_response),
+            },
+            producer=Producer(
+                subsystem="S10",
+                version="0.0.0",
+                actor_id="s10-model-broker",
+                job_id=identity.job_id,
+            ),
+            lineage=Lineage(
+                input_refs=(),
+                code_ref="git:project-argus/s10-model-broker",
+                environment_digest=environment_digest,
+                actor_id=identity.caller_id,
+                job_id=identity.job_id,
+            ),
+        )
+
+    def _deny_model(self, scope_token: ScopeToken, *, model_id: str, reason: str) -> None:
+        self.audit.append(
+            "model.denied",
+            {
+                "audience": "model",
+                "model_id": model_id,
+                "reason": reason,
+                "scope_id": scope_token.scope_id,
+                "job_id": scope_token.job_id,
+            },
+        )
+        raise ScopeDeniedError(reason)
+
+    def _audit_model_budget_halt(
+        self,
+        *,
+        scope_token: ScopeToken,
+        budget_token: BudgetToken,
+        model_id: str,
+        reason: str,
+        requested_tokens: int,
+    ) -> None:
+        state = self.quota.state(budget_token.budget_id)
+        self.audit.append(
+            "model.budget_halt",
+            {
+                "audience": "model",
+                "model_id": model_id,
+                "reason": reason,
+                "scope_id": scope_token.scope_id,
+                "budget_id": budget_token.budget_id,
+                "job_id": budget_token.job_id,
+                "requested_tokens": requested_tokens,
+                "actual_model_tokens": state.actual.model_tokens,
+                "actual_cost_usd": state.actual.cost_usd,
+                "budget_halted": state.halted,
+            },
+        )
+
+    @staticmethod
+    def _call_credentialed_model(
+        target: CredentialedModelTarget,
+        *,
+        endpoint_url: str,
+        payload: Mapping[str, Any],
+        operation: str,
+    ) -> dict[str, Any]:
+        headers = {
+            "Content-Type": "application/json",
+            target.credential_header: target.credential,
+            **dict(target.static_headers),
+        }
+        outbound = request.Request(
+            endpoint_url,
+            data=canonical_json_bytes(payload),
+            method="POST",
+            headers=headers,
+        )
+        try:
+            with request.urlopen(outbound, timeout=target.timeout_s) as response:
+                raw = response.read()
+        except error.HTTPError as exc:
+            raise ModelBrokerUpstreamError(
+                f"model provider {operation} request failed with HTTP {exc.code}"
+            ) from exc
+        except OSError as exc:
+            raise ModelBrokerUpstreamError(f"model provider {operation} endpoint is unavailable") from exc
+        try:
+            result = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ModelBrokerUpstreamError(f"model provider {operation} returned invalid JSON") from exc
+        if not isinstance(result, dict):
+            raise ModelBrokerUpstreamError(f"model provider {operation} returned a non-object response")
+        if target.credential in json.dumps(result, sort_keys=True, ensure_ascii=False):
+            raise ModelBrokerUpstreamError(f"model provider {operation} response contained credential material")
         return result
 
     def _verified_scope_for_identity(
@@ -526,6 +931,8 @@ class S10SupervisorApp:
                 "egress_sidecar_configured": self._docker_supervisor.egress_sidecar_configured,
                 "secrets_broker_configured": bool(self._adapter_targets),
                 "adapter_broker_targets": sorted(self._adapter_targets),
+                "model_broker_configured": bool(self._model_targets),
+                "model_broker_targets": sorted(self._model_targets),
                 "audit_events": len(self.audit.events()),
             }
 
@@ -717,6 +1124,30 @@ class S10SupervisorApp:
             except Exception as exc:
                 return 400, {"error": type(exc).__name__, "message": str(exc)}
 
+        @self.http.route("POST", "/v1/broker/model/complete")
+        def broker_model_complete(request: JsonRequest) -> tuple[int, Any]:
+            try:
+                identity = self._authenticate(request)
+                if not isinstance(request.body, dict):
+                    return 400, {"error": "json_object_required"}
+                return 200, self.broker_complete_model_for_identity(identity, request.body)
+            except UnauthorizedError as exc:
+                return 401, {"error": "Unauthorized", "message": str(exc)}
+            except TokenInvalidError as exc:
+                return 401, {"error": type(exc).__name__, "message": str(exc)}
+            except BudgetExceededError as exc:
+                return 403, {
+                    "error": type(exc).__name__,
+                    "message": str(exc),
+                    "budget_halted": True,
+                }
+            except (PermissionError, PriceTableSignatureError, ScopeDeniedError) as exc:
+                return 403, {"error": type(exc).__name__, "message": str(exc)}
+            except ModelBrokerUpstreamError as exc:
+                return 502, {"error": type(exc).__name__, "message": str(exc)}
+            except Exception as exc:
+                return 400, {"error": type(exc).__name__, "message": str(exc)}
+
         @self.http.route("POST", "/v1/tokens:revoke")
         def revoke_token(request: JsonRequest) -> tuple[int, Any]:
             try:
@@ -830,6 +1261,7 @@ def build_app_from_env() -> S10SupervisorApp:
     verifier_key_provider = _verifier_key_provider_from_env()
     verifier_key_auth_token = os.environ.get("ARGUS_S10_VERIFIER_KEY_AUTH_TOKEN")
     adapter_targets = _adapter_targets_from_env()
+    model_targets = _model_targets_from_env()
     if verifier_key_provider is not None and not verifier_key_auth_token:
         raise RuntimeError("ARGUS_S10_VERIFIER_KEY_AUTH_TOKEN is required when verifier keys are configured")
     if s8_broker_url:
@@ -854,6 +1286,7 @@ def build_app_from_env() -> S10SupervisorApp:
             price_table=price_table,
             price_table_trust_store=price_table_trust_store,
             adapter_targets=adapter_targets,
+            model_targets=model_targets,
         )
     data_dir = os.environ.get("ARGUS_S8_DATA_DIR")
     if data_dir:
@@ -874,6 +1307,7 @@ def build_app_from_env() -> S10SupervisorApp:
             price_table=price_table,
             price_table_trust_store=price_table_trust_store,
             adapter_targets=adapter_targets,
+            model_targets=model_targets,
         )
     return S10SupervisorApp(
         token_service=token_service,
@@ -890,6 +1324,7 @@ def build_app_from_env() -> S10SupervisorApp:
         price_table=price_table,
         price_table_trust_store=price_table_trust_store,
         adapter_targets=adapter_targets,
+        model_targets=model_targets,
     )
 
 
@@ -975,6 +1410,60 @@ def _adapter_targets_from_env() -> dict[str, CredentialedAdapterTarget]:
             )
         except (TypeError, ValueError) as exc:
             raise RuntimeError(f"invalid adapter target {adapter_id}: {exc}") from exc
+    return targets
+
+
+def _model_targets_from_env() -> dict[str, CredentialedModelTarget]:
+    raw = os.environ.get("ARGUS_S10_MODEL_TARGETS_JSON")
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("ARGUS_S10_MODEL_TARGETS_JSON must be valid JSON") from exc
+    if not isinstance(parsed, dict):
+        raise RuntimeError("ARGUS_S10_MODEL_TARGETS_JSON must be an object map")
+    targets: dict[str, CredentialedModelTarget] = {}
+    for model_id, value in parsed.items():
+        if not isinstance(model_id, str) or not model_id or not isinstance(value, dict):
+            raise RuntimeError("model target entries must map non-empty ids to objects")
+        completion_url = value.get("completion_url")
+        token_count_url = value.get("token_count_url")
+        credential_env = value.get("credential_env")
+        credential_header = value.get("credential_header", "X-Api-Key")
+        static_headers = value.get("static_headers", {})
+        if not isinstance(completion_url, str) or not completion_url:
+            raise RuntimeError(f"model target {model_id} requires completion_url")
+        if not isinstance(token_count_url, str) or not token_count_url:
+            raise RuntimeError(f"model target {model_id} requires token_count_url")
+        if not isinstance(credential_env, str) or not credential_env:
+            raise RuntimeError(f"model target {model_id} requires credential_env")
+        credential = os.environ.get(credential_env)
+        if not credential:
+            raise RuntimeError(f"model target {model_id} credential env is unavailable: {credential_env}")
+        if not isinstance(credential_header, str):
+            raise RuntimeError(f"model target {model_id} credential_header must be a string")
+        if not isinstance(static_headers, dict) or any(
+            not isinstance(name, str) or not isinstance(header_value, str)
+            for name, header_value in static_headers.items()
+        ):
+            raise RuntimeError(f"model target {model_id} static_headers must map strings to strings")
+        audience = value.get("audience", "model")
+        if not isinstance(audience, str):
+            raise RuntimeError(f"model target {model_id} audience must be a string")
+        try:
+            targets[model_id] = CredentialedModelTarget(
+                model_id=model_id,
+                completion_url=completion_url,
+                token_count_url=token_count_url,
+                credential_header=credential_header,
+                credential=credential,
+                static_headers=static_headers,
+                audience=audience,
+                timeout_s=float(value.get("timeout_s", 30.0)),
+            )
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(f"invalid model target {model_id}: {exc}") from exc
     return targets
 
 
@@ -1460,6 +1949,95 @@ def _required_str(body: dict[str, Any], field: str) -> str:
     value = body.get(field)
     if not isinstance(value, str) or not value:
         raise ValueError(f"{field} is required")
+    return value
+
+
+def _validate_outbound_header_name(value: Any, *, field: str) -> str:
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"{field} must be a non-empty string")
+    if re.fullmatch(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+", value) is None:
+        raise ValueError(f"{field} is not a valid HTTP header name")
+    return value
+
+
+def _validated_model_broker_request(value: dict[str, Any]) -> dict[str, Any]:
+    disallowed_fields = {
+        "api_key",
+        "authorization",
+        "credential",
+        "credential_header",
+        "headers",
+    }
+    present_disallowed = sorted(disallowed_fields.intersection(key.lower() for key in value))
+    if present_disallowed:
+        raise ValueError("model request contains broker-owned credential fields")
+    _required_str(value, "model")
+    _positive_int(value.get("max_tokens"), "request.max_tokens")
+    messages = value.get("messages")
+    if not isinstance(messages, list) or not messages:
+        raise ValueError("request.messages must be a non-empty array")
+    if value.get("stream") is not None and value.get("stream") is not False:
+        raise ValueError("streaming model calls are not supported by the metering hook")
+    try:
+        canonical_json_bytes(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("model request must be canonical JSON") from exc
+    return dict(value)
+
+
+def _model_token_count_request(model_request: Mapping[str, Any]) -> dict[str, Any]:
+    count_fields = ("model", "messages", "system", "tools", "tool_choice", "thinking")
+    return {field: model_request[field] for field in count_fields if field in model_request}
+
+
+def _model_input_token_count(value: Mapping[str, Any]) -> int:
+    try:
+        return _positive_int(value.get("input_tokens"), "provider input_tokens")
+    except ValueError as exc:
+        raise ModelBrokerUpstreamError("model provider token count is invalid") from exc
+
+
+def _validated_model_usage(
+    response: dict[str, Any],
+    *,
+    expected_model_id: str,
+    expected_input_tokens: int,
+    max_output_tokens: int,
+) -> dict[str, int]:
+    if response.get("model") != expected_model_id:
+        raise ModelBrokerUpstreamError("model provider response id does not match the broker target")
+    if not isinstance(response.get("id"), str) or not response["id"]:
+        raise ModelBrokerUpstreamError("model provider response omits a request id")
+    if not isinstance(response.get("content"), list):
+        raise ModelBrokerUpstreamError("model provider response omits content")
+    usage = response.get("usage")
+    if not isinstance(usage, Mapping):
+        raise ModelBrokerUpstreamError("model provider response omits usage")
+    input_tokens = _nonnegative_provider_int(usage.get("input_tokens"), "input_tokens")
+    output_tokens = _nonnegative_provider_int(usage.get("output_tokens"), "output_tokens")
+    if input_tokens != expected_input_tokens:
+        raise ModelBrokerUpstreamError("model provider completion usage disagrees with token preflight")
+    if output_tokens > max_output_tokens:
+        raise ModelBrokerUpstreamError("model provider exceeded request.max_tokens")
+    total_tokens = input_tokens + output_tokens
+    if total_tokens > expected_input_tokens + max_output_tokens:
+        raise ModelBrokerUpstreamError("model provider usage exceeded the reserved token amount")
+    return {
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": total_tokens,
+    }
+
+
+def _nonnegative_provider_int(value: Any, field: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ModelBrokerUpstreamError(f"model provider {field} must be a non-negative integer")
+    return value
+
+
+def _positive_int(value: Any, field: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError(f"{field} must be a positive integer")
     return value
 
 

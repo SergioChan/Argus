@@ -398,6 +398,11 @@ class ArgusM0RuntimeServiceTests(unittest.TestCase):
         self.assertEqual(requests["partial-capture"]["job_id"], "m0-partial-capture-job")
         self.assertEqual(policy["m0-partial-capture"]["job_id"], "m0-partial-capture-job")
         self.assertEqual(policy["m0-partial-capture"]["budget_caps"]["max_wallclock_s"], 10)
+        self.assertIn("model", requests)
+        self.assertEqual(requests["model"]["caller_id"], "m0-model-broker")
+        self.assertEqual(requests["model"]["budget_caps"]["max_model_tokens"], 1000)
+        self.assertEqual(requests["model"]["scopes"]["broker_audiences"], ["model"])
+        self.assertEqual(policy["m0-model-broker"]["budget_caps"]["max_model_tokens"], 1000)
 
     def test_m1_reference_service_tokens_are_preprovisioned_and_non_minting(self) -> None:
         secrets = m0_battery._m0_runtime_secrets()
@@ -550,6 +555,155 @@ class ArgusM0RuntimeServiceTests(unittest.TestCase):
         self.assertFalse(results[1]["detail"]["object_store_credential_env_present"])
         self.assertNotIn(broker_credential, json.dumps(evidence, sort_keys=True))
         self.assertTrue(all(broker_credential not in " ".join(command) for command in run_commands))
+
+    def test_s10_model_broker_battery_proves_metering_halt_and_provenance(self) -> None:
+        evidence: dict[str, object] = {"results": []}
+        broker_credential = "broker-only-model-secret"
+        provider_health = iter(
+            [
+                {
+                    "service": "s10-reference-model-provider",
+                    "status": "ok",
+                    "count_requests": 1,
+                    "completion_requests": 1,
+                },
+                {
+                    "service": "s10-reference-model-provider",
+                    "status": "ok",
+                    "count_requests": 2,
+                    "completion_requests": 1,
+                },
+                {
+                    "service": "s10-reference-model-provider",
+                    "status": "ok",
+                    "count_requests": 2,
+                    "completion_requests": 1,
+                },
+            ]
+        )
+        model_call_count = 0
+
+        def fake_post_json(
+            url: str,
+            body: dict[str, object],
+            *,
+            expected_status: int = 200,
+            token: str | None = None,
+            timeout: float = 10,
+        ) -> dict[str, object]:
+            nonlocal model_call_count
+            del token, timeout
+            if url.endswith("/v1/scope-tokens"):
+                self.assertEqual(expected_status, 201)
+                return {"scope_id": "scope-model", "job_id": "m0-model-broker-job"}
+            if url.endswith("/v1/budget-tokens"):
+                self.assertEqual(expected_status, 201)
+                return {"budget_id": "budget-model", "job_id": "m0-model-broker-job"}
+            if url.endswith("/v1/broker/model/complete"):
+                model_call_count += 1
+                if model_call_count == 1:
+                    self.assertEqual(expected_status, 200)
+                    return {
+                        "response": {
+                            "id": "msg-1",
+                            "model": "argus-reference-model-v1",
+                            "content": [{"type": "text", "text": "metered"}],
+                            "usage": {"input_tokens": 12, "output_tokens": 8},
+                        },
+                        "usage": {"input_tokens": 12, "output_tokens": 8, "total_tokens": 20},
+                        "tokens_used": 20,
+                        "provenance_ref": "c4://artifact/model-call",
+                    }
+                self.assertEqual(expected_status, 403)
+                return {
+                    "error": "BudgetExceededError",
+                    "message": "model budget halted",
+                    "budget_halted": True,
+                }
+            raise AssertionError(f"unexpected POST: {url}")
+
+        get_payloads = iter(
+            [
+                {
+                    "artifact_ref": "c4://artifact/model-call",
+                    "kind": "llm_call",
+                    "producer": {"subsystem": "S10"},
+                },
+                {
+                    "schema": "argus.s10.llm-call.v1",
+                    "request": m0_battery._s10_tc16_model_request(max_tokens=32),
+                    "response": {
+                        "id": "msg-1",
+                        "model": "argus-reference-model-v1",
+                        "content": [{"type": "text", "text": "metered"}],
+                        "usage": {"input_tokens": 12, "output_tokens": 8},
+                    },
+                    "usage": {"input_tokens": 12, "output_tokens": 8, "total_tokens": 20},
+                },
+            ]
+        )
+
+        with (
+            patch.object(
+                m0_battery,
+                "_s10_model_provider_direct_probe",
+                return_value={
+                    "broker_credential_env_present": False,
+                    "s1_provider_reachable": False,
+                    "s1_provider_error": "URLError",
+                    "unauthorized_status": 403,
+                    "unauthorized_error": "broker_credential_required",
+                    "provider_health": {"count_requests": 0, "completion_requests": 0},
+                },
+            ),
+            patch.object(
+                m0_battery,
+                "_s10_model_provider_health",
+                side_effect=lambda **kwargs: next(provider_health),
+            ),
+            patch.object(
+                m0_battery,
+                "_s10_model_quota_state",
+                return_value=(
+                    {"max_model_tokens": 1000, "max_cost_usd": 1},
+                    {"model_tokens": 0, "cost_usd": 0},
+                    {"model_tokens": 20, "cost_usd": 0.00008},
+                    True,
+                ),
+            ),
+            patch.object(m0_battery, "_post_json", side_effect=fake_post_json),
+            patch.object(m0_battery, "_get_json", side_effect=lambda *args, **kwargs: next(get_payloads)),
+            patch.object(
+                m0_battery,
+                "_run",
+                return_value=subprocess.CompletedProcess(["docker", "compose", "logs"], 0, "clean logs", ""),
+            ),
+        ):
+            m0_battery._battery_s10_model_broker(
+                evidence,
+                docker="docker",
+                compose_file="compose.yaml",
+                compose_env={"COMPOSE_PROJECT_NAME": "argus-s10-t15"},
+                postgres_port="55432",
+                s10_url="http://s10",
+                s8_url="http://s8",
+                model_token="model-token",
+                read_token="read-token",
+                broker_credential=broker_credential,
+            )
+
+        results = evidence["results"]  # type: ignore[assignment]
+        self.assertEqual([result["item"] for result in results], ["s10-tc16"])
+        detail = results[0]["detail"]
+        self.assertEqual(detail["tokens_used"], 20)
+        self.assertEqual(detail["actual_model_tokens"], 20)
+        self.assertEqual(detail["reserved_model_tokens"], 0)
+        self.assertTrue(detail["budget_halted"])
+        self.assertFalse(detail["over_limit_reached_completion"])
+        self.assertFalse(detail["direct_provider_reachable_from_s1"])
+        self.assertEqual(detail["provider_unauthorized_status"], 403)
+        self.assertTrue(detail["prompt_response_persisted"])
+        self.assertNotIn(broker_credential, json.dumps(evidence, sort_keys=True))
 
     def test_s1_reference_physics_demo_battery_requires_verified_http_face(self) -> None:
         evidence: dict[str, object] = {"results": []}
@@ -2189,6 +2343,8 @@ class ArgusM0RuntimeServiceTests(unittest.TestCase):
         self.assertEqual(payload["quota_ledger"], "memory")
         self.assertEqual(payload["price_table"], "unconfigured")
         self.assertEqual(payload["price_table_signer_key_id"], "unconfigured")
+        self.assertFalse(payload["model_broker_configured"])
+        self.assertEqual(payload["model_broker_targets"], [])
         self.assertEqual(payload["resource_meter"], "docker-api-cgroup")
         self.assertLessEqual(payload["meter_interval_s"], 5)
         self.assertGreaterEqual(payload["meter_gap_halt_s"], payload["meter_interval_s"])
@@ -2271,6 +2427,62 @@ class ArgusM0RuntimeServiceTests(unittest.TestCase):
         self.assertNotIn("broker-only-test-credential", repr(app._adapter_targets))
         with patch.dict(os.environ, base_env, clear=True):
             with self.assertRaisesRegex(RuntimeError, "credential env is unavailable"):
+                build_s10_app_from_env()
+
+    def test_s10_env_build_loads_model_target_without_exposing_credential(self) -> None:
+        base_env = {
+            "ARGUS_S10_SIGNING_KEY": "test-s10-signing-key",
+            "ARGUS_RUNTIME_BOOTSTRAP_TOKEN": BOOTSTRAP_TOKEN,
+            "ARGUS_RUNTIME_IDENTITY_SIGNING_KEY": IDENTITY_SIGNING_KEY.decode("utf-8"),
+            "ARGUS_RUNTIME_IDENTITY_MINT_POLICY_JSON": _runtime_identity_mint_policy_json(),
+            "ARGUS_M0_HEALTH_TOKEN": HEALTH_TOKEN,
+            "ARGUS_S10_POLICY_SIGNING_KEY": POLICY_SIGNING_KEY,
+            "ARGUS_S10_CHECKPOINT_SIGNING_KEY": CHECKPOINT_SIGNING_KEY,
+            "ARGUS_S10_CHECKPOINT_SIGNER_AUTH_TOKEN": CHECKPOINT_SIGNER_AUTH_TOKEN,
+            "ARGUS_S10_PRICE_TABLE_SIGNING_KEY": PRICE_TABLE_SIGNING_KEY,
+            "ARGUS_S10_PRICE_TABLE_ISSUED_AT": "1",
+            "ARGUS_S10_PRICE_TABLE_EXPIRES_AT": "4102444800",
+            "ARGUS_S10_MODEL_TARGETS_JSON": json.dumps(
+                {
+                    "argus-reference-model-v1": {
+                        "completion_url": "https://api.anthropic.com/v1/messages",
+                        "token_count_url": "https://api.anthropic.com/v1/messages/count_tokens",
+                        "credential_env": "ARGUS_TEST_MODEL_CREDENTIAL",
+                        "credential_header": "X-Api-Key",
+                        "static_headers": {"Anthropic-Version": "2023-06-01"},
+                        "audience": "model",
+                    }
+                }
+            ),
+        }
+        with patch.dict(
+            os.environ,
+            {**base_env, "ARGUS_TEST_MODEL_CREDENTIAL": "broker-only-test-model-credential"},
+            clear=True,
+        ):
+            app = build_s10_app_from_env()
+            status, health = app.http.handle(
+                JsonRequest(method="GET", path="/healthz", query={}, body=None, headers=_auth_headers(HEALTH_TOKEN))
+            )
+
+        self.assertEqual(status, 200)
+        self.assertTrue(health["model_broker_configured"])
+        self.assertEqual(health["model_broker_targets"], ["argus-reference-model-v1"])
+        self.assertNotIn("broker-only-test-model-credential", repr(app._model_targets))
+        with patch.dict(os.environ, base_env, clear=True):
+            with self.assertRaisesRegex(RuntimeError, "credential env is unavailable"):
+                build_s10_app_from_env()
+
+        invalid_audience_env = {
+            **base_env,
+            "ARGUS_TEST_MODEL_CREDENTIAL": "broker-only-test-model-credential",
+            "ARGUS_S10_MODEL_TARGETS_JSON": base_env["ARGUS_S10_MODEL_TARGETS_JSON"].replace(
+                '"audience": "model"',
+                '"audience": null',
+            ),
+        }
+        with patch.dict(os.environ, invalid_audience_env, clear=True):
+            with self.assertRaisesRegex(RuntimeError, "audience must be a string"):
                 build_s10_app_from_env()
 
     def test_s10_env_build_exposes_signed_exfil_thresholds_and_rejects_invalid_order(self) -> None:
@@ -2772,6 +2984,7 @@ class ArgusM0ComposeTests(unittest.TestCase):
                 "ARGUS_S3_REFERENCE_REFEREE_ACCESS_TOKEN": "s3-reference-token",
                 "ARGUS_S7_REFERENCE_ADAPTER_ACCESS_TOKEN": "s7-reference-token",
                 "ARGUS_S10_GW_SPECTRUM_BROKER_CREDENTIAL": "s10-t13-adapter-credential",
+                "ARGUS_S10_REFERENCE_MODEL_BROKER_CREDENTIAL": "s10-t15-model-credential",
                 "ARGUS_S11_REFERENCE_OBSERVATORY_ACCESS_TOKEN": "s11-reference-token",
             },
         )
@@ -2782,10 +2995,20 @@ class ArgusM0ComposeTests(unittest.TestCase):
         services = rendered["services"]
         self.assertIn("argus-data", rendered["networks"])
         self.assertIn("argus-services", rendered["networks"])
+        self.assertIn("argus-model", rendered["networks"])
         self.assertFalse(rendered["networks"]["argus-data"].get("internal", False))
+        self.assertTrue(rendered["networks"]["argus-model"].get("internal", False))
         self.assertEqual(set(services["postgres"]["networks"]), {"argus-data"})
         self.assertEqual(set(services["minio"]["networks"]), {"argus-data"})
         self.assertEqual(set(services["s1-reference-demo"]["networks"]), {"argus-services"})
+        self.assertEqual(
+            set(services["s10-reference-model-provider"]["networks"]),
+            {"argus-model"},
+        )
+        self.assertEqual(
+            set(services["s10-supervisor"]["networks"]),
+            {"argus-data", "argus-model", "argus-services"},
+        )
         self.assertTrue(services["postgres"]["ports"])
         self.assertTrue(
             all(port.get("host_ip") == "127.0.0.1" for port in services["postgres"]["ports"]),
@@ -2802,6 +3025,7 @@ class ArgusM0ComposeTests(unittest.TestCase):
                 "minio",
                 "s8-writer",
                 "s10-supervisor",
+                "s10-reference-model-provider",
                 "s1-reference-demo",
                 "s2-reference-builder",
                 "s3-reference-referee",
@@ -2814,6 +3038,10 @@ class ArgusM0ComposeTests(unittest.TestCase):
         self.assertTrue(services["minio"]["image"].startswith("minio/minio@sha256:"))
         self.assertEqual(services["s8-writer"]["command"], ["python", "-m", "argus_runtime.s8_writer_service"])
         self.assertEqual(services["s10-supervisor"]["command"], ["python", "-m", "argus_runtime.s10_supervisor_service"])
+        self.assertEqual(
+            services["s10-reference-model-provider"]["command"],
+            ["python", "-m", "argus_runtime.s10_reference_model_provider_service"],
+        )
         self.assertEqual(
             services["s1-reference-demo"]["command"],
             ["python", "-m", "argus_runtime.s1_reference_demo_service", "--serve"],
@@ -2951,6 +3179,20 @@ class ArgusM0ComposeTests(unittest.TestCase):
             services["s1-reference-demo"]["environment"],
         )
         self.assertEqual(
+            services["s10-reference-model-provider"]["environment"][
+                "ARGUS_S10_REFERENCE_MODEL_BROKER_CREDENTIAL"
+            ],
+            "s10-t15-model-credential",
+        )
+        self.assertEqual(
+            services["s10-supervisor"]["environment"]["ARGUS_S10_REFERENCE_MODEL_BROKER_CREDENTIAL"],
+            "s10-t15-model-credential",
+        )
+        self.assertNotIn(
+            "ARGUS_S10_REFERENCE_MODEL_BROKER_CREDENTIAL",
+            services["s1-reference-demo"]["environment"],
+        )
+        self.assertEqual(
             services["s11-reference-observatory"]["environment"]["ARGUS_S11_REFERENCE_OBSERVATORY_S8_URL"],
             "http://s8-writer:8080",
         )
@@ -2961,6 +3203,7 @@ class ArgusM0ComposeTests(unittest.TestCase):
         self.assertEqual(services["s3-reference-referee"]["ports"][0]["host_ip"], "127.0.0.1")
         self.assertNotIn("ports", services["s7-reference-adapter"])
         self.assertNotIn("ports", services["s11-reference-observatory"])
+        self.assertNotIn("ports", services["s10-reference-model-provider"])
         self.assertNotIn("volumes", services["s8-writer"])
         self.assertIn("ARGUS_RUNTIME_BOOTSTRAP_TOKEN", services["s8-writer"]["environment"])
         self.assertIn("ARGUS_RUNTIME_IDENTITY_SIGNING_KEY", services["s8-writer"]["environment"])

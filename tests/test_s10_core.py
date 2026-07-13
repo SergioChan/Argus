@@ -321,6 +321,25 @@ class S10QuotaLedgerTests(unittest.TestCase):
         with self.assertRaises(BudgetExceededError):
             ledger.reserve(token.budget_id, BudgetUsage(gpu_seconds=61))
 
+    def test_explicit_halt_preserves_actual_usage_and_refuses_future_work(self) -> None:
+        tokens = InMemoryTokenService(signing_key=b"test-key", now_fn=lambda: 1_000)
+        token = tokens.mint_budget(
+            caps=BudgetCaps(max_model_tokens=1000, max_cost_usd=1),
+            job_id="job-model-halt",
+            root_request_id="root-model-halt",
+        )
+        ledger = InMemoryQuotaLedger()
+        ledger.register_budget(token)
+        ledger.consume(token.budget_id, BudgetUsage(model_tokens=12, cost_usd=0.003))
+
+        ledger.halt(token.budget_id, reason="model_reservation_exceeded")
+
+        state = ledger.state(token.budget_id)
+        self.assertTrue(state.halted)
+        self.assertEqual(state.actual, BudgetUsage(model_tokens=12, cost_usd=0.003))
+        with self.assertRaisesRegex(BudgetExceededError, "budget is halted"):
+            ledger.reserve(token.budget_id, BudgetUsage(model_tokens=1))
+
 
 class S10PriceTableTests(unittest.TestCase):
     def test_signed_price_table_rollup_matches_exact_formula(self) -> None:

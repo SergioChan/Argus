@@ -66,6 +66,7 @@ COMPOSE_BUILD_TIMEOUT_S = 600
 M1_REFERENCE_RUNTIME_SERVICES = (
     "s8-writer",
     "s10-supervisor",
+    "s10-reference-model-provider",
     "s1-reference-demo",
     "s2-reference-builder",
     "s3-reference-referee",
@@ -160,6 +161,18 @@ def main() -> int:
             adapter_token=reference_service_tokens["m1-reference-s1"],
             read_token=auth_tokens["read"],
             broker_credential=runtime_secrets["s10_gw_spectrum_broker_credential"],
+        )
+        _battery_s10_model_broker(
+            evidence,
+            docker=docker,
+            compose_file=args.compose_file,
+            compose_env=env,
+            postgres_port=ports["ARGUS_M0_POSTGRES_PORT"],
+            s10_url=s10_url,
+            s8_url=s8_url,
+            model_token=auth_tokens["model"],
+            read_token=auth_tokens["read"],
+            broker_credential=runtime_secrets["s10_reference_model_broker_credential"],
         )
         _battery_s1_reference_physics_demo(
             evidence,
@@ -582,6 +595,7 @@ def _m0_runtime_secrets() -> dict[str, str]:
         "s10_price_table_signing_key": f"argus-s10-price-table-key-{uuid4().hex}",
         "s8_broker_write_key": f"argus-s8-broker-key-{uuid4().hex}",
         "s10_gw_spectrum_broker_credential": f"argus-s10-gw-broker-{uuid4().hex}",
+        "s10_reference_model_broker_credential": f"argus-s10-model-broker-{uuid4().hex}",
         "c3_verifier_signing_key": f"argus-c3-verifier-key-{uuid4().hex}",
         "s3_reference_referee_signing_key": f"argus-s3-reference-referee-key-{uuid4().hex}",
         "m1_pilot_console_access_token": f"argus-m1-pilot-access-{uuid4().hex}",
@@ -606,6 +620,21 @@ def _m0_identity_requests() -> dict[str, dict[str, Any]]:
                 "broker_audiences": ["store"],
                 "capabilities": ["s8.reproducibility.write"],
                 "producer_subsystems": ["S2"],
+                "sandbox_risk_class": "standard",
+            },
+        },
+        "model": {
+            "caller_id": "m0-model-broker",
+            "job_id": "m0-model-broker-job",
+            "root_request_id": "m0-model-broker-root",
+            "budget_caps": {
+                "max_compute_units": 10,
+                "max_model_tokens": 1000,
+                "max_wallclock_s": 30,
+                "max_cost_usd": 1,
+            },
+            "scopes": {
+                "broker_audiences": ["model"],
                 "sandbox_risk_class": "standard",
             },
         },
@@ -815,6 +844,9 @@ def _compose_environment(
         "ARGUS_S8_BROKER_WRITE_KEY": runtime_secrets["s8_broker_write_key"],
         "ARGUS_S10_GW_SPECTRUM_BROKER_CREDENTIAL": runtime_secrets[
             "s10_gw_spectrum_broker_credential"
+        ],
+        "ARGUS_S10_REFERENCE_MODEL_BROKER_CREDENTIAL": runtime_secrets[
+            "s10_reference_model_broker_credential"
         ],
         "ARGUS_S3_REFERENCE_REFEREE_SIGNER_SECRET": runtime_secrets["s3_reference_referee_signing_key"],
         "ARGUS_S1_REFERENCE_DEMO_ACCESS_TOKEN": reference_service_tokens["m1-reference-s1"],
@@ -1223,6 +1255,395 @@ print(json.dumps({
     )
     if broker_credential in json.dumps([tc14_detail, tc15_detail], sort_keys=True):
         raise AssertionError("broker credential leaked into S10-TC14/TC15 evidence")
+
+
+def _battery_s10_model_broker(
+    evidence: dict[str, Any],
+    *,
+    docker: str,
+    compose_file: str,
+    compose_env: dict[str, str],
+    postgres_port: str,
+    s10_url: str,
+    s8_url: str,
+    model_token: str,
+    read_token: str,
+    broker_credential: str,
+) -> None:
+    model_request = _s10_tc16_model_request(max_tokens=32)
+    direct_probe = _s10_model_provider_direct_probe(
+        docker=docker,
+        compose_file=compose_file,
+        compose_env=compose_env,
+        model_request=model_request,
+    )
+    if direct_probe.get("broker_credential_env_present") is not False:
+        raise AssertionError("model provider credential was exposed in the S1 runtime environment")
+    if direct_probe.get("s1_provider_reachable") is not False:
+        raise AssertionError(f"model provider remained directly reachable from S1: {direct_probe}")
+    if (
+        direct_probe.get("unauthorized_status") != 403
+        or direct_probe.get("unauthorized_error") != "broker_credential_required"
+    ):
+        raise AssertionError(f"model provider accepted a credentialless network-local call: {direct_probe}")
+
+    scope_token = _post_json(
+        f"{s10_url}/v1/scope-tokens",
+        {},
+        expected_status=201,
+        token=model_token,
+    )
+    budget_token = _post_json(
+        f"{s10_url}/v1/budget-tokens",
+        {},
+        expected_status=201,
+        token=model_token,
+    )
+    completed = _post_json(
+        f"{s10_url}/v1/broker/model/complete",
+        {
+            "scope_token": scope_token,
+            "budget_token": budget_token,
+            "request": model_request,
+        },
+        expected_status=200,
+        token=model_token,
+    )
+    usage = completed.get("usage")
+    if not isinstance(usage, dict):
+        raise AssertionError(f"brokered model call omitted usage: {completed}")
+    total_tokens = usage.get("total_tokens")
+    if (
+        not isinstance(total_tokens, int)
+        or total_tokens <= 0
+        or completed.get("tokens_used") != total_tokens
+        or total_tokens != usage.get("input_tokens", 0) + usage.get("output_tokens", 0)
+    ):
+        raise AssertionError(f"brokered model usage was not exact: {completed}")
+    provenance_ref = completed.get("provenance_ref")
+    if not isinstance(provenance_ref, str) or not provenance_ref.startswith("c4://"):
+        raise AssertionError(f"brokered model call omitted C4 provenance: {completed}")
+    encoded_ref = parse.quote(provenance_ref, safe="")
+    provenance_record = _get_json(
+        f"{s8_url}/v1/artifacts/{encoded_ref}/record",
+        token=read_token,
+    )
+    provenance_payload = _get_json(
+        f"{s8_url}/v1/artifacts/{encoded_ref}/payload",
+        token=read_token,
+    )
+    if provenance_record.get("kind") != "llm_call":
+        raise AssertionError(f"model provenance used the wrong artifact kind: {provenance_record}")
+    if provenance_record.get("producer", {}).get("subsystem") != "S10":
+        raise AssertionError(f"model provenance was not emitted by S10: {provenance_record}")
+    if provenance_payload.get("request") != model_request or provenance_payload.get("response") != completed.get(
+        "response"
+    ):
+        raise AssertionError("model provenance did not preserve the prompt and response")
+    if provenance_payload.get("usage") != usage:
+        raise AssertionError("model provenance usage disagrees with the broker response")
+
+    provider_after_complete = _s10_model_provider_health(
+        docker=docker,
+        compose_file=compose_file,
+        compose_env=compose_env,
+    )
+    completion_count = int(provider_after_complete.get("completion_requests", -1))
+    count_count = int(provider_after_complete.get("count_requests", -1))
+    if completion_count != 1 or count_count != 1:
+        raise AssertionError(f"model provider did not observe one count and one completion: {provider_after_complete}")
+
+    denied = _post_json(
+        f"{s10_url}/v1/broker/model/complete",
+        {
+            "scope_token": scope_token,
+            "budget_token": budget_token,
+            "request": _s10_tc16_model_request(max_tokens=1000),
+        },
+        expected_status=403,
+        token=model_token,
+    )
+    if denied.get("error") != "BudgetExceededError" or denied.get("budget_halted") is not True:
+        raise AssertionError(f"over-token model call did not halt the budget: {denied}")
+    provider_after_denial = _s10_model_provider_health(
+        docker=docker,
+        compose_file=compose_file,
+        compose_env=compose_env,
+    )
+    if int(provider_after_denial.get("completion_requests", -1)) != completion_count:
+        raise AssertionError("over-token model call reached the completion endpoint")
+    if int(provider_after_denial.get("count_requests", -1)) != count_count + 1:
+        raise AssertionError("over-token model call did not use the provider token-count preflight")
+
+    repeated = _post_json(
+        f"{s10_url}/v1/broker/model/complete",
+        {
+            "scope_token": scope_token,
+            "budget_token": budget_token,
+            "request": _s10_tc16_model_request(max_tokens=1),
+        },
+        expected_status=403,
+        token=model_token,
+    )
+    if repeated.get("error") != "BudgetExceededError" or repeated.get("budget_halted") is not True:
+        raise AssertionError(f"halted model budget admitted another call: {repeated}")
+    provider_after_repeated = _s10_model_provider_health(
+        docker=docker,
+        compose_file=compose_file,
+        compose_env=compose_env,
+    )
+    if provider_after_repeated != provider_after_denial:
+        raise AssertionError("already-halted budget reached the model provider")
+
+    quota_row = _s10_model_quota_state(
+        postgres_port=postgres_port,
+        budget_id=str(budget_token["budget_id"]),
+    )
+    if quota_row is None:
+        raise AssertionError("model broker budget was not persisted in Postgres")
+    caps, reserved, actual, halted = quota_row
+    if float(actual["model_tokens"]) != float(total_tokens):
+        raise AssertionError(f"persisted model-token debit disagrees with provider usage: {actual}")
+    if float(actual["model_tokens"]) > float(caps["max_model_tokens"]):
+        raise AssertionError(f"persisted model-token debit exceeded the cap: {actual}")
+    if float(reserved["model_tokens"]) != 0 or float(reserved["cost_usd"]) != 0:
+        raise AssertionError(f"model broker left a stale reservation: {reserved}")
+    if halted is not True:
+        raise AssertionError("over-token model call did not durably halt the budget")
+
+    service_logs = _run(
+        [
+            docker,
+            "compose",
+            "-f",
+            compose_file,
+            "logs",
+            "--no-color",
+            "s10-supervisor",
+            "s10-reference-model-provider",
+            "s1-reference-demo",
+        ],
+        env=compose_env,
+        timeout=30,
+    )
+    observed = json.dumps(
+        [
+            direct_probe,
+            completed,
+            provenance_record,
+            provenance_payload,
+            denied,
+            repeated,
+            provider_after_repeated,
+        ],
+        sort_keys=True,
+    )
+    if broker_credential in observed or broker_credential in service_logs.stdout or broker_credential in service_logs.stderr:
+        raise AssertionError("model provider credential leaked into evidence, API responses, or service logs")
+
+    detail = {
+        "route": "POST /v1/broker/model/complete",
+        "model_id": model_request["model"],
+        "direct_provider_reachable_from_s1": direct_probe["s1_provider_reachable"],
+        "provider_unauthorized_status": direct_probe["unauthorized_status"],
+        "provider_unauthorized_error": direct_probe["unauthorized_error"],
+        "broker_credential_env_present": direct_probe["broker_credential_env_present"],
+        "tokens_used": total_tokens,
+        "max_model_tokens": caps["max_model_tokens"],
+        "actual_model_tokens": actual["model_tokens"],
+        "actual_cost_usd": actual["cost_usd"],
+        "reserved_model_tokens": reserved["model_tokens"],
+        "budget_halted": halted,
+        "over_limit_error": denied["error"],
+        "over_limit_reached_completion": False,
+        "halted_repeat_reached_provider": False,
+        "provenance_ref": provenance_ref,
+        "provenance_kind": provenance_record["kind"],
+        "provenance_producer": provenance_record["producer"]["subsystem"],
+        "prompt_response_persisted": True,
+        "credential_absent_from_s1_responses_provenance_and_logs": True,
+    }
+    _record(
+        evidence,
+        "s10-tc16",
+        (
+            "S10-TC16 deployed model broker metered an Anthropic-compatible reference-provider call, "
+            "persisted provenance, and halted before an over-limit completion"
+        ),
+        detail,
+    )
+
+
+def _s10_model_quota_state(
+    *,
+    postgres_port: str,
+    budget_id: str,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], bool] | None:
+    import psycopg
+
+    dsn = f"postgresql://argus:argus-dev-password@127.0.0.1:{postgres_port}/argus"
+    with psycopg.connect(dsn) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT caps, reserved, actual, halted
+                FROM s10.quota_budget
+                WHERE budget_id = %s;
+                """,
+                (budget_id,),
+            )
+            return cur.fetchone()
+
+
+def _s10_model_provider_direct_probe(
+    *,
+    docker: str,
+    compose_file: str,
+    compose_env: dict[str, str],
+    model_request: dict[str, Any],
+) -> dict[str, Any]:
+    s1_probe_script = """\
+import json
+import os
+import urllib.request
+
+try:
+    urllib.request.urlopen("http://s10-reference-model-provider:8080/healthz", timeout=5).read()
+    reachable = True
+    failure = None
+except Exception as exc:
+    reachable = False
+    failure = type(exc).__name__
+print(json.dumps({
+    "broker_credential_env_present": "ARGUS_S10_REFERENCE_MODEL_BROKER_CREDENTIAL" in os.environ,
+    "s1_provider_reachable": reachable,
+    "s1_provider_error": failure,
+}, sort_keys=True))
+"""
+    s1_completed = _run(
+        [
+            docker,
+            "compose",
+            "-f",
+            compose_file,
+            "exec",
+            "-T",
+            "s1-reference-demo",
+            "python",
+            "-c",
+            s1_probe_script,
+        ],
+        env=compose_env,
+        timeout=30,
+    )
+    try:
+        result = json.loads(s1_completed.stdout)
+    except json.JSONDecodeError as exc:
+        raise AssertionError("S1 model-provider network probe did not return JSON") from exc
+    if not isinstance(result, dict):
+        raise AssertionError("S1 model-provider network probe did not return a JSON object")
+
+    unauthorized_probe_script = """\
+import json
+import sys
+import urllib.error
+import urllib.request
+
+payload = sys.argv[1].encode("utf-8")
+request = urllib.request.Request(
+    "http://s10-reference-model-provider:8080/v1/messages",
+    data=payload,
+    headers={"Content-Type": "application/json"},
+    method="POST",
+)
+try:
+    with urllib.request.urlopen(request, timeout=10) as response:
+        status = response.status
+        body = json.load(response)
+except urllib.error.HTTPError as exc:
+    status = exc.code
+    body = json.load(exc)
+health = json.load(urllib.request.urlopen("http://s10-reference-model-provider:8080/healthz", timeout=10))
+print(json.dumps({
+    "unauthorized_status": status,
+    "unauthorized_error": body.get("error"),
+    "provider_health": health,
+}, sort_keys=True))
+"""
+    unauthorized_completed = _run(
+        [
+            docker,
+            "compose",
+            "-f",
+            compose_file,
+            "exec",
+            "-T",
+            "s10-supervisor",
+            "python",
+            "-c",
+            unauthorized_probe_script,
+            json.dumps(model_request, separators=(",", ":"), sort_keys=True),
+        ],
+        env=compose_env,
+        timeout=30,
+    )
+    try:
+        unauthorized_result = json.loads(unauthorized_completed.stdout)
+    except json.JSONDecodeError as exc:
+        raise AssertionError("network-local unauthorized model-provider probe did not return JSON") from exc
+    if not isinstance(unauthorized_result, dict):
+        raise AssertionError("network-local unauthorized model-provider probe did not return a JSON object")
+    result.update(unauthorized_result)
+    return result
+
+
+def _s10_model_provider_health(
+    *,
+    docker: str,
+    compose_file: str,
+    compose_env: dict[str, str],
+) -> dict[str, Any]:
+    completed = _run(
+        [
+            docker,
+            "compose",
+            "-f",
+            compose_file,
+            "exec",
+            "-T",
+            "s10-supervisor",
+            "python",
+            "-c",
+            (
+                "import json,urllib.request; "
+                "print(json.dumps(json.load(urllib.request.urlopen("
+                "'http://s10-reference-model-provider:8080/healthz',timeout=10)),sort_keys=True))"
+            ),
+        ],
+        env=compose_env,
+        timeout=30,
+    )
+    try:
+        result = json.loads(completed.stdout)
+    except json.JSONDecodeError as exc:
+        raise AssertionError("model provider health probe did not return JSON") from exc
+    if not isinstance(result, dict):
+        raise AssertionError("model provider health probe did not return a JSON object")
+    return result
+
+
+def _s10_tc16_model_request(*, max_tokens: int) -> dict[str, Any]:
+    return {
+        "model": "argus-reference-model-v1",
+        "max_tokens": max_tokens,
+        "messages": [
+            {
+                "role": "user",
+                "content": "Explain why a model broker must meter tokens before releasing a completion.",
+            }
+        ],
+        "temperature": 0,
+    }
 
 
 def _s10_tc14_eval_request() -> dict[str, Any]:

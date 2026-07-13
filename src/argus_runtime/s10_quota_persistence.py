@@ -140,6 +140,31 @@ class PostgresQuotaLedger:
         if exceeded_error is not None:
             raise exceeded_error
 
+    def halt(self, budget_id: str, *, reason: str) -> None:
+        if not isinstance(reason, str) or not reason.strip():
+            raise ValueError("quota halt reason is required")
+        import psycopg
+
+        with psycopg.connect(self._dsn) as conn:
+            with conn.transaction():
+                with conn.cursor() as cur:
+                    state = self._fetch_state(cur, budget_id, lock=True)
+                    halted_state = QuotaState(
+                        caps=state.caps,
+                        reserved=state.reserved,
+                        actual=state.actual,
+                        halted=True,
+                    )
+                    cur.execute(
+                        """
+                        UPDATE s10.quota_budget
+                        SET halted = true, updated_at = now()
+                        WHERE budget_id = %s;
+                        """,
+                        (budget_id,),
+                    )
+                    self._insert_entry(cur, budget_id, "halt", BudgetUsage(), halted_state)
+
     def release(self, budget_id: str, usage: BudgetUsage | None = None) -> None:
         import psycopg
         from psycopg.types.json import Jsonb
