@@ -11,9 +11,9 @@ argus_fail() {
   exit 125
 }
 
-mount -t proc proc /proc || argus_fail mount-proc
-mount -t sysfs sysfs /sys || argus_fail mount-sysfs
-mount -t devtmpfs devtmpfs /dev || argus_fail mount-devtmpfs
+mountpoint -q /proc || mount -t proc proc /proc || argus_fail mount-proc
+mountpoint -q /sys || mount -t sysfs sysfs /sys || argus_fail mount-sysfs
+mountpoint -q /dev || mount -t devtmpfs devtmpfs /dev || argus_fail mount-devtmpfs
 
 mkdir -p /mnt/argus-input /mnt/scratch
 mount -t ext4 -o ro,nosuid,nodev,noexec /dev/vdb /mnt/argus-input || argus_fail mount-input

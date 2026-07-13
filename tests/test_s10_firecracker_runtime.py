@@ -469,6 +469,16 @@ class S10FirecrackerRuntimeTests(unittest.TestCase):
         self.assertNotIn("reboot", script)
         self.assertNotIn("ARGUS_FIRECRACKER_EXIT_CODE", script)
 
+    def test_guest_init_reuses_kernel_mounted_virtual_filesystems(self) -> None:
+        guest_init = (
+            Path(__file__).resolve().parents[1]
+            / "deploy/argus-m0/security/firecracker-guest-init.sh"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("mountpoint -q /proc || mount -t proc proc /proc", guest_init)
+        self.assertIn("mountpoint -q /sys || mount -t sysfs sysfs /sys", guest_init)
+        self.assertIn("mountpoint -q /dev || mount -t devtmpfs devtmpfs /dev", guest_init)
+
     def test_orchestrator_records_one_host_controlled_microvm_attestation(self) -> None:
         audit = InMemoryAuditLedger()
         orchestrator = DockerSandboxOrchestrator(
