@@ -1000,6 +1000,7 @@ class FirecrackerSandboxSupervisor:
     """Node-level Firecracker supervisor using the same-version production jailer."""
 
     _API_SOCKET_IN_JAIL = "/run/firecracker.socket"
+    _AF_UNIX_PATH_MAX_BYTES = 107
     _CGROUP_PARENT = "argus-firecracker"
 
     def __init__(
@@ -1202,6 +1203,7 @@ class FirecrackerSandboxSupervisor:
         self._verify_host_runtime()
         firecracker_version, jailer_version = self.verify_runtime_versions()
         jail_root = self._jail_root(str(spec["microvm_id"]))
+        self._validate_api_socket_path(str(spec["microvm_id"]))
         microvm_dir = jail_root.parent
         if microvm_dir.exists():
             raise SandboxRuntimeUnavailableError(f"Firecracker jail already exists: {microvm_dir}")
@@ -1298,6 +1300,18 @@ class FirecrackerSandboxSupervisor:
             / microvm_id
             / "root"
         )
+
+    def _api_socket_host_path(self, microvm_id: str) -> Path:
+        return self._jail_root(microvm_id) / self._API_SOCKET_IN_JAIL.lstrip("/")
+
+    def _validate_api_socket_path(self, microvm_id: str) -> None:
+        socket_path = self._api_socket_host_path(microvm_id)
+        path_bytes = len(os.fsencode(socket_path))
+        if path_bytes > self._AF_UNIX_PATH_MAX_BYTES:
+            raise SandboxRuntimeUnavailableError(
+                "Firecracker host API socket path exceeds the Linux AF_UNIX limit: "
+                f"{path_bytes} bytes > {self._AF_UNIX_PATH_MAX_BYTES}"
+            )
 
     def _launch_jailer(self, spec: Mapping[str, Any]) -> None:
         try:
@@ -1407,7 +1421,7 @@ class FirecrackerSandboxSupervisor:
 
     def _wait_for_jailer_ready(self, microvm_id: str, *, timeout_s: float) -> _FirecrackerProcessIdentity:
         jail_root = self._jail_root(microvm_id)
-        api_socket = jail_root / self._API_SOCKET_IN_JAIL.lstrip("/")
+        api_socket = self._api_socket_host_path(microvm_id)
         pid_file = jail_root / f"{Path(self._config.firecracker_bin).name}.pid"
         deadline = time.monotonic() + timeout_s
         last_error = "jailer resources not created"

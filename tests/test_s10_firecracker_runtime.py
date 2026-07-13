@@ -297,6 +297,21 @@ class S10FirecrackerRuntimeTests(unittest.TestCase):
         self.assertNotIn("--seccomp-filter", command)
         self.assertNotIn("--seccomp-level", command)
 
+    def test_rejects_overlong_host_api_socket_path_before_jailer_launch(self) -> None:
+        config = FirecrackerRuntimeConfig(
+            **{
+                **self.config.__dict__,
+                "chroot_base_dir": "/tmp/" + ("a" * 90),
+            }
+        )
+        supervisor = FirecrackerSandboxSupervisor(config=config)
+
+        with self.assertRaisesRegex(
+            SandboxRuntimeUnavailableError,
+            "host API socket path exceeds the Linux AF_UNIX limit",
+        ):
+            supervisor._validate_api_socket_path(self.handle.sandbox_id)
+
     def test_firecracker_api_attestation_rejects_network_or_drive_drift(self) -> None:
         supervisor = FirecrackerSandboxSupervisor(config=self.config)
         spec = supervisor.materialize_vm_spec(

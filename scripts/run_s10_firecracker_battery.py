@@ -98,15 +98,17 @@ def main() -> int:
             }
         )
 
-        with tempfile.TemporaryDirectory(prefix="argus-firecracker-battery-") as temp_dir_raw:
+        with (
+            tempfile.TemporaryDirectory(prefix="argus-firecracker-battery-") as temp_dir_raw,
+            tempfile.TemporaryDirectory(prefix="argus-fc-jailer-", dir="/tmp") as chroot_base_raw,
+        ):
             temp_dir = Path(temp_dir_raw)
             rootfs_path = _build_rootfs(squashfs_path, temp_dir)
             rootfs_sha256 = _sha256_file(rootfs_path)
             rootfs_hash = _blake3_file(rootfs_path)
             kernel_hash = _blake3_file(kernel_path)
             rootfs_image_ref = f"argus.local/firecracker-rootfs@sha256:{rootfs_sha256}"
-            chroot_base = temp_dir / "jailer"
-            chroot_base.mkdir(mode=0o700)
+            chroot_base = Path(chroot_base_raw)
 
             config = FirecrackerRuntimeConfig(
                 expected_version=FIRECRACKER_VERSION,
