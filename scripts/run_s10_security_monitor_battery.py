@@ -763,15 +763,7 @@ def _verify_forensic_artifacts(
                 raise AssertionError(f"scratch forensic bytes are incomplete: {payload}")
             summary.update({"archive_bytes": len(archive), "tar_members": member_names[:20]})
         else:
-            network_events = payload.get("events")
-            if (
-                payload.get("network_mode") != "none"
-                or not isinstance(network_events, list)
-                or len(network_events) != payload.get("event_count")
-                or hash_json(network_events) != payload.get("events_hash")
-            ):
-                raise AssertionError(f"network forensic evidence is invalid: {payload}")
-            summary["event_count"] = len(network_events)
+            summary.update(_verify_network_forensic_payload(payload))
         component_summaries.append(summary)
 
     audit_record, audit_payload = _read_c4_artifact(
@@ -840,6 +832,33 @@ def _verify_forensic_artifacts(
         "audit_event_count": len(events),
         "audit_event_types": event_types,
         "durable_record_ref": case["quarantine_record_ref"],
+    }
+
+
+def _verify_network_forensic_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
+    network_mode = payload.get("network_mode")
+    network_events = payload.get("events")
+    proxy_manifest_hash = (
+        network_mode.removeprefix("egress-proxy:")
+        if isinstance(network_mode, str) and network_mode.startswith("egress-proxy:")
+        else None
+    )
+    supported_mode = network_mode == "none" or (
+        proxy_manifest_hash is not None and _CONTENT_HASH.fullmatch(proxy_manifest_hash) is not None
+    )
+    if (
+        not supported_mode
+        or not isinstance(network_events, list)
+        or any(not isinstance(event, dict) for event in network_events)
+        or (network_mode == "none" and network_events)
+        or len(network_events) != payload.get("event_count")
+        or hash_json(network_events) != payload.get("events_hash")
+    ):
+        raise AssertionError(f"network forensic evidence is invalid: {payload}")
+    return {
+        "network_mode": network_mode,
+        "event_count": len(network_events),
+        "events_hash": payload["events_hash"],
     }
 
 

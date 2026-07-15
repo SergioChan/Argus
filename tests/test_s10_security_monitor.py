@@ -644,6 +644,42 @@ class SecurityMonitorBatteryEvidenceTests(unittest.TestCase):
             },
         )
 
+    def test_netlog_evidence_accepts_empty_attested_egress_proxy_capture(self) -> None:
+        manifest_hash = "blake3:" + "a" * 64
+        payload = {
+            "network_mode": f"egress-proxy:{manifest_hash}",
+            "event_count": 0,
+            "events_hash": self.battery.hash_json([]),
+            "events": [],
+        }
+
+        summary = self.battery._verify_network_forensic_payload(payload)
+
+        self.assertEqual(summary["network_mode"], f"egress-proxy:{manifest_hash}")
+        self.assertEqual(summary["event_count"], 0)
+
+    def test_netlog_evidence_rejects_unattested_mode_or_tampered_events(self) -> None:
+        valid = {
+            "network_mode": "none",
+            "event_count": 0,
+            "events_hash": self.battery.hash_json([]),
+            "events": [],
+        }
+        self.battery._verify_network_forensic_payload(valid)
+
+        for field, value in (
+            ("network_mode", "egress-proxy:latest"),
+            ("event_count", 1),
+            ("events_hash", "blake3:" + "0" * 64),
+        ):
+            invalid = copy.deepcopy(valid)
+            invalid[field] = value
+            with self.subTest(field=field), self.assertRaisesRegex(
+                AssertionError,
+                "network forensic evidence is invalid",
+            ):
+                self.battery._verify_network_forensic_payload(invalid)
+
     def test_attack_probe_programs_are_valid_python(self) -> None:
         compile(self.battery._trust_write_probe_program(), "<tc01>", "exec")
         compile(self.battery._escape_probe_program(165), "<tc20>", "exec")
