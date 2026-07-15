@@ -39,7 +39,15 @@ from argus_core import (
     hash_bytes,
     hash_json,
 )
-from argus_core.s8 import _assert_known_bucket_class, _assert_payload_matches_hash, _object_name
+from argus_core.s8 import (
+    _artifact_query_filter,
+    _assert_known_bucket_class,
+    _assert_payload_matches_hash,
+    _object_name,
+)
+
+
+_POSTGRES_QUERY_BATCH_SIZE = 1000
 
 
 class MinioObjectStore:
@@ -467,8 +475,11 @@ class PostgresArtifactStore:
         page_size: int | None = None,
         page_token: int | None = None,
     ) -> tuple[ArtifactRecord, ...]:
-        self.refresh()
-        return self._snapshot.query_artifacts(query, page_size=page_size, page_token=page_token)
+        return self.query_artifacts_page(
+            query,
+            page_size=page_size,
+            page_token=page_token,
+        ).records
 
     def query_artifacts_page(
         self,
@@ -477,8 +488,29 @@ class PostgresArtifactStore:
         page_size: int | None = None,
         page_token: int | None = None,
     ) -> ArtifactQueryPage:
-        self.refresh()
-        return self._snapshot.query_artifacts_page(query, page_size=page_size, page_token=page_token)
+        parsed_query = _artifact_query_filter(query)
+        offset = page_token or 0
+        if offset < 0:
+            raise ValueError("page_token must be non-negative")
+        if page_size is not None and page_size <= 0:
+            raise ValueError("page_size must be positive")
+
+        fetch_count = None if page_size is None else page_size + 1
+        payloads = self._query_artifact_metadata(
+            {key: value for key, value in asdict(parsed_query).items() if value is not None},
+            offset=offset,
+            limit=fetch_count,
+        )
+        if page_size is None:
+            page_payloads = payloads
+            next_page_token = None
+        else:
+            page_payloads = payloads[:page_size]
+            next_page_token = offset + page_size if len(payloads) > page_size else None
+        return ArtifactQueryPage(
+            records=tuple(self._record_from_query_payload(payload) for payload in page_payloads),
+            next_page_token=next_page_token,
+        )
 
     def get_reproducibility_manifest(self, artifact_ref: str) -> ReproducibilityManifest:
         self.refresh()
@@ -873,6 +905,37 @@ class PostgresArtifactStore:
                 )
                 return list(cur.fetchall())
 
+    def _query_artifact_metadata(
+        self,
+        query: dict[str, Any],
+        *,
+        offset: int,
+        limit: int | None,
+    ) -> list[dict[str, Any]]:
+        import psycopg
+        from psycopg.types.json import Jsonb
+
+        payloads: list[dict[str, Any]] = []
+        next_offset = offset
+        remaining = limit
+        while remaining is None or remaining > 0:
+            batch_size = _POSTGRES_QUERY_BATCH_SIZE if remaining is None else min(_POSTGRES_QUERY_BATCH_SIZE, remaining)
+            with psycopg.connect(self._dsn) as conn:
+                _set_role(conn, self._db_role)
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT record FROM s8.query_artifacts(%s::jsonb, %s, %s) AS query(record);",
+                        (Jsonb(query), batch_size, next_offset),
+                    )
+                    batch = [_jsonb_object(row[0]) for row in cur.fetchall()]
+            payloads.extend(batch)
+            if len(batch) < batch_size:
+                break
+            next_offset += len(batch)
+            if remaining is not None:
+                remaining -= len(batch)
+        return payloads
+
     def _fetch_audit_leaves(self) -> list[dict[str, Any]]:
         import psycopg
         from psycopg.rows import dict_row
@@ -963,6 +1026,25 @@ class PostgresArtifactStore:
             payload_bytes = self._object_store.get(str(row["content_hash"]))
             size_bytes = len(payload_bytes)
         return _record_from_row(row, size_bytes=int(size_bytes))
+
+    def _record_from_query_payload(self, payload: dict[str, Any]) -> ArtifactRecord:
+        artifact_ref = str(payload.get("artifact_ref") or payload.get("artifact_id") or "")
+        size_bytes = payload.get("size_bytes")
+        if size_bytes is None:
+            return self.get_artifact_record(artifact_ref)
+        return _record_from_row(
+            {
+                "artifact_id": artifact_ref,
+                "content_hash": payload["content_hash"],
+                "kind": payload["kind"],
+                "producer": payload["producer"],
+                "lineage": payload["lineage"],
+                "claim_tier": payload["claim_tier"],
+                "validation_report_ref": payload.get("validation_report_ref"),
+                "created_at": payload["created_at"],
+            },
+            size_bytes=int(size_bytes),
+        )
 
 
 def build_postgres_minio_store_from_env(env: dict[str, str]) -> PostgresArtifactStore:
@@ -1184,6 +1266,11 @@ def _record_from_row(row: dict[str, Any], *, size_bytes: int) -> ArtifactRecord:
     created_at = row["created_at"]
     if isinstance(created_at, datetime):
         created_at = created_at.astimezone(UTC).isoformat().replace("+00:00", "Z")
+    elif isinstance(created_at, str):
+        normalized_created_at = created_at[:-1] + "+00:00" if created_at.endswith("Z") else created_at
+        parsed_created_at = datetime.fromisoformat(normalized_created_at)
+        if parsed_created_at.tzinfo is not None:
+            created_at = parsed_created_at.astimezone(UTC).isoformat().replace("+00:00", "Z")
     lineage = dict(row["lineage"])
     lineage["input_refs"] = tuple(lineage.get("input_refs") or ())
     lineage["seeds"] = tuple(lineage.get("seeds") or ())

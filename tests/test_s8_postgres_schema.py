@@ -18,6 +18,7 @@ from argus_core import (
     AdapterBroker,
     AdapterDescriptor,
     ArtifactRecord,
+    ArtifactQueryFilter,
     DatasetRegistry,
     DatasetSplit,
     EvalRequest,
@@ -1383,6 +1384,59 @@ class S8PostgresSchemaTests(unittest.TestCase):
                 object_store=InMemoryObjectStore(),
                 db_role="argus_s8_ledger_writer",
             )
+
+    def test_postgres_store_queries_metadata_without_reading_object_payloads(self) -> None:
+        class ReadGuardObjectStore(InMemoryObjectStore):
+            def __init__(self) -> None:
+                super().__init__()
+                self.forbid_reads = False
+                self.read_count = 0
+
+            def get(self, content_hash: str) -> bytes:
+                self.read_count += 1
+                if self.forbid_reads:
+                    raise AssertionError("artifact metadata query read an object payload")
+                return super().get(content_hash)
+
+        object_store = ReadGuardObjectStore()
+        store = self._postgres_store(object_store=object_store)
+        records = tuple(
+            store.create_artifact(
+                artifact_ref=f"c4://query/spend-{index}",
+                kind="spend.final",
+                payload={"trial": index},
+                producer=Producer(subsystem="S10", version="0.0.0", job_id="query-job"),
+                lineage=Lineage(
+                    input_refs=(),
+                    code_ref="git:query",
+                    environment_digest="oci:query",
+                    job_id="query-job",
+                ),
+                created_at=f"2026-07-15T00:00:0{index}Z",
+            )
+            for index in (1, 2)
+        )
+        object_store.read_count = 0
+        object_store.forbid_reads = True
+
+        first_page = store.query_artifacts_page(
+            ArtifactQueryFilter(kind="spend.final", job_id="query-job"),
+            page_size=1,
+        )
+        second_page = store.query_artifacts_page(
+            {"kind": "spend.final", "job_id": "query-job"},
+            page_size=1,
+            page_token=first_page.next_page_token,
+        )
+        all_records = store.query_artifacts({"kind": "spend.final", "job_id": "query-job"})
+
+        self.assertEqual(first_page.records, (records[0],))
+        self.assertEqual(first_page.next_page_token, 1)
+        self.assertEqual(second_page.records, (records[1],))
+        self.assertIsNone(second_page.next_page_token)
+        self.assertEqual(all_records, records)
+        self.assertEqual([record.size_bytes for record in all_records], [11, 11])
+        self.assertEqual(object_store.read_count, 0)
 
     def test_postgres_store_serializes_concurrent_create_and_commit(self) -> None:
         store = self._postgres_store()
