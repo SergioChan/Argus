@@ -838,6 +838,39 @@ class SecurityMonitorBatteryEvidenceTests(unittest.TestCase):
             },
         )
 
+    def test_battery_prepares_real_cosign_trust_for_the_pipeline_image(self) -> None:
+        image = "sha256:" + "c" * 64
+        manifest = {
+            "entries": [{"image": image}],
+            "private_key_present": False,
+        }
+        compose_env: dict[str, str] = {}
+        with TemporaryDirectory(prefix="argus-s10-image-trust-") as temp_dir:
+            trust_root = Path(temp_dir) / "image-trust"
+            trust_root.mkdir()
+            with mock.patch.object(
+                self.battery,
+                "create_cosign_image_trust",
+                return_value=manifest,
+            ) as create_trust:
+                prepared = self.battery._prepare_cosign_image_trust(
+                    docker="docker",
+                    trust_root=trust_root,
+                    image=image,
+                    compose_env=compose_env,
+                )
+
+        create_trust.assert_called_once_with(
+            docker_bin="docker",
+            output_dir=trust_root,
+            images=(image,),
+        )
+        self.assertEqual(prepared, manifest)
+        self.assertEqual(
+            compose_env["ARGUS_S10_IMAGE_TRUST_SOURCE_ROOT"],
+            str(trust_root.resolve()),
+        )
+
     def test_supervisor_compose_mounts_dynamic_trust_root_read_only(self) -> None:
         compose = (ROOT / "deploy/argus-m0/compose.yaml").read_text(encoding="utf-8")
 

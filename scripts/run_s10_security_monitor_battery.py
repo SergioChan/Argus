@@ -32,6 +32,7 @@ from argus_core import hash_bytes, hash_json
 from argus_core.s10 import audit_event_hash
 from scripts import run_m0_spine_battery as m0_battery
 from scripts import run_s10_gvisor_battery as gvisor_battery
+from scripts.s10_cosign_fixture import create_cosign_image_trust
 
 
 TC01_JOB_ID = "s10-t17-tc01-job"
@@ -130,6 +131,7 @@ def main() -> int:
             temp_root = Path(temp_dir)
             verifier_dir = temp_root / "verifier"
             ledger_dir = temp_root / "ledger"
+            image_trust_root = temp_root / "image-trust"
             verifier_dir.mkdir()
             ledger_dir.mkdir()
             verifier_file = verifier_dir / "verify.py"
@@ -189,6 +191,12 @@ def main() -> int:
                     compose_file=compose_file,
                     env=compose_env,
                 )
+                image_trust = _prepare_cosign_image_trust(
+                    docker=docker,
+                    trust_root=image_trust_root,
+                    image=pipeline_image,
+                    compose_env=compose_env,
+                )
                 _compose(
                     docker,
                     compose_file,
@@ -241,6 +249,10 @@ def main() -> int:
                     or s10_health.get("forensic_spool") != "filesystem"
                     or s10_health.get("forensic_spool_pending") != 0
                     or s10_health.get("forensic_spool_pending_ids") != []
+                    or s10_health.get("image_verifier") != "cosign-private-infrastructure"
+                    or s10_health.get("image_verifier_version") != "v2.6.3"
+                    or s10_health.get("image_verifier_signer_key_id")
+                    != image_trust.get("signer_key_id")
                 ):
                     raise AssertionError(f"S10 forensic deployment is incomplete: {s10_health}")
                 monitor_health_before = _monitor_health(
@@ -258,6 +270,7 @@ def main() -> int:
                     "pager_url": pager_url,
                     "monitor_health_before": monitor_health_before,
                     "s10_health": s10_health,
+                    "image_trust": image_trust,
                 }
 
                 gvisor_evidence = _run_existing_gvisor_battery(
@@ -1631,6 +1644,38 @@ def _gvisor_trust_source_mount_environment(trust_root: Path) -> dict[str, str]:
         "ARGUS_S10_GVISOR_TRUST_SOURCE_ROOT": rendered_root,
         "ARGUS_S10_GVISOR_TRUST_SOURCE_ROOT_MOUNT_PATH": rendered_root,
     }
+
+
+def _prepare_cosign_image_trust(
+    *,
+    docker: str,
+    trust_root: Path,
+    image: str,
+    compose_env: dict[str, str],
+) -> dict[str, Any]:
+    manifest = create_cosign_image_trust(
+        docker_bin=docker,
+        output_dir=trust_root,
+        images=(image,),
+    )
+    entries = manifest.get("entries")
+    signed_images = {
+        str(entry.get("image"))
+        for entry in entries
+        if isinstance(entry, Mapping)
+    } if isinstance(entries, list) else set()
+    private_material = tuple(trust_root.rglob("*.key"))
+    if (
+        manifest.get("private_key_present") is not False
+        or signed_images != {image}
+        or private_material
+    ):
+        raise RuntimeError(
+            "S10 cosign trust preparation did not produce exactly one public-only signature "
+            f"for {image!r}"
+        )
+    compose_env["ARGUS_S10_IMAGE_TRUST_SOURCE_ROOT"] = str(trust_root.resolve(strict=True))
+    return manifest
 
 
 def _compose(
