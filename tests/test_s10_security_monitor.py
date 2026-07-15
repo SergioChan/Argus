@@ -562,6 +562,45 @@ class SecurityMonitorBatteryEvidenceTests(unittest.TestCase):
                 expected_container_digest=TC21_CONTAINER_DIGEST,
             )
 
+    def test_clean_tc21_launch_fits_the_signed_s2_compute_budget(self) -> None:
+        response = {
+            "handle": {"state": "SUCCEEDED"},
+            "exit_code": 0,
+            "partial_result": None,
+            "stderr": "",
+            "stdout": "{}\n",
+        }
+        with (
+            mock.patch.object(self.battery, "_launch", return_value=response) as launch,
+            mock.patch.object(self.battery, "_assert_clean_tc21_summary"),
+            mock.patch.object(self.battery, "_audit_events", return_value=[]),
+            mock.patch.object(
+                self.battery,
+                "_launch_provenance",
+                return_value={"artifact_ref": "c4://artifact/tc21-launch"},
+            ),
+            mock.patch.object(
+                self.battery.m0_battery,
+                "_battery_spend_final",
+                return_value={"cost_usd_exact": "0.1"},
+            ),
+        ):
+            self.battery._run_clean_tc21_case(
+                s10_url="http://s10.example",
+                s8_url="http://s8.example",
+                image=TC21_CONTAINER_DIGEST,
+                launch_token="tc21-token",
+                read_token="read-token",
+                audit_read_token="audit-token",
+                expected_profile_hash="blake3:" + "3" * 64,
+            )
+
+        envelope = launch.call_args.kwargs
+        caps = self.battery.m0_battery._m0_identity_requests()["m1-reference-s2"]["budget_caps"]
+        requested_compute = (envelope["cpu_m"] / 1000.0) * envelope["wallclock_s"]
+        self.assertLessEqual(requested_compute, caps["max_compute_units"])
+        self.assertLessEqual(envelope["wallclock_s"], caps["max_wallclock_s"])
+
     def test_attack_probe_programs_are_valid_python(self) -> None:
         compile(self.battery._trust_write_probe_program(), "<tc01>", "exec")
         compile(self.battery._escape_probe_program(165), "<tc20>", "exec")

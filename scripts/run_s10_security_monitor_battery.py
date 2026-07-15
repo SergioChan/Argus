@@ -451,6 +451,7 @@ def _run_clean_tc21_case(
             "--container-digest",
             image,
         ),
+        cpu_m=500,
         wallclock_s=20,
         mem_bytes=128 * 1024 * 1024,
         pids=128,
@@ -510,6 +511,7 @@ def _launch(
     image: str,
     entrypoint: tuple[str, ...],
     args: tuple[str, ...],
+    cpu_m: int = 1000,
     wallclock_s: int,
     mem_bytes: int,
     pids: int = 32,
@@ -547,6 +549,7 @@ def _launch(
     )
     body["requested_envelope"].update(
         {
+            "cpu_m": cpu_m,
             "mem_bytes": mem_bytes,
             "pids": pids,
             "scratch_bytes": scratch_bytes,
