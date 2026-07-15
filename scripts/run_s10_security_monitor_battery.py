@@ -1075,8 +1075,8 @@ def _run_shared_budget_tc22_case(
     )
     caps = dict(budget.get("caps") or {})
     if (
-        caps.get("max_compute_units") != 0.85
-        or caps.get("max_wallclock_s") != 17
+        caps.get("max_compute_units") != 5
+        or caps.get("max_wallclock_s") != 10
         or caps.get("max_cost_usd") != 1
     ):
         raise AssertionError(f"TC22 identity did not receive the bounded shared budget: {caps}")
@@ -1090,7 +1090,7 @@ def _run_shared_budget_tc22_case(
             budget=budget,
             scope=scope,
         )
-        expected_status = 201 if generation <= 2 else 403
+        expected_status = 201 if generation == 1 else 403
         response = m0_battery._post_sandbox_launch(
             s10_url,
             body,
@@ -1109,8 +1109,8 @@ def _run_shared_budget_tc22_case(
             raise AssertionError(f"TC22 generation {generation} emitted quarantine evidence")
         successful.append(response)
     if (
-        len(successful) != 2
-        or rejected_generation != 3
+        len(successful) != 1
+        or rejected_generation != 2
         or rejection is None
         or rejection.get("error") != "BudgetExceededError"
     ):
@@ -1122,7 +1122,7 @@ def _run_shared_budget_tc22_case(
     launched = [event for event in events if event.get("event_type") == "sandbox.launched"]
     rejects = [event for event in events if event.get("event_type") == "budget.reject"]
     spend_events = [event for event in events if event.get("event_type") == "spend.final"]
-    if len(launched) != 2 or len(rejects) != 1 or len(spend_events) != 2:
+    if len(launched) != 1 or len(rejects) != 1 or len(spend_events) != 1:
         raise AssertionError(f"TC22 audit attribution is incomplete: {events}")
     reject_sequence = int(rejects[0]["sequence"])
     if any(
@@ -1210,7 +1210,7 @@ def _tc22_generation_request(
         args=(
             "-c",
             (
-                "import json,time;time.sleep(3.5);"
+                "import json,time;time.sleep(0.5);"
                 f"print(json.dumps({{'generation':{generation},'status':'ok'}},sort_keys=True))"
             ),
         ),
@@ -1228,7 +1228,7 @@ def _tc22_generation_request(
     )
     body["requested_envelope"].update(
         {
-            "cpu_m": 50,
+            "cpu_m": 500,
             "mem_bytes": 128 * 1024 * 1024,
             "pids": 32,
             "scratch_bytes": 1024 * 1024,

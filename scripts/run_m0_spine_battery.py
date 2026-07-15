@@ -759,8 +759,8 @@ def _m0_identity_requests() -> dict[str, dict[str, Any]]:
             "job_id": "s10-t18-tc22-job",
             "root_request_id": "s10-t18-tc22-root",
             "budget_caps": {
-                "max_compute_units": 0.85,
-                "max_wallclock_s": 17,
+                "max_compute_units": 5,
+                "max_wallclock_s": 10,
                 "max_cost_usd": 1,
             },
             "scopes": {"sandbox_risk_class": "standard"},

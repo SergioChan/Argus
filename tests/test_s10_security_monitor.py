@@ -16,6 +16,8 @@ from unittest import mock
 
 from argus_core import (
     BudgetCaps,
+    BudgetExceededError,
+    BudgetToken,
     BudgetUsage,
     DockerSandboxOrchestrator,
     DockerSandboxSupervisor,
@@ -638,8 +640,8 @@ class SecurityMonitorBatteryEvidenceTests(unittest.TestCase):
         self.assertEqual(
             identity["budget_caps"],
             {
-                "max_compute_units": 0.85,
-                "max_wallclock_s": 17,
+                "max_compute_units": 5,
+                "max_wallclock_s": 10,
                 "max_cost_usd": 1,
             },
         )
@@ -663,14 +665,14 @@ class SecurityMonitorBatteryEvidenceTests(unittest.TestCase):
             request["args"],
             [
                 "-c",
-                "import json,time;time.sleep(3.5);"
+                "import json,time;time.sleep(0.5);"
                 "print(json.dumps({'generation':2,'status':'ok'},sort_keys=True))",
             ],
         )
         self.assertEqual(
             request["requested_envelope"],
             {
-                "cpu_m": 50,
+                "cpu_m": 500,
                 "mem_bytes": 128 * 1024 * 1024,
                 "gpu_count": 0,
                 "wallclock_s": 10,
@@ -680,7 +682,7 @@ class SecurityMonitorBatteryEvidenceTests(unittest.TestCase):
             },
         )
 
-    def test_tc22_budget_geometry_admits_two_measured_generations_then_rejects_three(self) -> None:
+    def test_tc22_shared_cap_admits_one_generation_then_rejects_any_positive_spend(self) -> None:
         identity = self.battery.m0_battery._m0_identity_requests()["s10-t18-tc22"]
         request = self.battery._tc22_generation_request(
             generation=1,
@@ -690,21 +692,40 @@ class SecurityMonitorBatteryEvidenceTests(unittest.TestCase):
         )
         caps = identity["budget_caps"]
         envelope = request["requested_envelope"]
-        workload_floor_s = 3.5
-        reservation_compute = (envelope["cpu_m"] / 1000.0) * envelope["wallclock_s"]
+        reservation = BudgetUsage(
+            compute_units=(envelope["cpu_m"] / 1000.0) * envelope["wallclock_s"],
+            wallclock_s=envelope["wallclock_s"],
+            cost_usd=envelope["estimated_cost_usd"],
+        )
+        token = BudgetToken(
+            budget_id="shared-budget",
+            job_id="s10-t18-tc22-job",
+            root_request_id="s10-t18-tc22-root",
+            budget_epoch=1,
+            caps=BudgetCaps(
+                max_compute_units=caps["max_compute_units"],
+                max_wallclock_s=caps["max_wallclock_s"],
+                max_cost_usd=caps["max_cost_usd"],
+            ),
+            risk_class="standard",
+            issued_at=0,
+            expires_at=60,
+            ttl_s=60,
+            parent_budget_id=None,
+            signer_key_id="test-key",
+            signature="test-signature",
+        )
+        ledger = InMemoryQuotaLedger()
+        ledger.register_budget(token)
+        ledger.reserve(token.budget_id, reservation)
+        ledger.consume(
+            token.budget_id,
+            BudgetUsage(compute_units=0.01, wallclock_s=0.02, cost_usd=0.0001),
+        )
+        ledger.release(token.budget_id, reservation)
 
-        # Two completed sleeps exceed the remaining capacity before a third reservation.
-        self.assertEqual(caps["max_wallclock_s"] - envelope["wallclock_s"], 7)
-        self.assertEqual(2 * workload_floor_s, 7)
-        self.assertAlmostEqual(caps["max_compute_units"] - reservation_compute, 0.35)
-        self.assertAlmostEqual(
-            2 * workload_floor_s * (envelope["cpu_m"] / 1000.0),
-            0.35,
-        )
-        self.assertGreaterEqual(
-            caps["max_wallclock_s"] - envelope["wallclock_s"] - workload_floor_s,
-            workload_floor_s,
-        )
+        with self.assertRaises(BudgetExceededError):
+            ledger.reserve(token.budget_id, reservation)
 
     def test_netlog_evidence_accepts_empty_attested_egress_proxy_capture(self) -> None:
         manifest_hash = "blake3:" + "a" * 64
