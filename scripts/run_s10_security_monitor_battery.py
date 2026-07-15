@@ -1084,37 +1084,11 @@ def _run_shared_budget_tc22_case(
     rejection: dict[str, Any] | None = None
     rejected_generation: int | None = None
     for generation in range(1, generation_cap + 1):
-        body = m0_battery._launch_request_json(
-            job_id=TC22_JOB_ID,
+        body = _tc22_generation_request(
+            generation=generation,
             image=image,
             budget=budget,
             scope=scope,
-            args=(
-                "-c",
-                (
-                    "import json,time;time.sleep(1.8);"
-                    f"print(json.dumps({{'generation':{generation},'status':'ok'}},sort_keys=True))"
-                ),
-            ),
-            env={},
-            env_allowlist=(),
-            wallclock_s=3,
-            estimated_cost_usd=0.01,
-        )
-        body.update(
-            {
-                "subagent_id": f"s10-t18-evolver-generation-{generation}",
-                "entrypoint": ["python"],
-                "runtime_class_hint": "gvisor",
-            }
-        )
-        body["requested_envelope"].update(
-            {
-                "cpu_m": 50,
-                "mem_bytes": 32 * 1024 * 1024,
-                "pids": 16,
-                "scratch_bytes": 1024 * 1024,
-            }
         )
         expected_status = 201 if generation <= 2 else 403
         response = m0_battery._post_sandbox_launch(
@@ -1217,6 +1191,50 @@ def _run_shared_budget_tc22_case(
         },
         "no_sandbox_after_cap": True,
     }
+
+
+def _tc22_generation_request(
+    *,
+    generation: int,
+    image: str,
+    budget: dict[str, Any],
+    scope: dict[str, Any],
+) -> dict[str, Any]:
+    if isinstance(generation, bool) or not isinstance(generation, int) or generation < 1:
+        raise ValueError("TC22 generation must be a positive integer")
+    body = m0_battery._launch_request_json(
+        job_id=TC22_JOB_ID,
+        image=image,
+        budget=budget,
+        scope=scope,
+        args=(
+            "-c",
+            (
+                "import json,time;time.sleep(1.8);"
+                f"print(json.dumps({{'generation':{generation},'status':'ok'}},sort_keys=True))"
+            ),
+        ),
+        env={},
+        env_allowlist=(),
+        wallclock_s=3,
+        estimated_cost_usd=0.01,
+    )
+    body.update(
+        {
+            "subagent_id": f"s10-t18-evolver-generation-{generation}",
+            "entrypoint": ["python"],
+            "runtime_class_hint": "gvisor",
+        }
+    )
+    body["requested_envelope"].update(
+        {
+            "cpu_m": 50,
+            "mem_bytes": 128 * 1024 * 1024,
+            "pids": 32,
+            "scratch_bytes": 1024 * 1024,
+        }
+    )
+    return body
 
 
 def _launch(

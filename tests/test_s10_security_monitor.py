@@ -644,6 +644,34 @@ class SecurityMonitorBatteryEvidenceTests(unittest.TestCase):
             },
         )
 
+    def test_tc22_generation_request_preserves_the_verified_gvisor_runtime_floor(self) -> None:
+        budget = {"budget_id": "shared-budget", "token": "budget-token"}
+        scope = {"scope_id": "shared-scope", "token": "scope-token"}
+
+        request = self.battery._tc22_generation_request(
+            generation=2,
+            image=TC21_CONTAINER_DIGEST,
+            budget=budget,
+            scope=scope,
+        )
+
+        self.assertIs(request["budget_token"], budget)
+        self.assertIs(request["scope_token"], scope)
+        self.assertEqual(request["runtime_class_hint"], "gvisor")
+        self.assertEqual(request["subagent_id"], "s10-t18-evolver-generation-2")
+        self.assertEqual(
+            request["requested_envelope"],
+            {
+                "cpu_m": 50,
+                "mem_bytes": 128 * 1024 * 1024,
+                "gpu_count": 0,
+                "wallclock_s": 3,
+                "scratch_bytes": 1024 * 1024,
+                "pids": 32,
+                "estimated_cost_usd": 0.01,
+            },
+        )
+
     def test_netlog_evidence_accepts_empty_attested_egress_proxy_capture(self) -> None:
         manifest_hash = "blake3:" + "a" * 64
         payload = {
