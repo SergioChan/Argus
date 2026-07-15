@@ -1725,25 +1725,27 @@ fn falco_stderr_indicates_degraded_sensor(engine: SensorEngine, line: &str) -> b
     let lower = line.to_ascii_lowercase();
     match engine {
         SensorEngine::ModernEbpf => {
-            (lower.contains("toctou")
-                && (lower.contains("not available")
-                    || lower.contains("failed")
-                    || lower.contains("unable")))
-                || (lower.contains("tracepoint")
-                    && (lower.contains("not available") || lower.contains("failed to attach")))
-                || lower.contains("unable to attach required")
+            let toctou_failure = lower.contains("toctou")
+                && ["not available", "failed", "failure", "unable"]
+                    .iter()
+                    .any(|marker| lower.contains(marker));
+            let tracepoint_failure = lower.contains("tracepoint")
+                && [
+                    "not available",
+                    "failed to attach",
+                    "failed to create",
+                    "failed to determine",
+                ]
+                .iter()
+                .any(|marker| lower.contains(marker));
+            toctou_failure || tracepoint_failure || lower.contains("unable to attach required")
         }
         SensorEngine::Gvisor => false,
     }
 }
 
-fn spawn_falco_modern(state: &Arc<SharedState>) -> Result<(), Box<dyn Error + Send + Sync>> {
-    let engine = SensorEngine::ModernEbpf;
-    let falco_bin = env::var("ARGUS_S10_FALCO_BIN").unwrap_or_else(|_| DEFAULT_FALCO_BIN.into());
-    let rules_path =
-        env::var("ARGUS_S10_FALCO_RULES_PATH").unwrap_or_else(|_| DEFAULT_RULES_PATH.into());
-    let mut command = Command::new(&falco_bin);
-    command.args([
+fn falco_modern_args(rules_path: &str) -> Vec<&str> {
+    vec![
         "-U",
         "-o",
         "json_output=true",
@@ -1753,10 +1755,24 @@ fn spawn_falco_modern(state: &Arc<SharedState>) -> Result<(), Box<dyn Error + Se
         "file_output.enabled=false",
         "-o",
         "syslog_output.enabled=false",
+        "-o",
+        "webserver.enabled=false",
+        "-o",
+        "base_syscalls.all=true",
         "-r",
-        &rules_path,
-    ]);
-    command.args(["-o", "engine.kind=modern_ebpf"]);
+        rules_path,
+        "-o",
+        "engine.kind=modern_ebpf",
+    ]
+}
+
+fn spawn_falco_modern(state: &Arc<SharedState>) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let engine = SensorEngine::ModernEbpf;
+    let falco_bin = env::var("ARGUS_S10_FALCO_BIN").unwrap_or_else(|_| DEFAULT_FALCO_BIN.into());
+    let rules_path =
+        env::var("ARGUS_S10_FALCO_RULES_PATH").unwrap_or_else(|_| DEFAULT_RULES_PATH.into());
+    let mut command = Command::new(&falco_bin);
+    command.args(falco_modern_args(&rules_path));
     let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -2444,10 +2460,29 @@ mod tests {
             SensorEngine::ModernEbpf,
             "TOCTOU mitigation tracepoint is not available"
         ));
+        assert!(falco_stderr_indicates_degraded_sensor(
+            SensorEngine::ModernEbpf,
+            "libpman: failure while attaching TOCTOU mitigation program for 'openat' system call"
+        ));
+        assert!(falco_stderr_indicates_degraded_sensor(
+            SensorEngine::ModernEbpf,
+            "libbpf: prog 'openat_e': failed to create tracepoint 'syscalls/sys_enter_openat' perf event"
+        ));
         assert!(!falco_stderr_indicates_degraded_sensor(
             SensorEngine::ModernEbpf,
             "Falco initialized with modern eBPF probe"
         ));
+    }
+
+    #[test]
+    fn falco_command_owns_no_http_port_and_captures_ignored_write_syscalls() {
+        let arguments = falco_modern_args("/etc/falco/argus_rules.yaml");
+        assert!(arguments
+            .windows(2)
+            .any(|pair| pair == ["-o", "webserver.enabled=false"]));
+        assert!(arguments
+            .windows(2)
+            .any(|pair| pair == ["-o", "base_syscalls.all=true"]));
     }
 
     #[test]

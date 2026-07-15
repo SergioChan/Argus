@@ -12,6 +12,7 @@ import sys
 import threading
 from tempfile import TemporaryDirectory
 import unittest
+from unittest import mock
 
 from argus_core import (
     BudgetCaps,
@@ -584,6 +585,42 @@ class SecurityMonitorBatteryEvidenceTests(unittest.TestCase):
                 self.battery._assert_runsc_runtime_config(
                     {"runtimeArgs": [argument for argument in required_args if argument != missing]}
                 )
+
+    def test_compose_startup_failure_includes_monitor_diagnostics(self) -> None:
+        calls: list[list[str]] = []
+
+        def fake_run(command: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+            calls.append(command)
+            if len(calls) == 1:
+                raise RuntimeError("compose startup failed")
+            output = (
+                '{"Service":"s10-security-monitor","State":"exited"}'
+                if "ps" in command
+                else "monitor stderr: address already in use"
+            )
+            return subprocess.CompletedProcess(command, 0, stdout=output, stderr="")
+
+        with mock.patch.object(self.battery.m0_battery, "_run", side_effect=fake_run):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "monitor stderr: address already in use",
+            ) as raised:
+                self.battery._compose(
+                    "docker",
+                    "compose.yaml",
+                    {"COMPOSE_PROJECT_NAME": "argus-s10-test"},
+                    "up",
+                    "-d",
+                    "--wait",
+                    "s10-security-monitor",
+                    timeout=240,
+                    diagnostic_services=("s10-security-monitor",),
+                )
+
+        self.assertIn('"State":"exited"', str(raised.exception))
+        self.assertEqual(len(calls), 3)
+        self.assertIn("ps", calls[1])
+        self.assertIn("logs", calls[2])
 
 
 class HttpSecurityMonitorClientTests(unittest.TestCase):

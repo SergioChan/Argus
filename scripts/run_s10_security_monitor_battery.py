@@ -184,6 +184,7 @@ def main() -> int:
                     "--wait",
                     "s10-security-monitor",
                     timeout=240,
+                    diagnostic_services=("s10-security-monitor",),
                 )
                 _compose(
                     docker,
@@ -838,12 +839,56 @@ def _compose(
     compose_env: dict[str, str],
     *args: str,
     timeout: int,
+    diagnostic_services: tuple[str, ...] = (),
 ) -> None:
-    m0_battery._run(
-        [docker, "compose", "-f", compose_file, "--profile", "host-security", *args],
-        env=compose_env,
-        timeout=timeout,
+    command = [docker, "compose", "-f", compose_file, "--profile", "host-security", *args]
+    try:
+        m0_battery._run(command, env=compose_env, timeout=timeout)
+    except RuntimeError as error:
+        if not diagnostic_services:
+            raise
+        diagnostics = _compose_startup_diagnostics(
+            docker=docker,
+            compose_file=compose_file,
+            compose_env=compose_env,
+            services=diagnostic_services,
+        )
+        raise RuntimeError(f"{error}\n\nS10 compose startup diagnostics:\n{diagnostics}") from error
+
+
+def _compose_startup_diagnostics(
+    *,
+    docker: str,
+    compose_file: str,
+    compose_env: dict[str, str],
+    services: tuple[str, ...],
+) -> str:
+    base = [docker, "compose", "-f", compose_file, "--profile", "host-security"]
+    commands = (
+        ("compose ps", [*base, "ps", "--all", "--format", "json"]),
+        (
+            "compose logs",
+            [*base, "logs", "--no-color", "--timestamps", "--tail", "200", *services],
+        ),
     )
+    sections: list[str] = []
+    for label, command in commands:
+        try:
+            completed = m0_battery._run(
+                command,
+                env=compose_env,
+                timeout=60,
+                check=False,
+            )
+            output = "\n".join(
+                part.strip()
+                for part in (completed.stdout or "", completed.stderr or "")
+                if part.strip()
+            )
+        except Exception as error:  # noqa: BLE001 - diagnostics must not hide the primary failure.
+            output = f"diagnostic command failed: {type(error).__name__}: {error}"
+        sections.append(f"[{label}]\n{output[:32768] or '<no output>'}")
+    return "\n".join(sections)
 
 
 def _compose_down(*, docker: str, compose_file: str, compose_env: dict[str, str]) -> None:
