@@ -1075,8 +1075,8 @@ def _run_shared_budget_tc22_case(
     )
     caps = dict(budget.get("caps") or {})
     if (
-        caps.get("max_compute_units") != 0.31
-        or caps.get("max_wallclock_s") != 6.2
+        caps.get("max_compute_units") != 0.85
+        or caps.get("max_wallclock_s") != 17
         or caps.get("max_cost_usd") != 1
     ):
         raise AssertionError(f"TC22 identity did not receive the bounded shared budget: {caps}")
@@ -1210,13 +1210,13 @@ def _tc22_generation_request(
         args=(
             "-c",
             (
-                "import json,time;time.sleep(1.8);"
+                "import json,time;time.sleep(3.5);"
                 f"print(json.dumps({{'generation':{generation},'status':'ok'}},sort_keys=True))"
             ),
         ),
         env={},
         env_allowlist=(),
-        wallclock_s=3,
+        wallclock_s=10,
         estimated_cost_usd=0.01,
     )
     body.update(

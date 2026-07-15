@@ -638,8 +638,8 @@ class SecurityMonitorBatteryEvidenceTests(unittest.TestCase):
         self.assertEqual(
             identity["budget_caps"],
             {
-                "max_compute_units": 0.31,
-                "max_wallclock_s": 6.2,
+                "max_compute_units": 0.85,
+                "max_wallclock_s": 17,
                 "max_cost_usd": 1,
             },
         )
@@ -660,16 +660,50 @@ class SecurityMonitorBatteryEvidenceTests(unittest.TestCase):
         self.assertEqual(request["runtime_class_hint"], "gvisor")
         self.assertEqual(request["subagent_id"], "s10-t18-evolver-generation-2")
         self.assertEqual(
+            request["args"],
+            [
+                "-c",
+                "import json,time;time.sleep(3.5);"
+                "print(json.dumps({'generation':2,'status':'ok'},sort_keys=True))",
+            ],
+        )
+        self.assertEqual(
             request["requested_envelope"],
             {
                 "cpu_m": 50,
                 "mem_bytes": 128 * 1024 * 1024,
                 "gpu_count": 0,
-                "wallclock_s": 3,
+                "wallclock_s": 10,
                 "scratch_bytes": 1024 * 1024,
                 "pids": 32,
                 "estimated_cost_usd": 0.01,
             },
+        )
+
+    def test_tc22_budget_geometry_admits_two_measured_generations_then_rejects_three(self) -> None:
+        identity = self.battery.m0_battery._m0_identity_requests()["s10-t18-tc22"]
+        request = self.battery._tc22_generation_request(
+            generation=1,
+            image=TC21_CONTAINER_DIGEST,
+            budget={"budget_id": "shared-budget", "token": "budget-token"},
+            scope={"scope_id": "shared-scope", "token": "scope-token"},
+        )
+        caps = identity["budget_caps"]
+        envelope = request["requested_envelope"]
+        workload_floor_s = 3.5
+        reservation_compute = (envelope["cpu_m"] / 1000.0) * envelope["wallclock_s"]
+
+        # Two completed sleeps exceed the remaining capacity before a third reservation.
+        self.assertEqual(caps["max_wallclock_s"] - envelope["wallclock_s"], 7)
+        self.assertEqual(2 * workload_floor_s, 7)
+        self.assertAlmostEqual(caps["max_compute_units"] - reservation_compute, 0.35)
+        self.assertAlmostEqual(
+            2 * workload_floor_s * (envelope["cpu_m"] / 1000.0),
+            0.35,
+        )
+        self.assertGreaterEqual(
+            caps["max_wallclock_s"] - envelope["wallclock_s"] - workload_floor_s,
+            workload_floor_s,
         )
 
     def test_netlog_evidence_accepts_empty_attested_egress_proxy_capture(self) -> None:
