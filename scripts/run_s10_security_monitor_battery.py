@@ -128,6 +128,7 @@ def main() -> int:
                 ports=ports,
                 now=int(time.time()),
             )
+            compose_env.update(_gvisor_trust_source_mount_environment(temp_root))
             monitor_token = f"argus-s10-monitor-{uuid4().hex}"
             compose_env.update(
                 {
@@ -830,6 +831,25 @@ def _compose_ports() -> dict[str, str]:
         "ARGUS_M0_S1_DEMO_PORT": str(m0_battery._free_port()),
         "ARGUS_M0_S2_REFERENCE_BUILDER_PORT": str(m0_battery._free_port()),
         "ARGUS_M0_S3_REFERENCE_REFEREE_PORT": str(m0_battery._free_port()),
+    }
+
+
+def _gvisor_trust_source_mount_environment(trust_root: Path) -> dict[str, str]:
+    try:
+        resolved_root = trust_root.resolve(strict=True)
+    except FileNotFoundError as error:
+        raise RuntimeError(
+            f"gVisor trust source root does not exist: {trust_root}"
+        ) from error
+    if not resolved_root.is_dir():
+        raise RuntimeError(
+            f"gVisor trust source root is not a directory: {resolved_root}"
+        )
+
+    rendered_root = str(resolved_root)
+    return {
+        "ARGUS_S10_GVISOR_TRUST_SOURCE_ROOT": rendered_root,
+        "ARGUS_S10_GVISOR_TRUST_SOURCE_ROOT_MOUNT_PATH": rendered_root,
     }
 
 

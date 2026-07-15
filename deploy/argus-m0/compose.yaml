@@ -214,6 +214,10 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
       - s10-token-state:/var/lib/argus/s10
       - ./security/argus-gvisor-seccomp.json:/etc/argus/s10/argus-gvisor-seccomp.json:ro
+      - type: bind
+        source: ${ARGUS_S10_GVISOR_TRUST_SOURCE_ROOT:-./security}
+        target: ${ARGUS_S10_GVISOR_TRUST_SOURCE_ROOT_MOUNT_PATH:-/var/lib/argus/s10/trust-sources}
+        read_only: true
     depends_on:
       postgres:
         condition: service_healthy

@@ -3417,6 +3417,7 @@ class ArgusM0ComposeTests(unittest.TestCase):
             [
                 "/etc/argus/s10/argus-gvisor-seccomp.json",
                 "/var/lib/argus/s10",
+                "/var/lib/argus/s10/trust-sources",
                 "/var/run/docker.sock",
             ],
         )
@@ -3428,6 +3429,14 @@ class ArgusM0ComposeTests(unittest.TestCase):
         )
         self.assertTrue(profile_mount["read_only"])
         self.assertTrue(profile_mount["source"].endswith("/deploy/argus-m0/security/argus-gvisor-seccomp.json"))
+        trust_source_mount = next(
+            volume
+            for volume in s10_volumes
+            if volume["target"] == "/var/lib/argus/s10/trust-sources"
+        )
+        self.assertEqual(trust_source_mount["type"], "bind")
+        self.assertTrue(trust_source_mount["read_only"])
+        self.assertTrue(trust_source_mount["source"].endswith("/deploy/argus-m0/security"))
         self.assertEqual(
             services["s10-supervisor"]["environment"]["ARGUS_S10_DEFAULT_RUNTIME_CLASS"],
             "docker",

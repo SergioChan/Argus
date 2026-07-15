@@ -622,6 +622,33 @@ class SecurityMonitorBatteryEvidenceTests(unittest.TestCase):
         self.assertIn("ps", calls[1])
         self.assertIn("logs", calls[2])
 
+    def test_battery_projects_dynamic_trust_root_at_identical_path(self) -> None:
+        with TemporaryDirectory(prefix="argus-s10-trust-root-") as temp_dir:
+            trust_root = Path(temp_dir)
+            environment = self.battery._gvisor_trust_source_mount_environment(trust_root)
+
+        expected_path = str(trust_root.resolve())
+        self.assertEqual(
+            environment,
+            {
+                "ARGUS_S10_GVISOR_TRUST_SOURCE_ROOT": expected_path,
+                "ARGUS_S10_GVISOR_TRUST_SOURCE_ROOT_MOUNT_PATH": expected_path,
+            },
+        )
+
+    def test_supervisor_compose_mounts_dynamic_trust_root_read_only(self) -> None:
+        compose = (ROOT / "deploy/argus-m0/compose.yaml").read_text(encoding="utf-8")
+
+        self.assertIn(
+            "source: ${ARGUS_S10_GVISOR_TRUST_SOURCE_ROOT:-./security}",
+            compose,
+        )
+        self.assertIn(
+            "target: ${ARGUS_S10_GVISOR_TRUST_SOURCE_ROOT_MOUNT_PATH:-/var/lib/argus/s10/trust-sources}",
+            compose,
+        )
+        self.assertIn("read_only: true", compose)
+
 
 class HttpSecurityMonitorClientTests(unittest.TestCase):
     def setUp(self) -> None:
