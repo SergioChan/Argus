@@ -103,6 +103,37 @@ services:
       timeout: 3s
       retries: 20
 
+  s10-security-monitor:
+    profiles: ["host-security"]
+    build:
+      context: ../..
+      dockerfile: deploy/argus-m0/security/s10-security-monitor.Dockerfile
+    privileged: true
+    pid: host
+    networks:
+      - argus-services
+    environment:
+      ARGUS_S10_SECURITY_MONITOR_AUTH_TOKEN: ${ARGUS_S10_SECURITY_MONITOR_AUTH_TOKEN:-}
+      ARGUS_S10_GVISOR_SOCKET_PATH: /run/argus-gvisor/events.sock
+      ARGUS_S10_GVISOR_LOG_ROOT: /host/var/log/argus-runsc
+    volumes:
+      - /var/run/docker.sock:/host/var/run/docker.sock:ro
+      - /proc:/host/proc:ro
+      - /boot:/host/boot:ro
+      - /lib/modules:/host/lib/modules:ro
+      - /usr:/host/usr:ro
+      - /etc:/host/etc:ro
+      - /sys/kernel/debug:/sys/kernel/debug:ro
+      - /sys/kernel/tracing:/sys/kernel/tracing:ro
+      - /run/argus-gvisor:/run/argus-gvisor
+      - /var/log/argus-runsc:/host/var/log/argus-runsc:ro
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/argus-s10-security-monitor", "healthcheck"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    stop_grace_period: 5s
+
   s10-supervisor:
     build:
       context: ../..
@@ -155,6 +186,10 @@ services:
       ARGUS_S10_GVISOR_KUBERNETES_RUNTIME_CLASS: ${ARGUS_S10_GVISOR_KUBERNETES_RUNTIME_CLASS:-gvisor}
       ARGUS_S10_GVISOR_KUBERNETES_SECCOMP_PROFILE: ${ARGUS_S10_GVISOR_KUBERNETES_SECCOMP_PROFILE:-argus/argus-gvisor-seccomp.json}
       ARGUS_S10_GVISOR_TRUST_MOUNTS_JSON: ${ARGUS_S10_GVISOR_TRUST_MOUNTS_JSON:-}
+      ARGUS_S10_SECURITY_MONITOR_URL: ${ARGUS_S10_SECURITY_MONITOR_URL:-}
+      ARGUS_S10_SECURITY_MONITOR_AUTH_TOKEN: ${ARGUS_S10_SECURITY_MONITOR_AUTH_TOKEN:-}
+      ARGUS_S10_ALLOW_INSECURE_SECURITY_MONITOR: ${ARGUS_S10_ALLOW_INSECURE_SECURITY_MONITOR:-0}
+      ARGUS_S10_SECURITY_MONITOR_TIMEOUT_S: ${ARGUS_S10_SECURITY_MONITOR_TIMEOUT_S:-1.0}
       ARGUS_S10_EGRESS_SIDECAR_IMAGE: ${ARGUS_S10_EGRESS_SIDECAR_IMAGE:-}
       ARGUS_S10_EGRESS_NETWORK_MODE: ${ARGUS_S10_EGRESS_NETWORK_MODE:-bridge}
       ARGUS_S10_EGRESS_LISTEN_PORT: ${ARGUS_S10_EGRESS_LISTEN_PORT:-15001}

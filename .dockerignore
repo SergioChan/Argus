@@ -1,0 +1,6 @@
+.git
+.commons
+**/__pycache__
+**/*.pyc
+bindings/rust/target
+bindings/typescript/node_modules

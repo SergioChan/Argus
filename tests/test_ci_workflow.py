@@ -29,12 +29,23 @@ class CIWorkflowEvidenceTests(unittest.TestCase):
         self.assertIn("  gvisor-security:\n", self.workflow)
         self.assertIn('GVISOR_RELEASE: "20260706"', self.workflow)
         self.assertIn("runsc.sha512", self.workflow)
-        self.assertIn("runsc install --runtime runsc-argus -- --oci-seccomp", self.workflow)
+        self.assertIn("scripts/generate_s10_gvisor_monitor_config.py", self.workflow)
+        self.assertIn("/etc/argus/s10/gvisor-monitor-pod-init.json", self.workflow)
+        self.assertIn("--pod-init-config=/etc/argus/s10/gvisor-monitor-pod-init.json", self.workflow)
+        self.assertIn("--debug-command=boot", self.workflow)
+        self.assertIn("--debug-log=/var/log/argus-runsc/%ID%/gvisor.%COMMAND%.json", self.workflow)
+        self.assertIn("--debug-log-format=json", self.workflow)
         self.assertIn(
-            'python3 scripts/run_s10_gvisor_battery.py --evidence-file "$RUNNER_TEMP/s10-gvisor-evidence.json"',
+            'python3 scripts/run_s10_security_monitor_battery.py',
+            self.workflow,
+        )
+        self.assertIn('--gvisor-evidence-file "$RUNNER_TEMP/s10-gvisor-evidence.json"', self.workflow)
+        self.assertIn(
+            '--evidence-file "$RUNNER_TEMP/s10-security-monitor-evidence.json"',
             self.workflow,
         )
         self.assertIn("name: s10-gvisor-evidence", self.workflow)
+        self.assertIn("${{ runner.temp }}/s10-security-monitor-evidence.json", self.workflow)
         self.assertNotIn("ARGUS_REQUIRE_GVISOR_TESTS", self.workflow)
 
     def test_real_firecracker_job_is_pinned_unskippable_and_uploads_evidence(self) -> None:

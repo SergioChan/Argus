@@ -2953,9 +2953,12 @@ def render_rust_manifest() -> str:
             'chrono = { version = "0.4", features = ["serde"] }',
             'hmac = "0.13"',
             'postgres = { version = "0.19", features = ["with-chrono-0_4", "with-serde_json-1"] }',
+            'prost = "0.14.4"',
             'serde = { version = "1", features = ["derive"] }',
             'serde_json = { version = "1", features = ["float_roundtrip"] }',
             'sha2 = "0.11"',
+            'socket2 = { version = "0.6.5", features = ["all"] }',
+            'tiny_http = "0.12"',
             "",
             "[[bin]]",
             'name = "argus-s8-ledger-writer"',
@@ -2968,6 +2971,10 @@ def render_rust_manifest() -> str:
             "[[bin]]",
             'name = "argus-s10-audit-ledger-writer"',
             'path = "src/bin/s10_audit_ledger_writer.rs"',
+            "",
+            "[[bin]]",
+            'name = "argus-s10-security-monitor"',
+            'path = "src/bin/s10_security_monitor.rs"',
             "",
         ]
     )

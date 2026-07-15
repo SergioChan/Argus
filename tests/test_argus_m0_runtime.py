@@ -3462,6 +3462,17 @@ class ArgusM0ComposeTests(unittest.TestCase):
         self.assertIn("--bin argus-s10-audit-ledger-writer", dockerfile)
         self.assertIn("/usr/local/bin/argus-s10-audit-ledger-writer", dockerfile)
 
+    def test_root_docker_context_excludes_local_build_artifacts(self) -> None:
+        patterns = {
+            line.strip()
+            for line in Path(".dockerignore").read_text(encoding="utf-8").splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        }
+
+        self.assertTrue(
+            {".git", "bindings/rust/target", "bindings/typescript/node_modules"}.issubset(patterns)
+        )
+
     def _skip_or_fail(self, reason: str) -> None:
         if os.environ.get("ARGUS_REQUIRE_DOCKER_TESTS") == "1":
             raise AssertionError(reason)

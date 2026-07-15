@@ -80,6 +80,7 @@ from .auth import (
 )
 from .http_json import JsonHttpApp, JsonRequest, serve_json_app
 from .s10_audit_persistence import PostgresAuditLedger
+from .s10_security_monitor_client import HttpSecurityMonitorClient
 
 
 class AdapterBrokerUpstreamError(RuntimeError):
@@ -973,6 +974,7 @@ class S10SupervisorApp:
                     self._docker_supervisor.firecracker_resource_meter_kind or "unconfigured"
                 ),
                 "egress_sidecar_configured": self._docker_supervisor.egress_sidecar_configured,
+                "security_monitor_configured": self._docker_supervisor.security_monitor_configured,
                 "secrets_broker_configured": bool(self._adapter_targets),
                 "adapter_broker_targets": sorted(self._adapter_targets),
                 "model_broker_configured": bool(self._model_targets),
@@ -1679,6 +1681,7 @@ def _token_revocation_store_from_env() -> FileTokenRevocationStore | None:
 def _docker_supervisor_from_env() -> DockerSandboxSupervisor:
     meter_interval_s = _positive_float_env("ARGUS_S10_METER_INTERVAL_S", 1.0)
     firecracker_config = _firecracker_runtime_config_from_env()
+    security_monitor = _security_monitor_from_env()
     return DockerSandboxSupervisor(
         meter_interval_s=meter_interval_s,
         meter_gap_halt_s=_positive_float_env("ARGUS_S10_METER_GAP_HALT_S", 5.0),
@@ -1689,7 +1692,34 @@ def _docker_supervisor_from_env() -> DockerSandboxSupervisor:
             else None
         ),
         egress_sidecar_config=_egress_sidecar_runtime_config_from_env(),
+        security_monitor=security_monitor,
     )
+
+
+def _security_monitor_from_env() -> HttpSecurityMonitorClient | None:
+    endpoint_url = os.environ.get("ARGUS_S10_SECURITY_MONITOR_URL")
+    auth_token = os.environ.get("ARGUS_S10_SECURITY_MONITOR_AUTH_TOKEN")
+    if not endpoint_url and not auth_token:
+        return None
+    if not endpoint_url or not auth_token:
+        raise RuntimeError(
+            "ARGUS_S10_SECURITY_MONITOR_URL and ARGUS_S10_SECURITY_MONITOR_AUTH_TOKEN "
+            "must be configured together"
+        )
+    allow_insecure = os.environ.get("ARGUS_S10_ALLOW_INSECURE_SECURITY_MONITOR", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    client = HttpSecurityMonitorClient(
+        endpoint_url=endpoint_url,
+        auth_token=auth_token,
+        allow_insecure=allow_insecure,
+        timeout_s=_positive_float_env("ARGUS_S10_SECURITY_MONITOR_TIMEOUT_S", 1.0),
+    )
+    client.health()
+    return client
 
 
 def _egress_sidecar_runtime_config_from_env() -> EgressSidecarRuntimeConfig | None:

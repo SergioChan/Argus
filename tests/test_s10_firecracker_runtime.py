@@ -427,9 +427,12 @@ class S10FirecrackerRuntimeTests(unittest.TestCase):
 
     def test_docker_supervisor_delegates_firecracker_before_docker(self) -> None:
         firecracker = _DelegatedFirecrackerSupervisor()
+        security_monitor = object()
+        security_events: list[object] = []
         supervisor = DockerSandboxSupervisor(
             docker_bin="definitely-not-a-docker-binary",
             firecracker_supervisor=firecracker,
+            security_monitor=security_monitor,  # type: ignore[arg-type]
         )
 
         result = supervisor.run(
@@ -437,10 +440,13 @@ class S10FirecrackerRuntimeTests(unittest.TestCase):
             request=self.request,
             materialized_env={},
             policy_bundle=self.bundle,
+            security_event_sink=security_events.append,  # type: ignore[arg-type]
         )
 
         self.assertEqual(result.exit_code, 0)
         self.assertEqual(firecracker.calls, 1)
+        self.assertIs(firecracker.security_monitor, security_monitor)
+        self.assertEqual(firecracker.security_event_sink, security_events.append)
 
     def test_firecracker_rejects_materialized_environment_drift_before_host_launch(self) -> None:
         supervisor = FirecrackerSandboxSupervisor(config=self.config)
@@ -628,10 +634,14 @@ class _NoAttestationFirecrackerSupervisor:
 class _DelegatedFirecrackerSupervisor:
     def __init__(self) -> None:
         self.calls = 0
+        self.security_monitor = None
+        self.security_event_sink = None
 
     def run(self, *, handle, request, materialized_env, **kwargs):  # type: ignore[no-untyped-def]
-        del request, materialized_env, kwargs
+        del request, materialized_env
         self.calls += 1
+        self.security_monitor = kwargs.get("security_monitor")
+        self.security_event_sink = kwargs.get("security_event_sink")
         return SandboxExecutionResult(
             handle=handle,
             exit_code=0,

@@ -736,6 +736,20 @@ def _m0_identity_requests() -> dict[str, dict[str, Any]]:
             "budget_caps": {"max_compute_units": 10, "max_wallclock_s": 10, "max_cost_usd": 5},
             "scopes": {"sandbox_risk_class": "standard"},
         },
+        "s10-t17-tc01": {
+            "caller_id": "s10-t17-tc01",
+            "job_id": "s10-t17-tc01-job",
+            "root_request_id": "s10-t17-tc01-root",
+            "budget_caps": {"max_compute_units": 20, "max_wallclock_s": 20, "max_cost_usd": 1},
+            "scopes": {"sandbox_risk_class": "standard"},
+        },
+        "s10-t17-tc20": {
+            "caller_id": "s10-t17-tc20",
+            "job_id": "s10-t17-tc20-job",
+            "root_request_id": "s10-t17-tc20-root",
+            "budget_caps": {"max_compute_units": 20, "max_wallclock_s": 20, "max_cost_usd": 1},
+            "scopes": {"sandbox_risk_class": "standard"},
+        },
         "verify": {
             "caller_id": "m0-verifier",
             "job_id": "m0-verifier-job",

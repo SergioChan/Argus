@@ -173,20 +173,37 @@ jobs:
           curl --fail --silent --show-error --location --output runsc.sha512 "${BASE_URL}/runsc.sha512"
           sha512sum --check runsc.sha512
           sudo install --mode 0755 runsc /usr/local/bin/runsc
-          sudo /usr/local/bin/runsc install --runtime runsc-argus -- --oci-seccomp
+          sudo install --directory --mode 0755 /run/argus-gvisor /var/log/argus-runsc /etc/argus/s10
+          sudo python3 "$GITHUB_WORKSPACE/scripts/generate_s10_gvisor_monitor_config.py" \
+            --architecture "$ARCH" \
+            --endpoint /run/argus-gvisor/events.sock \
+            --output /etc/argus/s10/gvisor-monitor-pod-init.json
+          sudo /usr/local/bin/runsc install --runtime runsc-argus -- \
+            --oci-seccomp \
+            --pod-init-config=/etc/argus/s10/gvisor-monitor-pod-init.json \
+            --debug \
+            --debug-command=boot \
+            --debug-log=/var/log/argus-runsc/%ID%/gvisor.%COMMAND%.json \
+            --debug-log-format=json
           sudo systemctl restart docker
           docker info --format '{{json .Runtimes}}' | python3 -c 'import json,sys; assert "runsc-argus" in json.load(sys.stdin)'
           /usr/local/bin/runsc --version
 
       - name: Run real gVisor security battery
-        run: python3 scripts/run_s10_gvisor_battery.py --evidence-file "$RUNNER_TEMP/s10-gvisor-evidence.json"
+        run: |
+          test -z "$(git status --porcelain)"
+          python3 scripts/run_s10_security_monitor_battery.py \
+            --gvisor-evidence-file "$RUNNER_TEMP/s10-gvisor-evidence.json" \
+            --evidence-file "$RUNNER_TEMP/s10-security-monitor-evidence.json"
 
       - name: Upload gVisor security evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: s10-gvisor-evidence
-          path: ${{ runner.temp }}/s10-gvisor-evidence.json
+          path: |
+            ${{ runner.temp }}/s10-gvisor-evidence.json
+            ${{ runner.temp }}/s10-security-monitor-evidence.json
 
   firecracker-security:
     runs-on: ubuntu-latest

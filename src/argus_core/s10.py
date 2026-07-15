@@ -48,6 +48,8 @@ TOKEN_ED25519_SIGNATURE_PREFIX = "ed25519:"
 DOCKER_SANDBOX_USER = "65532:65532"
 PARTIAL_RESULT_LOG_CAPTURE_LIMIT_BYTES = 64 * 1024
 METER_AUDIT_BACKLOG_MAX_ITEMS = 1024
+SECURITY_MONITOR_TERMINAL_DRAIN_ATTEMPTS = 4
+SECURITY_MONITOR_TERMINAL_DRAIN_INTERVAL_S = 0.05
 DEFAULT_EXFIL_SOFT_BYTES = 64 * 1024 * 1024
 DEFAULT_EXFIL_HARD_BYTES = 128 * 1024 * 1024
 SECRET_VALUE_PATTERNS = (
@@ -114,6 +116,10 @@ class PriceTableSignatureError(S10Error):
 
 class SandboxRuntimeUnavailableError(S10Error):
     """Raised when the configured sandbox runtime cannot be invoked."""
+
+
+class SecurityMonitorError(SandboxRuntimeUnavailableError):
+    """Raised when the host security monitor cannot provide trusted evidence."""
 
 
 @dataclass(frozen=True)
@@ -483,6 +489,304 @@ class SandboxExecutionResult:
     duration_s: float
     budget_usage: BudgetUsage
     partial_result: SandboxPartialResult | None = None
+
+
+SecurityMonitorRuntimeKind = Literal["container", "host_process"]
+SecurityMonitorEventKind = Literal["trustwrite", "escape"]
+SecurityMonitorIsolationClass = Literal["docker", "gvisor", "firecracker"]
+SecurityMonitorEngine = Literal["falco-modern-ebpf", "gvisor-runtime-monitor"]
+
+
+def security_monitor_engine_for_isolation_class(
+    isolation_class: SecurityMonitorIsolationClass,
+) -> SecurityMonitorEngine:
+    if isolation_class == "gvisor":
+        return "gvisor-runtime-monitor"
+    if isolation_class in {"docker", "firecracker"}:
+        return "falco-modern-ebpf"
+    raise ValueError("security monitor isolation class is invalid")
+
+
+@dataclass(frozen=True)
+class SecurityMonitorRegistration:
+    """Identity and trust paths registered before an isolated runtime starts."""
+
+    sandbox_id: str
+    job_id: str
+    isolation_class: SecurityMonitorIsolationClass
+    runtime_kind: SecurityMonitorRuntimeKind
+    container_id: str | None = None
+    process_id: int | None = None
+    cgroup_v2_path: str | None = None
+    trust_paths: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        identifier_pattern = r"[A-Za-z0-9._:-]{1,160}"
+        if (
+            re.fullmatch(identifier_pattern, self.sandbox_id) is None
+            or re.fullmatch(identifier_pattern, self.job_id) is None
+        ):
+            raise ValueError("security monitor registration requires valid sandbox_id and job_id")
+        if self.isolation_class not in {"docker", "gvisor", "firecracker"}:
+            raise ValueError("security monitor isolation class is invalid")
+        if self.runtime_kind not in {"container", "host_process"}:
+            raise ValueError("security monitor runtime_kind is invalid")
+        if self.isolation_class in {"docker", "gvisor"} and self.runtime_kind != "container":
+            raise ValueError("container isolation classes require container runtime identity")
+        if self.isolation_class == "firecracker" and self.runtime_kind != "host_process":
+            raise ValueError("Firecracker isolation requires host-process runtime identity")
+        normalized_paths: list[str] = []
+        for path in self.trust_paths:
+            if not isinstance(path, str) or not path or "\x00" in path or not os.path.isabs(path):
+                raise ValueError("security monitor trust paths must be absolute")
+            normalized = os.path.normpath(path)
+            if normalized != path or normalized == "/":
+                raise ValueError("security monitor trust paths must be normalized and non-root")
+            normalized_paths.append(normalized)
+        if len(normalized_paths) != len(set(normalized_paths)):
+            raise ValueError("security monitor trust paths must be unique")
+        if self.runtime_kind == "container":
+            if not isinstance(self.container_id, str) or re.fullmatch(r"[0-9a-f]{64}", self.container_id) is None:
+                raise ValueError("container security registration requires a full lowercase container ID")
+            if self.process_id is not None or self.cgroup_v2_path is not None:
+                raise ValueError("container security registration cannot include host process identity")
+            return
+        if self.container_id is not None:
+            raise ValueError("host-process security registration cannot include a container ID")
+        if isinstance(self.process_id, bool) or not isinstance(self.process_id, int) or self.process_id <= 0:
+            raise ValueError("host-process security registration requires a positive process ID")
+        if (
+            not isinstance(self.cgroup_v2_path, str)
+            or self.cgroup_v2_path != f"/argus-firecracker/{self.sandbox_id}"
+        ):
+            raise ValueError("host-process security registration requires its exact Argus Firecracker cgroup")
+
+    def as_wire_payload(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "sandbox_id": self.sandbox_id,
+            "job_id": self.job_id,
+            "isolation_class": self.isolation_class,
+            "runtime_kind": self.runtime_kind,
+            "trust_paths": list(self.trust_paths),
+        }
+        if self.container_id is not None:
+            payload["container_id"] = self.container_id
+        if self.process_id is not None:
+            payload["process_id"] = self.process_id
+        if self.cgroup_v2_path is not None:
+            payload["cgroup_v2_path"] = self.cgroup_v2_path
+        return payload
+
+    @property
+    def engine(self) -> SecurityMonitorEngine:
+        return security_monitor_engine_for_isolation_class(self.isolation_class)
+
+
+@dataclass(frozen=True)
+class HostSecurityEvent:
+    """Content-bound Sev-1 event emitted by an isolation-aware host sensor."""
+
+    event_id: str
+    sequence: int
+    kind: SecurityMonitorEventKind
+    severity: Literal["Sev-1"]
+    engine: SecurityMonitorEngine
+    rule: str
+    observed_at: str
+    sandbox_id: str
+    job_id: str
+    isolation_class: SecurityMonitorIsolationClass
+    runtime_kind: SecurityMonitorRuntimeKind
+    container_id: str | None
+    process_id: int
+    syscall: str
+    result: int
+    path: str | None = None
+
+    _RULES = {
+        "trustwrite": "Argus trust path write attempt",
+        "escape": "Argus sandbox escape indicator",
+    }
+    _TRUSTWRITE_SYSCALLS = frozenset(
+        {
+            "creat",
+            "ftruncate",
+            "link",
+            "linkat",
+            "open",
+            "openat",
+            "openat2",
+            "pwrite64",
+            "pwritev",
+            "pwritev2",
+            "rename",
+            "renameat",
+            "renameat2",
+            "symlink",
+            "symlinkat",
+            "truncate",
+            "write",
+            "writev",
+        }
+    )
+    _ESCAPE_SYSCALLS = frozenset(
+        {
+            "bpf",
+            "ioctl",
+            "kexec_load",
+            "keyctl",
+            "mount",
+            "open",
+            "openat",
+            "openat2",
+            "ptrace",
+            "setns",
+            "umount2",
+            "unshare",
+            "write",
+        }
+    )
+
+    def __post_init__(self) -> None:
+        if isinstance(self.sequence, bool) or not isinstance(self.sequence, int) or self.sequence <= 0:
+            raise ValueError("security event sequence must be positive")
+        if self.kind not in self._RULES or self.rule != self._RULES[self.kind]:
+            raise ValueError("security event rule does not match its kind")
+        if self.severity != "Sev-1":
+            raise ValueError("security event must be Sev-1")
+        if self.engine not in {"falco-modern-ebpf", "gvisor-runtime-monitor"}:
+            raise ValueError("security event engine is invalid")
+        if self.isolation_class not in {"docker", "gvisor", "firecracker"}:
+            raise ValueError("security event isolation class is invalid")
+        if self.engine != security_monitor_engine_for_isolation_class(self.isolation_class):
+            raise ValueError("security event engine does not match its isolation class")
+        if not self.sandbox_id or not self.job_id:
+            raise ValueError("security event requires sandbox and job identity")
+        if self.runtime_kind not in {"container", "host_process"}:
+            raise ValueError("security event runtime kind is invalid")
+        if self.isolation_class in {"docker", "gvisor"} and self.runtime_kind != "container":
+            raise ValueError("container security event isolation/runtime identity mismatch")
+        if self.isolation_class == "firecracker" and self.runtime_kind != "host_process":
+            raise ValueError("Firecracker security event isolation/runtime identity mismatch")
+        if self.runtime_kind == "container":
+            if not isinstance(self.container_id, str) or re.fullmatch(r"[0-9a-f]{64}", self.container_id) is None:
+                raise ValueError("container security event requires a full container ID")
+        elif self.container_id is not None:
+            raise ValueError("host-process security event cannot include a container ID")
+        if isinstance(self.process_id, bool) or not isinstance(self.process_id, int) or self.process_id <= 0:
+            raise ValueError("security event process_id must be positive")
+        if isinstance(self.result, bool) or not isinstance(self.result, int):
+            raise ValueError("security event result must be an integer errno/result")
+        allowed_syscalls = self._TRUSTWRITE_SYSCALLS if self.kind == "trustwrite" else self._ESCAPE_SYSCALLS
+        if self.syscall not in allowed_syscalls:
+            raise ValueError("security event syscall is not allowed for its kind")
+        if self.kind == "trustwrite":
+            if not isinstance(self.path, str) or not self.path.startswith("/") or "\x00" in self.path:
+                raise ValueError("trust-path security event requires an absolute path")
+        elif self.path is not None and (not self.path.startswith("/") or "\x00" in self.path):
+            raise ValueError("escape event path must be absolute when present")
+        try:
+            observed = datetime.fromisoformat(self.observed_at.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise ValueError("security event observed_at must be ISO-8601") from exc
+        if observed.tzinfo is None:
+            raise ValueError("security event observed_at must include a timezone")
+        expected_event_id = self.compute_event_id()
+        if not self.event_id:
+            object.__setattr__(self, "event_id", expected_event_id)
+        elif self.event_id != expected_event_id:
+            raise ValueError("security event ID is not bound to the event payload")
+
+    def compute_event_id(self) -> str:
+        return hash_json(
+            {
+                "sequence": self.sequence,
+                "kind": self.kind,
+                "severity": self.severity,
+                "engine": self.engine,
+                "rule": self.rule,
+                "observed_at": self.observed_at,
+                "sandbox_id": self.sandbox_id,
+                "job_id": self.job_id,
+                "isolation_class": self.isolation_class,
+                "runtime_kind": self.runtime_kind,
+                "container_id": self.container_id,
+                "process_id": self.process_id,
+                "syscall": self.syscall,
+                "result": self.result,
+                "path": self.path,
+            }
+        )
+
+    @property
+    def audit_event_type(self) -> str:
+        return "trustwrite.detected" if self.kind == "trustwrite" else "escape.detected"
+
+    @property
+    def halt_reason(self) -> str:
+        return "trust_path_write" if self.kind == "trustwrite" else "escape_attempt"
+
+    def as_audit_payload(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "event_id": self.event_id,
+            "sensor_sequence": self.sequence,
+            "sandbox_id": self.sandbox_id,
+            "job_id": self.job_id,
+            "isolation_class": self.isolation_class,
+            "severity": self.severity,
+            "engine": self.engine,
+            "rule": self.rule,
+            "observed_at": self.observed_at,
+            "runtime_kind": self.runtime_kind,
+            "process_id": self.process_id,
+            "syscall": self.syscall,
+            "result": self.result,
+        }
+        if self.container_id is not None:
+            payload["container_id"] = self.container_id
+        if self.path is not None:
+            payload["path"] = self.path
+        return payload
+
+
+@dataclass(frozen=True)
+class SecurityMonitorPoll:
+    cursor: int
+    healthy: bool
+    engine: SecurityMonitorEngine
+    overflowed: bool
+    events: tuple[HostSecurityEvent, ...]
+
+    def __post_init__(self) -> None:
+        if isinstance(self.cursor, bool) or not isinstance(self.cursor, int) or self.cursor < 0:
+            raise ValueError("security monitor cursor must be non-negative")
+        if self.engine not in {"falco-modern-ebpf", "gvisor-runtime-monitor"}:
+            raise ValueError("security monitor engine is invalid")
+        if not isinstance(self.healthy, bool) or not isinstance(self.overflowed, bool):
+            raise ValueError("security monitor health fields must be boolean")
+        event_ids = [event.event_id for event in self.events]
+        if len(event_ids) != len(set(event_ids)):
+            raise ValueError("security monitor poll contains duplicate events")
+        sequences = [event.sequence for event in self.events]
+        if sequences != sorted(sequences) or any(sequence > self.cursor for sequence in sequences):
+            raise ValueError("security monitor events are not cursor ordered")
+        if any(event.engine != self.engine for event in self.events):
+            raise ValueError("security monitor poll contains an event from another sensor source")
+
+    def require_healthy(self) -> SecurityMonitorPoll:
+        if not self.healthy:
+            raise SecurityMonitorError("host security monitor is unhealthy")
+        if self.overflowed:
+            raise SecurityMonitorError("host security monitor event buffer overflowed")
+        return self
+
+
+class SecurityMonitor(Protocol):
+    def register(self, registration: SecurityMonitorRegistration) -> None: ...
+
+    def poll(self, *, sandbox_id: str, after: int) -> SecurityMonitorPoll: ...
+
+    def unregister(self, *, sandbox_id: str) -> None: ...
 
 
 @dataclass(frozen=True)
@@ -1273,6 +1577,8 @@ class FirecrackerSandboxSupervisor:
         halt_telemetry_sink: Callable[[SandboxHaltTelemetry], None] | None = None,
         policy_bundle: PolicyBundle | None = None,
         runtime_evidence_sink: Callable[[RuntimeLaunchEvidence], None] | None = None,
+        security_monitor: SecurityMonitor | None = None,
+        security_event_sink: Callable[[HostSecurityEvent], None] | None = None,
     ) -> SandboxExecutionResult:
         if policy_bundle is None:
             raise SandboxRuntimeUnavailableError("Firecracker launch requires its pinned policy bundle")
@@ -1292,6 +1598,61 @@ class FirecrackerSandboxSupervisor:
 
         process_identity: _FirecrackerProcessIdentity | None = None
         resources: _FirecrackerJailResources | None = None
+        security_registered = False
+        security_cursor = 0
+        seen_security_event_ids: set[str] = set()
+        pending_security_events: list[HostSecurityEvent] = []
+
+        def probe_security_halt() -> _RuntimeHaltSignal | None:
+            nonlocal security_cursor
+            if security_monitor is None or not security_registered:
+                return None
+            try:
+                poll = security_monitor.poll(
+                    sandbox_id=handle.sandbox_id,
+                    after=security_cursor,
+                ).require_healthy()
+                if poll.engine != security_monitor_engine_for_isolation_class("firecracker"):
+                    raise SecurityMonitorError("host security monitor returned the wrong Firecracker sensor source")
+                if poll.cursor < security_cursor:
+                    raise SecurityMonitorError("host security monitor cursor moved backwards")
+                security_cursor = poll.cursor
+                for event in poll.events:
+                    if (
+                        event.sandbox_id != handle.sandbox_id
+                        or event.job_id != request.job_id
+                        or event.isolation_class != "firecracker"
+                        or event.runtime_kind != "host_process"
+                        or event.container_id is not None
+                    ):
+                        raise SecurityMonitorError(
+                            "host security event identity differs from the registered microVM"
+                        )
+                    if event.event_id in seen_security_event_ids:
+                        continue
+                    seen_security_event_ids.add(event.event_id)
+                    pending_security_events.append(event)
+            except (OSError, TimeoutError, ValueError, SecurityMonitorError):
+                return _RuntimeHaltSignal(
+                    reason="security_monitor_unavailable",
+                    dimensions=("security_monitor_unavailable",),
+                    source="falco-modern-ebpf",
+                )
+            if not pending_security_events:
+                return None
+            first = pending_security_events[0]
+            return _RuntimeHaltSignal(
+                reason=first.halt_reason,
+                dimensions=("security_violation", first.kind),
+                source=first.engine,
+            )
+
+        def combined_runtime_halt_probe() -> _RuntimeHaltSignal | tuple[str, tuple[str, ...]] | None:
+            security_halt = probe_security_halt()
+            if security_halt is not None:
+                return security_halt
+            return runtime_halt_probe() if runtime_halt_probe is not None else None
+
         try:
             with tempfile.TemporaryDirectory(prefix="argus-firecracker-") as temp_dir:
                 request_drive, request_hash, scratch_drive = self._create_drive_images(
@@ -1313,6 +1674,18 @@ class FirecrackerSandboxSupervisor:
                     firecracker_version=firecracker_version,
                     jailer_version=jailer_version,
                 )
+                if security_monitor is not None:
+                    security_monitor.register(
+                        SecurityMonitorRegistration(
+                            sandbox_id=handle.sandbox_id,
+                            job_id=request.job_id,
+                            isolation_class="firecracker",
+                            runtime_kind="host_process",
+                            process_id=process_identity.pid,
+                            cgroup_v2_path=process_identity.cgroup_v2_path,
+                        )
+                    )
+                    security_registered = True
                 self._firecracker_api_request(
                     resources.api_socket,
                     "PUT",
@@ -1327,20 +1700,67 @@ class FirecrackerSandboxSupervisor:
                 evidence = replace(evidence, seccomp_filter_count=seccomp_filter_count)
                 if runtime_evidence_sink is not None:
                     runtime_evidence_sink(evidence)
-                return self._wait_for_microvm(
+                result = self._wait_for_microvm(
                     handle=handle,
                     request=request,
                     resources=resources,
                     process_identity=process_identity,
                     meter_sample_sink=meter_sample_sink,
-                    runtime_halt_probe=runtime_halt_probe,
+                    runtime_halt_probe=combined_runtime_halt_probe,
                     halt_telemetry_sink=halt_telemetry_sink,
                 )
+                if security_monitor is not None and security_registered and not pending_security_events:
+                    terminal_security_halt: _RuntimeHaltSignal | None = None
+                    for attempt in range(SECURITY_MONITOR_TERMINAL_DRAIN_ATTEMPTS):
+                        terminal_security_halt = probe_security_halt()
+                        if terminal_security_halt is not None:
+                            break
+                        if attempt + 1 < SECURITY_MONITOR_TERMINAL_DRAIN_ATTEMPTS:
+                            time.sleep(SECURITY_MONITOR_TERMINAL_DRAIN_INTERVAL_S)
+                    if (
+                        terminal_security_halt is not None
+                        and terminal_security_halt.reason == "security_monitor_unavailable"
+                    ):
+                        raise SecurityMonitorError(
+                            "host security monitor became unavailable during terminal drain"
+                        )
+                if security_event_sink is not None:
+                    for event in pending_security_events:
+                        security_event_sink(event)
+                return result
         finally:
+            active_error = sys.exception()
+            cleanup_errors: list[Exception] = []
             if process_identity is not None and self._process_identity_is_alive(process_identity):
-                self._signal_microvm(process_identity, signal.SIGKILL)
-                self._wait_for_process_exit(process_identity, timeout_s=2.0)
-            self._cleanup_microvm(str(spec["microvm_id"]), microvm_dir)
+                try:
+                    self._signal_microvm(process_identity, signal.SIGKILL)
+                    self._wait_for_process_exit(process_identity, timeout_s=2.0)
+                except Exception as exc:
+                    cleanup_errors.append(exc)
+            if security_registered and security_monitor is not None:
+                try:
+                    security_monitor.unregister(sandbox_id=handle.sandbox_id)
+                except Exception as exc:
+                    cleanup_errors.append(exc)
+            try:
+                self._cleanup_microvm(str(spec["microvm_id"]), microvm_dir)
+            except Exception as exc:
+                cleanup_errors.append(exc)
+            if cleanup_errors:
+                if active_error is not None:
+                    for cleanup_error in cleanup_errors:
+                        active_error.add_note(
+                            "Firecracker cleanup failure: "
+                            f"{type(cleanup_error).__name__}: {cleanup_error}"
+                        )
+                else:
+                    primary = cleanup_errors[0]
+                    for additional in cleanup_errors[1:]:
+                        primary.add_note(
+                            "additional Firecracker cleanup failure: "
+                            f"{type(additional).__name__}: {additional}"
+                        )
+                    raise primary
 
     def _binary_version(self, label: str, binary_path: str) -> str:
         if not os.access(binary_path, os.X_OK):
@@ -4376,6 +4796,7 @@ class DockerSandboxSupervisor:
         gvisor_config: GvisorRuntimeConfig | None = None,
         firecracker_supervisor: FirecrackerSandboxSupervisor | None = None,
         egress_sidecar_config: EgressSidecarRuntimeConfig | None = None,
+        security_monitor: SecurityMonitor | None = None,
     ) -> None:
         self._docker_bin = docker_bin or shutil.which("docker") or "docker"
         self._meter_interval_s = min(max(float(meter_interval_s), 0.1), 5.0)
@@ -4388,6 +4809,7 @@ class DockerSandboxSupervisor:
         self._gvisor_config = gvisor_config
         self._firecracker_supervisor = firecracker_supervisor
         self._egress_sidecar_config = egress_sidecar_config
+        self._security_monitor = security_monitor
 
     @property
     def resource_meter_kind(self) -> str:
@@ -4465,6 +4887,10 @@ class DockerSandboxSupervisor:
     def egress_sidecar_configured(self) -> bool:
         return self._egress_sidecar_config is not None
 
+    @property
+    def security_monitor_configured(self) -> bool:
+        return self._security_monitor is not None
+
     def materialize_security_spec(
         self,
         handle: SandboxHandle,
@@ -4528,6 +4954,7 @@ class DockerSandboxSupervisor:
         policy_bundle: PolicyBundle | None = None,
         runtime_evidence_sink: Callable[[RuntimeLaunchEvidence], None] | None = None,
         egress_audit_sink: Callable[[str, dict[str, Any]], None] | None = None,
+        security_event_sink: Callable[[HostSecurityEvent], None] | None = None,
     ) -> SandboxExecutionResult:
         if not _is_digest_pinned_image(request.image):
             raise PolicyDeniedError("image must be digest-pinned")
@@ -4545,6 +4972,8 @@ class DockerSandboxSupervisor:
                 halt_telemetry_sink=halt_telemetry_sink,
                 policy_bundle=policy_bundle,
                 runtime_evidence_sink=runtime_evidence_sink,
+                security_monitor=self._security_monitor,
+                security_event_sink=security_event_sink,
             )
         security_spec = self.materialize_security_spec(handle, policy_bundle)
         egress_manifest = self._materialize_egress_manifest(handle, request, policy_bundle)
@@ -4562,7 +4991,10 @@ class DockerSandboxSupervisor:
                     runtime_evidence_sink=runtime_evidence_sink,
                     egress_manifest=egress_manifest,
                     egress_audit_sink=egress_audit_sink,
+                    security_event_sink=security_event_sink,
                 )
+            except SecurityMonitorError:
+                raise
             except SandboxRuntimeUnavailableError:
                 if security_spec.runtime_class != "docker" or sidecar_required:
                     raise
@@ -4570,6 +5002,8 @@ class DockerSandboxSupervisor:
                     raise
         if sidecar_required:
             raise SandboxRuntimeUnavailableError("egress sidecar launch requires the Docker Engine API")
+        if self._security_monitor is not None:
+            raise SecurityMonitorError("host security monitoring requires the Docker Engine API")
         if shutil.which(self._docker_bin) is None and "/" not in self._docker_bin:
             raise SandboxRuntimeUnavailableError("docker runtime is unavailable")
 
@@ -4721,12 +5155,17 @@ class DockerSandboxSupervisor:
         runtime_evidence_sink: Callable[[DockerRuntimeLaunchEvidence], None] | None = None,
         egress_manifest: EgressProxyManifest | None = None,
         egress_audit_sink: Callable[[str, dict[str, Any]], None] | None = None,
+        security_event_sink: Callable[[HostSecurityEvent], None] | None = None,
     ) -> SandboxExecutionResult:
         container_name = f"argus-{handle.sandbox_id.replace('-', '')[:24]}"
         envelope = request.requested_envelope
         container_id: str | None = None
         sidecar_id: str | None = None
         seen_egress_events: list[tuple[str, dict[str, Any]]] = []
+        security_registered = False
+        security_cursor = 0
+        seen_security_event_ids: set[str] = set()
+        pending_security_events: list[HostSecurityEvent] = []
         started_at = time.monotonic()
 
         def probe_egress_halt() -> _RuntimeHaltSignal | None:
@@ -4745,6 +5184,53 @@ class DockerSandboxSupervisor:
                     source="egress-sidecar-byte-meter",
                 )
             return None
+
+        def probe_security_halt() -> _RuntimeHaltSignal | None:
+            nonlocal security_cursor
+            monitor = self._security_monitor
+            if monitor is None or not security_registered:
+                return None
+            try:
+                poll = monitor.poll(sandbox_id=handle.sandbox_id, after=security_cursor).require_healthy()
+                expected_engine = security_monitor_engine_for_isolation_class(security_spec.runtime_class)
+                if poll.engine != expected_engine:
+                    raise SecurityMonitorError("host security monitor returned the wrong sandbox sensor source")
+                if poll.cursor < security_cursor:
+                    raise SecurityMonitorError("host security monitor cursor moved backwards")
+                security_cursor = poll.cursor
+                for event in poll.events:
+                    if (
+                        event.sandbox_id != handle.sandbox_id
+                        or event.job_id != request.job_id
+                        or event.isolation_class != security_spec.runtime_class
+                        or event.runtime_kind != "container"
+                        or event.container_id != container_id
+                    ):
+                        raise SecurityMonitorError("host security event identity differs from the registered sandbox")
+                    if event.event_id in seen_security_event_ids:
+                        continue
+                    seen_security_event_ids.add(event.event_id)
+                    pending_security_events.append(event)
+            except (OSError, TimeoutError, ValueError, SecurityMonitorError):
+                return _RuntimeHaltSignal(
+                    reason="security_monitor_unavailable",
+                    dimensions=("security_monitor_unavailable",),
+                    source=security_monitor_engine_for_isolation_class(security_spec.runtime_class),
+                )
+            if not pending_security_events:
+                return None
+            first = pending_security_events[0]
+            return _RuntimeHaltSignal(
+                reason=first.halt_reason,
+                dimensions=("security_violation", first.kind),
+                source=first.engine,
+            )
+
+        def probe_pre_state_halt() -> _RuntimeHaltSignal | None:
+            security_halt = probe_security_halt()
+            if security_halt is not None:
+                return security_halt
+            return probe_egress_halt()
 
         try:
             self._ensure_docker_api_runtime_available(security_spec)
@@ -4820,6 +5306,18 @@ class DockerSandboxSupervisor:
             container_id = str(create_response.get("Id") or "")
             if not container_id:
                 raise SandboxRuntimeUnavailableError("docker runtime did not return a container id")
+            if self._security_monitor is not None:
+                self._security_monitor.register(
+                    SecurityMonitorRegistration(
+                        sandbox_id=handle.sandbox_id,
+                        job_id=request.job_id,
+                        isolation_class=security_spec.runtime_class,
+                        runtime_kind="container",
+                        container_id=container_id,
+                        trust_paths=tuple(mount.target for mount in security_spec.trust_mounts),
+                    )
+                )
+                security_registered = True
             inspected: dict[str, Any] | None = None
             if security_spec.runtime_class == "gvisor" or sidecar_id is not None:
                 inspected = self._docker_api_request(
@@ -4855,9 +5353,29 @@ class DockerSandboxSupervisor:
                 started_at=started_at,
                 meter_sample_sink=meter_sample_sink,
                 runtime_halt_probe=runtime_halt_probe,
-                pre_state_halt_probe=probe_egress_halt if sidecar_id is not None else None,
+                pre_state_halt_probe=(
+                    probe_pre_state_halt
+                    if self._security_monitor is not None or sidecar_id is not None
+                    else None
+                ),
                 halt_telemetry_sink=halt_telemetry_sink,
             )
+            if self._security_monitor is not None and security_registered and not pending_security_events:
+                terminal_security_halt: _RuntimeHaltSignal | None = None
+                for attempt in range(SECURITY_MONITOR_TERMINAL_DRAIN_ATTEMPTS):
+                    terminal_security_halt = probe_security_halt()
+                    if terminal_security_halt is not None:
+                        break
+                    if attempt + 1 < SECURITY_MONITOR_TERMINAL_DRAIN_ATTEMPTS:
+                        time.sleep(SECURITY_MONITOR_TERMINAL_DRAIN_INTERVAL_S)
+                if (
+                    terminal_security_halt is not None
+                    and terminal_security_halt.reason == "security_monitor_unavailable"
+                ):
+                    raise SecurityMonitorError("host security monitor became unavailable during terminal drain")
+            if security_event_sink is not None:
+                for event in pending_security_events:
+                    security_event_sink(event)
             if partial_result is None:
                 log_capture = self._docker_api_logs(container_id)
                 stdout, stderr = log_capture.stdout, log_capture.stderr
@@ -4879,6 +5397,11 @@ class DockerSandboxSupervisor:
         finally:
             active_error = sys.exception()
             cleanup_errors: list[Exception] = []
+            if security_registered and self._security_monitor is not None:
+                try:
+                    self._security_monitor.unregister(sandbox_id=handle.sandbox_id)
+                except Exception as exc:
+                    cleanup_errors.append(exc)
             if container_id:
                 try:
                     self._docker_api_request(
@@ -4911,14 +5434,14 @@ class DockerSandboxSupervisor:
                 if active_error is not None:
                     for cleanup_error in cleanup_errors:
                         active_error.add_note(
-                            "egress cleanup failure: "
+                            "runtime cleanup failure: "
                             f"{type(cleanup_error).__name__}: {cleanup_error}"
                         )
                 else:
                     primary = cleanup_errors[0]
                     for additional in cleanup_errors[1:]:
                         primary.add_note(
-                            "additional egress cleanup failure: "
+                            "additional runtime cleanup failure: "
                             f"{type(additional).__name__}: {additional}"
                         )
                     raise primary
@@ -6338,6 +6861,7 @@ class DockerSandboxOrchestrator(InMemorySandboxOrchestrator):
         meter_samples: list[ResourceMeterSample] = []
         halt_telemetry_items: list[SandboxHaltTelemetry] = []
         runtime_evidence_items: list[RuntimeLaunchEvidence] = []
+        security_events: list[HostSecurityEvent] = []
         meter_halt_recorded = False
         token_revocation_halt_recorded = False
 
@@ -6499,6 +7023,19 @@ class DockerSandboxOrchestrator(InMemorySandboxOrchestrator):
                 raise SandboxRuntimeUnavailableError("egress sidecar audit policy version mismatch")
             self._audit_ledger.append(event_type, payload)
 
+        def record_security_event(event: HostSecurityEvent) -> None:
+            if event.sandbox_id != handle.sandbox_id or event.job_id != request.job_id:
+                raise SecurityMonitorError("host security event identity differs from the admitted sandbox")
+            if (
+                event.isolation_class != handle.runtime_class
+                or event.engine
+                != security_monitor_engine_for_isolation_class(handle.runtime_class)  # type: ignore[arg-type]
+            ):
+                raise SecurityMonitorError("host security event source differs from the admitted isolation class")
+            if event.event_id in {existing.event_id for existing in security_events}:
+                return
+            security_events.append(event)
+
         self._audit_ledger.append(
             "sandbox.started",
             {"sandbox_id": handle.sandbox_id, "job_id": request.job_id, "runtime_class": handle.runtime_class},
@@ -6532,6 +7069,7 @@ class DockerSandboxOrchestrator(InMemorySandboxOrchestrator):
                 halt_telemetry_sink=record_halt_telemetry,
                 runtime_evidence_sink=record_runtime_evidence,
                 egress_audit_sink=record_egress_event,
+                security_event_sink=record_security_event,
             )
         except Exception as exc:
             runtime_error = exc
@@ -6586,7 +7124,43 @@ class DockerSandboxOrchestrator(InMemorySandboxOrchestrator):
             self._record_runtime_failure(handle, request, reserved_usage, exc)
             raise
         result = replace(result, budget_usage=price_rollup.usage)
-        final_state = _final_sandbox_state(result)
+        security_halt_reason = result.partial_result.reason if result.partial_result is not None else ""
+        security_halted = security_halt_reason in {
+            "escape_attempt",
+            "security_monitor_unavailable",
+            "trust_path_write",
+        }
+        if security_events and not security_halted:
+            self._record_runtime_failure(
+                handle,
+                request,
+                reserved_usage,
+                SecurityMonitorError("security event did not produce a physical runtime halt"),
+            )
+            raise SecurityMonitorError("security event did not produce a physical runtime halt")
+        if security_halt_reason in {"escape_attempt", "trust_path_write"} and not security_events:
+            self._record_runtime_failure(
+                handle,
+                request,
+                reserved_usage,
+                SecurityMonitorError("security halt omitted its host sensor event"),
+            )
+            raise SecurityMonitorError("security halt omitted its host sensor event")
+        for event in security_events:
+            self._audit_ledger.append(event.audit_event_type, event.as_audit_payload())
+        if security_halt_reason == "security_monitor_unavailable":
+            self._audit_ledger.append(
+                "security_monitor.unavailable",
+                {
+                    "sandbox_id": handle.sandbox_id,
+                    "job_id": request.job_id,
+                    "severity": "Sev-1",
+                    "engine": security_monitor_engine_for_isolation_class(handle.runtime_class),  # type: ignore[arg-type]
+                    "isolation_class": handle.runtime_class,
+                    "action": "fail_closed_halt",
+                },
+            )
+        final_state = "QUARANTINED" if security_halted else _final_sandbox_state(result)
         final_handle = replace(handle, state=final_state)
         self._handles[handle.sandbox_id] = final_handle
         partial_result_ref = self._emit_partial_result(
@@ -6604,6 +7178,19 @@ class DockerSandboxOrchestrator(InMemorySandboxOrchestrator):
                 "duration_s": round(result.duration_s, 6),
             },
         )
+        if security_halted:
+            self._audit_ledger.append(
+                "sandbox.quarantined",
+                {
+                    "sandbox_id": handle.sandbox_id,
+                    "job_id": request.job_id,
+                    "reason": security_halt_reason,
+                    "state": final_handle.state,
+                    "security_event_ids": [event.event_id for event in security_events],
+                    "snapshot_refs": [],
+                    "forensic_snapshot_status": "pending_s10_t18",
+                },
+            )
         try:
             self._quota_ledger.consume(request.budget_token.budget_id, result.budget_usage)
         except BudgetExceededError:

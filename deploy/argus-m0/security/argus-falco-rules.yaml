@@ -1,0 +1,101 @@
+- required_engine_version: 47
+
+- list: argus_trustwrite_open_syscalls
+  items:
+    - open
+    - openat
+    - openat2
+
+- list: argus_trustwrite_mutation_syscalls
+  items:
+    - creat
+    - truncate
+    - ftruncate
+    - rename
+    - renameat
+    - renameat2
+    - link
+    - linkat
+    - symlink
+    - symlinkat
+    - write
+    - writev
+    - pwrite64
+    - pwritev
+    - pwritev2
+
+- list: argus_escape_syscalls
+  items:
+    - mount
+    - umount2
+    - setns
+    - unshare
+    - bpf
+    - ptrace
+    - kexec_load
+    - keyctl
+
+- macro: argus_trust_path
+  condition: >
+    (fd.name startswith /opt/argus/trust or
+     fs.path.name startswith /opt/argus/trust or
+     fs.path.source startswith /opt/argus/trust or
+     fs.path.target startswith /opt/argus/trust or
+     evt.arg.name startswith /opt/argus/trust or
+     evt.arg.pathname startswith /opt/argus/trust or
+     evt.arg.path startswith /opt/argus/trust or
+     evt.arg.target startswith /opt/argus/trust)
+
+- macro: argus_host_boundary_path
+  condition: >
+    (fd.name startswith /proc/1/root or
+     fd.name startswith /host/proc or
+     fd.name startswith /sys/fs/cgroup or
+     fd.name contains /release_agent or
+     evt.arg.name startswith /proc/1/root or
+     evt.arg.name startswith /host/proc or
+     evt.arg.name startswith /sys/fs/cgroup or
+     evt.arg.name contains /release_agent or
+     evt.arg.pathname startswith /proc/1/root or
+     evt.arg.pathname startswith /host/proc or
+     evt.arg.pathname startswith /sys/fs/cgroup or
+     evt.arg.pathname contains /release_agent or
+     evt.arg.path startswith /proc/1/root or
+     evt.arg.path startswith /host/proc or
+     evt.arg.path startswith /sys/fs/cgroup or
+     evt.arg.path contains /release_agent)
+
+- rule: Argus trust path write attempt
+  desc: Detect any write-like syscall against an Argus verifier or provenance trust mount.
+  condition: >
+    ((evt.type in (argus_trustwrite_open_syscalls) and evt.is_open_write=true) or
+     evt.type in (argus_trustwrite_mutation_syscalls)) and
+    argus_trust_path
+  output: >
+    Argus trust path write attempt
+    (container_id=%container.id process_id=%proc.pid parent_process_id=%proc.ppid
+     syscall=%evt.type result=%evt.rawres path=%fd.name arg_name=%evt.arg.name
+     arg_pathname=%evt.arg.pathname arg_path=%evt.arg.path arg_target=%evt.arg.target
+     fs_path=%fs.path.name fs_source=%fs.path.source fs_target=%fs.path.target)
+  priority: CRITICAL
+  source: syscall
+  tags: [argus, s10, trustwrite]
+
+- rule: Argus sandbox escape indicator
+  desc: Detect namespace, host-boundary, cgroup, GPU, and TOCTOU escape indicators for registered Argus sandboxes.
+  condition: >
+    (evt.type in (argus_escape_syscalls) or
+     (evt.type in (open, openat, openat2, creat, write, truncate, ftruncate) and
+      argus_host_boundary_path) or
+     (evt.type = ioctl and fd.name startswith /dev/nvidia) or
+     (evt.type in (rename, renameat, renameat2, link, linkat, symlink, symlinkat) and
+      argus_trust_path))
+  output: >
+    Argus sandbox escape indicator
+    (container_id=%container.id process_id=%proc.pid parent_process_id=%proc.ppid
+     syscall=%evt.type result=%evt.rawres path=%fd.name arg_name=%evt.arg.name
+     arg_pathname=%evt.arg.pathname arg_path=%evt.arg.path arg_target=%evt.arg.target
+     fs_path=%fs.path.name fs_source=%fs.path.source fs_target=%fs.path.target)
+  priority: CRITICAL
+  source: syscall
+  tags: [argus, s10, escape]
