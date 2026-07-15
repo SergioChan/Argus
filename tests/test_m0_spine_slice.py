@@ -7,6 +7,7 @@ from argus_core import (
     EgressRule,
     InMemoryArtifactStore,
     InMemoryAuditLedger,
+    InMemoryImageVerifier,
     InMemoryQuotaLedger,
     InMemorySandboxOrchestrator,
     InMemoryTokenService,
@@ -62,6 +63,9 @@ class M0SpineIntegrationSliceTests(unittest.TestCase):
             token_service=self.tokens,
             quota_ledger=self.quota,
             audit_ledger=self.audit,
+            image_verifier=InMemoryImageVerifier(
+                trusted_images=("registry.local/argus@sha256:" + "b" * 64,),
+            ),
             policy_bundle=self.bundle,
             artifact_store=self.artifacts,
         )

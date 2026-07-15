@@ -10,6 +10,7 @@ from argus_core import (
     EgressRule,
     InMemoryArtifactStore,
     InMemoryAuditLedger,
+    InMemoryImageVerifier,
     InMemoryQuotaLedger,
     InMemorySandboxOrchestrator,
     InMemoryTokenService,
@@ -183,6 +184,9 @@ class S3FrozenPipelineRunnerTests(unittest.TestCase):
             token_service=tokens,
             quota_ledger=InMemoryQuotaLedger(),
             audit_ledger=audit,
+            image_verifier=InMemoryImageVerifier(
+                trusted_images=("sha256:" + "c" * 64,),
+            ),
             policy_bundle=PolicyBundle(
                 bundle_version="s3-t10-real-s10-test",
                 egress_allowlist=(EgressRule("store.local", 443, "https"),),

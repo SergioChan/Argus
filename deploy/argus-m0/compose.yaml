@@ -175,6 +175,11 @@ services:
       ARGUS_S10_TOKEN_ED25519_PRIVATE_KEY_HEX: ${ARGUS_S10_TOKEN_ED25519_PRIVATE_KEY_HEX:?ARGUS_S10_TOKEN_ED25519_PRIVATE_KEY_HEX is required}
       ARGUS_S10_TOKEN_ED25519_PUBLIC_KEY_HEX: ${ARGUS_S10_TOKEN_ED25519_PUBLIC_KEY_HEX:?ARGUS_S10_TOKEN_ED25519_PUBLIC_KEY_HEX is required}
       ARGUS_S10_TOKEN_REVOCATION_STORE_PATH: /var/lib/argus/s10/token-revocations.jsonl
+      ARGUS_S10_COSIGN_BIN: /usr/local/bin/cosign
+      ARGUS_S10_COSIGN_PUBLIC_KEY_PATH: /etc/argus/s10/image-trust/cosign.pub
+      ARGUS_S10_COSIGN_SIGNATURE_STORE_DIR: /etc/argus/s10/image-trust/signatures
+      ARGUS_S10_COSIGN_EXPECTED_VERSION: v2.6.3
+      ARGUS_S10_COSIGN_VERIFY_TIMEOUT_S: ${ARGUS_S10_COSIGN_VERIFY_TIMEOUT_S:-10.0}
       ARGUS_S10_POLICY_SIGNING_KEY: ${ARGUS_S10_POLICY_SIGNING_KEY:?ARGUS_S10_POLICY_SIGNING_KEY is required}
       ARGUS_S10_CHECKPOINT_SIGNER_KEY_ID: argus-m0-s8-checkpoint
       ARGUS_S10_CHECKPOINT_SIGNING_KEY: ${ARGUS_S10_CHECKPOINT_SIGNING_KEY:?ARGUS_S10_CHECKPOINT_SIGNING_KEY is required}
@@ -244,6 +249,10 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
       - s10-token-state:/var/lib/argus/s10
       - ./security/argus-gvisor-seccomp.json:/etc/argus/s10/argus-gvisor-seccomp.json:ro
+      - type: bind
+        source: ${ARGUS_S10_IMAGE_TRUST_SOURCE_ROOT:-./security/image-trust}
+        target: /etc/argus/s10/image-trust
+        read_only: true
       - type: bind
         source: ${ARGUS_S10_GVISOR_TRUST_SOURCE_ROOT:-./security}
         target: ${ARGUS_S10_GVISOR_TRUST_SOURCE_ROOT_MOUNT_PATH:-/var/lib/argus/s10/trust-sources}

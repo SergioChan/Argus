@@ -25,6 +25,7 @@ from argus_core import (
     FileSystemArtifactStore,
     InMemoryS10KmsCheckpointSigner,
     InMemoryS10KmsVerifierKeyProvider,
+    InMemoryImageVerifier,
     Lineage,
     PriceTableSignatureError,
     Producer,
@@ -39,7 +40,7 @@ from argus_runtime.http_json import JsonRequest
 from argus_runtime.m1_reference_runtime import M1_REFERENCE_SERVICE_REQUEST_TIMEOUT_S
 from argus_runtime.s10_supervisor_service import (
     RuntimeIdentityMintPolicy,
-    S10SupervisorApp,
+    S10SupervisorApp as RuntimeS10SupervisorApp,
     build_app_from_env as build_s10_app_from_env,
 )
 from argus_runtime.s8_persistence import SubprocessRustLedgerWriter, _rust_ledger_writer_from_env
@@ -74,7 +75,31 @@ S10_C3_VERIFIER_KEYS_JSON = json.dumps(
 )
 
 
+def _test_image_verifier() -> InMemoryImageVerifier:
+    return InMemoryImageVerifier(
+        trusted_images=(
+            m0_battery.DEFAULT_IMAGE,
+            "busybox@sha256:" + "1" * 64,
+            "sha256:" + "a" * 64,
+        )
+    )
+
+
+class S10SupervisorApp(RuntimeS10SupervisorApp):
+    def __init__(self, *args, **kwargs) -> None:
+        kwargs.setdefault("image_verifier", _test_image_verifier())
+        super().__init__(*args, **kwargs)
+
+
 class ArgusM0RuntimeServiceTests(unittest.TestCase):
+    def setUp(self) -> None:
+        patcher = patch(
+            "argus_runtime.s10_supervisor_service._image_verifier_from_env",
+            return_value=_test_image_verifier(),
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def _spend_final_payload(
         self,
         *,
@@ -2205,7 +2230,7 @@ class ArgusM0RuntimeServiceTests(unittest.TestCase):
         self.assertEqual(payload["error"], "BudgetExceededError")
         self.assertIsNone(payload["handle"])
         self.assertIn("budget.reject", payload["audit_events"])
-        self.assertEqual(payload["audit_events"], ["budget.reject"])
+        self.assertEqual(payload["audit_events"], ["image.verified", "budget.reject"])
         self.assertNotIn("sandbox.launched", payload["audit_events"])
         self.assertNotIn("sandbox.started", payload["audit_events"])
         self.assertNotIn("spend.final", payload["audit_events"])
@@ -3442,6 +3467,22 @@ class ArgusM0ComposeTests(unittest.TestCase):
             "/var/lib/argus/s10/token-revocations.jsonl",
         )
         self.assertEqual(
+            services["s10-supervisor"]["environment"]["ARGUS_S10_COSIGN_BIN"],
+            "/usr/local/bin/cosign",
+        )
+        self.assertEqual(
+            services["s10-supervisor"]["environment"]["ARGUS_S10_COSIGN_PUBLIC_KEY_PATH"],
+            "/etc/argus/s10/image-trust/cosign.pub",
+        )
+        self.assertEqual(
+            services["s10-supervisor"]["environment"]["ARGUS_S10_COSIGN_SIGNATURE_STORE_DIR"],
+            "/etc/argus/s10/image-trust/signatures",
+        )
+        self.assertEqual(
+            services["s10-supervisor"]["environment"]["ARGUS_S10_COSIGN_EXPECTED_VERSION"],
+            "v2.6.3",
+        )
+        self.assertEqual(
             services["s10-supervisor"]["environment"]["ARGUS_S10_QUOTA_POSTGRES_DSN"],
             "postgresql://argus:argus-dev-password@postgres:5432/argus",
         )
@@ -3526,6 +3567,7 @@ class ArgusM0ComposeTests(unittest.TestCase):
             sorted(volume["target"] for volume in s10_volumes),
             [
                 "/etc/argus/s10/argus-gvisor-seccomp.json",
+                "/etc/argus/s10/image-trust",
                 "/var/lib/argus/s10",
                 "/var/lib/argus/s10/trust-sources",
                 "/var/run/docker.sock",
@@ -3539,6 +3581,14 @@ class ArgusM0ComposeTests(unittest.TestCase):
         )
         self.assertTrue(profile_mount["read_only"])
         self.assertTrue(profile_mount["source"].endswith("/deploy/argus-m0/security/argus-gvisor-seccomp.json"))
+        image_trust_mount = next(
+            volume
+            for volume in s10_volumes
+            if volume["target"] == "/etc/argus/s10/image-trust"
+        )
+        self.assertEqual(image_trust_mount["type"], "bind")
+        self.assertTrue(image_trust_mount["read_only"])
+        self.assertTrue(image_trust_mount["source"].endswith("/deploy/argus-m0/security/image-trust"))
         trust_source_mount = next(
             volume
             for volume in s10_volumes
@@ -3580,6 +3630,12 @@ class ArgusM0ComposeTests(unittest.TestCase):
         self.assertIn("/usr/local/bin/argus-s3-report-signer", dockerfile)
         self.assertIn("--bin argus-s10-audit-ledger-writer", dockerfile)
         self.assertIn("/usr/local/bin/argus-s10-audit-ledger-writer", dockerfile)
+        self.assertIn(
+            "ghcr.io/sigstore/cosign/cosign:v2.6.3@sha256:"
+            "4bedb8de1c5c1abd8dea60de704ba449402d238623fa8bb33d2ccaa9beffcbf5",
+            dockerfile,
+        )
+        self.assertIn("COPY --from=cosign /ko-app/cosign /usr/local/bin/cosign", dockerfile)
 
     def test_root_docker_context_excludes_local_build_artifacts(self) -> None:
         patterns = {

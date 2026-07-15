@@ -31,6 +31,7 @@ from argus_core import (
     FirecrackerSandboxSupervisor,
     InMemoryArtifactStore,
     InMemoryAuditLedger,
+    InMemoryImageVerifier,
     InMemoryPolicyBundleTrustStore,
     InMemoryPolicyService,
     InMemoryQuotaLedger,
@@ -337,6 +338,7 @@ def _launch_probe(config: FirecrackerRuntimeConfig):
         token_service=tokens,
         quota_ledger=InMemoryQuotaLedger(),
         audit_ledger=audit,
+        image_verifier=InMemoryImageVerifier(trusted_images=(request.image,)),
         policy_service=policy_service,
         artifact_store=artifacts,
         supervisor=DockerSandboxSupervisor(

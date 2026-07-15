@@ -19,6 +19,7 @@ from argus_core import (
     EgressRule,
     FileSystemArtifactStore,
     GWSpectrumAdapter,
+    InMemoryImageVerifier,
     InMemoryS10KmsVerifierKeyProvider,
     Lineage,
     Producer,
@@ -398,6 +399,9 @@ class M1ReferenceLifecycleServiceTests(unittest.TestCase):
                 runtime_identity_mint_policy=RuntimeIdentityMintPolicy(identities_by_caller=identities),
                 verifier_key_provider=verifier_provider,
                 verifier_key_auth_token=verifier_key_token,
+                image_verifier=InMemoryImageVerifier(
+                    trusted_images=(REFERENCE_SANDBOX_IMAGE, pipeline_image),
+                ),
                 docker_supervisor=DockerSandboxSupervisor(docker_bin=docker),
                 adapter_targets={
                     "gw_spectrum": CredentialedAdapterTarget(

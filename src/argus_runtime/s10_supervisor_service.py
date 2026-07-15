@@ -20,6 +20,7 @@ from argus_core import (
     BudgetExceededError,
     BudgetToken,
     BudgetUsage,
+    CosignImageVerifier,
     EgressRule,
     EgressSidecarRuntimeConfig,
     DockerSandboxOrchestrator,
@@ -42,6 +43,7 @@ from argus_core import (
     InMemoryS10KmsVerifierKeyProvider,
     InMemoryQuotaLedger,
     InMemoryTokenService,
+    ImageVerifier,
     LaunchEnvelope,
     LaunchRequest,
     Lineage,
@@ -304,6 +306,7 @@ class S10SupervisorApp:
         checkpoint_signer_auth_token: str | None = None,
         verifier_key_provider: InMemoryS10KmsVerifierKeyProvider | None = None,
         verifier_key_auth_token: str | None = None,
+        image_verifier: ImageVerifier | None = None,
         docker_supervisor: DockerSandboxSupervisor | None = None,
         price_table: PriceTable | None = None,
         price_table_trust_store: PriceTableTrustStore | None = None,
@@ -339,6 +342,7 @@ class S10SupervisorApp:
         self._checkpoint_signer_auth_token = checkpoint_signer_auth_token
         self.verifier_key_provider = verifier_key_provider
         self._verifier_key_auth_token = verifier_key_auth_token
+        self._image_verifier = image_verifier
         self._docker_supervisor = docker_supervisor or DockerSandboxSupervisor()
         self.price_table = price_table
         self.price_table_trust_store = price_table_trust_store
@@ -998,6 +1002,7 @@ class S10SupervisorApp:
             token_service=self.tokens,
             quota_ledger=self.quota,
             audit_ledger=self.audit,
+            image_verifier=self._image_verifier,
             policy_service=self.policy_service,
             artifact_store=self.artifacts,
             supervisor=self._docker_supervisor,
@@ -1059,6 +1064,7 @@ class S10SupervisorApp:
             except UnauthorizedError as exc:
                 return 401, {"error": "Unauthorized", "message": str(exc)}
             forensic_spool_pending_ids = self.forensic_spool.pending_quarantine_ids()
+            image_verifier = self._docker_orchestrator.image_verifier
             return 200, {
                 "service": "s10-supervisor",
                 "status": "ok",
@@ -1073,6 +1079,10 @@ class S10SupervisorApp:
                 "token_signature_algorithm": self.tokens.signature_algorithm,
                 "token_verifier": self.tokens.verifier_kind,
                 "token_revocation_store": self.tokens.revocation_store_kind,
+                "image_verifier": image_verifier.kind,
+                "image_verifier_version": image_verifier.version,
+                "image_verifier_signer_key_id": image_verifier.signer_key_id,
+                "image_verifier_binary_sha256": image_verifier.binary_sha256,
                 "quota_ledger": getattr(self.quota, "kind", type(self.quota).__name__),
                 "price_table": self._docker_orchestrator.price_table_version or "unconfigured",
                 "price_table_signer_key_id": self._docker_orchestrator.price_table_signer_key_id or "unconfigured",
@@ -1644,6 +1654,7 @@ def build_app_from_env() -> S10SupervisorApp:
     token_service = _token_service_from_env()
     quota_ledger = _quota_ledger_from_env()
     price_table, price_table_trust_store = _price_table_from_env()
+    image_verifier = _image_verifier_from_env()
     docker_supervisor = _docker_supervisor_from_env()
     s8_broker_url = os.environ.get("ARGUS_S8_BROKER_URL")
     s8_broker_key = os.environ.get("ARGUS_S8_BROKER_WRITE_KEY")
@@ -1700,6 +1711,7 @@ def build_app_from_env() -> S10SupervisorApp:
         checkpoint_signer_auth_token=checkpoint_signer_auth_token,
         verifier_key_provider=verifier_key_provider,
         verifier_key_auth_token=verifier_key_auth_token,
+        image_verifier=image_verifier,
         docker_supervisor=docker_supervisor,
         price_table=price_table,
         price_table_trust_store=price_table_trust_store,
@@ -1895,6 +1907,16 @@ def _token_revocation_store_from_env() -> FileTokenRevocationStore | None:
     if not path:
         return None
     return FileTokenRevocationStore(path)
+
+
+def _image_verifier_from_env() -> CosignImageVerifier:
+    return CosignImageVerifier(
+        cosign_bin=os.environ.get("ARGUS_S10_COSIGN_BIN", "/usr/local/bin/cosign"),
+        public_key_path=_required_env("ARGUS_S10_COSIGN_PUBLIC_KEY_PATH"),
+        signature_store_dir=_required_env("ARGUS_S10_COSIGN_SIGNATURE_STORE_DIR"),
+        expected_version=os.environ.get("ARGUS_S10_COSIGN_EXPECTED_VERSION", "v2.6.3"),
+        timeout_s=_positive_float_env("ARGUS_S10_COSIGN_VERIFY_TIMEOUT_S", 10.0),
+    )
 
 
 def _docker_supervisor_from_env() -> DockerSandboxSupervisor:

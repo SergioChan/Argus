@@ -23,6 +23,7 @@ from argus_core import (
     FileTokenRevocationStore,
     InMemoryArtifactStore,
     InMemoryAuditLedger,
+    InMemoryImageVerifier,
     InMemoryPolicyBundleTrustStore,
     InMemoryPolicyService,
     InMemoryQuotaLedger,
@@ -58,6 +59,13 @@ from argus_core import (
     hash_json,
     materialize_sandbox_env,
 )
+
+
+TEST_DIGEST_IMAGE = "registry.local/argus@sha256:" + "b" * 64
+
+
+def _test_image_verifier(image: str = TEST_DIGEST_IMAGE) -> InMemoryImageVerifier:
+    return InMemoryImageVerifier(trusted_images=(image,))
 
 
 class S10TokenServiceTests(unittest.TestCase):
@@ -546,6 +554,7 @@ print(canonical_json_bytes(asdict(service.decide(request))).decode("utf-8"))
             token_service=self.tokens,
             quota_ledger=InMemoryQuotaLedger(),
             audit_ledger=audit,
+            image_verifier=_test_image_verifier(),
             policy_service=service,
         )
 
@@ -934,6 +943,7 @@ class S10OrchestratorAndAuditTests(unittest.TestCase):
             token_service=self.tokens,
             quota_ledger=self.quota,
             audit_ledger=self.audit,
+            image_verifier=_test_image_verifier(),
             policy_bundle=self.bundle,
         )
 
@@ -955,6 +965,7 @@ class S10OrchestratorAndAuditTests(unittest.TestCase):
             token_service=self.tokens,
             quota_ledger=self.quota,
             audit_ledger=self.audit,
+            image_verifier=_test_image_verifier(),
             policy_bundle=self.bundle,
             artifact_store=artifacts,
         )
@@ -1008,6 +1019,7 @@ class S10OrchestratorAndAuditTests(unittest.TestCase):
             token_service=self.tokens,
             quota_ledger=self.quota,
             audit_ledger=self.audit,
+            image_verifier=_test_image_verifier(),
             policy_bundle=self.bundle,
             artifact_store=artifacts,
         )
@@ -1030,6 +1042,7 @@ class S10OrchestratorAndAuditTests(unittest.TestCase):
             token_service=self.tokens,
             quota_ledger=self.quota,
             audit_ledger=self.audit,
+            image_verifier=_test_image_verifier(),
             policy_bundle=self.bundle,
             artifact_store=artifacts,
         )
@@ -1133,6 +1146,7 @@ class S10OrchestratorAndAuditTests(unittest.TestCase):
             token_service=self.tokens,
             quota_ledger=quota,
             audit_ledger=self.audit,
+            image_verifier=_test_image_verifier(),
             policy_bundle=self.bundle,
             artifact_store=artifacts,
         )
@@ -1180,6 +1194,7 @@ class S10OrchestratorAndAuditTests(unittest.TestCase):
             token_service=self.tokens,
             quota_ledger=quota,
             audit_ledger=self.audit,
+            image_verifier=_test_image_verifier(),
             policy_bundle=self.bundle,
             artifact_store=artifacts,
         )
@@ -2239,6 +2254,7 @@ class S10DockerOrchestratorTests(unittest.TestCase):
             token_service=self.tokens,
             quota_ledger=self.quota,
             audit_ledger=self.audit,
+            image_verifier=_test_image_verifier(self.image),
             policy_bundle=self.bundle,
             artifact_store=self.artifacts,
             supervisor=DockerSandboxSupervisor(docker_bin=self.docker_bin),
@@ -2346,6 +2362,7 @@ class S10DockerOrchestratorTests(unittest.TestCase):
             token_service=self.tokens,
             quota_ledger=InMemoryQuotaLedger(),
             audit_ledger=audit,
+            image_verifier=_test_image_verifier(self.image),
             policy_bundle=self.bundle,
             artifact_store=InMemoryArtifactStore(),
             supervisor=supervisor,
@@ -2384,6 +2401,7 @@ class S10DockerOrchestratorTests(unittest.TestCase):
             token_service=self.tokens,
             quota_ledger=InMemoryQuotaLedger(),
             audit_ledger=audit,
+            image_verifier=_test_image_verifier(self.image),
             policy_bundle=self.bundle,
             artifact_store=InMemoryArtifactStore(),
             supervisor=supervisor,
@@ -2405,6 +2423,7 @@ class S10DockerOrchestratorTests(unittest.TestCase):
             token_service=self.tokens,
             quota_ledger=self.quota,
             audit_ledger=self.audit,
+            image_verifier=_test_image_verifier(self.image),
             policy_bundle=self.bundle,
             supervisor=_FixedUsageSupervisor(over_budget_usage),
             artifact_store=InMemoryArtifactStore(),
@@ -2511,6 +2530,7 @@ class S10DockerOrchestratorFailureTests(unittest.TestCase):
                 token_service=self.tokens,
                 quota_ledger=self.quota,
                 audit_ledger=self.audit,
+                image_verifier=_test_image_verifier(),
                 policy_bundle=self.bundle,
                 supervisor=_RaisingSupervisor(PermissionError("not reached")),
             )
@@ -2532,6 +2552,7 @@ class S10DockerOrchestratorFailureTests(unittest.TestCase):
                 token_service=self.tokens,
                 quota_ledger=InMemoryQuotaLedger(),
                 audit_ledger=InMemoryAuditLedger(),
+                image_verifier=_test_image_verifier(),
                 policy_bundle=self.bundle,
                 policy_service=policy_service,
                 artifact_store=InMemoryArtifactStore(),
@@ -2542,6 +2563,7 @@ class S10DockerOrchestratorFailureTests(unittest.TestCase):
             token_service=self.tokens,
             quota_ledger=InMemoryQuotaLedger(),
             audit_ledger=InMemoryAuditLedger(),
+            image_verifier=_test_image_verifier(),
             policy_service=policy_service,
             artifact_store=InMemoryArtifactStore(),
             supervisor=_FixedUsageSupervisor(BudgetUsage(wallclock_s=0.1)),
@@ -2563,6 +2585,7 @@ class S10DockerOrchestratorFailureTests(unittest.TestCase):
                     token_service=self.tokens,
                     quota_ledger=quota,
                     audit_ledger=audit,
+                    image_verifier=_test_image_verifier(),
                     policy_bundle=self.bundle,
                     artifact_store=InMemoryArtifactStore(),
                     supervisor=_RaisingSupervisor(exc),
@@ -2588,6 +2611,7 @@ class S10DockerOrchestratorFailureTests(unittest.TestCase):
             token_service=self.tokens,
             quota_ledger=self.quota,
             audit_ledger=self.audit,
+            image_verifier=_test_image_verifier(),
             policy_bundle=self.bundle,
             artifact_store=artifacts,
             supervisor=_RaisingSupervisor(AssertionError("supervisor must not run after admission reject")),
@@ -2613,7 +2637,7 @@ class S10DockerOrchestratorFailureTests(unittest.TestCase):
         self.assertEqual(orchestrator._handles, {})
         self.assertEqual(artifacts.record_count, 0)
         event_types = [event.event_type for event in self.audit.events()]
-        self.assertEqual(event_types, ["budget.reject"])
+        self.assertEqual(event_types, ["image.verified", "budget.reject"])
 
     def test_docker_orchestrator_emits_spend_final_with_signed_price_table(self) -> None:
         artifacts = InMemoryArtifactStore()
@@ -2622,6 +2646,7 @@ class S10DockerOrchestratorFailureTests(unittest.TestCase):
             token_service=self.tokens,
             quota_ledger=InMemoryQuotaLedger(),
             audit_ledger=InMemoryAuditLedger(),
+            image_verifier=_test_image_verifier(),
             policy_bundle=self.bundle,
             artifact_store=artifacts,
             supervisor=_FixedUsageSupervisor(BudgetUsage(compute_units=2, wallclock_s=1)),
@@ -2656,6 +2681,7 @@ class S10DockerOrchestratorFailureTests(unittest.TestCase):
             token_service=self.tokens,
             quota_ledger=InMemoryQuotaLedger(),
             audit_ledger=InMemoryAuditLedger(),
+            image_verifier=_test_image_verifier(),
             policy_bundle=self.bundle,
             artifact_store=artifacts,
             supervisor=_FixedUsageSupervisor(BudgetUsage(compute_units=20, wallclock_s=1)),
@@ -2682,6 +2708,7 @@ class S10DockerOrchestratorFailureTests(unittest.TestCase):
             token_service=self.tokens,
             quota_ledger=InMemoryQuotaLedger(),
             audit_ledger=audit,
+            image_verifier=_test_image_verifier(),
             policy_bundle=self.bundle,
             artifact_store=artifacts,
             supervisor=_PartialResultSupervisor(BudgetUsage(compute_units=20, wallclock_s=1)),
@@ -2729,6 +2756,7 @@ class S10DockerOrchestratorFailureTests(unittest.TestCase):
             token_service=self.tokens,
             quota_ledger=InMemoryQuotaLedger(),
             audit_ledger=audit,
+            image_verifier=_test_image_verifier(),
             policy_bundle=self.bundle,
             artifact_store=artifacts,
             supervisor=_InjectedMeterGapSupervisor(),
@@ -2758,6 +2786,7 @@ class S10DockerOrchestratorFailureTests(unittest.TestCase):
             token_service=self.tokens,
             quota_ledger=InMemoryQuotaLedger(),
             audit_ledger=audit,
+            image_verifier=_test_image_verifier(),
             policy_bundle=self.bundle,
             artifact_store=artifacts,
             supervisor=_RevokingRuntimeHaltSupervisor(self.tokens),

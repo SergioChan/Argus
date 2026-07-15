@@ -64,6 +64,10 @@ SECRET_VALUE_PATTERNS = (
     re.compile(r"(?i)(password|secret|api[_-]?key|token)=?[A-Za-z0-9_./+=:-]{8,}"),
 )
 DIGEST_PINNED_IMAGE = re.compile(r"^(?:[^\s@]+@)?sha256:[0-9a-f]{64}$")
+COSIGN_CONTAINER_SIGNATURE_TYPE = "cosign container image signature"
+COSIGN_PAYLOAD_MAX_BYTES = 64 * 1024
+COSIGN_SIGNATURE_MAX_BYTES = 16 * 1024
+COSIGN_PUBLIC_KEY_MAX_BYTES = 64 * 1024
 RuntimeClass = Literal["auto", "gvisor", "firecracker", "docker"]
 RiskClass = Literal["standard", "federated", "high"]
 EgressProto = Literal["https", "grpc", "tcp"]
@@ -123,6 +127,22 @@ class SandboxRuntimeUnavailableError(S10Error):
     """Raised when the configured sandbox runtime cannot be invoked."""
 
 
+class ImageVerificationError(S10Error):
+    """Raised when an image is unsigned or its signed claims are not trusted."""
+
+    def __init__(self, reason_code: str, message: str) -> None:
+        super().__init__(message)
+        self.reason_code = reason_code
+
+
+class ImageVerifierUnavailableError(SandboxRuntimeUnavailableError):
+    """Raised when the configured image verifier cannot produce trusted evidence."""
+
+    def __init__(self, reason_code: str, message: str) -> None:
+        super().__init__(message)
+        self.reason_code = reason_code
+
+
 class SecurityMonitorError(SandboxRuntimeUnavailableError):
     """Raised when the host security monitor cannot provide trusted evidence."""
 
@@ -145,6 +165,303 @@ class QuarantineSnapshotPendingError(S10Error):
 
 class QuarantineAlreadyClosedError(S10Error):
     """Raised when a closed quarantine receives a conflicting second disposition."""
+
+
+@dataclass(frozen=True)
+class ImageVerificationEvidence:
+    image_identity: str
+    manifest_digest: str
+    signer_key_id: str
+    payload_sha256: str
+    signature_sha256: str
+    verifier_kind: str
+    verifier_version: str
+    verifier_binary_sha256: str
+
+
+class ImageVerifier(Protocol):
+    @property
+    def kind(self) -> str: ...
+
+    @property
+    def version(self) -> str: ...
+
+    @property
+    def signer_key_id(self) -> str: ...
+
+    @property
+    def binary_sha256(self) -> str: ...
+
+    def verify(self, image: str) -> ImageVerificationEvidence: ...
+
+
+class DenyAllImageVerifier:
+    """Fail-closed verifier used when no image trust configuration exists."""
+
+    @property
+    def kind(self) -> str:
+        return "unconfigured"
+
+    @property
+    def version(self) -> str:
+        return "unconfigured"
+
+    @property
+    def signer_key_id(self) -> str:
+        return "unconfigured"
+
+    @property
+    def binary_sha256(self) -> str:
+        return "unconfigured"
+
+    def verify(self, image: str) -> ImageVerificationEvidence:
+        del image
+        raise ImageVerifierUnavailableError(
+            "verifier_unconfigured",
+            "image verifier is not configured",
+        )
+
+
+class InMemoryImageVerifier:
+    """Explicit test verifier that trusts only exact digest-pinned image references."""
+
+    def __init__(self, *, trusted_images: Iterable[str] = ()) -> None:
+        self._trusted_images = frozenset(trusted_images)
+
+    @property
+    def kind(self) -> str:
+        return "in-memory-test"
+
+    @property
+    def version(self) -> str:
+        return "test-v1"
+
+    @property
+    def signer_key_id(self) -> str:
+        return "sha256:" + sha256(b"argus-in-memory-image-verifier").hexdigest()
+
+    @property
+    def binary_sha256(self) -> str:
+        return "sha256:" + "0" * 64
+
+    def verify(self, image: str) -> ImageVerificationEvidence:
+        identity, digest = _parse_digest_pinned_image(image)
+        if image not in self._trusted_images:
+            raise ImageVerificationError(
+                "signature_not_found",
+                "image verification failed: signature_not_found",
+            )
+        payload_hash = "sha256:" + sha256(("payload:" + image).encode("utf-8")).hexdigest()
+        signature_hash = "sha256:" + sha256(("signature:" + image).encode("utf-8")).hexdigest()
+        return ImageVerificationEvidence(
+            image_identity=identity,
+            manifest_digest=digest,
+            signer_key_id=self.signer_key_id,
+            payload_sha256=payload_hash,
+            signature_sha256=signature_hash,
+            verifier_kind=self.kind,
+            verifier_version=self.version,
+            verifier_binary_sha256=self.binary_sha256,
+        )
+
+
+class CosignImageVerifier:
+    """Verify digest-bound cosign simple-signing payloads from a read-only store."""
+
+    def __init__(
+        self,
+        *,
+        cosign_bin: str,
+        public_key_path: str | os.PathLike[str],
+        signature_store_dir: str | os.PathLike[str],
+        expected_version: str,
+        timeout_s: float = 10.0,
+    ) -> None:
+        if not expected_version:
+            raise ValueError("expected_version is required")
+        if not math.isfinite(timeout_s) or timeout_s <= 0:
+            raise ValueError("timeout_s must be finite and positive")
+        resolved_bin = Path(cosign_bin)
+        if not resolved_bin.is_absolute():
+            discovered = shutil.which(cosign_bin)
+            if discovered is None:
+                raise ImageVerifierUnavailableError("verifier_unavailable", "cosign binary is unavailable")
+            resolved_bin = Path(discovered)
+        try:
+            self._cosign_bin = resolved_bin.resolve(strict=True)
+        except OSError as exc:
+            raise ImageVerifierUnavailableError("verifier_unavailable", "cosign binary is unavailable") from exc
+        if not self._cosign_bin.is_file() or not os.access(self._cosign_bin, os.X_OK):
+            raise ImageVerifierUnavailableError("verifier_unavailable", "cosign binary is not executable")
+        try:
+            self._public_key_path = Path(public_key_path).resolve(strict=True)
+            self._signature_store_dir = Path(signature_store_dir).resolve(strict=True)
+        except OSError as exc:
+            raise ImageVerifierUnavailableError(
+                "trust_store_unavailable",
+                "cosign image trust store is unavailable",
+            ) from exc
+        if not self._public_key_path.is_file() or not self._signature_store_dir.is_dir():
+            raise ImageVerifierUnavailableError(
+                "trust_store_unavailable",
+                "cosign image trust store is unavailable",
+            )
+        self._timeout_s = float(timeout_s)
+        self._expected_version = expected_version
+        self._public_key_bytes = _read_bounded_regular_file(
+            self._public_key_path,
+            max_bytes=COSIGN_PUBLIC_KEY_MAX_BYTES,
+            description="cosign public key",
+        )
+        self._signer_key_id = "sha256:" + sha256(self._public_key_bytes).hexdigest()
+        self._binary_sha256 = "sha256:" + _sha256_file(self._cosign_bin)
+        self._version = self._read_version()
+
+    @property
+    def kind(self) -> str:
+        return "cosign-private-infrastructure"
+
+    @property
+    def version(self) -> str:
+        return self._version
+
+    @property
+    def signer_key_id(self) -> str:
+        return self._signer_key_id
+
+    @property
+    def binary_sha256(self) -> str:
+        return self._binary_sha256
+
+    def verify(self, image: str) -> ImageVerificationEvidence:
+        identity, digest = _parse_digest_pinned_image(image)
+        entry_dir = cosign_signature_store_path(self._signature_store_dir, image)
+        payload_path = entry_dir / "payload.json"
+        signature_path = entry_dir / "signature.sig"
+        if not payload_path.exists() or not signature_path.exists():
+            raise ImageVerificationError(
+                "signature_not_found",
+                "image verification failed: signature_not_found",
+            )
+        payload = _read_trust_store_file(
+            payload_path,
+            root=self._signature_store_dir,
+            max_bytes=COSIGN_PAYLOAD_MAX_BYTES,
+            description="cosign payload",
+        )
+        signature = _read_trust_store_file(
+            signature_path,
+            root=self._signature_store_dir,
+            max_bytes=COSIGN_SIGNATURE_MAX_BYTES,
+            description="cosign signature",
+        )
+        if not signature.strip():
+            raise ImageVerificationError("signature_invalid", "image verification failed: signature_invalid")
+        self._verify_signature(payload=payload, signature=signature)
+        _validate_cosign_image_payload(payload, expected_identity=identity, expected_digest=digest)
+        return ImageVerificationEvidence(
+            image_identity=identity,
+            manifest_digest=digest,
+            signer_key_id=self.signer_key_id,
+            payload_sha256="sha256:" + sha256(payload).hexdigest(),
+            signature_sha256="sha256:" + sha256(signature).hexdigest(),
+            verifier_kind=self.kind,
+            verifier_version=self.version,
+            verifier_binary_sha256=self.binary_sha256,
+        )
+
+    def _read_version(self) -> str:
+        try:
+            completed = subprocess.run(
+                [str(self._cosign_bin), "version", "--json"],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=self._timeout_s,
+                env=_cosign_subprocess_env(),
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise ImageVerifierUnavailableError(
+                "verifier_unavailable",
+                "cosign version probe failed",
+            ) from exc
+        if completed.returncode != 0:
+            raise ImageVerifierUnavailableError("verifier_unavailable", "cosign version probe failed")
+        try:
+            version = json.loads(completed.stdout)
+        except json.JSONDecodeError as exc:
+            raise ImageVerifierUnavailableError(
+                "verifier_output_invalid",
+                "cosign version output is invalid",
+            ) from exc
+        observed = version.get("gitVersion") if isinstance(version, dict) else None
+        if observed != self._expected_version:
+            raise ImageVerifierUnavailableError(
+                "version_mismatch",
+                f"cosign version mismatch: expected {self._expected_version}",
+            )
+        if version.get("gitTreeState") != "clean":
+            raise ImageVerifierUnavailableError(
+                "version_untrusted",
+                "cosign binary does not report a clean build",
+            )
+        return observed
+
+    def _verify_signature(self, *, payload: bytes, signature: bytes) -> None:
+        with tempfile.TemporaryDirectory(prefix="argus-cosign-verify-") as temp_dir:
+            verify_root = Path(temp_dir)
+            verify_root.chmod(0o700)
+            payload_path = verify_root / "payload.json"
+            signature_path = verify_root / "signature.sig"
+            public_key_path = verify_root / "cosign.pub"
+            payload_path.write_bytes(payload)
+            signature_path.write_bytes(signature)
+            public_key_path.write_bytes(self._public_key_bytes)
+            for path in (payload_path, signature_path, public_key_path):
+                path.chmod(0o400)
+            try:
+                completed = subprocess.run(
+                    [
+                        str(self._cosign_bin),
+                        "verify-blob",
+                        "--private-infrastructure",
+                        "--key",
+                        str(public_key_path),
+                        "--signature",
+                        str(signature_path),
+                        str(payload_path),
+                    ],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=self._timeout_s,
+                    env=_cosign_subprocess_env(home=verify_root),
+                )
+            except subprocess.TimeoutExpired as exc:
+                raise ImageVerifierUnavailableError(
+                    "verifier_timeout",
+                    "cosign verification timed out",
+                ) from exc
+            except OSError as exc:
+                raise ImageVerifierUnavailableError(
+                    "verifier_unavailable",
+                    "cosign verification could not run",
+                ) from exc
+        if completed.returncode != 0:
+            raise ImageVerificationError(
+                "signature_invalid",
+                "image verification failed: signature_invalid",
+            )
+        output_lines = {
+            line.strip()
+            for line in (completed.stdout + "\n" + completed.stderr).splitlines()
+            if line.strip()
+        }
+        if "Verified OK" not in output_lines:
+            raise ImageVerifierUnavailableError(
+                "verifier_output_invalid",
+                "cosign verification output did not contain its success proof",
+            )
 
 
 @dataclass(frozen=True)
@@ -4224,6 +4541,148 @@ def _looks_secret_shaped(value: str) -> bool:
     return any(pattern.search(value) for pattern in SECRET_VALUE_PATTERNS)
 
 
+def _parse_digest_pinned_image(image: str) -> tuple[str, str]:
+    if not isinstance(image, str) or len(image) > 2048 or not _is_digest_pinned_image(image):
+        raise ImageVerificationError(
+            "digest_required",
+            "image verification failed: digest_required",
+        )
+    if "@" in image:
+        identity, digest = image.rsplit("@", 1)
+    else:
+        identity, digest = image, image
+    if not identity:
+        raise ImageVerificationError(
+            "identity_invalid",
+            "image verification failed: identity_invalid",
+        )
+    return identity, digest
+
+
+def cosign_signature_store_path(
+    signature_store_dir: str | os.PathLike[str],
+    image: str,
+) -> Path:
+    """Return the digest-and-identity-scoped location for cosign verification material."""
+    identity, digest = _parse_digest_pinned_image(image)
+    digest_hex = digest.removeprefix("sha256:")
+    identity_hash = sha256(identity.encode("utf-8")).hexdigest()
+    return Path(signature_store_dir) / digest_hex / identity_hash
+
+
+def _read_trust_store_file(
+    path: Path,
+    *,
+    root: Path,
+    max_bytes: int,
+    description: str,
+) -> bytes:
+    try:
+        if path.is_symlink():
+            raise OSError(f"{description} must not be a symlink")
+        resolved = path.resolve(strict=True)
+        resolved.relative_to(root)
+        return _read_bounded_regular_file(
+            resolved,
+            max_bytes=max_bytes,
+            description=description,
+        )
+    except ImageVerifierUnavailableError as exc:
+        raise ImageVerificationError(
+            "signature_material_invalid",
+            "image verification failed: signature_material_invalid",
+        ) from exc
+    except (OSError, ValueError) as exc:
+        raise ImageVerificationError(
+            "signature_material_invalid",
+            "image verification failed: signature_material_invalid",
+        ) from exc
+
+
+def _read_bounded_regular_file(path: Path, *, max_bytes: int, description: str) -> bytes:
+    try:
+        stat_result = path.stat()
+        if not path.is_file() or stat_result.st_size <= 0 or stat_result.st_size > max_bytes:
+            raise OSError(f"{description} is not a bounded regular file")
+        payload = path.read_bytes()
+    except OSError as exc:
+        raise ImageVerifierUnavailableError(
+            "trust_store_invalid",
+            f"{description} is unavailable or invalid",
+        ) from exc
+    if len(payload) != stat_result.st_size or len(payload) > max_bytes:
+        raise ImageVerifierUnavailableError(
+            "trust_store_invalid",
+            f"{description} changed while it was read",
+        )
+    return payload
+
+
+def _sha256_file(path: Path) -> str:
+    digest = sha256()
+    try:
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+    except OSError as exc:
+        raise ImageVerifierUnavailableError(
+            "verifier_unavailable",
+            "cosign binary could not be fingerprinted",
+        ) from exc
+    return digest.hexdigest()
+
+
+def _cosign_subprocess_env(*, home: Path | None = None) -> dict[str, str]:
+    return {
+        "HOME": str(home or Path(tempfile.gettempdir())),
+        "LANG": "C",
+        "LC_ALL": "C",
+        "HTTP_PROXY": "",
+        "HTTPS_PROXY": "",
+        "ALL_PROXY": "",
+        "NO_PROXY": "*",
+    }
+
+
+def _validate_cosign_image_payload(
+    payload: bytes,
+    *,
+    expected_identity: str,
+    expected_digest: str,
+) -> None:
+    try:
+        parsed = json.loads(payload)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ImageVerificationError(
+            "payload_invalid",
+            "image verification failed: payload_invalid",
+        ) from exc
+    if not isinstance(parsed, dict) or set(parsed) != {"critical", "optional"}:
+        raise ImageVerificationError("payload_invalid", "image verification failed: payload_invalid")
+    critical = parsed.get("critical")
+    optional = parsed.get("optional")
+    if not isinstance(critical, dict) or set(critical) != {"identity", "image", "type"}:
+        raise ImageVerificationError("payload_invalid", "image verification failed: payload_invalid")
+    if not isinstance(optional, dict) or critical.get("type") != COSIGN_CONTAINER_SIGNATURE_TYPE:
+        raise ImageVerificationError("payload_invalid", "image verification failed: payload_invalid")
+    identity = critical.get("identity")
+    image_claim = critical.get("image")
+    if not isinstance(identity, dict) or set(identity) != {"docker-reference"}:
+        raise ImageVerificationError("payload_invalid", "image verification failed: payload_invalid")
+    if not isinstance(image_claim, dict) or set(image_claim) != {"Docker-manifest-digest"}:
+        raise ImageVerificationError("payload_invalid", "image verification failed: payload_invalid")
+    if identity.get("docker-reference") != expected_identity:
+        raise ImageVerificationError(
+            "identity_mismatch",
+            "image verification failed: identity_mismatch",
+        )
+    if image_claim.get("Docker-manifest-digest") != expected_digest:
+        raise ImageVerificationError(
+            "digest_mismatch",
+            "image verification failed: digest_mismatch",
+        )
+
+
 def _is_digest_pinned_image(image: str) -> bool:
     return DIGEST_PINNED_IMAGE.match(image) is not None
 
@@ -7744,6 +8203,7 @@ class InMemorySandboxOrchestrator:
         token_service: InMemoryTokenService,
         quota_ledger: QuotaLedger,
         audit_ledger: InMemoryAuditLedger,
+        image_verifier: ImageVerifier | None = None,
         policy_bundle: PolicyBundle | None = None,
         policy_service: InMemoryPolicyService | None = None,
         artifact_store: InMemoryArtifactStore | None = None,
@@ -7758,6 +8218,7 @@ class InMemorySandboxOrchestrator:
         self._token_service = token_service
         self._quota_ledger = quota_ledger
         self._audit_ledger = audit_ledger
+        self._image_verifier = image_verifier or DenyAllImageVerifier()
         self._policy_service = policy_service
         self._artifact_store = artifact_store
         self._handles: dict[str, SandboxHandle] = {}
@@ -7784,9 +8245,7 @@ class InMemorySandboxOrchestrator:
                 {"job_id": request.job_id, "env_keys": sorted(set(request.env) & set(request.env_allowlist))},
             )
             raise PolicyDeniedError("env contains secret-shaped value") from exc
-        if not _is_digest_pinned_image(request.image):
-            self._audit_ledger.append("image.verify_fail", {"image": request.image, "job_id": request.job_id})
-            raise PolicyDeniedError("image must be digest-pinned")
+        verification = self._verify_image_for_launch(request)
 
         self._quota_ledger.register_budget(request.budget_token)
         try:
@@ -7798,7 +8257,12 @@ class InMemorySandboxOrchestrator:
             )
             raise
 
-        launch_provenance_ref = self._emit_launch_provenance(request, verdict, policy_bundle)
+        launch_provenance_ref = self._emit_launch_provenance(
+            request,
+            verdict,
+            policy_bundle,
+            verification,
+        )
         handle = SandboxHandle(
             sandbox_id=str(uuid4()),
             job_id=request.job_id,
@@ -7815,6 +8279,49 @@ class InMemorySandboxOrchestrator:
             {"sandbox_id": handle.sandbox_id, "job_id": request.job_id, "runtime_class": handle.runtime_class},
         )
         return handle
+
+    @property
+    def image_verifier(self) -> ImageVerifier:
+        return self._image_verifier
+
+    def _verify_image_for_launch(self, request: LaunchRequest) -> ImageVerificationEvidence:
+        try:
+            verification = self._image_verifier.verify(request.image)
+        except ImageVerificationError as exc:
+            self._audit_image_verification_failure(request, reason_code=exc.reason_code)
+            raise PolicyDeniedError(f"image verification failed: {exc.reason_code}") from exc
+        except ImageVerifierUnavailableError as exc:
+            self._audit_image_verification_failure(request, reason_code=exc.reason_code)
+            raise
+        except Exception as exc:
+            self._audit_image_verification_failure(request, reason_code="verifier_error")
+            raise ImageVerifierUnavailableError(
+                "verifier_error",
+                "image verifier failed without trusted evidence",
+            ) from exc
+        self._audit_ledger.append(
+            "image.verified",
+            {
+                "job_id": request.job_id,
+                **asdict(verification),
+            },
+        )
+        return verification
+
+    def _audit_image_verification_failure(self, request: LaunchRequest, *, reason_code: str) -> None:
+        payload = {
+            "image": request.image,
+            "job_id": request.job_id,
+            "reason_code": reason_code,
+            "verifier_kind": self._image_verifier.kind,
+            "verifier_version": self._image_verifier.version,
+            "signer_key_id": self._image_verifier.signer_key_id,
+        }
+        if _is_digest_pinned_image(request.image):
+            identity, digest = _parse_digest_pinned_image(request.image)
+            payload["image_identity"] = identity
+            payload["manifest_digest"] = digest
+        self._audit_ledger.append("image.verify_fail", payload)
 
     def get(self, sandbox_id: str) -> SandboxHandle:
         return self._handles[sandbox_id]
@@ -8029,10 +8536,16 @@ class InMemorySandboxOrchestrator:
         request: LaunchRequest,
         verdict: PolicyVerdict,
         policy_bundle: PolicyBundle,
+        image_verification: ImageVerificationEvidence,
     ) -> str | None:
         if self._artifact_store is None:
             return None
-        exec_environment = _launch_exec_environment(request, verdict, policy_bundle)
+        exec_environment = _launch_exec_environment(
+            request,
+            verdict,
+            policy_bundle,
+            image_verification,
+        )
         exec_environment_digest = hash_json(exec_environment)
         payload = {
             "exec_environment_digest": exec_environment_digest,
@@ -8066,9 +8579,11 @@ def _launch_exec_environment(
     request: LaunchRequest,
     verdict: PolicyVerdict,
     policy_bundle: PolicyBundle,
+    image_verification: ImageVerificationEvidence,
 ) -> dict[str, Any]:
     return {
         "image_digest": request.image,
+        "image_verification": asdict(image_verification),
         "runtime_class": verdict.runtime_class or "gvisor",
         "runtime_user": DOCKER_SANDBOX_USER,
         "entrypoint": list(request.entrypoint),
@@ -8164,6 +8679,7 @@ class DockerSandboxOrchestrator(InMemorySandboxOrchestrator):
         token_service: InMemoryTokenService,
         quota_ledger: QuotaLedger,
         audit_ledger: InMemoryAuditLedger,
+        image_verifier: ImageVerifier | None = None,
         policy_bundle: PolicyBundle | None = None,
         policy_service: InMemoryPolicyService | None = None,
         artifact_store: InMemoryArtifactStore | None = None,
@@ -8183,6 +8699,7 @@ class DockerSandboxOrchestrator(InMemorySandboxOrchestrator):
             token_service=token_service,
             quota_ledger=quota_ledger,
             audit_ledger=audit_ledger,
+            image_verifier=image_verifier,
             policy_bundle=policy_bundle,
             policy_service=policy_service,
             artifact_store=artifact_store,

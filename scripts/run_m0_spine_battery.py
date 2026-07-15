@@ -17,6 +17,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from typing import Any
@@ -24,7 +25,10 @@ from urllib import error, parse, request
 from uuid import uuid4
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "src"))
+
+from scripts.s10_cosign_fixture import create_cosign_image_trust
 
 from argus_core import (
     ArtifactRecord,
@@ -91,6 +95,12 @@ def main() -> int:
     docker = shutil.which("docker")
     if docker is None:
         raise RuntimeError("docker CLI is required for the M0 spine battery")
+    image_trust_cleanup: tempfile.TemporaryDirectory[str] | None = None
+    if args.keep_stack:
+        image_trust_root = Path(tempfile.mkdtemp(prefix="argus-m0-image-trust-"))
+    else:
+        image_trust_cleanup = tempfile.TemporaryDirectory(prefix="argus-m0-image-trust-")
+        image_trust_root = Path(image_trust_cleanup.name)
 
     evidence: dict[str, Any] = {
         "battery": "M0 Spine Integration Slice",
@@ -112,6 +122,7 @@ def main() -> int:
         "ARGUS_M0_S3_REFERENCE_REFEREE_PORT": str(_free_port()),
     }
     env = _compose_environment(runtime_secrets=runtime_secrets, ports=ports, now=price_table_now)
+    env["ARGUS_S10_IMAGE_TRUST_SOURCE_ROOT"] = str(image_trust_root)
     s8_url = f"http://127.0.0.1:{ports['ARGUS_M0_S8_PORT']}"
     s10_url = f"http://127.0.0.1:{ports['ARGUS_M0_S10_PORT']}"
     s1_reference_demo_url = f"http://127.0.0.1:{ports['ARGUS_M0_S1_DEMO_PORT']}"
@@ -126,6 +137,7 @@ def main() -> int:
         "persistence": "postgres-minio",
         "auth_callers": list(_m0_identity_requests().keys()),
         "reference_service_auth": "preprovisioned-runtime-identity-tokens",
+        "image_trust_source_root": str(image_trust_root),
     }
 
     try:
@@ -142,12 +154,18 @@ def main() -> int:
                 "argus-m0 Compose built the S3 nested frozen-pipeline image",
                 {"pipeline_image": pipeline_image},
             )
+            _ensure_image(docker, args.image)
+            image_trust = create_cosign_image_trust(
+                docker_bin=docker,
+                output_dir=image_trust_root,
+                images=(args.image, pipeline_image),
+            )
+            evidence["target"]["image_trust"] = image_trust
             _record(evidence, "deploy", "argus-m0 compose up --wait")
             _run([docker, "compose", "-f", args.compose_file, "up", "-d", "--wait"], env=env, timeout=240)
         _wait_health(f"{s8_url}/healthz", token=runtime_secrets["health_token"])
         _wait_health(f"{s10_url}/healthz", token=runtime_secrets["health_token"])
         _wait_health(f"{s1_reference_demo_url}/healthz", token=None)
-        _ensure_image(docker, args.image)
         _battery_runtime_identity_mint_policy(
             evidence,
             s10_url,
@@ -155,6 +173,20 @@ def main() -> int:
             service_access_token=reference_service_tokens["m1-reference-s7"],
         )
         auth_tokens = _mint_m0_runtime_identities(s10_url=s10_url, bootstrap_token=runtime_secrets["bootstrap_token"])
+        _battery_s10_image_verification(
+            evidence,
+            docker=docker,
+            compose_file=args.compose_file,
+            compose_env=env,
+            postgres_port=ports["ARGUS_M0_POSTGRES_PORT"],
+            s10_url=s10_url,
+            s8_url=s8_url,
+            signed_image=args.image,
+            runtime_token=auth_tokens["spine"],
+            s8_read_token=auth_tokens["read"],
+            audit_read_token=runtime_secrets["s10_audit_api_read_token"],
+            health_token=runtime_secrets["health_token"],
+        )
         _battery_s10_secrets_broker(
             evidence,
             docker=docker,
@@ -581,6 +613,8 @@ def main() -> int:
     finally:
         if not args.skip_compose_up and not args.keep_stack:
             _run([docker, "compose", "-f", args.compose_file, "down", "--volumes"], env=env, timeout=120, check=False)
+        if image_trust_cleanup is not None:
+            image_trust_cleanup.cleanup()
 
 
 def _battery_a_contracts(evidence: dict[str, Any]) -> None:
@@ -595,6 +629,199 @@ def _battery_a_contracts(evidence: dict[str, Any]) -> None:
     for command in commands:
         _run(command, timeout=120)
     _record(evidence, "a", "schemas meta-validated and Python/TypeScript/Rust binding gates passed")
+
+
+def _battery_s10_image_verification(
+    evidence: dict[str, Any],
+    *,
+    docker: str,
+    compose_file: str,
+    compose_env: dict[str, str],
+    postgres_port: str,
+    s10_url: str,
+    s8_url: str,
+    signed_image: str,
+    runtime_token: str,
+    s8_read_token: str,
+    audit_read_token: str,
+    health_token: str,
+) -> None:
+    health = _get_json(f"{s10_url}/healthz", token=health_token)
+    if health.get("image_verifier") != "cosign-private-infrastructure":
+        raise AssertionError(f"S10 did not start with the real cosign verifier: {health}")
+    if health.get("image_verifier_version") != "v2.6.3":
+        raise AssertionError(f"S10 cosign version drifted: {health}")
+    private_material_probe = _run(
+        [
+            docker,
+            "compose",
+            "-f",
+            compose_file,
+            "exec",
+            "-T",
+            "s10-supervisor",
+            "sh",
+            "-c",
+            "test -z \"${COSIGN_PASSWORD+x}\" && "
+            "test -z \"$(find /etc/argus/s10/image-trust -type f -name '*.key' -print -quit)\"",
+        ],
+        env=compose_env,
+        timeout=30,
+    )
+    if private_material_probe.stdout.strip() or private_material_probe.stderr.strip():
+        raise AssertionError("S10 image trust private-material probe emitted unexpected output")
+
+    if "@" in signed_image:
+        manifest_digest = signed_image.rsplit("@", 1)[1]
+    else:
+        manifest_digest = signed_image
+    unsigned_image = f"registry.invalid/argus-unsigned@{manifest_digest}"
+
+    def launch_material() -> tuple[dict[str, Any], dict[str, Any]]:
+        return (
+            _post_json(
+                f"{s10_url}/v1/budget-tokens",
+                {},
+                expected_status=201,
+                token=runtime_token,
+            ),
+            _post_json(
+                f"{s10_url}/v1/scope-tokens",
+                {},
+                expected_status=201,
+                token=runtime_token,
+            ),
+        )
+
+    rejected: list[dict[str, Any]] = []
+    for case_id, image, reason_code in (
+        ("tag-only", "busybox:latest", "digest_required"),
+        ("unsigned", unsigned_image, "signature_not_found"),
+    ):
+        budget, scope = launch_material()
+        launch = _launch_request_json(
+            job_id="m0-spine-job",
+            image=image,
+            budget=budget,
+            scope=scope,
+            args=("-c", "true"),
+            env={},
+            env_allowlist=(),
+            wallclock_s=2,
+        )
+        launch["trace_id"] = "trace-s10-tc30"
+        response = _post_sandbox_launch(
+            s10_url,
+            launch,
+            expected_status=403,
+            token=runtime_token,
+        )
+        if response.get("error") != "PolicyDeniedError" or reason_code not in str(response.get("message")):
+            raise AssertionError(f"TC30 {case_id} rejection was not typed POLICY: {response}")
+        if response.get("handle") is not None or response.get("audit_events") != ["image.verify_fail"]:
+            raise AssertionError(f"TC30 {case_id} crossed the pre-launch boundary: {response}")
+        if _s10_quota_budget_exists(postgres_port=postgres_port, budget_id=str(budget["budget_id"])):
+            raise AssertionError(f"TC30 {case_id} registered quota before image verification")
+        rejected.append(
+            {
+                "case": case_id,
+                "image": image,
+                "reason_code": reason_code,
+                "http_status": 403,
+                "handle": None,
+                "quota_registered": False,
+                "audit_events": response["audit_events"],
+            }
+        )
+
+    budget, scope = launch_material()
+    signed_launch = _launch_request_json(
+        job_id="m0-spine-job",
+        image=signed_image,
+        budget=budget,
+        scope=scope,
+        args=("-c", "printf 'cosign-verified-launch\\n'"),
+        env={},
+        env_allowlist=(),
+        wallclock_s=5,
+    )
+    signed_launch["trace_id"] = "trace-s10-tc30"
+    accepted = _post_sandbox_launch(
+        s10_url,
+        signed_launch,
+        expected_status=201,
+        token=runtime_token,
+    )
+    handle = accepted.get("handle") or {}
+    if handle.get("state") != "SUCCEEDED" or accepted.get("exit_code") != 0:
+        raise AssertionError(f"TC30 signed image did not execute successfully: {accepted}")
+    if "cosign-verified-launch" not in str(accepted.get("stdout")):
+        raise AssertionError(f"TC30 signed image output was missing: {accepted}")
+    if not _s10_quota_budget_exists(postgres_port=postgres_port, budget_id=str(budget["budget_id"])):
+        raise AssertionError("TC30 verified launch did not reach quota admission")
+
+    provenance_ref = str(handle.get("launch_provenance_ref") or "")
+    provenance = _get_json(
+        f"{s8_url}/v1/artifacts/{provenance_ref}/payload",
+        token=s8_read_token,
+    )
+    verification = provenance.get("exec_environment", {}).get("image_verification")
+    if not isinstance(verification, dict):
+        raise AssertionError(f"TC30 C4 provenance omitted image verification: {provenance}")
+    if verification.get("manifest_digest") != manifest_digest:
+        raise AssertionError(f"TC30 C4 provenance digest mismatch: {verification}")
+    if verification.get("verifier_kind") != "cosign-private-infrastructure":
+        raise AssertionError(f"TC30 C4 provenance verifier mismatch: {verification}")
+    if verification.get("signer_key_id") != health.get("image_verifier_signer_key_id"):
+        raise AssertionError(f"TC30 C4 provenance signer mismatch: {verification}")
+
+    audit_events = _get_json(
+        f"{s10_url}/v1/audit/query?" + parse.urlencode({"job_id": "m0-spine-job"}),
+        token=audit_read_token,
+    )
+    failures = [event for event in audit_events if event.get("event_type") == "image.verify_fail"]
+    verified = [event for event in audit_events if event.get("event_type") == "image.verified"]
+    if [event.get("payload", {}).get("reason_code") for event in failures] != [
+        "digest_required",
+        "signature_not_found",
+    ]:
+        raise AssertionError(f"TC30 image verification failure audit drifted: {failures}")
+    if len(verified) != 1 or verified[0].get("payload", {}).get("manifest_digest") != manifest_digest:
+        raise AssertionError(f"TC30 verified-image audit drifted: {verified}")
+
+    _record(
+        evidence,
+        "s10-tc30",
+        "S10-TC30 rejects tag-only and unsigned images before quota/runtime, then launches only a digest-bound cosign-verified image",
+        {
+            "verifier_kind": health["image_verifier"],
+            "verifier_version": health["image_verifier_version"],
+            "verifier_binary_sha256": health["image_verifier_binary_sha256"],
+            "signer_key_id": health["image_verifier_signer_key_id"],
+            "private_key_absent_from_s10": True,
+            "rejected": rejected,
+            "accepted_image": signed_image,
+            "accepted_manifest_digest": manifest_digest,
+            "accepted_state": handle["state"],
+            "accepted_exit_code": accepted["exit_code"],
+            "launch_provenance_ref": provenance_ref,
+            "image_verification": verification,
+        },
+    )
+
+
+def _s10_quota_budget_exists(*, postgres_port: str, budget_id: str) -> bool:
+    import psycopg
+
+    dsn = f"postgresql://argus:argus-dev-password@127.0.0.1:{postgres_port}/argus"
+    with psycopg.connect(dsn) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT EXISTS (SELECT 1 FROM s10.quota_budget WHERE budget_id = %s);",
+                (budget_id,),
+            )
+            row = cur.fetchone()
+    return bool(row and row[0])
 
 
 def _m0_runtime_secrets() -> dict[str, str]:

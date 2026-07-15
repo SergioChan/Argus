@@ -21,6 +21,7 @@ from argus_core import (
     ExecContext,
     InMemoryArtifactStore,
     InMemoryAuditLedger,
+    InMemoryImageVerifier,
     InMemoryQuotaLedger,
     InMemoryS1TelemetrySink,
     InMemorySandboxOrchestrator,
@@ -2075,6 +2076,7 @@ class S1SDKBaseClassTests(unittest.TestCase):
             token_service=tokens,
             quota_ledger=InMemoryQuotaLedger(),
             audit_ledger=audit,
+            image_verifier=InMemoryImageVerifier(trusted_images=(request.image,)),
             policy_bundle=policy,
             artifact_store=artifacts,
         )
