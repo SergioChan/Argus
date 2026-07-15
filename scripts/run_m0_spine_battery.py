@@ -4,19 +4,23 @@
 from __future__ import annotations
 
 import argparse
+import base64
 from contextlib import closing
 from dataclasses import asdict, replace
 from decimal import Decimal
 from hashlib import sha256
 import hmac
+import io
 import json
 import math
 import os
 from pathlib import Path
+import re
 import shutil
 import socket
 import subprocess
 import sys
+import tarfile
 import tempfile
 import threading
 import time
@@ -70,6 +74,18 @@ M1_REFERENCE_PIPELINE_IMAGE_ENV = "ARGUS_S2_REFERENCE_PIPELINE_IMAGE"
 M1_REFERENCE_PIPELINE_PLACEHOLDER_IMAGE = "sha256:" + "0" * 64
 M1_REFERENCE_PIPELINE_SERVICE = "s3-reference-referee"
 COMPOSE_BUILD_TIMEOUT_S = 600
+SECRET_SCAN_MEMBER_MAX_BYTES = 128 * 1024 * 1024
+SECRET_SCAN_TOTAL_MAX_BYTES = 512 * 1024 * 1024
+SECRET_SCAN_MAX_ARCHIVE_DEPTH = 2
+SECRET_ARCHIVE_PATTERNS = (
+    re.compile(br"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----", re.IGNORECASE),
+    re.compile(br"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"),
+    re.compile(br"\bsk-(?:proj-)?[A-Za-z0-9_-]{16,}\b", re.IGNORECASE),
+    re.compile(br"\bgh[oprsu]_[A-Za-z0-9]{20,}\b"),
+    re.compile(br"\bxox[baprs]-[A-Za-z0-9-]{20,}\b", re.IGNORECASE),
+    re.compile(br"\bAIza[0-9A-Za-z_-]{30,}\b"),
+    re.compile(br"\b(?:sk|rk)_live_[0-9A-Za-z]{16,}\b", re.IGNORECASE),
+)
 M1_REFERENCE_RUNTIME_SERVICES = (
     "s8-writer",
     "s10-supervisor",
@@ -186,6 +202,19 @@ def main() -> int:
             s8_read_token=auth_tokens["read"],
             audit_read_token=runtime_secrets["s10_audit_api_read_token"],
             health_token=runtime_secrets["health_token"],
+        )
+        _battery_s10_env_sanitization(
+            evidence,
+            docker=docker,
+            compose_env=env,
+            postgres_port=ports["ARGUS_M0_POSTGRES_PORT"],
+            s10_url=s10_url,
+            s8_url=s8_url,
+            image=args.image,
+            runtime_token=auth_tokens["env-sanitization"],
+            s8_read_token=auth_tokens["read"],
+            audit_read_token=runtime_secrets["s10_audit_api_read_token"],
+            runtime_secret_values=tuple(runtime_secrets.values()),
         )
         _battery_s10_secrets_broker(
             evidence,
@@ -810,6 +839,301 @@ def _battery_s10_image_verification(
     )
 
 
+def _battery_s10_env_sanitization(
+    evidence: dict[str, Any],
+    *,
+    docker: str,
+    compose_env: dict[str, str],
+    postgres_port: str,
+    s10_url: str,
+    s8_url: str,
+    image: str,
+    runtime_token: str,
+    s8_read_token: str,
+    audit_read_token: str,
+    runtime_secret_values: tuple[str, ...],
+) -> None:
+    job_id = "s10-t21-env-job"
+    github_secret = "ghp_" + "A7z" * 14
+    openai_secret = "sk-proj-" + "B8" * 20
+    encoded_secret = base64.b64encode(
+        json.dumps({"api_key": openai_secret}, separators=(",", ":")).encode("utf-8")
+    ).decode("ascii")
+    unlisted_secret = "xoxb-" + "123456789012-" * 2 + "abcdefghijklmnopqrstuvwx"
+    secret_values = (github_secret, openai_secret, encoded_secret, unlisted_secret)
+    forbidden_values = tuple(runtime_secret_values) + secret_values
+
+    def launch_material() -> tuple[dict[str, Any], dict[str, Any]]:
+        return (
+            _post_json(
+                f"{s10_url}/v1/budget-tokens",
+                {},
+                expected_status=201,
+                token=runtime_token,
+            ),
+            _post_json(
+                f"{s10_url}/v1/scope-tokens",
+                {},
+                expected_status=201,
+                token=runtime_token,
+            ),
+        )
+
+    rejected: list[dict[str, Any]] = []
+    for case_id, env, allowlist, reason_code, secret_value in (
+        (
+            "plain-secret-value",
+            {"ARGUS_CONFIG": github_secret},
+            ("ARGUS_CONFIG",),
+            "secret_value",
+            github_secret,
+        ),
+        (
+            "encoded-secret-value",
+            {"ARGUS_CONFIG": encoded_secret},
+            ("ARGUS_CONFIG",),
+            "secret_value",
+            encoded_secret,
+        ),
+        (
+            "sensitive-key-name",
+            {"SERVICE_API_TOKEN": "visible"},
+            ("SERVICE_API_TOKEN",),
+            "secret_key",
+            None,
+        ),
+    ):
+        budget, scope = launch_material()
+        launch = _launch_request_json(
+            job_id=job_id,
+            image=image,
+            budget=budget,
+            scope=scope,
+            args=("-c", "true"),
+            env=env,
+            env_allowlist=allowlist,
+            wallclock_s=2,
+        )
+        launch["trace_id"] = "trace-s10-t21-env-reject"
+        response = _post_sandbox_launch(
+            s10_url,
+            launch,
+            expected_status=403,
+            token=runtime_token,
+        )
+        response_json = json.dumps(response, separators=(",", ":"), sort_keys=True)
+        if response.get("error") != "PolicyDeniedError" or response.get("message") != "sandbox environment rejected":
+            raise AssertionError(f"TC36 {case_id} did not return a generic policy rejection: {response}")
+        if response.get("handle") is not None or response.get("audit_events") != ["env.denied"]:
+            raise AssertionError(f"TC36 {case_id} crossed the pre-launch boundary: {response}")
+        if secret_value is not None and secret_value in response_json:
+            raise AssertionError("TC36 rejection response exposed secret material")
+        if _s10_quota_budget_exists(postgres_port=postgres_port, budget_id=str(budget["budget_id"])):
+            raise AssertionError(f"TC36 {case_id} registered quota before environment rejection")
+        if _sandbox_container_ids(docker, compose_env=compose_env, job_id=job_id):
+            raise AssertionError(f"TC36 {case_id} created a sandbox container")
+        rejected.append(
+            {
+                "case": case_id,
+                "reason_code": reason_code,
+                "http_status": 403,
+                "handle": None,
+                "quota_registered": False,
+                "container_created": False,
+                "audit_events": response["audit_events"],
+                "secret_value_exposed": False,
+            }
+        )
+
+    with tempfile.TemporaryDirectory(prefix="argus-s10-t21-scan-") as temp_dir:
+        scan_root = Path(temp_dir)
+        image_archive = scan_root / "image.tar"
+        _write_docker_archive(
+            [docker, "image", "save", image],
+            image_archive,
+            env=compose_env,
+            timeout=120,
+        )
+        image_scan = _scan_secret_free_tar(
+            image_archive,
+            forbidden_values=forbidden_values,
+        )
+
+        budget, scope = launch_material()
+        launch = _launch_request_json(
+            job_id=job_id,
+            image=image,
+            budget=budget,
+            scope=scope,
+            args=(
+                "-c",
+                "set -eu; "
+                "test \"${ARGUS_VISIBLE:-}\" = visible; "
+                "if env | grep -q '^ARGUS_UNLISTED_SECRET='; then exit 41; fi; "
+                "if env | grep -Eiq '(^|_)(PASSWORD|PASSWD|SECRET|TOKEN|API_KEY|ACCESS_KEY|PRIVATE_KEY|CREDENTIAL)(_|=)|AKIA[0-9A-Z]{16}|sk-(proj-)?[A-Za-z0-9_-]{16,}|gh[oprsu]_[A-Za-z0-9]{20,}|xox[baprs]-[A-Za-z0-9-]{20,}|BEGIN [A-Z0-9 ]*PRIVATE KEY'; then exit 42; fi; "
+                "if test -e /vault || test -e /run/secrets; then exit 43; fi; "
+                "if wget -T 2 -q -O /tmp/vault-response http://vault:8200/v1/sys/health; then exit 44; fi; "
+                "echo tc05-env-scan-pass; echo tc05-vault-unreachable; sleep 12",
+            ),
+            env={"ARGUS_VISIBLE": "visible", "ARGUS_UNLISTED_SECRET": unlisted_secret},
+            env_allowlist=("ARGUS_VISIBLE",),
+            wallclock_s=20,
+        )
+        launch["requested_envelope"]["cpu_m"] = 500
+        launch["trace_id"] = "trace-s10-t21-env-accepted"
+        launch_result: dict[str, Any] = {}
+        launch_failures: list[BaseException] = []
+
+        def launch_in_background() -> None:
+            try:
+                launch_result.update(
+                    _post_sandbox_launch(
+                        s10_url,
+                        launch,
+                        expected_status=201,
+                        token=runtime_token,
+                    )
+                )
+            except BaseException as exc:
+                launch_failures.append(exc)
+
+        launch_thread = threading.Thread(target=launch_in_background, daemon=True)
+        launch_thread.start()
+        inspection_error: BaseException | None = None
+        inspect_payload: dict[str, Any] = {}
+        filesystem_scan: dict[str, int] = {}
+        try:
+            container_id = _wait_for_sandbox_container(
+                docker,
+                compose_env=compose_env,
+                job_id=job_id,
+                timeout_s=10,
+            )
+            inspect_items = json.loads(
+                _run(
+                    [docker, "inspect", container_id],
+                    env=compose_env,
+                    timeout=30,
+                ).stdout
+            )
+            if not isinstance(inspect_items, list) or len(inspect_items) != 1:
+                raise AssertionError("TC05 Docker inspect did not return exactly one sandbox")
+            inspect_payload = inspect_items[0]
+            inspect_json = json.dumps(inspect_payload, separators=(",", ":"), sort_keys=True)
+            if any(secret in inspect_json for secret in forbidden_values):
+                raise AssertionError("TC05 Docker inspect exposed secret material")
+            container_env = inspect_payload.get("Config", {}).get("Env", [])
+            if not isinstance(container_env, list) or "ARGUS_VISIBLE=visible" not in container_env:
+                raise AssertionError(f"TC05 safe environment was not materialized: {container_env}")
+            if any(str(item).startswith("ARGUS_UNLISTED_SECRET=") for item in container_env):
+                raise AssertionError("TC05 unlisted environment materialized in Docker inspect")
+            network_mode = inspect_payload.get("HostConfig", {}).get("NetworkMode")
+            if network_mode != "none":
+                raise AssertionError(f"TC05 sandbox did not retain no-network isolation: {network_mode}")
+            mount_targets = {
+                str(item.get("Destination") or item.get("Target") or "")
+                for item in inspect_payload.get("Mounts", [])
+                if isinstance(item, dict)
+            }
+            if any(target == "/vault" or target.startswith("/run/secrets") for target in mount_targets):
+                raise AssertionError(f"TC05 sandbox received a secret mount: {sorted(mount_targets)}")
+
+            filesystem_archive = scan_root / "filesystem.tar"
+            _write_docker_archive(
+                [docker, "export", container_id],
+                filesystem_archive,
+                env=compose_env,
+                timeout=60,
+            )
+            filesystem_scan = _scan_secret_free_tar(
+                filesystem_archive,
+                forbidden_values=forbidden_values,
+            )
+        except BaseException as exc:
+            inspection_error = exc
+        finally:
+            launch_thread.join(timeout=30)
+
+        if launch_thread.is_alive():
+            raise AssertionError("TC05 accepted sandbox launch did not finish within the bounded wait")
+        if launch_failures:
+            raise launch_failures[0]
+        if inspection_error is not None:
+            raise inspection_error
+
+    handle = launch_result.get("handle") or {}
+    stdout = str(launch_result.get("stdout") or "")
+    if handle.get("state") != "SUCCEEDED" or launch_result.get("exit_code") != 0:
+        raise AssertionError(f"TC05 safe sandbox did not complete successfully: {launch_result}")
+    if "tc05-env-scan-pass" not in stdout or "tc05-vault-unreachable" not in stdout:
+        raise AssertionError(f"TC05 in-sandbox scanner did not pass: {launch_result}")
+    if not _s10_quota_budget_exists(postgres_port=postgres_port, budget_id=str(budget["budget_id"])):
+        raise AssertionError("TC05 accepted sandbox never reached quota admission")
+
+    provenance_ref = str(handle.get("launch_provenance_ref") or "")
+    provenance = _get_json(
+        f"{s8_url}/v1/artifacts/{provenance_ref}/payload",
+        token=s8_read_token,
+    )
+    audit_events = _get_json(
+        f"{s10_url}/v1/audit/query?" + parse.urlencode({"job_id": job_id}),
+        token=audit_read_token,
+    )
+    env_denials = [event for event in audit_events if event.get("event_type") == "env.denied"]
+    reason_codes = [event.get("payload", {}).get("reason_code") for event in env_denials]
+    if reason_codes != ["secret_value", "secret_value", "secret_key"]:
+        raise AssertionError(f"TC36 environment rejection audit drifted: {reason_codes}")
+    leak_surfaces = json.dumps(
+        {
+            "launch_response": launch_result,
+            "provenance": provenance,
+            "audit_events": audit_events,
+            "docker_inspect": inspect_payload,
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    if any(secret in leak_surfaces for secret in forbidden_values):
+        raise AssertionError("TC05/TC36 response, audit, provenance, or inspect evidence exposed secret material")
+
+    inspect_env = inspect_payload.get("Config", {}).get("Env", [])
+    inspect_env_keys = sorted(
+        str(item).split("=", 1)[0]
+        for item in inspect_env
+        if isinstance(item, str) and "=" in item
+    )
+    mount_targets = sorted(
+        str(item.get("Destination") or item.get("Target") or "")
+        for item in inspect_payload.get("Mounts", [])
+        if isinstance(item, dict)
+    )
+    _record(
+        evidence,
+        "s10-tc05-tc36",
+        "S10-TC05/TC36 reject unsafe environments before quota/container creation and prove a real secret-free sandbox image, filesystem, env, mount, and network boundary",
+        {
+            "rejected": rejected,
+            "audit_reason_codes": reason_codes,
+            "accepted_state": handle["state"],
+            "accepted_exit_code": launch_result["exit_code"],
+            "accepted_env_keys": inspect_env_keys,
+            "unlisted_env_absent": "ARGUS_UNLISTED_SECRET" not in inspect_env_keys,
+            "network_mode": inspect_payload.get("HostConfig", {}).get("NetworkMode"),
+            "mount_targets": mount_targets,
+            "vault_mount_absent": all(
+                target != "/vault" and not target.startswith("/run/secrets")
+                for target in mount_targets
+            ),
+            "vault_unreachable": True,
+            "image_scan": image_scan,
+            "filesystem_scan": filesystem_scan,
+            "launch_provenance_ref": provenance_ref,
+            "quota_registered": True,
+            "secret_value_exposed": False,
+        },
+    )
+
+
 def _s10_quota_budget_exists(*, postgres_port: str, budget_id: str) -> bool:
     import psycopg
 
@@ -919,6 +1243,17 @@ def _m0_identity_requests() -> dict[str, dict[str, Any]]:
                 "producer_subsystems": ["S2"],
                 "sandbox_risk_class": "standard",
             },
+        },
+        "env-sanitization": {
+            "caller_id": "s10-t21-env-sanitization",
+            "job_id": "s10-t21-env-job",
+            "root_request_id": "s10-t21-env-root",
+            "budget_caps": {
+                "max_compute_units": 20,
+                "max_wallclock_s": 30,
+                "max_cost_usd": 1,
+            },
+            "scopes": {"sandbox_risk_class": "standard"},
         },
         "halt": {
             "caller_id": "m0-budget-halt",
@@ -5057,6 +5392,150 @@ def _wait_health(url: str, *, token: str, timeout_s: int = 60) -> None:
         except Exception:
             time.sleep(1)
     raise TimeoutError(f"health check did not pass: {url}")
+
+
+def _scan_secret_free_tar(
+    archive_path: Path,
+    *,
+    forbidden_values: tuple[str | bytes, ...],
+) -> dict[str, int]:
+    """Scan an image/export tar and nested layer tars without extracting them."""
+
+    forbidden = tuple(
+        value.encode("utf-8") if isinstance(value, str) else bytes(value)
+        for value in forbidden_values
+        if value
+    )
+    report = {
+        "archive_count": 0,
+        "file_count": 0,
+        "scanned_bytes": 0,
+        "secret_matches": 0,
+    }
+
+    def scan_payload(payload: bytes) -> None:
+        if any(secret in payload for secret in forbidden) or any(
+            pattern.search(payload) for pattern in SECRET_ARCHIVE_PATTERNS
+        ):
+            report["secret_matches"] += 1
+            raise AssertionError("secret material detected in scanned archive")
+
+    def scan_bounded(payload: bytes) -> None:
+        if len(payload) > SECRET_SCAN_MEMBER_MAX_BYTES:
+            raise AssertionError("secret scan archive metadata exceeded its bound")
+        report["scanned_bytes"] += len(payload)
+        if report["scanned_bytes"] > SECRET_SCAN_TOTAL_MAX_BYTES:
+            raise AssertionError("secret scan exceeded its total byte bound")
+        scan_payload(payload)
+
+    def scan_archive(fileobj: Any, *, depth: int) -> None:
+        if depth > SECRET_SCAN_MAX_ARCHIVE_DEPTH:
+            raise AssertionError("secret scan archive nesting exceeded its bound")
+        report["archive_count"] += 1
+        try:
+            archive = tarfile.open(fileobj=fileobj, mode="r:*")
+        except (tarfile.TarError, OSError) as exc:
+            raise AssertionError("secret scan could not parse an archive") from exc
+        with archive:
+            for member in archive:
+                metadata = "\0".join(
+                    (
+                        member.name,
+                        member.linkname,
+                        member.uname,
+                        member.gname,
+                        json.dumps(member.pax_headers, ensure_ascii=False, sort_keys=True),
+                    )
+                ).encode("utf-8", errors="backslashreplace")
+                scan_bounded(metadata)
+                if not member.isfile():
+                    continue
+                if member.size < 0 or member.size > SECRET_SCAN_MEMBER_MAX_BYTES:
+                    raise AssertionError("secret scan archive member exceeded its bound")
+                extracted = archive.extractfile(member)
+                if extracted is None:
+                    raise AssertionError("secret scan could not read an archive member")
+                payload = extracted.read(SECRET_SCAN_MEMBER_MAX_BYTES + 1)
+                if len(payload) != member.size or len(payload) > SECRET_SCAN_MEMBER_MAX_BYTES:
+                    raise AssertionError("secret scan archive member length was invalid")
+                nested_tar = member.name.endswith(".tar") or (
+                    len(payload) >= 262 and payload[257:262] == b"ustar"
+                )
+                if nested_tar:
+                    scan_archive(io.BytesIO(payload), depth=depth + 1)
+                    continue
+                report["file_count"] += 1
+                scan_bounded(payload)
+
+    with archive_path.open("rb") as archive_file:
+        scan_archive(archive_file, depth=0)
+    return report
+
+
+def _write_docker_archive(
+    command: list[str],
+    destination: Path,
+    *,
+    env: dict[str, str],
+    timeout: int,
+) -> None:
+    with destination.open("wb") as output:
+        completed = subprocess.run(
+            command,
+            cwd=ROOT,
+            env=env,
+            timeout=timeout,
+            check=False,
+            stdout=output,
+            stderr=subprocess.PIPE,
+        )
+    if completed.returncode != 0:
+        raise RuntimeError("Docker archive command failed")
+
+
+def _sandbox_container_ids(
+    docker: str,
+    *,
+    compose_env: dict[str, str],
+    job_id: str,
+) -> tuple[str, ...]:
+    completed = _run(
+        [
+            docker,
+            "ps",
+            "--filter",
+            f"label=argus.dev/job-id={job_id}",
+            "--filter",
+            "label=argus.dev/role=sandbox",
+            "--format",
+            "{{.ID}}",
+        ],
+        env=compose_env,
+        timeout=30,
+    )
+    return tuple(line.strip() for line in completed.stdout.splitlines() if line.strip())
+
+
+def _wait_for_sandbox_container(
+    docker: str,
+    *,
+    compose_env: dict[str, str],
+    job_id: str,
+    timeout_s: float,
+) -> str:
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        container_ids = _sandbox_container_ids(
+            docker,
+            compose_env=compose_env,
+            job_id=job_id,
+        )
+        if len(container_ids) == 1:
+            return container_ids[0]
+        if len(container_ids) > 1:
+            raise AssertionError("TC05 found multiple running sandbox containers for one job")
+        time.sleep(0.1)
+    raise AssertionError("TC05 did not observe the running sandbox container")
 
 
 def _ensure_image(docker: str, image: str) -> None:

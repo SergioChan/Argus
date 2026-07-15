@@ -2175,6 +2175,35 @@ class ArgusM0RuntimeServiceTests(unittest.TestCase):
         self.assertIn("sandbox.started", event_types)
         self.assertIn("meter.sample", event_types)
 
+    def test_s10_http_rejects_secret_env_without_value_leak_or_supervisor_call(self) -> None:
+        secret = "ghp_" + "A7z" * 14
+        supervisor = _SuccessfulSupervisor()
+        app = S10SupervisorApp(signing_key=b"test-key", auth=_runtime_auth(), docker_supervisor=supervisor)
+        launch = _launch_body(app)
+        launch["env"] = {"ARGUS_CONFIG": secret}
+        launch["env_allowlist"] = ["ARGUS_CONFIG"]
+
+        status, payload = app.http.handle(
+            JsonRequest(
+                method="POST",
+                path="/v1/sandboxes:launch",
+                query={},
+                body=launch,
+                headers=_auth_headers(),
+            )
+        )
+
+        self.assertEqual(status, 403)
+        self.assertEqual(payload["error"], "PolicyDeniedError")
+        self.assertEqual(payload["message"], "sandbox environment rejected")
+        self.assertEqual(payload["audit_events"], ["env.denied"])
+        self.assertNotIn(secret, json.dumps(payload, sort_keys=True))
+        self.assertEqual(supervisor.calls, [])
+        env_events = [event for event in app.audit.events() if event.event_type == "env.denied"]
+        self.assertEqual(len(env_events), 1)
+        self.assertEqual(env_events[0].payload["reason_code"], "secret_value")
+        self.assertNotIn(secret, json.dumps([asdict(event) for event in env_events], sort_keys=True))
+
     def test_s10_http_launch_rejects_identity_bound_job_override(self) -> None:
         supervisor = _SuccessfulSupervisor()
         app = S10SupervisorApp(signing_key=b"test-key", auth=_runtime_auth(), docker_supervisor=supervisor)

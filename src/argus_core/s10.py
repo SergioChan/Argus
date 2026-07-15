@@ -24,6 +24,7 @@ import sys
 import tempfile
 import threading
 import time
+import unicodedata
 from copy import deepcopy
 from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
@@ -31,6 +32,7 @@ from decimal import Decimal
 from hashlib import sha256
 from pathlib import Path
 from typing import Any, Callable, Iterable, Literal, Mapping, NoReturn, Protocol
+from urllib.parse import unquote_to_bytes
 from uuid import uuid4
 from weakref import ref
 
@@ -57,12 +59,81 @@ SECURITY_MONITOR_TERMINAL_DRAIN_ATTEMPTS = 4
 SECURITY_MONITOR_TERMINAL_DRAIN_INTERVAL_S = 0.05
 DEFAULT_EXFIL_SOFT_BYTES = 64 * 1024 * 1024
 DEFAULT_EXFIL_HARD_BYTES = 128 * 1024 * 1024
-SECRET_VALUE_PATTERNS = (
-    re.compile(r"-----BEGIN [A-Z ]+PRIVATE KEY-----"),
-    re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
-    re.compile(r"\bsk-[A-Za-z0-9_-]{16,}\b"),
-    re.compile(r"(?i)(password|secret|api[_-]?key|token)=?[A-Za-z0-9_./+=:-]{8,}"),
+MAX_SANDBOX_ENV_ENTRIES = 128
+MAX_SANDBOX_ENV_KEY_BYTES = 128
+MAX_SANDBOX_ENV_VALUE_BYTES = 16 * 1024
+MAX_SANDBOX_ENV_TOTAL_BYTES = 64 * 1024
+MAX_SECRET_DECODE_CANDIDATES = 8
+SANDBOX_ENV_KEY_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+SENSITIVE_ENV_KEY_PATTERN = re.compile(
+    r"(?:^|_)(?:AUTHORIZATION|COOKIE|CREDENTIALS?|PASSWORD|PASSWD|PRIVATE_KEY|"
+    r"SECRET|SESSION|TOKEN|API_KEY|ACCESS_KEY|CLIENT_SECRET|VAULT)(?:_|$)",
+    re.IGNORECASE,
 )
+RESERVED_SANDBOX_ENV_KEYS = frozenset(
+    {
+        "BASH_ENV",
+        "CDPATH",
+        "CURL_CA_BUNDLE",
+        "DOCKER_CONFIG",
+        "DOCKER_CONTEXT",
+        "DOCKER_HOST",
+        "ENV",
+        "GCONV_PATH",
+        "GOOGLE_APPLICATION_CREDENTIALS",
+        "HOME",
+        "HOSTALIASES",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "IFS",
+        "KUBECONFIG",
+        "LD_LIBRARY_PATH",
+        "LD_PRELOAD",
+        "NO_PROXY",
+        "PATH",
+        "PYTHONHOME",
+        "PYTHONPATH",
+        "REQUESTS_CA_BUNDLE",
+        "SHELLOPTS",
+        "SSH_AUTH_SOCK",
+        "SSL_CERT_DIR",
+        "SSL_CERT_FILE",
+        "SSLKEYLOGFILE",
+        "all_proxy",
+        "http_proxy",
+        "https_proxy",
+        "no_proxy",
+    }
+)
+RESERVED_SANDBOX_ENV_PREFIXES = ("DYLD_", "LD_", "VAULT_", "AWS_", "AZURE_")
+SECRET_VALUE_PATTERNS = (
+    re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----", re.IGNORECASE),
+    re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"),
+    re.compile(r"\bsk-(?:proj-)?[A-Za-z0-9_-]{16,}\b", re.IGNORECASE),
+    re.compile(r"\bgh[oprsu]_[A-Za-z0-9]{20,}\b"),
+    re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{20,}\b", re.IGNORECASE),
+    re.compile(r"\bAIza[0-9A-Za-z_-]{30,}\b"),
+    re.compile(r"\b(?:sk|rk)_live_[0-9A-Za-z]{16,}\b", re.IGNORECASE),
+    re.compile(
+        r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b"
+    ),
+    re.compile(r"\b(?:Bearer|Basic)\s+[A-Za-z0-9+/_=.:-]{16,}\b", re.IGNORECASE),
+    re.compile(r"://[^/@\s:]+:[^/@\s]{8,}@"),
+    re.compile(
+        r"(?:password|passwd|secret|api[_-]?key|access[_-]?token|refresh[_-]?token|"
+        r"client[_-]?secret|private[_-]?key|authorization)[\"']?\s*[:=]\s*[\"']?"
+        r"[A-Za-z0-9_./+=:@-]{8,}",
+        re.IGNORECASE,
+    ),
+)
+SAFE_OPAQUE_ENV_VALUE_PATTERNS = (
+    re.compile(r"^(?:sha256|blake3):[0-9a-f]{64}$"),
+    re.compile(r"^[^\s@]+@sha256:[0-9a-f]{64}$"),
+)
+OPAQUE_SECRET_CANDIDATE_PATTERN = re.compile(r"[A-Za-z0-9+/_=-]{32,512}")
+PERCENT_ESCAPE_PATTERN = re.compile(r"%[0-9A-Fa-f]{2}")
+BASE64_VALUE_PATTERN = re.compile(r"^[A-Za-z0-9+/_=-]{16,}$")
+HEX_VALUE_PATTERN = re.compile(r"^[0-9A-Fa-f]{32,}$")
 DIGEST_PINNED_IMAGE = re.compile(r"^(?:[^\s@]+@)?sha256:[0-9a-f]{64}$")
 COSIGN_CONTAINER_SIGNATURE_TYPE = "cosign container image signature"
 COSIGN_PAYLOAD_MAX_BYTES = 64 * 1024
@@ -109,6 +180,20 @@ class BudgetExceededError(S10Error):
 
 class PolicyDeniedError(S10Error):
     """Raised when policy or admission denies a sandbox launch."""
+
+
+class EnvironmentSanitizationError(PolicyDeniedError):
+    """Raised without value material when a sandbox environment is unsafe."""
+
+    def __init__(self, reason_code: str, *, key: str | None = None) -> None:
+        message = (
+            "secret-shaped sandbox environment value rejected"
+            if reason_code == "secret_value"
+            else "sandbox environment rejected"
+        )
+        super().__init__(message)
+        self.reason_code = reason_code
+        self.key = key
 
 
 class PolicyBundleSignatureError(S10Error):
@@ -4525,20 +4610,141 @@ def _json_safe_float(value: float) -> float | str:
 
 
 def materialize_sandbox_env(env: dict[str, str], env_allowlist: tuple[str, ...]) -> dict[str, str]:
-    """Return allowlisted env values, failing closed on secret-shaped material."""
-    allowed_keys = set(env_allowlist)
+    """Return a bounded environment containing only explicitly safe values."""
+
+    if len(env) > MAX_SANDBOX_ENV_ENTRIES or len(env_allowlist) > MAX_SANDBOX_ENV_ENTRIES:
+        raise EnvironmentSanitizationError("too_many_entries")
+    if len(set(env_allowlist)) != len(env_allowlist):
+        raise EnvironmentSanitizationError("duplicate_allowlist_key")
+
+    for key in env_allowlist:
+        _validate_sandbox_env_key(key)
+
+    allowed_keys = frozenset(env_allowlist)
     materialized: dict[str, str] = {}
-    for key, value in env.items():
-        if key not in allowed_keys:
+    total_bytes = 0
+    for key in sorted(allowed_keys):
+        if key not in env:
             continue
+        value = env[key]
+        if not isinstance(value, str):
+            raise EnvironmentSanitizationError("invalid_value_type", key=key)
+        value_bytes = value.encode("utf-8")
+        if len(value_bytes) > MAX_SANDBOX_ENV_VALUE_BYTES:
+            raise EnvironmentSanitizationError("value_too_large", key=key)
+        if any(ord(character) < 0x20 or ord(character) == 0x7F for character in value):
+            raise EnvironmentSanitizationError("control_character", key=key)
         if _looks_secret_shaped(value):
-            raise PolicyDeniedError(f"secret-shaped env value rejected for {key}")
+            raise EnvironmentSanitizationError("secret_value", key=key)
+        total_bytes += len(key.encode("ascii")) + 1 + len(value_bytes)
+        if total_bytes > MAX_SANDBOX_ENV_TOTAL_BYTES:
+            raise EnvironmentSanitizationError("environment_too_large")
         materialized[key] = value
     return materialized
 
 
+def _validate_sandbox_env_key(key: str) -> None:
+    if not isinstance(key, str) or not key or len(key.encode("utf-8")) > MAX_SANDBOX_ENV_KEY_BYTES:
+        raise EnvironmentSanitizationError("invalid_key")
+    if SANDBOX_ENV_KEY_PATTERN.fullmatch(key) is None:
+        raise EnvironmentSanitizationError("invalid_key", key=key)
+    if SENSITIVE_ENV_KEY_PATTERN.search(key) is not None:
+        raise EnvironmentSanitizationError("secret_key", key=key)
+    if key in RESERVED_SANDBOX_ENV_KEYS or key.upper() in RESERVED_SANDBOX_ENV_KEYS:
+        raise EnvironmentSanitizationError("reserved_key", key=key)
+    upper_key = key.upper()
+    if any(upper_key.startswith(prefix) for prefix in RESERVED_SANDBOX_ENV_PREFIXES):
+        raise EnvironmentSanitizationError("reserved_key", key=key)
+
+
 def _looks_secret_shaped(value: str) -> bool:
-    return any(pattern.search(value) for pattern in SECRET_VALUE_PATTERNS)
+    for candidate in _secret_scan_candidates(value):
+        if any(pattern.fullmatch(candidate) for pattern in SAFE_OPAQUE_ENV_VALUE_PATTERNS):
+            continue
+        if any(pattern.search(candidate) for pattern in SECRET_VALUE_PATTERNS):
+            return True
+        if _contains_high_entropy_secret_candidate(candidate):
+            return True
+    return False
+
+
+def _secret_scan_candidates(value: str) -> tuple[str, ...]:
+    initial = unicodedata.normalize("NFKC", value)
+    candidates = [initial]
+    seen = {initial}
+    index = 0
+    while index < len(candidates) and len(candidates) < MAX_SECRET_DECODE_CANDIDATES:
+        candidate = candidates[index]
+        index += 1
+        for decoded in _decode_secret_candidate(candidate):
+            normalized = unicodedata.normalize("NFKC", decoded)
+            if normalized in seen or len(normalized.encode("utf-8")) > MAX_SANDBOX_ENV_VALUE_BYTES:
+                continue
+            seen.add(normalized)
+            candidates.append(normalized)
+            if len(candidates) >= MAX_SECRET_DECODE_CANDIDATES:
+                break
+    return tuple(candidates)
+
+
+def _decode_secret_candidate(value: str) -> tuple[str, ...]:
+    decoded: list[str] = []
+    if PERCENT_ESCAPE_PATTERN.search(value):
+        try:
+            percent_decoded = unquote_to_bytes(value).decode("utf-8")
+        except UnicodeDecodeError:
+            percent_decoded = ""
+        if percent_decoded and percent_decoded != value:
+            decoded.append(percent_decoded)
+
+    compact = "".join(value.split())
+    if BASE64_VALUE_PATTERN.fullmatch(compact):
+        padded = compact + "=" * ((4 - len(compact) % 4) % 4)
+        try:
+            raw = base64.b64decode(padded.encode("ascii"), altchars=b"-_", validate=True)
+        except (binascii.Error, ValueError):
+            raw = b""
+        text = _decoded_secret_text(raw)
+        if text is not None and text != value:
+            decoded.append(text)
+
+    if len(value) % 2 == 0 and HEX_VALUE_PATTERN.fullmatch(value):
+        try:
+            raw = bytes.fromhex(value)
+        except ValueError:
+            raw = b""
+        text = _decoded_secret_text(raw)
+        if text is not None and text != value:
+            decoded.append(text)
+    return tuple(decoded)
+
+
+def _decoded_secret_text(raw: bytes) -> str | None:
+    if not raw or len(raw) > MAX_SANDBOX_ENV_VALUE_BYTES:
+        return None
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+    printable = sum(character.isprintable() or character in "\r\n\t" for character in text)
+    if printable / max(len(text), 1) < 0.9:
+        return None
+    return text
+
+
+def _contains_high_entropy_secret_candidate(value: str) -> bool:
+    for match in OPAQUE_SECRET_CANDIDATE_PATTERN.finditer(value):
+        candidate = match.group(0).rstrip("=")
+        if len(candidate) < 32 or len(set(candidate)) < 10:
+            continue
+        frequencies = {character: candidate.count(character) for character in set(candidate)}
+        entropy = -sum(
+            (count / len(candidate)) * math.log2(count / len(candidate))
+            for count in frequencies.values()
+        )
+        if entropy >= 4.25:
+            return True
+    return False
 
 
 def _parse_digest_pinned_image(image: str) -> tuple[str, str]:
@@ -8238,45 +8444,64 @@ class InMemorySandboxOrchestrator:
             self._audit_ledger.append("sandbox.denied", {"reason": verdict.deny_reason, "job_id": request.job_id})
             raise PolicyDeniedError(verdict.deny_reason or "policy denied")
         try:
-            materialize_sandbox_env(request.env, request.env_allowlist)
-        except PolicyDeniedError as exc:
+            materialized_env = materialize_sandbox_env(request.env, request.env_allowlist)
+        except EnvironmentSanitizationError as exc:
             self._audit_ledger.append(
                 "env.denied",
-                {"job_id": request.job_id, "env_keys": sorted(set(request.env) & set(request.env_allowlist))},
+                {
+                    "job_id": request.job_id,
+                    "env_keys": sorted(set(request.env) & set(request.env_allowlist)),
+                    "reason_code": exc.reason_code,
+                },
             )
-            raise PolicyDeniedError("env contains secret-shaped value") from exc
-        verification = self._verify_image_for_launch(request)
+            raise PolicyDeniedError("sandbox environment rejected") from exc
+        admitted_request = replace(
+            request,
+            env=dict(materialized_env),
+            env_allowlist=tuple(sorted(materialized_env)),
+        )
+        verification = self._verify_image_for_launch(admitted_request)
 
-        self._quota_ledger.register_budget(request.budget_token)
+        self._quota_ledger.register_budget(admitted_request.budget_token)
         try:
-            self._quota_ledger.reserve(request.budget_token.budget_id, request.requested_envelope.budget_usage())
+            self._quota_ledger.reserve(
+                admitted_request.budget_token.budget_id,
+                admitted_request.requested_envelope.budget_usage(),
+            )
         except BudgetExceededError:
             self._audit_ledger.append(
                 "budget.reject",
-                {"budget_id": request.budget_token.budget_id, "job_id": request.job_id},
+                {
+                    "budget_id": admitted_request.budget_token.budget_id,
+                    "job_id": admitted_request.job_id,
+                },
             )
             raise
 
         launch_provenance_ref = self._emit_launch_provenance(
-            request,
+            admitted_request,
             verdict,
             policy_bundle,
             verification,
         )
         handle = SandboxHandle(
             sandbox_id=str(uuid4()),
-            job_id=request.job_id,
+            job_id=admitted_request.job_id,
             runtime_class=verdict.runtime_class or "gvisor",
-            budget_epoch=request.budget_token.budget_epoch,
+            budget_epoch=admitted_request.budget_token.budget_epoch,
             policy_bundle_version=policy_bundle.bundle_version,
             state="ADMITTED",
             launch_provenance_ref=launch_provenance_ref,
         )
         self._handles[handle.sandbox_id] = handle
-        self._requests[handle.sandbox_id] = request
+        self._requests[handle.sandbox_id] = admitted_request
         self._audit_ledger.append(
             "sandbox.launched",
-            {"sandbox_id": handle.sandbox_id, "job_id": request.job_id, "runtime_class": handle.runtime_class},
+            {
+                "sandbox_id": handle.sandbox_id,
+                "job_id": admitted_request.job_id,
+                "runtime_class": handle.runtime_class,
+            },
         )
         return handle
 
@@ -8730,7 +8955,16 @@ class DockerSandboxOrchestrator(InMemorySandboxOrchestrator):
     def launch_and_wait(self, request: LaunchRequest) -> SandboxExecutionResult:
         handle = super().launch(request)
         policy_bundle = self._policy_service.bundle(handle.policy_bundle_version)
-        materialized_env = materialize_sandbox_env(request.env, request.env_allowlist)
+        admitted_request = self._requests[handle.sandbox_id]
+        materialized_env = materialize_sandbox_env(
+            admitted_request.env,
+            admitted_request.env_allowlist,
+        )
+        request = replace(
+            admitted_request,
+            env=dict(materialized_env),
+            env_allowlist=tuple(sorted(materialized_env)),
+        )
         reserved_usage = request.requested_envelope.budget_usage()
         meter_samples: list[ResourceMeterSample] = []
         halt_telemetry_items: list[SandboxHaltTelemetry] = []
