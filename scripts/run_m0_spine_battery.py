@@ -42,6 +42,8 @@ from argus_core import (
     ResourceCeilings,
     ScopeGrant,
     SIGNATURE_VERIFICATION_ACCEPTED,
+    TelemetrySpan,
+    TraceAssembler,
     hash_json,
     s8_checkpoint_signature_payload,
 )
@@ -55,10 +57,11 @@ M0_C3_VERIFIER_KEY_ID = "argus-m0-c3-verifier"
 M1_S3_REFERENCE_REFEREE_KEY_ID = "s3-reference-referee-key"
 HALT_LATENCY_TRIALS = 50
 HALT_LATENCY_LIMIT_S = 2.0
-HALT_LATENCY_RESPONSE_TIMEOUT_S = 30.0
+S10_SANDBOX_RESPONSE_TIMEOUT_S = 90.0
+HALT_LATENCY_RESPONSE_TIMEOUT_S = S10_SANDBOX_RESPONSE_TIMEOUT_S
 TOKEN_REVOCATION_PROPAGATION_SLO_S = 2.0
-INFLIGHT_REVOCATION_RESPONSE_TIMEOUT_S = TOKEN_REVOCATION_PROPAGATION_SLO_S + 8.0
-M1_REFERENCE_DEMO_E2E_TIMEOUT_S = 60.0
+INFLIGHT_REVOCATION_RESPONSE_TIMEOUT_S = S10_SANDBOX_RESPONSE_TIMEOUT_S
+M1_REFERENCE_DEMO_E2E_TIMEOUT_S = 300.0
 M1_REFERENCE_PIPELINE_IMAGE_ENV = "ARGUS_S2_REFERENCE_PIPELINE_IMAGE"
 M1_REFERENCE_PIPELINE_PLACEHOLDER_IMAGE = "sha256:" + "0" * 64
 M1_REFERENCE_PIPELINE_SERVICE = "s3-reference-referee"
@@ -208,6 +211,7 @@ def main() -> int:
         _battery_revoked_inflight_sandbox_halted(
             evidence,
             s10_url,
+            docker=docker,
             s8_url=s8_url,
             image=args.image,
             token=auth_tokens["spine"],
@@ -533,6 +537,18 @@ def main() -> int:
             read_token=auth_tokens["read"],
             health_token=runtime_secrets["health_token"],
         )
+        _battery_s10_audit_ledger(
+            evidence,
+            docker=docker,
+            compose_file=args.compose_file,
+            compose_env=env,
+            postgres_port=ports["ARGUS_M0_POSTGRES_PORT"],
+            s10_url=s10_url,
+            image=args.image,
+            runtime_token=auth_tokens["read"],
+            audit_write_token=runtime_secrets["s10_audit_api_write_token"],
+            audit_read_token=runtime_secrets["s10_audit_api_read_token"],
+        )
         _battery_g_argusverify(evidence)
         _battery_real_persistence(
             evidence,
@@ -592,6 +608,9 @@ def _m0_runtime_secrets() -> dict[str, str]:
         "s10_checkpoint_signing_key": f"argus-s10-checkpoint-key-{uuid4().hex}",
         "s10_checkpoint_signer_auth_token": f"argus-s10-checkpoint-signer-{uuid4().hex}",
         "s10_verifier_key_auth_token": f"argus-s10-verifier-key-{uuid4().hex}",
+        "s10_audit_anchor_auth_token": f"argus-s10-audit-anchor-{uuid4().hex}",
+        "s10_audit_api_write_token": f"argus-s10-audit-write-{uuid4().hex}",
+        "s10_audit_api_read_token": f"argus-s10-audit-read-{uuid4().hex}",
         "s10_price_table_signing_key": f"argus-s10-price-table-key-{uuid4().hex}",
         "s8_broker_write_key": f"argus-s8-broker-key-{uuid4().hex}",
         "s10_gw_spectrum_broker_credential": f"argus-s10-gw-broker-{uuid4().hex}",
@@ -830,6 +849,9 @@ def _compose_environment(
         "ARGUS_S10_CHECKPOINT_SIGNING_KEY": runtime_secrets["s10_checkpoint_signing_key"],
         "ARGUS_S10_CHECKPOINT_SIGNER_AUTH_TOKEN": runtime_secrets["s10_checkpoint_signer_auth_token"],
         "ARGUS_S10_VERIFIER_KEY_AUTH_TOKEN": runtime_secrets["s10_verifier_key_auth_token"],
+        "ARGUS_S10_AUDIT_ANCHOR_AUTH_TOKEN": runtime_secrets["s10_audit_anchor_auth_token"],
+        "ARGUS_S10_AUDIT_API_WRITE_TOKEN": runtime_secrets["s10_audit_api_write_token"],
+        "ARGUS_S10_AUDIT_API_READ_TOKEN": runtime_secrets["s10_audit_api_read_token"],
         "ARGUS_S10_C3_VERIFIER_KEYS_JSON": json.dumps(
             {
                 M0_C3_VERIFIER_KEY_ID: runtime_secrets["c3_verifier_signing_key"],
@@ -1923,8 +1945,8 @@ def _battery_revoked_budget_token_denied(
         expected_status=200,
         token=token,
     )
-    denied_response = _post_json(
-        f"{s10_url}/v1/sandboxes:launch",
+    denied_response = _post_sandbox_launch(
+        s10_url,
         launch,
         expected_status=401,
         token=token,
@@ -1958,6 +1980,7 @@ def _battery_revoked_inflight_sandbox_halted(
     evidence: dict[str, Any],
     s10_url: str,
     *,
+    docker: str,
     s8_url: str,
     image: str,
     token: str,
@@ -1991,12 +2014,12 @@ def _battery_revoked_inflight_sandbox_halted(
     def launch_in_background() -> None:
         try:
             launch_result.update(
-                _post_json(
-                    f"{s10_url}/v1/sandboxes:launch",
+                _post_sandbox_launch(
+                    s10_url,
                     launch,
                     expected_status=201,
                     token=token,
-                    timeout=20,
+                    timeout=INFLIGHT_REVOCATION_RESPONSE_TIMEOUT_S,
                 )
             )
         except BaseException as exc:  # pragma: no cover - surfaced in caller thread
@@ -2004,7 +2027,11 @@ def _battery_revoked_inflight_sandbox_halted(
 
     thread = threading.Thread(target=launch_in_background, daemon=True)
     thread.start()
-    time.sleep(1.0)
+    sandbox_container_id = _wait_for_running_sandbox(
+        docker=docker,
+        job_id="m0-spine-job",
+        timeout_s=INFLIGHT_REVOCATION_RESPONSE_TIMEOUT_S,
+    )
     revoke_started = time.monotonic()
     revoke_response = _post_json(
         f"{s10_url}/v1/tokens:revoke",
@@ -2018,7 +2045,7 @@ def _battery_revoked_inflight_sandbox_halted(
     launch_response_after_revocation_ack_s = time.monotonic() - halt_started
     if thread.is_alive():
         raise AssertionError(
-            "in-flight sandbox did not halt after budget token revocation within the propagation window"
+            "in-flight sandbox response did not complete within the durable-audit response window"
         )
     if launch_error:
         raise AssertionError("in-flight revoked launch request failed unexpectedly") from launch_error[0]
@@ -2061,6 +2088,7 @@ def _battery_revoked_inflight_sandbox_halted(
             "token_type": "budget",
             "revocation_store": revoke_response["revocation_store"],
             "revoked_token_id": revoke_response["revoked_token_id"],
+            "sandbox_container_id": sandbox_container_id,
             "revocation_ack_elapsed_s": round(revocation_ack_elapsed_s, 6),
             "halted_after_revocation_ack_s": round(halted_after_revocation_ack_s, 6),
             "terminated_after_revocation_ack_s": round(terminated_after_revocation_ack_s, 6),
@@ -2079,6 +2107,39 @@ def _battery_revoked_inflight_sandbox_halted(
             "spend_final_halt_telemetry": spend_final["halt_telemetry"],
         },
     )
+
+
+def _wait_for_running_sandbox(*, docker: str, job_id: str, timeout_s: float) -> str:
+    deadline = time.monotonic() + timeout_s
+    while True:
+        result = subprocess.run(
+            [
+                docker,
+                "ps",
+                "--filter",
+                f"label=argus.dev/job-id={job_id}",
+                "--filter",
+                "label=argus.dev/role=sandbox",
+                "--filter",
+                "status=running",
+                "--format",
+                "{{.ID}}",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.returncode != 0:
+            raise AssertionError(f"Docker sandbox observation failed: {result.stderr.strip()}")
+        container_ids = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+        if len(container_ids) == 1:
+            return container_ids[0]
+        if len(container_ids) > 1:
+            raise AssertionError(f"multiple running sandboxes matched job_id {job_id!r}: {container_ids}")
+        if time.monotonic() >= deadline:
+            raise AssertionError(f"sandbox for job_id {job_id!r} did not reach running state")
+        time.sleep(0.05)
 
 
 def _revocation_halt_telemetry(value: object) -> tuple[float, float]:
@@ -2516,12 +2577,14 @@ def _battery_s1_reference_physics_demo(
     s8_url: str,
     read_token: str,
 ) -> None:
+    started_at = time.monotonic()
     response = _post_json(
         f"{s1_reference_demo_url}/v1/s1-reference-physics-demo",
         {"job_id": "m1-reference-job"},
         expected_status=200,
         timeout=M1_REFERENCE_DEMO_E2E_TIMEOUT_S,
     )
+    elapsed_s = time.monotonic() - started_at
     expected_checks = {
         "INJECTION",
         "NULL_CONTROL",
@@ -2615,6 +2678,7 @@ def _battery_s1_reference_physics_demo(
             "artifact_refs": artifact_refs,
             "producers": producers,
             "s2_pipeline_lineage_includes_s1_training_dataset": True,
+            "elapsed_s": round(elapsed_s, 6),
         },
     )
 
@@ -2696,6 +2760,295 @@ def _battery_s10_verifier_key_store(
     )
 
 
+def _battery_s10_audit_ledger(
+    evidence: dict[str, Any],
+    *,
+    docker: str,
+    compose_file: str,
+    compose_env: dict[str, str],
+    postgres_port: str,
+    s10_url: str,
+    image: str,
+    runtime_token: str,
+    audit_write_token: str,
+    audit_read_token: str,
+) -> None:
+    unauthenticated = _post_json(
+        f"{s10_url}/v1/audit/append",
+        {"event_type": "audit.unauthorized_probe", "payload": {}},
+        expected_status=401,
+    )
+    runtime_denied = _post_json(
+        f"{s10_url}/v1/audit/append",
+        {"event_type": "audit.runtime_probe", "payload": {}},
+        expected_status=401,
+        token=runtime_token,
+    )
+    caller_hash_denied = _post_json(
+        f"{s10_url}/v1/audit/append",
+        {
+            "event_type": "audit.caller_hash_probe",
+            "payload": {},
+            "sequence": 999,
+            "event_hash": "blake3:" + "f" * 64,
+        },
+        expected_status=400,
+        token=audit_write_token,
+    )
+    api_probe = _post_json(
+        f"{s10_url}/v1/audit/append",
+        {
+            "event_type": "audit.api_probe",
+            "payload": {"severity": "info", "source": "m0-deployed-battery"},
+        },
+        expected_status=201,
+        token=audit_write_token,
+    )
+    if not str(api_probe.get("this_hash", "")).startswith("blake3:"):
+        raise AssertionError(f"audit append API omitted its committed hash: {api_probe}")
+
+    runner = _compose_exec_json(
+        docker=docker,
+        compose_file=compose_file,
+        compose_env=compose_env,
+        service="s10-supervisor",
+        args=(image,),
+        timeout=180,
+        script="""\
+import json
+import sys
+from uuid import uuid4
+
+from argus_core import BudgetCaps, BudgetExceededError, ScopeGrant
+from argus_runtime.auth import RuntimeIdentity
+from argus_runtime.s10_supervisor_service import build_app_from_env
+
+image = sys.argv[1]
+job_id = "s10-tc40-" + uuid4().hex
+trace_id = "trace-s10-tc40-" + uuid4().hex
+identity = RuntimeIdentity(
+    caller_id="s10-tc40-runner",
+    job_id=job_id,
+    root_request_id="root-" + job_id,
+    scopes=ScopeGrant(
+        broker_audiences=("model", "store"),
+        capabilities=("s8.read",),
+        producer_subsystems=("S10",),
+        sandbox_risk_class="standard",
+    ),
+    budget_caps=BudgetCaps(
+        max_compute_units=20,
+        max_model_tokens=64,
+        max_wallclock_s=30,
+        max_cost_usd=2,
+    ),
+    max_ttl_s=300,
+)
+app = build_app_from_env()
+budget = app.mint_budget_for_identity(identity, {"trace_id": trace_id})
+scope = app.mint_scope_for_identity(identity, {"trace_id": trace_id})
+launch = app.launch_sandbox_for_identity(
+    identity,
+    {
+        "job_id": job_id,
+        "subagent_id": "s10-tc40-subagent",
+        "trace_id": trace_id,
+        "budget_token": budget,
+        "scope_token": scope,
+        "image": image,
+        "entrypoint": ["sh"],
+        "args": ["-c", "echo s10-tc40-real-launch"],
+        "env": {},
+        "env_allowlist": [],
+        "requested_envelope": {
+            "cpu_m": 500,
+            "mem_bytes": 16777216,
+            "gpu_count": 0,
+            "wallclock_s": 5,
+            "scratch_bytes": 1048576,
+            "pids": 16,
+            "estimated_cost_usd": 0,
+        },
+        "runtime_class_hint": "auto",
+        "policy_pin": None,
+    },
+)
+completed = app.broker_complete_model_for_identity(
+    identity,
+    {
+        "scope_token": scope,
+        "budget_token": budget,
+        "request": {
+            "model": "argus-reference-model-v1",
+            "max_tokens": 8,
+            "messages": [{"role": "user", "content": "Audit TC40 trace join"}],
+        },
+    },
+)
+halted = False
+try:
+    app.broker_complete_model_for_identity(
+        identity,
+        {
+            "scope_token": scope,
+            "budget_token": budget,
+            "request": {
+                "model": "argus-reference-model-v1",
+                "max_tokens": 1000,
+                "messages": [{"role": "user", "content": "This request must halt before completion"}],
+            },
+        },
+    )
+except BudgetExceededError:
+    halted = True
+handle = launch["handle"]
+quarantine = app._docker_orchestrator.quarantine_sandbox_job(
+    job_id=job_id,
+    sandbox_id=handle["sandbox_id"],
+    reason="POST_RUN_AUDIT_INTEGRITY_FINDING",
+    grace_seconds=0,
+    error={
+        "category": "AUDIT",
+        "code": "TC40_POST_RUN_QUARANTINE",
+        "message": "TC40 exercises the existing core quarantine transition",
+        "retryable": False,
+    },
+)
+print(json.dumps({
+    "job_id": job_id,
+    "trace_id": trace_id,
+    "sandbox_id": handle["sandbox_id"],
+    "launch_state": handle["state"],
+    "model_tokens": completed["tokens_used"],
+    "budget_halted": halted,
+    "quarantine_state": quarantine["state"],
+    "partial_result_ref": quarantine["partial_result_ref"],
+}, sort_keys=True))
+""",
+    )
+    if runner.get("launch_state") != "SUCCEEDED":
+        raise AssertionError(f"TC40 deployed sandbox did not complete: {runner}")
+    if runner.get("budget_halted") is not True:
+        raise AssertionError(f"TC40 model overage did not halt: {runner}")
+    if runner.get("quarantine_state") != "QUARANTINED" or not runner.get("partial_result_ref"):
+        raise AssertionError(f"TC40 core quarantine transition did not complete: {runner}")
+
+    query_url = f"{s10_url}/v1/audit/query?" + parse.urlencode({"job_id": runner["job_id"]})
+    events = _get_json(query_url, token=audit_read_token)
+    if not isinstance(events, list) or not events:
+        raise AssertionError(f"TC40 audit query returned no events: {events}")
+    event_types = [str(event.get("event_type")) for event in events]
+    expected_counts = {
+        "token.mint": 2,
+        "sandbox.launched": 1,
+        "sandbox.started": 1,
+        "sandbox.exited": 1,
+        "model.complete": 1,
+        "model.budget_halt": 1,
+        "sandbox.partial_result": 1,
+        "sandbox.quarantined": 1,
+    }
+    observed_counts = {event_type: event_types.count(event_type) for event_type in expected_counts}
+    if observed_counts != expected_counts:
+        raise AssertionError(
+            f"TC40 trust-boundary event cardinality mismatch: expected={expected_counts} observed={observed_counts}"
+        )
+    if any(event.get("payload", {}).get("trace_id") != runner["trace_id"] for event in events):
+        raise AssertionError("TC40 job audit slice contains an event without the bound trace_id")
+    sequences = [int(event["sequence"]) for event in events]
+    verify_url = f"{s10_url}/v1/audit/verify?" + parse.urlencode(
+        {"from_seq": min(sequences), "to_seq": max(sequences)}
+    )
+    intact = _get_json(verify_url, token=audit_read_token)
+    if intact.get("intact") is not True or intact.get("anchor_mismatch") is not False:
+        raise AssertionError(f"TC40 deployed audit slice did not verify: {intact}")
+
+    span = TelemetrySpan(
+        trace_id=str(runner["trace_id"]),
+        span_id="span-s10-tc40-audit",
+        name="S10.audit",
+        subsystem="S10",
+        attributes={"job_id": runner["job_id"], "first_sequence": min(sequences), "last_sequence": max(sequences)},
+    )
+    trace_summary = TraceAssembler(required_spans=("S10.audit",)).assemble(
+        trace_id=str(runner["trace_id"]),
+        spans=(span,),
+    )
+    if trace_summary.status != "complete" or trace_summary.trace_id != runner["trace_id"]:
+        raise AssertionError(f"TC40 S11 trace contract did not join: {trace_summary}")
+
+    import psycopg
+    from psycopg.types.json import Jsonb
+
+    dsn = f"postgresql://argus:argus-dev-password@127.0.0.1:{postgres_port}/argus"
+    tamper_sequence = min(sequences)
+    with psycopg.connect(dsn) as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT payload FROM s10.audit_event WHERE sequence = %s;", (tamper_sequence,))
+            original_payload = dict(cur.fetchone()[0])
+            tampered_payload = {**original_payload, "tc19_tampered": True}
+            cur.execute("ALTER TABLE s10.audit_event DISABLE TRIGGER USER;")
+            cur.execute(
+                "UPDATE s10.audit_event SET payload = %s WHERE sequence = %s;",
+                (Jsonb(tampered_payload), tamper_sequence),
+            )
+    try:
+        broken = _get_json(
+            f"{s10_url}/v1/audit/verify?"
+            + parse.urlencode({"from_seq": tamper_sequence, "to_seq": tamper_sequence}),
+            token=audit_read_token,
+        )
+        if (
+            broken.get("intact") is not False
+            or broken.get("break_at") != tamper_sequence
+            or broken.get("anchor_mismatch") is not True
+        ):
+            raise AssertionError(f"TC19 historical tamper was not located with anchor mismatch: {broken}")
+    finally:
+        with psycopg.connect(dsn) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE s10.audit_event SET payload = %s WHERE sequence = %s;",
+                    (Jsonb(original_payload), tamper_sequence),
+                )
+                cur.execute("ALTER TABLE s10.audit_event ENABLE TRIGGER USER;")
+    restored = _get_json(verify_url, token=audit_read_token)
+    if restored.get("intact") is not True or restored.get("anchor_mismatch") is not False:
+        raise AssertionError(f"TC19 cleanup did not restore the original verified chain: {restored}")
+
+    _record(
+        evidence,
+        "s10-audit-tc19-tc40",
+        "deployed Rust/Postgres S10 audit chain passed internal-only API, C4 anchor, TC19 tamper, and TC40 job-slice verification",
+        {
+            "writer": "rust-postgres",
+            "anchor_store": "s8-c4-write-once",
+            "api_unauthenticated_error": unauthenticated.get("error"),
+            "api_runtime_identity_error": runtime_denied.get("error"),
+            "api_caller_hash_error": caller_hash_denied.get("error"),
+            "api_probe_sequence": api_probe["sequence"],
+            "job_id": runner["job_id"],
+            "trace_id": runner["trace_id"],
+            "first_sequence": min(sequences),
+            "last_sequence": max(sequences),
+            "event_count": len(events),
+            "expected_event_counts": expected_counts,
+            "observed_event_counts": observed_counts,
+            "chain_intact": intact["intact"],
+            "external_anchor_mismatch": intact["anchor_mismatch"],
+            "tc19_break_at": broken["break_at"],
+            "tc19_anchor_mismatch": broken["anchor_mismatch"],
+            "s11_trace_contract_joined": trace_summary.status == "complete",
+            "real_sandbox_state": runner["launch_state"],
+            "real_model_tokens": runner["model_tokens"],
+            "real_budget_halted": runner["budget_halted"],
+            "core_quarantine_state": runner["quarantine_state"],
+            "forensic_snapshot_t18_claimed": False,
+            "otel_transport_t23_claimed": False,
+        },
+    )
+
+
 def _battery_real_persistence(
     evidence: dict[str, Any],
     ports: dict[str, str],
@@ -2721,6 +3074,10 @@ def _battery_real_persistence(
             s10_quota_ledger_entries = int(cur.fetchone()[0])
             cur.execute("SELECT count(*) FROM s10.quota_budget WHERE halted;")
             s10_quota_halted_budgets = int(cur.fetchone()[0])
+            cur.execute("SELECT count(*), COALESCE(max(sequence), 0) FROM s10.audit_event;")
+            s10_audit_event_count, s10_audit_max_sequence = (int(value) for value in cur.fetchone())
+            cur.execute("SELECT count(*), count(DISTINCT root) FROM s10.audit_anchor;")
+            s10_audit_anchor_count, s10_audit_distinct_roots = (int(value) for value in cur.fetchone())
             cur.execute(
                 """
                 SELECT COALESCE(bool_and(
@@ -2839,6 +3196,10 @@ print(json.dumps({"object_count": sum(1 for _ in client.list_objects("argus-s8-o
         or s10_migration_count < 1
         or s10_quota_ledger_entries < 4
         or s10_quota_halted_budgets < 1
+        or s10_audit_event_count < 1
+        or s10_audit_event_count != s10_audit_anchor_count
+        or s10_audit_max_sequence != s10_audit_event_count
+        or s10_audit_distinct_roots != s10_audit_anchor_count
         or not s10_quota_remaining_non_negative
         or not {"register", "reserve", "consume", "release", "halt"}.issubset(s10_quota_entry_types)
     ):
@@ -2853,6 +3214,9 @@ print(json.dumps({"object_count": sum(1 for _ in client.list_objects("argus-s8-o
             f"record_hashes_match_refreshed_records={record_hashes_match} "
             f"s10_migrations={s10_migration_count} s10_quota_entries={s10_quota_ledger_entries} "
             f"s10_quota_halted_budgets={s10_quota_halted_budgets} "
+            f"s10_audit_events={s10_audit_event_count} s10_audit_anchors={s10_audit_anchor_count} "
+            f"s10_audit_max_sequence={s10_audit_max_sequence} "
+            f"s10_audit_distinct_roots={s10_audit_distinct_roots} "
             f"s10_quota_remaining_non_negative={s10_quota_remaining_non_negative} "
             f"s10_quota_entry_types={s10_quota_entry_types}"
         )
@@ -2866,6 +3230,10 @@ print(json.dumps({"object_count": sum(1 for _ in client.list_objects("argus-s8-o
             "s10_schema_migrations": s10_migration_count,
             "s10_quota_ledger_entries": s10_quota_ledger_entries,
             "s10_quota_halted_budgets": s10_quota_halted_budgets,
+            "s10_audit_events": s10_audit_event_count,
+            "s10_audit_anchors": s10_audit_anchor_count,
+            "s10_audit_max_sequence": s10_audit_max_sequence,
+            "s10_audit_distinct_roots": s10_audit_distinct_roots,
             "s10_quota_remaining_non_negative": s10_quota_remaining_non_negative,
             "s10_quota_entry_types": s10_quota_entry_types,
             "artifact_records": record_count,
@@ -3089,6 +3457,36 @@ def _postgres_append_only_denials(dsn: str) -> dict[str, bool]:
             "TRUNCATE s10.quota_ledger_entry;",
             "append-only table quota_ledger_entry",
         ),
+        "s10_audit_update_denied": _postgres_statement_denied(
+            dsn,
+            "UPDATE s10.audit_event SET event_type = 'tampered' WHERE sequence = 1;",
+            "append-only table audit_event",
+        ),
+        "s10_audit_delete_denied": _postgres_statement_denied(
+            dsn,
+            "DELETE FROM s10.audit_event WHERE sequence = 1;",
+            "append-only table audit_event",
+        ),
+        "s10_audit_truncate_denied": _postgres_statement_denied(
+            dsn,
+            "TRUNCATE s10.audit_event CASCADE;",
+            "append-only table audit_event",
+        ),
+        "s10_audit_writer_direct_insert_denied": _postgres_statement_denied(
+            dsn,
+            """
+            SET ROLE s10_audit_writer;
+            INSERT INTO s10.audit_event (sequence, event_type, payload, previous_hash, event_hash)
+            VALUES (
+                999999,
+                'direct',
+                '{}'::jsonb,
+                'blake3:0000000000000000000000000000000000000000000000000000000000000000',
+                'blake3:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff'
+            );
+            """,
+            "permission denied",
+        ),
     }
 
 
@@ -3212,8 +3610,8 @@ def _battery_e_budget_halt(
         env_allowlist=(),
         wallclock_s=1,
     )
-    response = _post_json(
-        f"{s10_url}/v1/sandboxes:launch",
+    response = _post_sandbox_launch(
+        s10_url,
         launch_body,
         expected_status=403,
         token=token,
@@ -3298,8 +3696,8 @@ def _battery_s10_preflight_budget_reject(
         wallclock_s=1,
         estimated_cost_usd=0.02,
     )
-    response = _post_json(
-        f"{s10_url}/v1/sandboxes:launch",
+    response = _post_sandbox_launch(
+        s10_url,
         launch_body,
         expected_status=403,
         token=token,
@@ -3375,8 +3773,8 @@ def _battery_s10_flagship_hpc_ceiling_reject(
         wallclock_s=86_400,
         estimated_cost_usd=25_000,
     )
-    response = _post_json(
-        f"{s10_url}/v1/sandboxes:launch",
+    response = _post_sandbox_launch(
+        s10_url,
         launch_body,
         expected_status=403,
         token=token,
@@ -3464,8 +3862,8 @@ def _battery_partial_capture(
         env_allowlist=(),
         wallclock_s=1,
     )
-    response = _post_json(
-        f"{s10_url}/v1/sandboxes:launch",
+    response = _post_sandbox_launch(
+        s10_url,
         launch_body,
         expected_status=201,
         token=token,
@@ -3618,8 +4016,8 @@ def _battery_halt_latency_trials(
             env_allowlist=(),
             wallclock_s=1,
         )
-        response = _post_json(
-            f"{s10_url}/v1/sandboxes:launch",
+        response = _post_sandbox_launch(
+            s10_url,
             launch_body,
             expected_status=403,
             token=token,
@@ -3758,8 +4156,8 @@ def _battery_non_injected_meter_gap(
             env_allowlist=(),
             wallclock_s=5,
         )
-        response = _post_json(
-            f"{s10_url}/v1/sandboxes:launch",
+        response = _post_sandbox_launch(
+            s10_url,
             launch_body,
             expected_status=201,
             token=token,
@@ -4245,8 +4643,8 @@ def _run_no_network_launch(
         env_allowlist=("VISIBLE",),
         wallclock_s=5,
     )
-    result = _post_json(
-        f"{s10_url}/v1/sandboxes:launch",
+    result = _post_sandbox_launch(
+        s10_url,
         launch,
         expected_status=201,
         token=token,
@@ -4317,6 +4715,23 @@ def _post_json(
     request_headers = {"Content-Type": "application/json", **_auth_headers(token), **(headers or {})}
     req = request.Request(url, data=encoded, method="POST", headers=request_headers)
     return _open_json(req, expected_status=expected_status, timeout=timeout)
+
+
+def _post_sandbox_launch(
+    s10_url: str,
+    body: dict[str, Any],
+    *,
+    expected_status: int,
+    token: str,
+    timeout: float = S10_SANDBOX_RESPONSE_TIMEOUT_S,
+) -> dict[str, Any]:
+    return _post_json(
+        f"{s10_url}/v1/sandboxes:launch",
+        body,
+        expected_status=expected_status,
+        token=token,
+        timeout=timeout,
+    )
 
 
 def _get_json(

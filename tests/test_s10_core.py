@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 
 import argus_core.s10 as s10_module
@@ -1172,6 +1173,31 @@ class S10OrchestratorAndAuditTests(unittest.TestCase):
         self.assertTrue(partial_payload["terminate_succeeded"])
         self.assertEqual(partial_records[0].lineage.input_refs, (handle.launch_provenance_ref,))
 
+    def test_quarantine_completed_sandbox_does_not_release_quota_twice(self) -> None:
+        artifacts = InMemoryArtifactStore()
+        quota = InMemoryQuotaLedger()
+        orchestrator = InMemorySandboxOrchestrator(
+            token_service=self.tokens,
+            quota_ledger=quota,
+            audit_ledger=self.audit,
+            policy_bundle=self.bundle,
+            artifact_store=artifacts,
+        )
+        request = self._launch_request(max_cost_usd=10, estimated_cost_usd=2)
+        handle = orchestrator.launch(request)
+        quota.release(request.budget_token.budget_id, request.requested_envelope.budget_usage())
+        orchestrator._handles[handle.sandbox_id] = replace(handle, state="SUCCEEDED")
+
+        payload = orchestrator.quarantine_sandbox_job(
+            job_id=request.job_id,
+            sandbox_id=handle.sandbox_id,
+            reason="POST_RUN_INTEGRITY_FINDING",
+            grace_seconds=0,
+        )
+
+        self.assertEqual(payload["state"], "QUARANTINED")
+        self.assertEqual(quota.state(request.budget_token.budget_id).reserved, BudgetUsage())
+
     def _launch_request(self, *, max_cost_usd: float, estimated_cost_usd: float) -> LaunchRequest:
         budget = self.tokens.mint_budget(
             caps=BudgetCaps(
@@ -1483,12 +1509,18 @@ class S10ResourceMeterGapTests(unittest.TestCase):
         supervisor = _GpuBudgetBreachDockerApiSupervisor(elapsed_s=1.25)
         started_at = s10_module.time.monotonic() - 1.25
         samples: list[s10_module.ResourceMeterSample] = []
+        halt_audit_observed_kill_states: list[bool] = []
+
+        def record_sample(sample: s10_module.ResourceMeterSample) -> None:
+            samples.append(sample)
+            if sample.halted:
+                halt_audit_observed_kill_states.append(supervisor.killed)
 
         exit_code, timed_out, stderr, usage, partial_result = supervisor._wait_for_container_with_meter(
             container_id="container-gpu",
             request=request,
             started_at=started_at,
-            meter_sample_sink=samples.append,
+            meter_sample_sink=record_sample,
         )
 
         self.assertIsNone(exit_code)
@@ -1506,6 +1538,8 @@ class S10ResourceMeterGapTests(unittest.TestCase):
         self.assertTrue(any("gpu_seconds" in sample.breached_dimensions for sample in samples))
         self.assertTrue(any(sample.halted for sample in samples))
         self.assertTrue(all(not sample.dcgm_available for sample in samples))
+        self.assertTrue(halt_audit_observed_kill_states)
+        self.assertTrue(all(halt_audit_observed_kill_states))
 
     def test_runtime_halt_probe_terminates_running_container_for_revoked_token(self) -> None:
         tokens = InMemoryTokenService(signing_key=b"test-key", now_fn=lambda: 1_000)
@@ -1537,12 +1571,18 @@ class S10ResourceMeterGapTests(unittest.TestCase):
         supervisor = _RuntimeHaltDockerApiSupervisor()
         samples: list[s10_module.ResourceMeterSample] = []
         halt_telemetry: list[s10_module.SandboxHaltTelemetry] = []
+        halt_audit_observed_kill_states: list[bool] = []
+
+        def record_sample(sample: s10_module.ResourceMeterSample) -> None:
+            samples.append(sample)
+            if sample.halted:
+                halt_audit_observed_kill_states.append(supervisor.killed)
 
         exit_code, timed_out, stderr, usage, partial_result = supervisor._wait_for_container_with_meter(
             container_id="container-revoked",
             request=request,
             started_at=s10_module.time.monotonic(),
-            meter_sample_sink=samples.append,
+            meter_sample_sink=record_sample,
             runtime_halt_probe=lambda: s10_module._RuntimeHaltSignal(
                 reason="token_revoked",
                 dimensions=("token_revoked", "budget_token"),
@@ -1572,6 +1612,8 @@ class S10ResourceMeterGapTests(unittest.TestCase):
         self.assertIsNotNone(halt_telemetry[0].revocation_ack_to_terminate_s)
         self.assertLessEqual(halt_telemetry[0].revocation_ack_to_freeze_s or 99, 2)
         self.assertLessEqual(halt_telemetry[0].revocation_ack_to_terminate_s or 99, 2)
+        self.assertTrue(halt_audit_observed_kill_states)
+        self.assertTrue(all(halt_audit_observed_kill_states))
 
     def test_partial_log_capture_is_byte_bounded_and_marks_truncation(self) -> None:
         supervisor = _CappedLogDockerApiSupervisor()
@@ -1746,6 +1788,13 @@ class S10ResourceMeterGapTests(unittest.TestCase):
         supervisor = _GapStallDockerApiSupervisor(meter_interval_s=0.1, meter_gap_halt_s=0.2)
         clock = _FakeClock()
         samples: list[s10_module.ResourceMeterSample] = []
+        halt_audit_observed_kill_states: list[bool] = []
+
+        def record_sample(sample: s10_module.ResourceMeterSample) -> None:
+            samples.append(sample)
+            if sample.halted:
+                halt_audit_observed_kill_states.append(supervisor.killed)
+
         original_monotonic = s10_module.time.monotonic
         original_sleep = s10_module.time.sleep
         s10_module.time.monotonic = clock.monotonic  # type: ignore[assignment]
@@ -1755,7 +1804,7 @@ class S10ResourceMeterGapTests(unittest.TestCase):
                 container_id="container-gap",
                 request=request,
                 started_at=0.0,
-                meter_sample_sink=samples.append,
+                meter_sample_sink=record_sample,
             )
         finally:
             s10_module.time.monotonic = original_monotonic  # type: ignore[assignment]
@@ -1780,6 +1829,8 @@ class S10ResourceMeterGapTests(unittest.TestCase):
         self.assertTrue(all("meter_gap" in sample.breached_dimensions for sample in gap_samples))
         self.assertEqual(samples[-1].source, "docker-api-cgroup-gap")
         self.assertIn("meter_gap", samples[-1].breached_dimensions)
+        self.assertTrue(halt_audit_observed_kill_states)
+        self.assertTrue(all(halt_audit_observed_kill_states))
 
     def _halt_request(self, job_id: str) -> LaunchRequest:
         tokens = InMemoryTokenService(signing_key=b"test-key", now_fn=lambda: 1_000)
@@ -2287,6 +2338,66 @@ class S10DockerOrchestratorTests(unittest.TestCase):
         self.assertTrue(spend_payload["partial_result_captured"])
         self.assertEqual(spend_payload["partial_result_ref"], partial_records[0].artifact_ref)
         self.assertIn(partial_records[0].artifact_ref, spend_records[-1].lineage.input_refs)
+
+    def test_meter_audit_persistence_does_not_block_the_runtime_monitor(self) -> None:
+        audit = _BlockingMeterAuditLedger()
+        supervisor = _SingleMeterSampleSupervisor()
+        orchestrator = DockerSandboxOrchestrator(
+            token_service=self.tokens,
+            quota_ledger=InMemoryQuotaLedger(),
+            audit_ledger=audit,
+            policy_bundle=self.bundle,
+            artifact_store=InMemoryArtifactStore(),
+            supervisor=supervisor,
+        )
+        result: list[SandboxExecutionResult] = []
+        errors: list[BaseException] = []
+
+        def launch() -> None:
+            try:
+                result.append(
+                    orchestrator.launch_and_wait(
+                        self._launch_request(args=("-c", "true"), env={}, env_allowlist=(), wallclock_s=1)
+                    )
+                )
+            except BaseException as exc:  # pragma: no cover - surfaced in the test thread
+                errors.append(exc)
+
+        worker = threading.Thread(target=launch, daemon=True)
+        worker.start()
+        self.assertTrue(audit.append_started.wait(timeout=1))
+        callback_returned_before_release = supervisor.callback_returned.wait(timeout=0.1)
+        audit.allow_append.set()
+        worker.join(timeout=2)
+
+        self.assertFalse(worker.is_alive())
+        if errors:
+            raise errors[0]
+        self.assertTrue(callback_returned_before_release)
+        self.assertEqual(result[0].handle.state, "SUCCEEDED")
+        self.assertIn("meter.sample", [event.event_type for event in audit.events()])
+
+    def test_meter_audit_worker_failure_fails_the_launch_closed(self) -> None:
+        audit = _FailingMeterAuditLedger()
+        supervisor = _SingleMeterSampleSupervisor()
+        orchestrator = DockerSandboxOrchestrator(
+            token_service=self.tokens,
+            quota_ledger=InMemoryQuotaLedger(),
+            audit_ledger=audit,
+            policy_bundle=self.bundle,
+            artifact_store=InMemoryArtifactStore(),
+            supervisor=supervisor,
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "meter audit unavailable"):
+            orchestrator.launch_and_wait(
+                self._launch_request(args=("-c", "true"), env={}, env_allowlist=(), wallclock_s=1)
+            )
+
+        self.assertTrue(supervisor.callback_returned.is_set())
+        event_types = [event.event_type for event in audit.events()]
+        self.assertIn("budget.release", event_types)
+        self.assertIn("sandbox.runtime_failed", event_types)
 
     def test_runtime_budget_exceed_halts_and_releases_reservation(self) -> None:
         over_budget_usage = BudgetUsage(compute_units=11, wallclock_s=11)
@@ -3050,6 +3161,65 @@ class _HaltFailureBranchDockerApiSupervisor(DockerSandboxSupervisor):
             stderr_bytes=0,
             log_capture_limit_bytes=s10_module.PARTIAL_RESULT_LOG_CAPTURE_LIMIT_BYTES,
             truncated=False,
+        )
+
+
+class _BlockingMeterAuditLedger(InMemoryAuditLedger):
+    def __init__(self) -> None:
+        super().__init__()
+        self.append_started = threading.Event()
+        self.allow_append = threading.Event()
+        self._blocked = False
+
+    def append(self, event_type: str, payload: dict[str, object]):  # type: ignore[override]
+        if event_type == "meter.sample" and not self._blocked:
+            self._blocked = True
+            self.append_started.set()
+            if not self.allow_append.wait(timeout=2):
+                raise TimeoutError("test meter audit append was not released")
+        return super().append(event_type, payload)
+
+
+class _FailingMeterAuditLedger(InMemoryAuditLedger):
+    def append(self, event_type: str, payload: dict[str, object]):  # type: ignore[override]
+        if event_type == "meter.sample":
+            raise RuntimeError("meter audit unavailable")
+        return super().append(event_type, payload)
+
+
+class _SingleMeterSampleSupervisor:
+    def __init__(self) -> None:
+        self.callback_returned = threading.Event()
+
+    def run(
+        self,
+        *,
+        handle: SandboxHandle,
+        request: LaunchRequest,
+        materialized_env: dict[str, str],
+        meter_sample_sink=None,
+    ) -> SandboxExecutionResult:
+        del request, materialized_env
+        usage = BudgetUsage(compute_units=0.1, wallclock_s=0.1)
+        if meter_sample_sink is not None:
+            meter_sample_sink(
+                s10_module.ResourceMeterSample(
+                    sample_seq=1,
+                    elapsed_s=0.1,
+                    cadence_s=0.0,
+                    usage=usage,
+                    source="test-meter",
+                )
+            )
+        self.callback_returned.set()
+        return SandboxExecutionResult(
+            handle=handle,
+            exit_code=0,
+            stdout="",
+            stderr="",
+            timed_out=False,
+            duration_s=0.1,
+            budget_usage=usage,
         )
 
 

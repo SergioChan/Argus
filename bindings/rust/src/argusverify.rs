@@ -192,7 +192,7 @@ fn signature_value(report_with_empty_signature: &Value, secret: &[u8]) -> Result
     Ok(C3_SIGNATURE_PREFIX.to_string() + &hex_lower(&mac.finalize().into_bytes()))
 }
 
-fn canonical_json(value: &Value) -> Result<String, String> {
+pub fn canonical_json(value: &Value) -> Result<String, String> {
     match value {
         Value::Null => Ok("null".to_string()),
         Value::Bool(value) => Ok(if *value { "true" } else { "false" }.to_string()),

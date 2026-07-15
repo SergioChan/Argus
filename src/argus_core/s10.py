@@ -9,6 +9,7 @@ import inspect
 import json
 import math
 import os
+import queue
 import re
 import selectors
 import shlex
@@ -20,7 +21,9 @@ import sys
 import tempfile
 import threading
 import time
+from copy import deepcopy
 from dataclasses import asdict, dataclass, field, replace
+from datetime import UTC, datetime
 from decimal import Decimal
 from hashlib import sha256
 from pathlib import Path
@@ -44,6 +47,7 @@ SIGNATURE_PREFIX = "hmac-sha256:"
 TOKEN_ED25519_SIGNATURE_PREFIX = "ed25519:"
 DOCKER_SANDBOX_USER = "65532:65532"
 PARTIAL_RESULT_LOG_CAPTURE_LIMIT_BYTES = 64 * 1024
+METER_AUDIT_BACKLOG_MAX_ITEMS = 1024
 DEFAULT_EXFIL_SOFT_BYTES = 64 * 1024 * 1024
 DEFAULT_EXFIL_HARD_BYTES = 128 * 1024 * 1024
 SECRET_VALUE_PATTERNS = (
@@ -2350,6 +2354,26 @@ class AuditEvent:
 class AuditVerification:
     valid: bool
     break_sequence: int | None = None
+    anchor_mismatch: bool = False
+    reason: str | None = None
+
+
+def audit_event_hash(
+    sequence: int,
+    event_type: str,
+    payload: dict[str, Any],
+    previous_hash: str,
+) -> str:
+    return hash_bytes(
+        canonical_c3_json_bytes(
+            {
+                "sequence": sequence,
+                "event_type": event_type,
+                "payload": payload,
+                "previous_hash": previous_hash,
+            }
+        )
+    )
 
 
 @dataclass(frozen=True)
@@ -3808,43 +3832,97 @@ class InMemoryAuditLedger:
 
     def __init__(self) -> None:
         self._events: list[AuditEvent] = []
+        self._created_at: list[datetime] = []
+        self._trace_ids: dict[str, str] = {}
+        self._lock = threading.RLock()
+
+    def bind_trace(self, *, job_id: str, trace_id: str) -> None:
+        if not job_id or not trace_id:
+            raise ValueError("audit trace binding requires job_id and trace_id")
+        with self._lock:
+            self._trace_ids[job_id] = trace_id
 
     def append(self, event_type: str, payload: dict[str, Any]) -> AuditEvent:
-        previous_hash = self._events[-1].event_hash if self._events else self._zero_hash()
-        sequence = len(self._events) + 1
-        event_hash = self._event_hash(sequence, event_type, payload, previous_hash)
-        event = AuditEvent(
-            sequence=sequence,
-            event_type=event_type,
-            payload=payload,
-            previous_hash=previous_hash,
-            event_hash=event_hash,
-        )
-        self._events.append(event)
-        return event
+        if not isinstance(event_type, str) or not event_type:
+            raise ValueError("audit event_type is required")
+        if not isinstance(payload, dict):
+            raise ValueError("audit payload must be an object")
+        with self._lock:
+            canonical_payload = deepcopy(payload)
+            job_id = canonical_payload.get("job_id")
+            if isinstance(job_id, str) and job_id and "trace_id" not in canonical_payload:
+                trace_id = self._trace_ids.get(job_id)
+                if trace_id is not None:
+                    canonical_payload["trace_id"] = trace_id
+            previous_hash = self._events[-1].event_hash if self._events else self._zero_hash()
+            sequence = len(self._events) + 1
+            event_hash = self._event_hash(sequence, event_type, canonical_payload, previous_hash)
+            event = AuditEvent(
+                sequence=sequence,
+                event_type=event_type,
+                payload=canonical_payload,
+                previous_hash=previous_hash,
+                event_hash=event_hash,
+            )
+            self._events.append(event)
+            self._created_at.append(datetime.now(UTC))
+            return deepcopy(event)
 
-    def verify_chain(self) -> AuditVerification:
-        previous_hash = self._zero_hash()
-        for event in self._events:
-            expected = self._event_hash(event.sequence, event.event_type, event.payload, previous_hash)
-            if event.previous_hash != previous_hash or event.event_hash != expected:
-                return AuditVerification(valid=False, break_sequence=event.sequence)
-            previous_hash = event.event_hash
+    def verify_chain(
+        self,
+        *,
+        from_sequence: int | None = None,
+        to_sequence: int | None = None,
+    ) -> AuditVerification:
+        lower = from_sequence or 1
+        upper = to_sequence or len(self._events)
+        if lower < 1 or upper < lower:
+            raise ValueError("audit verification range is invalid")
+        with self._lock:
+            previous_hash = self._zero_hash() if lower == 1 else self._events[lower - 2].event_hash
+            for event in self._events[lower - 1 : upper]:
+                expected = self._event_hash(event.sequence, event.event_type, event.payload, previous_hash)
+                if event.previous_hash != previous_hash or event.event_hash != expected:
+                    return AuditVerification(
+                        valid=False,
+                        break_sequence=event.sequence,
+                        reason="event_hash_mismatch",
+                    )
+                previous_hash = event.event_hash
         return AuditVerification(valid=True)
 
     def events(self) -> tuple[AuditEvent, ...]:
-        return tuple(self._events)
+        with self._lock:
+            return tuple(deepcopy(self._events))
+
+    def query(
+        self,
+        *,
+        job_id: str | None = None,
+        event_type: str | None = None,
+        severity: str | None = None,
+        from_time: datetime | None = None,
+        to_time: datetime | None = None,
+    ) -> tuple[AuditEvent, ...]:
+        with self._lock:
+            matches = []
+            for event, created_at in zip(self._events, self._created_at, strict=True):
+                if job_id is not None and event.payload.get("job_id") != job_id:
+                    continue
+                if event_type is not None and event.event_type != event_type:
+                    continue
+                if severity is not None and event.payload.get("severity") != severity:
+                    continue
+                if from_time is not None and created_at < from_time:
+                    continue
+                if to_time is not None and created_at > to_time:
+                    continue
+                matches.append(event)
+            return tuple(deepcopy(matches))
 
     @staticmethod
     def _event_hash(sequence: int, event_type: str, payload: dict[str, Any], previous_hash: str) -> str:
-        return hash_json(
-            {
-                "sequence": sequence,
-                "event_type": event_type,
-                "payload": payload,
-                "previous_hash": previous_hash,
-            }
-        )
+        return audit_event_hash(sequence, event_type, payload, previous_hash)
 
     @staticmethod
     def _zero_hash() -> str:
@@ -5312,7 +5390,6 @@ class DockerSandboxSupervisor:
                 breached_dimensions=dimensions or (reason,),
                 halted=True,
             )
-            emit(sample)
             return self._kill_metered_container(
                 container_id=container_id,
                 request=request,
@@ -5342,7 +5419,6 @@ class DockerSandboxSupervisor:
                     halted=True,
                     conservative_gap_s=gap_s,
                 )
-                emit(sample)
                 return self._kill_metered_container(
                     container_id=container_id,
                     request=request,
@@ -5411,7 +5487,6 @@ class DockerSandboxSupervisor:
                     breached_dimensions=breach_dimensions,
                     halted=halted,
                 )
-                emit(sample)
                 if halted:
                     reason = "budget_caps" if breach_dimensions else "wallclock_timeout"
                     return self._kill_metered_container(
@@ -5424,6 +5499,7 @@ class DockerSandboxSupervisor:
                         meter_sample_sink=meter_sample_sink,
                         halt_telemetry_sink=halt_telemetry_sink,
                     )
+                emit(sample)
                 next_sample_at = time.monotonic() + self._meter_interval_s
                 if envelope.wallclock_s > 0:
                     next_sample_at = min(next_sample_at, started_at + envelope.wallclock_s)
@@ -5538,6 +5614,7 @@ class DockerSandboxSupervisor:
             halted=True,
         )
         if meter_sample_sink is not None:
+            meter_sample_sink(last_sample)
             meter_sample_sink(final_sample)
         partial_result = SandboxPartialResult(
             reason=reason,
@@ -5891,7 +5968,7 @@ class InMemorySandboxOrchestrator:
             reason=reason,
             grace_seconds=grace_seconds,
         )
-        if request is not None:
+        if request is not None and handle.state in {"ADMITTED", "RUNNING"}:
             self._quota_ledger.release(request.budget_token.budget_id, request.requested_envelope.budget_usage())
         cancelled_handle = replace(handle, state="TERMINATED")
         self._handles[sandbox_id] = cancelled_handle
@@ -5932,7 +6009,7 @@ class InMemorySandboxOrchestrator:
             grace_seconds=grace_seconds,
             error=error_payload,
         )
-        if request is not None:
+        if request is not None and handle.state in {"ADMITTED", "RUNNING"}:
             self._quota_ledger.release(request.budget_token.budget_id, request.requested_envelope.budget_usage())
         quarantined_handle = replace(handle, state="QUARANTINED")
         self._handles[sandbox_id] = quarantined_handle
@@ -6138,6 +6215,73 @@ def _launch_exec_environment(
     }
 
 
+class _OrderedAuditBatchWriter:
+    _STOP = object()
+
+    def __init__(
+        self,
+        sink: Callable[[str, dict[str, Any]], Any],
+        *,
+        max_pending: int,
+    ) -> None:
+        self._sink = sink
+        self._queue: queue.Queue[object] = queue.Queue(maxsize=max_pending)
+        self._failure: Exception | None = None
+        self._failure_lock = threading.Lock()
+        self._closed = False
+        self._thread = threading.Thread(
+            target=self._run,
+            name="argus-meter-audit-writer",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def submit(self, events: tuple[tuple[str, dict[str, Any]], ...]) -> None:
+        if not events:
+            return
+        failure = self.failure()
+        if failure is not None:
+            raise SandboxRuntimeUnavailableError("meter audit persistence failed") from failure
+        try:
+            self._queue.put_nowait(events)
+        except queue.Full as exc:
+            raise SandboxRuntimeUnavailableError("meter audit backlog exceeded its fail-closed limit") from exc
+
+    def failure(self) -> Exception | None:
+        with self._failure_lock:
+            return self._failure
+
+    def flush(self) -> None:
+        if self._closed:
+            return
+        self._queue.join()
+        self._queue.put(self._STOP)
+        self._thread.join()
+        self._closed = True
+        failure = self.failure()
+        if failure is not None:
+            raise failure
+
+    def _run(self) -> None:
+        while True:
+            item = self._queue.get()
+            try:
+                if item is self._STOP:
+                    return
+                if self.failure() is not None:
+                    continue
+                events = item
+                assert isinstance(events, tuple)
+                for event_type, payload in events:
+                    self._sink(event_type, payload)
+            except Exception as exc:
+                with self._failure_lock:
+                    if self._failure is None:
+                        self._failure = exc
+            finally:
+                self._queue.task_done()
+
+
 class DockerSandboxOrchestrator(InMemorySandboxOrchestrator):
     """S10 admission path wired to the Docker node supervisor."""
 
@@ -6205,28 +6349,31 @@ class DockerSandboxOrchestrator(InMemorySandboxOrchestrator):
                 "job_id": request.job_id,
                 **_resource_meter_sample_payload(sample),
             }
-            self._audit_ledger.append("meter.sample", payload)
+            events: list[tuple[str, dict[str, Any]]] = [("meter.sample", payload)]
             if sample.conservative_gap_s > 0:
-                self._audit_ledger.append("meter.gap", payload)
+                events.append(("meter.gap", payload))
             if sample.halted and not meter_halt_recorded:
                 meter_halt_recorded = True
-                self._audit_ledger.append("meter.halt", payload)
+                events.append(("meter.halt", payload))
             if (
                 sample.halted
                 and "token_revoked" in sample.breached_dimensions
                 and not token_revocation_halt_recorded
             ):
                 token_revocation_halt_recorded = True
-                self._audit_ledger.append(
-                    "token.revocation_halt",
-                    {
-                        "sandbox_id": handle.sandbox_id,
-                        "job_id": request.job_id,
-                        "budget_id": request.budget_token.budget_id,
-                        "scope_id": request.scope_token.scope_id,
-                        "breached_dimensions": list(sample.breached_dimensions),
-                    },
+                events.append(
+                    (
+                        "token.revocation_halt",
+                        {
+                            "sandbox_id": handle.sandbox_id,
+                            "job_id": request.job_id,
+                            "budget_id": request.budget_token.budget_id,
+                            "scope_id": request.scope_token.scope_id,
+                            "breached_dimensions": list(sample.breached_dimensions),
+                        },
+                    )
                 )
+            meter_audit_writer.submit(tuple(events))
 
         def record_halt_telemetry(telemetry: SandboxHaltTelemetry) -> None:
             halt_telemetry_items.append(telemetry)
@@ -6356,6 +6503,24 @@ class DockerSandboxOrchestrator(InMemorySandboxOrchestrator):
             "sandbox.started",
             {"sandbox_id": handle.sandbox_id, "job_id": request.job_id, "runtime_class": handle.runtime_class},
         )
+        # Runtime safety probes must not wait on durable audit I/O, but the launch response still waits for a full drain.
+        meter_audit_writer = _OrderedAuditBatchWriter(
+            self._audit_ledger.append,
+            max_pending=METER_AUDIT_BACKLOG_MAX_ITEMS,
+        )
+        token_halt_probe = self._runtime_halt_probe(request)
+
+        def runtime_halt_probe() -> _RuntimeHaltSignal | None:
+            if meter_audit_writer.failure() is not None:
+                return _RuntimeHaltSignal(
+                    reason="audit_unavailable",
+                    dimensions=("audit_unavailable",),
+                    source="durable-audit-writer",
+                )
+            return token_halt_probe()
+
+        result: SandboxExecutionResult | None = None
+        runtime_error: Exception | None = None
         try:
             result = self._run_supervisor(
                 handle=handle,
@@ -6363,14 +6528,23 @@ class DockerSandboxOrchestrator(InMemorySandboxOrchestrator):
                 materialized_env=materialized_env,
                 policy_bundle=policy_bundle,
                 meter_sample_sink=record_meter_sample,
-                runtime_halt_probe=self._runtime_halt_probe(request),
+                runtime_halt_probe=runtime_halt_probe,
                 halt_telemetry_sink=record_halt_telemetry,
                 runtime_evidence_sink=record_runtime_evidence,
                 egress_audit_sink=record_egress_event,
             )
         except Exception as exc:
-            self._record_runtime_failure(handle, request, reserved_usage, exc)
-            raise
+            runtime_error = exc
+        audit_error: Exception | None = None
+        try:
+            meter_audit_writer.flush()
+        except Exception as exc:
+            audit_error = exc
+        failure = audit_error or runtime_error
+        if failure is not None:
+            self._record_runtime_failure(handle, request, reserved_usage, failure)
+            raise failure
+        assert result is not None
 
         expected_runtime_evidence_count = 1 if handle.runtime_class in {"gvisor", "firecracker"} else 0
         if len(runtime_evidence_items) != expected_runtime_evidence_count:

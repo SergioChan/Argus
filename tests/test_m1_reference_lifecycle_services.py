@@ -92,6 +92,34 @@ class M1ReferenceLifecycleServiceTests(unittest.TestCase):
             M1_REFERENCE_SERVICE_REQUEST_TIMEOUT_S,
         )
 
+    def test_s3_reference_referee_uses_build_budget_for_sandbox_requests(self) -> None:
+        referee = S3ReferenceRefereeApp(
+            s10_url="http://s10.example",
+            s8_url="http://s8.example",
+            access_token="m1-reference-s3-token",
+            caller_id="m1-reference-s3",
+            expected_job_id=M1_REFERENCE_JOB_ID,
+            signer=C3ReportSigner(
+                key_id="s3-reference-referee-key",
+                secret=b"m1-reference-s3-signing-secret",
+            ),
+            verifier_key_endpoint_url="http://s10.example/v1/internal/verifier-keys",
+            verifier_key_auth_token="m1-reference-verifier-key-token",
+            allow_insecure_verifier_key_store=True,
+        )
+        session = object()
+
+        with patch(
+            "argus_runtime.s3_reference_referee_service.runtime_identity_session",
+            return_value=session,
+        ) as create_session:
+            referee._artifact_store()
+
+        self.assertEqual(
+            create_session.call_args.kwargs["timeout_s"],
+            M1_REFERENCE_SERVICE_REQUEST_TIMEOUT_S,
+        )
+
     def test_s2_reference_builder_bounds_persisted_training_epochs(self) -> None:
         build_request = _reference_build_request(
             job_id=M1_REFERENCE_JOB_ID,

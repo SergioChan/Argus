@@ -2954,7 +2954,7 @@ def render_rust_manifest() -> str:
             'hmac = "0.13"',
             'postgres = { version = "0.19", features = ["with-chrono-0_4", "with-serde_json-1"] }',
             'serde = { version = "1", features = ["derive"] }',
-            'serde_json = "1"',
+            'serde_json = { version = "1", features = ["float_roundtrip"] }',
             'sha2 = "0.11"',
             "",
             "[[bin]]",
@@ -2964,6 +2964,10 @@ def render_rust_manifest() -> str:
             "[[bin]]",
             'name = "argus-s3-report-signer"',
             'path = "src/bin/s3_report_signer.rs"',
+            "",
+            "[[bin]]",
+            'name = "argus-s10-audit-ledger-writer"',
+            'path = "src/bin/s10_audit_ledger_writer.rs"',
             "",
         ]
     )
@@ -3754,7 +3758,7 @@ fn signature_value(report_with_empty_signature: &Value, secret: &[u8]) -> Result
     Ok(C3_SIGNATURE_PREFIX.to_string() + &hex_lower(&mac.finalize().into_bytes()))
 }}
 
-fn canonical_json(value: &Value) -> Result<String, String> {{
+pub fn canonical_json(value: &Value) -> Result<String, String> {{
     match value {{
         Value::Null => Ok("null".to_string()),
         Value::Bool(value) => Ok(if *value {{ "true" }} else {{ "false" }}.to_string()),

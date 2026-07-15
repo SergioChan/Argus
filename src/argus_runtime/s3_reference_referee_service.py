@@ -37,7 +37,11 @@ from .m1_runtime_artifacts import (
     S10S8ArtifactStore,
     runtime_identity_session,
 )
-from .m1_reference_runtime import HttpS10SandboxLauncher, mint_s10_launch_tokens
+from .m1_reference_runtime import (
+    M1_REFERENCE_SERVICE_REQUEST_TIMEOUT_S,
+    HttpS10SandboxLauncher,
+    mint_s10_launch_tokens,
+)
 from .s3_report_signer_service import RustS3ReportSigner
 from .s8_persistence import HttpS10VerifierKeyProvider
 
@@ -231,6 +235,7 @@ class S3ReferenceRefereeApp:
                 expected_job_id=self._expected_job_id,
                 bootstrap_token=self._bootstrap_token,
                 access_token=self._access_token,
+                timeout_s=M1_REFERENCE_SERVICE_REQUEST_TIMEOUT_S,
             )
             self._store = S10S8ArtifactStore(session=self._session, s8_url=self._s8_url)
         return self._store

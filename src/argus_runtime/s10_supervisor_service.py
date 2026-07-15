@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
+from datetime import datetime
 from hashlib import sha256
 import hmac
 import json
@@ -78,6 +79,7 @@ from .auth import (
     runtime_auth_from_env,
 )
 from .http_json import JsonHttpApp, JsonRequest, serve_json_app
+from .s10_audit_persistence import PostgresAuditLedger
 
 
 class AdapterBrokerUpstreamError(RuntimeError):
@@ -227,12 +229,21 @@ class S10SupervisorApp:
         price_table_trust_store: PriceTableTrustStore | None = None,
         adapter_targets: Mapping[str, CredentialedAdapterTarget] | None = None,
         model_targets: Mapping[str, CredentialedModelTarget] | None = None,
+        audit_ledger: Any | None = None,
+        audit_anchor_store: Any | None = None,
+        audit_api_write_token: str | None = None,
+        audit_api_read_token: str | None = None,
+        audit_anchor_auth_token: str | None = None,
     ) -> None:
         self.tokens = token_service or InMemoryTokenService(signing_key=signing_key)
         self.quota = quota_ledger or InMemoryQuotaLedger()
-        self.audit = InMemoryAuditLedger()
+        self.audit = audit_ledger or InMemoryAuditLedger()
         self.artifacts = artifact_store if artifact_store is not None else InMemoryArtifactStore()
         self._artifact_store_path = Path(artifact_store_path) if artifact_store_path is not None else None
+        self._audit_anchor_store = audit_anchor_store
+        self._audit_api_write_token = audit_api_write_token
+        self._audit_api_read_token = audit_api_read_token
+        self._audit_anchor_auth_token = audit_anchor_auth_token
         self.auth = auth
         self.runtime_identity_mint_policy = runtime_identity_mint_policy
         self._health_token = health_token
@@ -279,6 +290,7 @@ class S10SupervisorApp:
     def mint_budget_for_identity(self, identity: RuntimeIdentity, body: dict[str, Any]) -> dict[str, Any]:
         _require_runtime_identity(identity)
         reject_identity_overrides(body, ("job_id", "root_request_id", "caps", "risk_class"))
+        self._bind_audit_trace_if_present(identity.job_id, body)
         ttl_s = _bounded_ttl(body, identity.max_ttl_s)
         token = self.tokens.mint_budget(
             caps=identity.budget_caps,
@@ -286,6 +298,17 @@ class S10SupervisorApp:
             root_request_id=identity.root_request_id,
             risk_class=identity.scopes.sandbox_risk_class,
             ttl_s=ttl_s,
+        )
+        self.audit.append(
+            "token.mint",
+            {
+                "token_type": "budget",
+                "token_id": token.budget_id,
+                "caller_id": identity.caller_id,
+                "job_id": identity.job_id,
+                "root_request_id": identity.root_request_id,
+                "severity": "info",
+            },
         )
         return asdict(token)
 
@@ -302,11 +325,23 @@ class S10SupervisorApp:
     def mint_scope_for_identity(self, identity: RuntimeIdentity, body: dict[str, Any]) -> dict[str, Any]:
         _require_runtime_identity(identity)
         reject_identity_overrides(body, ("job_id", "scopes"))
+        self._bind_audit_trace_if_present(identity.job_id, body)
         ttl_s = _bounded_ttl(body, identity.max_ttl_s)
         token = self.tokens.mint_scope(
             job_id=identity.job_id,
             scopes=identity.scopes,
             ttl_s=ttl_s,
+        )
+        self.audit.append(
+            "token.mint",
+            {
+                "token_type": "scope",
+                "token_id": token.scope_id,
+                "caller_id": identity.caller_id,
+                "job_id": identity.job_id,
+                "root_request_id": identity.root_request_id,
+                "severity": "info",
+            },
         )
         return asdict(token)
 
@@ -816,6 +851,7 @@ class S10SupervisorApp:
         _require_runtime_identity(identity)
         launch = _launch_request_from_dict(body)
         _require_launch_identity_binding(identity, launch)
+        self.audit.bind_trace(job_id=launch.job_id, trace_id=launch.trace_id)
         self._refresh_artifacts()
         result = self._docker_orchestrator.launch_and_wait(launch)
         payload = asdict(result)
@@ -824,6 +860,14 @@ class S10SupervisorApp:
             payload["halt_telemetry"] = halt_telemetry
         payload["audit_events"] = self._recent_audit_event_types()
         return payload
+
+    def _bind_audit_trace_if_present(self, job_id: str, body: Mapping[str, Any]) -> None:
+        trace_id = body.get("trace_id")
+        if trace_id is None:
+            return
+        if not isinstance(trace_id, str) or not trace_id:
+            raise ValueError("trace_id must be a non-empty string")
+        self.audit.bind_trace(job_id=job_id, trace_id=trace_id)
 
     def revoke_token_for_identity(self, identity: RuntimeIdentity, body: dict[str, Any]) -> dict[str, Any]:
         _require_runtime_identity(identity)
@@ -933,8 +977,111 @@ class S10SupervisorApp:
                 "adapter_broker_targets": sorted(self._adapter_targets),
                 "model_broker_configured": bool(self._model_targets),
                 "model_broker_targets": sorted(self._model_targets),
+                "audit_ledger": getattr(self.audit, "kind", type(self.audit).__name__),
+                "audit_anchor_store": (
+                    "s8-c4" if self._audit_anchor_store is not None else "unconfigured"
+                ),
                 "audit_events": len(self.audit.events()),
             }
+
+        @self.http.route("POST", "/v1/internal/audit-anchor")
+        def audit_anchor(request: JsonRequest) -> tuple[int, Any]:
+            try:
+                self._authenticate_audit_anchor(request)
+                if self._audit_anchor_store is None:
+                    return 503, {"error": "audit_anchor_store_unavailable"}
+                if not isinstance(request.body, dict):
+                    return 400, {"error": "json_object_required"}
+                expected_fields = {"schema", "sequence", "previous_root", "root", "event_hash"}
+                if set(request.body) != expected_fields:
+                    raise ValueError("audit anchor fields do not match the internal contract")
+                if request.body.get("schema") != "argus.s10.audit-anchor.v1":
+                    raise ValueError("unsupported audit anchor schema")
+                sequence = int(request.body["sequence"])
+                if sequence < 1:
+                    raise ValueError("audit anchor sequence must be positive")
+                for field_name in ("previous_root", "root", "event_hash"):
+                    value = _required_str(request.body, field_name)
+                    if not re.fullmatch(r"blake3:[0-9a-f]{64}", value):
+                        raise ValueError(f"audit anchor {field_name} is invalid")
+                payload = dict(request.body)
+                stored = self._audit_anchor_store.create_audit_anchor(payload)
+                return 201, {
+                    "sequence": sequence,
+                    "root": payload["root"],
+                    "event_hash": payload["event_hash"],
+                    "artifact_ref": _required_str(stored, "artifact_ref"),
+                    "content_hash": _required_str(stored, "content_hash"),
+                }
+            except UnauthorizedError as exc:
+                return 401, {"error": "Unauthorized", "message": str(exc)}
+            except PermissionError as exc:
+                return 403, {"error": type(exc).__name__, "message": str(exc)}
+            except Exception as exc:
+                return 400, {"error": type(exc).__name__, "message": str(exc)}
+
+        @self.http.route("POST", "/v1/audit/append")
+        def audit_append(request: JsonRequest) -> tuple[int, Any]:
+            try:
+                self._authenticate_audit_writer(request)
+                if not isinstance(request.body, dict):
+                    return 400, {"error": "json_object_required"}
+                if set(request.body) != {"event_type", "payload"}:
+                    raise ValueError("audit append accepts only event_type and payload")
+                event_type = _required_str(request.body, "event_type")
+                payload = _required_dict(request.body, "payload")
+                event = self.audit.append(event_type, payload)
+                return 201, {"sequence": event.sequence, "this_hash": event.event_hash}
+            except UnauthorizedError as exc:
+                return 401, {"error": "Unauthorized", "message": str(exc)}
+            except PermissionError as exc:
+                return 403, {"error": type(exc).__name__, "message": str(exc)}
+            except Exception as exc:
+                return 400, {"error": type(exc).__name__, "message": str(exc)}
+
+        @self.http.route("GET", "/v1/audit/verify")
+        def audit_verify(request: JsonRequest) -> tuple[int, Any]:
+            try:
+                self._authenticate_audit_reader(request)
+                from_sequence = _optional_positive_query_int(request, "from_seq")
+                to_sequence = _optional_positive_query_int(request, "to_seq")
+                verification = self.audit.verify_chain(
+                    from_sequence=from_sequence,
+                    to_sequence=to_sequence,
+                )
+                payload: dict[str, Any] = {
+                    "intact": verification.valid,
+                    "break_at": verification.break_sequence,
+                    "anchor_mismatch": verification.anchor_mismatch,
+                }
+                if verification.reason is not None:
+                    payload["reason"] = verification.reason
+                return 200, payload
+            except UnauthorizedError as exc:
+                return 401, {"error": "Unauthorized", "message": str(exc)}
+            except PermissionError as exc:
+                return 403, {"error": type(exc).__name__, "message": str(exc)}
+            except Exception as exc:
+                return 400, {"error": type(exc).__name__, "message": str(exc)}
+
+        @self.http.route("GET", "/v1/audit/query")
+        def audit_query(request: JsonRequest) -> tuple[int, Any]:
+            try:
+                self._authenticate_audit_reader(request)
+                events = self.audit.query(
+                    job_id=_optional_query_value(request, "job_id"),
+                    event_type=_optional_query_value(request, "type"),
+                    severity=_optional_query_value(request, "sev"),
+                    from_time=_optional_query_datetime(request, "from_time"),
+                    to_time=_optional_query_datetime(request, "to_time"),
+                )
+                return 200, [asdict(event) for event in events]
+            except UnauthorizedError as exc:
+                return 401, {"error": "Unauthorized", "message": str(exc)}
+            except PermissionError as exc:
+                return 403, {"error": type(exc).__name__, "message": str(exc)}
+            except Exception as exc:
+                return 400, {"error": type(exc).__name__, "message": str(exc)}
 
         @self.http.route("POST", "/v1/runtime-identities")
         def runtime_identity(request: JsonRequest) -> tuple[int, Any]:
@@ -1167,6 +1314,7 @@ class S10SupervisorApp:
         @self.http.route("POST", "/v1/sandboxes:launch")
         def launch_sandbox(request: JsonRequest) -> tuple[int, Any]:
             launch: LaunchRequest | None = None
+            audit_start_sequence = len(self.audit.events()) + 1
             try:
                 identity = self._authenticate(request)
                 if not isinstance(request.body, dict):
@@ -1184,9 +1332,17 @@ class S10SupervisorApp:
                 PriceTableSignatureError,
                 ScopeDeniedError,
             ) as exc:
-                return 403, self._launch_error_payload(exc, launch)
+                return 403, self._launch_error_payload(
+                    exc,
+                    launch,
+                    from_sequence=audit_start_sequence,
+                )
             except SandboxRuntimeUnavailableError as exc:
-                return 503, self._launch_error_payload(exc, launch)
+                return 503, self._launch_error_payload(
+                    exc,
+                    launch,
+                    from_sequence=audit_start_sequence,
+                )
             except Exception as exc:
                 return 400, {"error": type(exc).__name__, "message": str(exc)}
 
@@ -1204,7 +1360,34 @@ class S10SupervisorApp:
             purpose="verifier key store",
         )
 
-    def _launch_error_payload(self, exc: Exception, launch: LaunchRequest | None) -> dict[str, Any]:
+    def _authenticate_audit_writer(self, request: JsonRequest) -> None:
+        require_static_bearer_token(
+            request,
+            expected_token=self._audit_api_write_token,
+            purpose="audit writer",
+        )
+
+    def _authenticate_audit_reader(self, request: JsonRequest) -> None:
+        require_static_bearer_token(
+            request,
+            expected_token=self._audit_api_read_token,
+            purpose="audit reader",
+        )
+
+    def _authenticate_audit_anchor(self, request: JsonRequest) -> None:
+        require_static_bearer_token(
+            request,
+            expected_token=self._audit_anchor_auth_token,
+            purpose="audit anchor",
+        )
+
+    def _launch_error_payload(
+        self,
+        exc: Exception,
+        launch: LaunchRequest | None,
+        *,
+        from_sequence: int | None = None,
+    ) -> dict[str, Any]:
         handle = None
         ceiling_reject = None
         if launch is not None:
@@ -1227,7 +1410,10 @@ class S10SupervisorApp:
             "error": type(exc).__name__,
             "message": str(exc),
             "handle": handle,
-            "audit_events": self._audit_event_types_for_job(launch.job_id)
+            "audit_events": self._audit_event_types_for_job(
+                launch.job_id,
+                from_sequence=from_sequence,
+            )
             if launch is not None
             else self._recent_audit_event_types(),
         }
@@ -1238,11 +1424,18 @@ class S10SupervisorApp:
     def _recent_audit_event_types(self, *, limit: int = 12) -> list[str]:
         return [event.event_type for event in self.audit.events()[-limit:]]
 
-    def _audit_event_types_for_job(self, job_id: str, *, limit: int = 12) -> list[str]:
+    def _audit_event_types_for_job(
+        self,
+        job_id: str,
+        *,
+        limit: int = 12,
+        from_sequence: int | None = None,
+    ) -> list[str]:
         return [
             event.event_type
             for event in self.audit.events()
             if event.payload.get("job_id") == job_id
+            and (from_sequence is None or event.sequence >= from_sequence)
         ][-limit:]
 
 
@@ -1264,54 +1457,27 @@ def build_app_from_env() -> S10SupervisorApp:
     model_targets = _model_targets_from_env()
     if verifier_key_provider is not None and not verifier_key_auth_token:
         raise RuntimeError("ARGUS_S10_VERIFIER_KEY_AUTH_TOKEN is required when verifier keys are configured")
+    artifact_store_path: str | None = None
     if s8_broker_url:
         if not s8_broker_key:
             raise RuntimeError("ARGUS_S8_BROKER_WRITE_KEY is required when ARGUS_S8_BROKER_URL is configured")
-        return S10SupervisorApp(
-            token_service=token_service,
-            quota_ledger=quota_ledger,
-            artifact_store=S8BrokeredArtifactStoreClient(
-                endpoint_url=s8_broker_url,
-                broker_write_key=s8_broker_key.encode("utf-8"),
-            ),
-            auth=runtime_auth_from_env(),
-            runtime_identity_mint_policy=mint_policy,
-            health_token=health_token,
-            policy_service=policy_service,
-            checkpoint_signer=checkpoint_signer,
-            checkpoint_signer_auth_token=checkpoint_signer_auth_token,
-            verifier_key_provider=verifier_key_provider,
-            verifier_key_auth_token=verifier_key_auth_token,
-            docker_supervisor=docker_supervisor,
-            price_table=price_table,
-            price_table_trust_store=price_table_trust_store,
-            adapter_targets=adapter_targets,
-            model_targets=model_targets,
+        artifact_store: Any = S8BrokeredArtifactStoreClient(
+            endpoint_url=s8_broker_url,
+            broker_write_key=s8_broker_key.encode("utf-8"),
         )
-    data_dir = os.environ.get("ARGUS_S8_DATA_DIR")
-    if data_dir:
-        return S10SupervisorApp(
-            token_service=token_service,
-            quota_ledger=quota_ledger,
-            artifact_store=FileSystemArtifactStore(data_dir),
-            artifact_store_path=data_dir,
-            auth=runtime_auth_from_env(),
-            runtime_identity_mint_policy=mint_policy,
-            health_token=health_token,
-            policy_service=policy_service,
-            checkpoint_signer=checkpoint_signer,
-            checkpoint_signer_auth_token=checkpoint_signer_auth_token,
-            verifier_key_provider=verifier_key_provider,
-            verifier_key_auth_token=verifier_key_auth_token,
-            docker_supervisor=docker_supervisor,
-            price_table=price_table,
-            price_table_trust_store=price_table_trust_store,
-            adapter_targets=adapter_targets,
-            model_targets=model_targets,
-        )
+    else:
+        data_dir = os.environ.get("ARGUS_S8_DATA_DIR")
+        if data_dir:
+            artifact_store = FileSystemArtifactStore(data_dir)
+            artifact_store_path = data_dir
+        else:
+            artifact_store = InMemoryArtifactStore()
+    audit_ledger = _audit_ledger_from_env(artifact_store)
     return S10SupervisorApp(
         token_service=token_service,
         quota_ledger=quota_ledger,
+        artifact_store=artifact_store,
+        artifact_store_path=artifact_store_path,
         auth=runtime_auth_from_env(),
         runtime_identity_mint_policy=mint_policy,
         health_token=health_token,
@@ -1325,6 +1491,42 @@ def build_app_from_env() -> S10SupervisorApp:
         price_table_trust_store=price_table_trust_store,
         adapter_targets=adapter_targets,
         model_targets=model_targets,
+        audit_ledger=audit_ledger,
+        audit_anchor_store=artifact_store if isinstance(artifact_store, S8BrokeredArtifactStoreClient) else None,
+        audit_api_write_token=os.environ.get("ARGUS_S10_AUDIT_API_WRITE_TOKEN"),
+        audit_api_read_token=os.environ.get("ARGUS_S10_AUDIT_API_READ_TOKEN"),
+        audit_anchor_auth_token=os.environ.get("ARGUS_S10_AUDIT_ANCHOR_AUTH_TOKEN"),
+    )
+
+
+def _audit_ledger_from_env(artifact_store: Any) -> Any:
+    dsn = os.environ.get("ARGUS_S10_AUDIT_POSTGRES_DSN")
+    if not dsn:
+        return InMemoryAuditLedger()
+    if not isinstance(artifact_store, S8BrokeredArtifactStoreClient):
+        raise RuntimeError("durable S10 audit requires the S8/C4 broker")
+    writer_binary = _required_env("ARGUS_S10_AUDIT_WRITER_BIN")
+    writer_role = os.environ.get("ARGUS_S10_AUDIT_POSTGRES_ROLE", "s10_audit_writer")
+    anchor_url = _required_env("ARGUS_S10_AUDIT_ANCHOR_URL")
+    anchor_auth_token = _required_env("ARGUS_S10_AUDIT_ANCHOR_AUTH_TOKEN")
+    if not os.environ.get("ARGUS_S10_AUDIT_API_WRITE_TOKEN"):
+        raise RuntimeError("ARGUS_S10_AUDIT_API_WRITE_TOKEN is required for durable audit")
+    if not os.environ.get("ARGUS_S10_AUDIT_API_READ_TOKEN"):
+        raise RuntimeError("ARGUS_S10_AUDIT_API_READ_TOKEN is required for durable audit")
+    allow_insecure_anchor = os.environ.get("ARGUS_S10_ALLOW_INSECURE_AUDIT_ANCHOR", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    return PostgresAuditLedger(
+        dsn=dsn,
+        writer_binary=writer_binary,
+        writer_role=writer_role,
+        anchor_url=anchor_url,
+        anchor_auth_token=anchor_auth_token,
+        allow_insecure_anchor=allow_insecure_anchor,
+        anchor_loader=artifact_store.get_audit_anchor,
     )
 
 
@@ -1884,6 +2086,105 @@ class S8BrokeredArtifactStoreClient:
             raise RuntimeError("s8 brokered read returned a non-object response")
         return response_body
 
+    def create_audit_anchor(self, payload: dict[str, Any]) -> dict[str, Any]:
+        sequence = int(payload["sequence"])
+        root = _required_str(payload, "root")
+        artifact_ref = f"c4://audit/s10/{sequence}/{root.removeprefix('blake3:')}"
+        job_id = "s10-audit-ledger"
+        body = {
+            "authorization": {
+                "audience": "store",
+                "scope_id": "s10-audit-ledger",
+                "scope_job_id": job_id,
+                "producer_subsystems": ["S10"],
+            },
+            "kind": "s10_audit_anchor",
+            "payload": payload,
+            "producer": asdict(
+                Producer(
+                    subsystem="S10",
+                    version="1",
+                    actor_id="s10-audit-ledger-writer",
+                    job_id=job_id,
+                )
+            ),
+            "lineage": asdict(
+                Lineage(
+                    input_refs=(),
+                    code_ref="git:project-argus/s10-audit-ledger-writer",
+                    environment_digest=hash_json(
+                        {
+                            "schema": "argus.s10.audit-anchor-environment.v1",
+                            "writer": "rust-postgres",
+                        }
+                    ),
+                    seeds=(str(sequence),),
+                    actor_id="s10-audit-ledger-writer",
+                    job_id=job_id,
+                )
+            ),
+            "artifact_ref": artifact_ref,
+            "claim_tier": "ran-toy",
+            "validation_report_ref": None,
+        }
+        encoded = canonical_json_bytes(body)
+        signature = "hmac-sha256:" + hmac.new(self._broker_write_key, encoded, sha256).hexdigest()
+        http_request = request.Request(
+            self._endpoint_url,
+            data=encoded,
+            method="POST",
+            headers={
+                "Content-Type": "application/json",
+                "X-Argus-Store-Write-Signature": signature,
+            },
+        )
+        try:
+            with request.urlopen(http_request, timeout=10) as response:
+                response_body = json.loads(response.read().decode("utf-8"))
+        except error.HTTPError as exc:
+            response_body = json.loads(exc.read().decode("utf-8"))
+            _raise_s8_http_error(response_body)
+        record = _artifact_record_from_dict(response_body)
+        if record.artifact_ref != artifact_ref or record.content_hash != hash_json(payload):
+            raise RuntimeError("S8 returned a mismatched audit anchor record")
+        return {
+            "artifact_ref": record.artifact_ref,
+            "content_hash": record.content_hash,
+        }
+
+    def get_audit_anchor(self, artifact_ref: str) -> dict[str, Any]:
+        job_id = "s10-audit-ledger"
+        body = {
+            "authorization": {
+                "audience": "store",
+                "scope_id": "s10-audit-ledger",
+                "scope_job_id": job_id,
+                "capabilities": ["s8.read"],
+            },
+            "artifact_ref": artifact_ref,
+            "representation": "payload",
+        }
+        encoded = canonical_json_bytes(body)
+        signature = "hmac-sha256:" + hmac.new(self._broker_write_key, encoded, sha256).hexdigest()
+        http_request = request.Request(
+            self._read_endpoint_url,
+            data=encoded,
+            method="POST",
+            headers={
+                "Content-Type": "application/json",
+                "X-Argus-Store-Write-Signature": signature,
+            },
+        )
+        try:
+            with request.urlopen(http_request, timeout=10) as response:
+                response_body = json.loads(response.read().decode("utf-8"))
+        except error.HTTPError as exc:
+            response_body = json.loads(exc.read().decode("utf-8"))
+            _raise_s8_http_error(response_body)
+        if not isinstance(response_body, dict):
+            raise RuntimeError("S8 audit anchor read returned a non-object response")
+        return response_body
+
     def create_artifact(
         self,
         *,
@@ -1950,6 +2251,35 @@ def _required_str(body: dict[str, Any], field: str) -> str:
     if not isinstance(value, str) or not value:
         raise ValueError(f"{field} is required")
     return value
+
+
+def _optional_query_value(request: JsonRequest, field: str) -> str | None:
+    values = request.query.get(field)
+    if values is None:
+        return None
+    if len(values) != 1 or not values[0]:
+        raise ValueError(f"{field} must be specified exactly once with a non-empty value")
+    return values[0]
+
+
+def _optional_positive_query_int(request: JsonRequest, field: str) -> int | None:
+    value = _optional_query_value(request, field)
+    if value is None:
+        return None
+    parsed = int(value)
+    if parsed < 1:
+        raise ValueError(f"{field} must be positive")
+    return parsed
+
+
+def _optional_query_datetime(request: JsonRequest, field: str) -> datetime | None:
+    value = _optional_query_value(request, field)
+    if value is None:
+        return None
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        raise ValueError(f"{field} must include a timezone")
+    return parsed
 
 
 def _validate_outbound_header_name(value: Any, *, field: str) -> str:

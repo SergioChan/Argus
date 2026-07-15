@@ -1163,6 +1163,69 @@ class S8PostgresSchemaTests(unittest.TestCase):
         self.assertEqual(refreshed.created_at, record.created_at)
         self.assertEqual(hash_json(asdict(refreshed)), stored_hash)
 
+    def test_postgres_store_sequential_appends_do_not_reload_committed_payloads(self) -> None:
+        class CountingObjectStore(InMemoryObjectStore):
+            def __init__(self) -> None:
+                super().__init__()
+                self.get_calls: list[str] = []
+
+            def get(self, content_hash: str) -> bytes:
+                self.get_calls.append(content_hash)
+                return super().get(content_hash)
+
+        object_store = CountingObjectStore()
+        store = self._postgres_store(object_store=object_store)
+        store.create_artifact(
+            artifact_ref="c4://s8-refresh/first",
+            kind="model",
+            payload={"weights": [1]},
+            producer=Producer(subsystem="S2", version="0.0.0"),
+            lineage=Lineage(input_refs=(), code_ref="git:s8-refresh-first", environment_digest="oci:s8-refresh"),
+        )
+        reads_after_first_append = tuple(object_store.get_calls)
+
+        store.create_artifact(
+            artifact_ref="c4://s8-refresh/second",
+            kind="model",
+            payload={"weights": [2]},
+            producer=Producer(subsystem="S2", version="0.0.0"),
+            lineage=Lineage(input_refs=(), code_ref="git:s8-refresh-second", environment_digest="oci:s8-refresh"),
+        )
+
+        self.assertEqual(tuple(object_store.get_calls), reads_after_first_append)
+        self.assertEqual(store.record_count, 2)
+
+    def test_postgres_store_refreshes_before_using_artifacts_from_an_external_writer(self) -> None:
+        object_store = InMemoryObjectStore()
+        first_store = self._postgres_store(object_store=object_store)
+        external_store = self._postgres_store(object_store=object_store)
+        parent = external_store.create_artifact(
+            artifact_ref="c4://s8-refresh/external-parent",
+            kind="dataset",
+            payload={"rows": [1]},
+            producer=Producer(subsystem="S1", version="0.0.0"),
+            lineage=Lineage(
+                input_refs=(),
+                code_ref="git:s8-refresh-external",
+                environment_digest="oci:s8-refresh",
+            ),
+        )
+
+        child = first_store.create_artifact(
+            artifact_ref="c4://s8-refresh/local-child",
+            kind="model",
+            payload={"weights": [1]},
+            producer=Producer(subsystem="S2", version="0.0.0"),
+            lineage=Lineage(
+                input_refs=(parent.artifact_ref,),
+                code_ref="git:s8-refresh-local",
+                environment_digest="oci:s8-refresh",
+            ),
+        )
+
+        self.assertEqual(child.lineage.input_refs, (parent.artifact_ref,))
+        self.assertEqual(first_store.record_count, 2)
+
     def test_postgres_store_targeted_reads_ignore_unrelated_tampered_object(self) -> None:
         object_store = InMemoryObjectStore()
         store = self._postgres_store(object_store=object_store)

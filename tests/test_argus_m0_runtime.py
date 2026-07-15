@@ -36,6 +36,7 @@ from argus_core import (
 from argus_core import canonical_json_bytes
 from argus_runtime.auth import RuntimeAuth, RuntimeIdentity
 from argus_runtime.http_json import JsonRequest
+from argus_runtime.m1_reference_runtime import M1_REFERENCE_SERVICE_REQUEST_TIMEOUT_S
 from argus_runtime.s10_supervisor_service import (
     RuntimeIdentityMintPolicy,
     S10SupervisorApp,
@@ -133,6 +134,14 @@ class ArgusM0RuntimeServiceTests(unittest.TestCase):
         self.assertEqual(summary["p95_nearest_rank_s"], 0.01)
         self.assertEqual(summary["p99_nearest_rank_s"], 1.75)
         self.assertEqual(summary["max_s"], 1.75)
+
+    def test_reference_demo_deadlines_cover_the_durable_audit_build_window(self) -> None:
+        self.assertGreaterEqual(M1_REFERENCE_SERVICE_REQUEST_TIMEOUT_S, 90.0)
+        self.assertGreaterEqual(m0_battery.M1_REFERENCE_DEMO_E2E_TIMEOUT_S, 300.0)
+        self.assertGreater(
+            m0_battery.M1_REFERENCE_DEMO_E2E_TIMEOUT_S,
+            M1_REFERENCE_SERVICE_REQUEST_TIMEOUT_S,
+        )
 
     def test_halt_latency_summary_rejects_missing_trials_and_p99_breach(self) -> None:
         with self.assertRaisesRegex(AssertionError, "expected 50 halt latency trials"):
@@ -810,6 +819,7 @@ class ArgusM0RuntimeServiceTests(unittest.TestCase):
 
     def test_inflight_revocation_slo_starts_after_revoke_acknowledgement(self) -> None:
         evidence: dict[str, object] = {"results": []}
+        call_order: list[str] = []
 
         class ImmediateThread:
             def __init__(self, *, target: object, daemon: bool) -> None:
@@ -832,6 +842,7 @@ class ArgusM0RuntimeServiceTests(unittest.TestCase):
             if url.endswith("/v1/scope-tokens"):
                 return {"scope_id": "scope-token"}
             if url.endswith("/v1/sandboxes:launch"):
+                call_order.append("launch")
                 return {
                     "handle": {
                         "state": "TIMED_OUT",
@@ -847,6 +858,7 @@ class ArgusM0RuntimeServiceTests(unittest.TestCase):
                     },
                 }
             if url.endswith("/v1/tokens:revoke"):
+                call_order.append("revoke")
                 return {
                     "revocation_store": "file",
                     "revoked_token_id": "budget-token",
@@ -873,12 +885,17 @@ class ArgusM0RuntimeServiceTests(unittest.TestCase):
                 },
             ),
             patch.object(m0_battery.threading, "Thread", ImmediateThread),
-            patch.object(m0_battery.time, "sleep"),
+            patch.object(
+                m0_battery,
+                "_wait_for_running_sandbox",
+                side_effect=lambda **_kwargs: call_order.append("running") or "sandbox-container-id",
+            ),
             patch.object(m0_battery.time, "monotonic", side_effect=[10.0, 12.75, 12.75, 12.9]),
         ):
             m0_battery._battery_revoked_inflight_sandbox_halted(
                 evidence,
                 "http://s10-demo",
+                docker="docker",
                 s8_url="http://s8-demo",
                 image="busybox@sha256:test",
                 token="runtime-token",
@@ -892,6 +909,8 @@ class ArgusM0RuntimeServiceTests(unittest.TestCase):
         self.assertEqual(detail["terminated_after_revocation_ack_s"], 0.19)
         self.assertEqual(detail["launch_response_after_revocation_ack_s"], 0.15)
         self.assertEqual(detail["propagation_slo_s"], 2.0)
+        self.assertEqual(detail["sandbox_container_id"], "sandbox-container-id")
+        self.assertLess(call_order.index("running"), call_order.index("revoke"))
 
     def test_revocation_halt_telemetry_rejects_slow_physical_termination(self) -> None:
         with self.assertRaisesRegex(AssertionError, "physical termination"):
@@ -902,6 +921,56 @@ class ArgusM0RuntimeServiceTests(unittest.TestCase):
                     "revocation_ack_to_terminate_s": 2.01,
                 }
             )
+
+    def test_inflight_revocation_waits_for_one_running_labeled_sandbox(self) -> None:
+        completed = subprocess.CompletedProcess(
+            args=["docker", "ps"],
+            returncode=0,
+            stdout="sandbox-container-id\n",
+            stderr="",
+        )
+
+        with patch.object(m0_battery.subprocess, "run", return_value=completed) as run:
+            container_id = m0_battery._wait_for_running_sandbox(
+                docker="/usr/local/bin/docker",
+                job_id="m0-spine-job",
+                timeout_s=5,
+            )
+
+        self.assertEqual(container_id, "sandbox-container-id")
+        self.assertEqual(
+            run.call_args.args[0],
+            [
+                "/usr/local/bin/docker",
+                "ps",
+                "--filter",
+                "label=argus.dev/job-id=m0-spine-job",
+                "--filter",
+                "label=argus.dev/role=sandbox",
+                "--filter",
+                "status=running",
+                "--format",
+                "{{.ID}}",
+            ],
+        )
+
+    def test_sandbox_launch_requests_use_the_durable_audit_response_budget(self) -> None:
+        with patch.object(m0_battery, "_post_json", return_value={"status": "ok"}) as post:
+            result = m0_battery._post_sandbox_launch(
+                "http://s10-demo",
+                {"job_id": "job-1"},
+                expected_status=201,
+                token="runtime-token",
+            )
+
+        self.assertEqual(result, {"status": "ok"})
+        self.assertEqual(post.call_args.args, ("http://s10-demo/v1/sandboxes:launch", {"job_id": "job-1"}))
+        self.assertEqual(post.call_args.kwargs["expected_status"], 201)
+        self.assertEqual(post.call_args.kwargs["token"], "runtime-token")
+        self.assertEqual(
+            post.call_args.kwargs["timeout"],
+            m0_battery.S10_SANDBOX_RESPONSE_TIMEOUT_S,
+        )
 
     def test_s8_writer_service_commits_and_replays_c4_records(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -2976,6 +3045,9 @@ class ArgusM0ComposeTests(unittest.TestCase):
                 "ARGUS_S10_PRICE_TABLE_EXPIRES_AT": "4102444800",
                 "ARGUS_S10_C3_VERIFIER_KEYS_JSON": S10_C3_VERIFIER_KEYS_JSON,
                 "ARGUS_S10_VERIFIER_KEY_AUTH_TOKEN": S10_VERIFIER_KEY_AUTH_TOKEN,
+                "ARGUS_S10_AUDIT_ANCHOR_AUTH_TOKEN": "s10-audit-anchor-token",
+                "ARGUS_S10_AUDIT_API_WRITE_TOKEN": "s10-audit-write-token",
+                "ARGUS_S10_AUDIT_API_READ_TOKEN": "s10-audit-read-token",
                 "ARGUS_S3_REFERENCE_REFEREE_SIGNER_SECRET": S3_REFERENCE_REFEREE_SIGNING_KEY,
                 "ARGUS_S1_REFERENCE_DEMO_ACCESS_TOKEN": "s1-reference-token",
                 "ARGUS_S1_REFERENCE_DEMO_PILOT_ACCESS_TOKEN": "m1-pilot-access-token",
@@ -3263,6 +3335,34 @@ class ArgusM0ComposeTests(unittest.TestCase):
             services["s10-supervisor"]["environment"]["ARGUS_S10_QUOTA_POSTGRES_DSN"],
             "postgresql://argus:argus-dev-password@postgres:5432/argus",
         )
+        self.assertEqual(
+            services["s10-supervisor"]["environment"]["ARGUS_S10_AUDIT_POSTGRES_DSN"],
+            "postgresql://argus:argus-dev-password@postgres:5432/argus",
+        )
+        self.assertEqual(
+            services["s10-supervisor"]["environment"]["ARGUS_S10_AUDIT_POSTGRES_ROLE"],
+            "s10_audit_writer",
+        )
+        self.assertEqual(
+            services["s10-supervisor"]["environment"]["ARGUS_S10_AUDIT_WRITER_BIN"],
+            "/usr/local/bin/argus-s10-audit-ledger-writer",
+        )
+        self.assertEqual(
+            services["s10-supervisor"]["environment"]["ARGUS_S10_AUDIT_ANCHOR_URL"],
+            "http://127.0.0.1:8080/v1/internal/audit-anchor",
+        )
+        self.assertEqual(
+            services["s10-supervisor"]["environment"]["ARGUS_S10_AUDIT_ANCHOR_AUTH_TOKEN"],
+            "s10-audit-anchor-token",
+        )
+        self.assertEqual(
+            services["s10-supervisor"]["environment"]["ARGUS_S10_AUDIT_API_WRITE_TOKEN"],
+            "s10-audit-write-token",
+        )
+        self.assertEqual(
+            services["s10-supervisor"]["environment"]["ARGUS_S10_AUDIT_API_READ_TOKEN"],
+            "s10-audit-read-token",
+        )
         self.assertEqual(services["s10-supervisor"]["environment"]["ARGUS_S10_APPLY_MIGRATIONS"], "1")
         self.assertEqual(services["s10-supervisor"]["environment"]["ARGUS_S10_MIGRATIONS_DIR"], "/app/db/s10")
         self.assertEqual(
@@ -3359,6 +3459,8 @@ class ArgusM0ComposeTests(unittest.TestCase):
         self.assertIn("COPY schemas ./schemas", dockerfile)
         self.assertIn("--bin argus-s3-report-signer", dockerfile)
         self.assertIn("/usr/local/bin/argus-s3-report-signer", dockerfile)
+        self.assertIn("--bin argus-s10-audit-ledger-writer", dockerfile)
+        self.assertIn("/usr/local/bin/argus-s10-audit-ledger-writer", dockerfile)
 
     def _skip_or_fail(self, reason: str) -> None:
         if os.environ.get("ARGUS_REQUIRE_DOCKER_TESTS") == "1":

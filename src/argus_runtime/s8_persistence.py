@@ -397,7 +397,7 @@ class PostgresArtifactStore:
         created_at: str | None = None,
     ) -> ArtifactRecord:
         with self._lock:
-            self.refresh()
+            self._refresh_if_database_advanced()
             before_count = self._snapshot.record_count
             record = self._snapshot.create_artifact(
                 kind=kind,
@@ -411,8 +411,16 @@ class PostgresArtifactStore:
             )
             if self._snapshot.record_count == before_count:
                 return record
-            self._commit_record(record)
+            try:
+                self._commit_record(record)
+            except Exception:
+                self.refresh()
+                raise
             return self.get_artifact_record(record.artifact_ref)
+
+    def _refresh_if_database_advanced(self) -> None:
+        if self.record_count != self._snapshot.record_count:
+            self.refresh()
 
     def get_artifact(self, ref: str) -> bytes:
         row = self._fetch_record(ref, require_unique_record=False)
