@@ -4,6 +4,7 @@ from dataclasses import replace
 import json
 import os
 from pathlib import Path
+import shutil
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -28,12 +29,71 @@ from argus_core import (
     cosign_signature_store_path,
 )
 from argus_runtime.s10_supervisor_service import _image_verifier_from_env
+from scripts.s10_cosign_fixture import CosignImageTrustWorkspace
 
 
 SIGNED_IMAGE = "registry.local/argus/runtime@sha256:" + "a" * 64
 UNSIGNED_IMAGE = "registry.local/argus/unsigned@sha256:" + "b" * 64
 TAG_ONLY_IMAGE = "registry.local/argus/runtime:latest"
 COSIGN_VERSION = "v2.6.3"
+ROOT = Path(__file__).resolve().parents[1]
+
+
+class CosignDeploymentBatteryContractTests(unittest.TestCase):
+    def test_independent_m1_compose_batteries_provision_pipeline_image_trust(self) -> None:
+        batteries = {
+            "scripts/run_m1_external_referee_battery.py": "images=(pipeline_image,)",
+            "scripts/run_m1_s2_reference_builder_battery.py": "images=(pipeline_image,)",
+            "scripts/run_m1_pilot_console_battery.py": "images=(DEFAULT_IMAGE, pipeline_image)",
+        }
+
+        for relative_path, expected_images in batteries.items():
+            with self.subTest(battery=relative_path):
+                source = (ROOT / relative_path).read_text(encoding="utf-8")
+                self.assertIn("CosignImageTrustWorkspace", source)
+                self.assertIn("**image_trust.compose_environment(),", source)
+                self.assertIn("image_trust.provision(", source)
+                self.assertIn(expected_images, source)
+                self.assertIn("image_trust.close()", source)
+
+
+class CosignImageTrustWorkspaceTests(unittest.TestCase):
+    def test_ephemeral_workspace_configures_provisioning_and_cleans_up(self) -> None:
+        workspace = CosignImageTrustWorkspace(prefix="argus-cosign-workspace-unit-", keep=False)
+        root = workspace.root
+        manifest = {"entries": [{"image": SIGNED_IMAGE}], "private_key_present": False}
+        try:
+            self.assertEqual(
+                workspace.compose_environment(),
+                {"ARGUS_S10_IMAGE_TRUST_SOURCE_ROOT": str(root)},
+            )
+            with patch(
+                "scripts.s10_cosign_fixture.create_cosign_image_trust",
+                return_value=manifest,
+            ) as create_trust:
+                self.assertEqual(
+                    workspace.provision(docker_bin="docker", images=(SIGNED_IMAGE,)),
+                    manifest,
+                )
+            create_trust.assert_called_once_with(
+                docker_bin="docker",
+                output_dir=root,
+                images=(SIGNED_IMAGE,),
+            )
+        finally:
+            workspace.close()
+
+        self.assertFalse(root.exists())
+        workspace.close()
+
+    def test_kept_workspace_survives_close_for_a_kept_stack(self) -> None:
+        workspace = CosignImageTrustWorkspace(prefix="argus-cosign-workspace-keep-unit-", keep=True)
+        root = workspace.root
+        try:
+            workspace.close()
+            self.assertTrue(root.is_dir())
+        finally:
+            shutil.rmtree(root)
 
 
 class S10ImageAdmissionTests(unittest.TestCase):

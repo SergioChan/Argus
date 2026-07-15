@@ -12,6 +12,7 @@ import secrets
 import shutil
 import subprocess
 import sys
+import tempfile
 from typing import Any, Iterable, Mapping
 
 
@@ -27,6 +28,32 @@ COSIGN_IMAGE = (
     "ghcr.io/sigstore/cosign/cosign:v2.6.3@"
     "sha256:4bedb8de1c5c1abd8dea60de704ba449402d238623fa8bb33d2ccaa9beffcbf5"
 )
+
+
+class CosignImageTrustWorkspace:
+    def __init__(self, *, prefix: str, keep: bool) -> None:
+        self._cleanup: tempfile.TemporaryDirectory[str] | None
+        if keep:
+            self._cleanup = None
+            self.root = Path(tempfile.mkdtemp(prefix=prefix)).resolve()
+        else:
+            self._cleanup = tempfile.TemporaryDirectory(prefix=prefix)
+            self.root = Path(self._cleanup.name).resolve()
+
+    def compose_environment(self) -> dict[str, str]:
+        return {"ARGUS_S10_IMAGE_TRUST_SOURCE_ROOT": str(self.root)}
+
+    def provision(self, *, docker_bin: str, images: Iterable[str]) -> dict[str, Any]:
+        return create_cosign_image_trust(
+            docker_bin=docker_bin,
+            output_dir=self.root,
+            images=images,
+        )
+
+    def close(self) -> None:
+        if self._cleanup is not None:
+            self._cleanup.cleanup()
+            self._cleanup = None
 
 
 def create_cosign_image_trust(

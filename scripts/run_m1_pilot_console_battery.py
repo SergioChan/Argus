@@ -22,6 +22,7 @@ if str(ROOT) not in sys.path:
 
 from argus_runtime.m1_pilot_console import M1_PILOT_REFERENCE_SCOPE
 from scripts.run_m0_spine_battery import (
+    DEFAULT_IMAGE,
     M1_REFERENCE_DEMO_E2E_TIMEOUT_S,
     _compose_environment,
     _free_port,
@@ -32,6 +33,7 @@ from scripts.run_m0_spine_battery import (
     _run,
     _wait_health,
 )
+from scripts.s10_cosign_fixture import CosignImageTrustWorkspace
 
 
 def main() -> int:
@@ -45,6 +47,10 @@ def main() -> int:
     if docker is None:
         raise RuntimeError("docker CLI is required for the M1 pilot console battery")
 
+    image_trust = CosignImageTrustWorkspace(
+        prefix="argus-m1-pilot-console-image-trust-",
+        keep=args.keep_stack,
+    )
     runtime_secrets = _m0_runtime_secrets()
     ports = {
         "ARGUS_M0_POSTGRES_PORT": str(_free_port()),
@@ -59,6 +65,7 @@ def main() -> int:
     compose_project_name = f"argus-m1-pilot-console-{uuid4().hex[:12]}"
     env = {
         **_compose_environment(runtime_secrets=runtime_secrets, ports=ports, now=int(time.time())),
+        **image_trust.compose_environment(),
         "COMPOSE_PROJECT_NAME": compose_project_name,
     }
     demo_url = f"http://127.0.0.1:{ports['ARGUS_M0_S1_DEMO_PORT']}"
@@ -72,6 +79,7 @@ def main() -> int:
             "pilot_console_url": demo_url,
             "persistence": "postgres-minio",
             "execution_profile": M1_PILOT_REFERENCE_SCOPE,
+            "image_trust_source_root": str(image_trust.root),
         },
         "results": [],
     }
@@ -83,6 +91,10 @@ def main() -> int:
             env=env,
         )
         evidence["target"]["s2_reference_pipeline_image"] = pipeline_image
+        evidence["target"]["image_trust"] = image_trust.provision(
+            docker_bin=docker,
+            images=(DEFAULT_IMAGE, pipeline_image),
+        )
         _record(evidence, "build", "argus-m0 Compose built the fixed M1 pipeline image")
         _run([docker, "compose", "-f", args.compose_file, "up", "-d", "--wait"], env=env, timeout=240)
         _wait_health(f"{demo_url}/healthz", token=None)
@@ -186,6 +198,7 @@ def main() -> int:
     finally:
         if not args.keep_stack:
             _run([docker, "compose", "-f", args.compose_file, "down", "--volumes"], env=env, timeout=120, check=False)
+        image_trust.close()
         if args.evidence_file:
             path = Path(args.evidence_file).resolve()
             path.parent.mkdir(parents=True, exist_ok=True)

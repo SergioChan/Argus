@@ -40,6 +40,7 @@ from scripts.run_m0_spine_battery import (
     _m0_runtime_secrets,
     _prepare_reference_pipeline_image,
 )
+from scripts.s10_cosign_fixture import CosignImageTrustWorkspace
 
 
 def main() -> int:
@@ -53,6 +54,10 @@ def main() -> int:
     if docker is None:
         raise RuntimeError("docker CLI is required for the M1 external referee battery")
 
+    image_trust = CosignImageTrustWorkspace(
+        prefix="argus-m1-external-referee-image-trust-",
+        keep=args.keep_stack,
+    )
     runtime_secrets = _m0_runtime_secrets()
     now = int(time.time())
     ports = {
@@ -68,6 +73,7 @@ def main() -> int:
     compose_project_name = _isolated_compose_project_name()
     env = {
         **_compose_environment(runtime_secrets=runtime_secrets, ports=ports, now=now),
+        **image_trust.compose_environment(),
         "COMPOSE_PROJECT_NAME": compose_project_name,
     }
     s8_url = f"http://127.0.0.1:{ports['ARGUS_M0_S8_PORT']}"
@@ -87,6 +93,7 @@ def main() -> int:
             "s3_reference_referee_url": referee_url,
             "persistence": "postgres-minio",
             "reference_service_auth": "preprovisioned-runtime-identity-tokens",
+            "image_trust_source_root": str(image_trust.root),
         },
         "results": [],
     }
@@ -98,6 +105,10 @@ def main() -> int:
             env=env,
         )
         evidence["target"]["s2_reference_pipeline_image"] = pipeline_image
+        evidence["target"]["image_trust"] = image_trust.provision(
+            docker_bin=docker,
+            images=(pipeline_image,),
+        )
         _record(
             evidence,
             "build",
@@ -272,6 +283,7 @@ def main() -> int:
     finally:
         if not args.keep_stack:
             _run([docker, "compose", "-f", args.compose_file, "down", "--volumes"], env=env, timeout=120, check=False)
+        image_trust.close()
         if args.evidence_file:
             path = Path(args.evidence_file).resolve()
             path.parent.mkdir(parents=True, exist_ok=True)
