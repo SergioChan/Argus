@@ -103,6 +103,30 @@ services:
       timeout: 3s
       retries: 20
 
+  s10-reference-security-pager:
+    build:
+      context: ../..
+      dockerfile: deploy/argus-m0/python-service.Dockerfile
+    networks:
+      - argus-services
+    command: ["python", "-m", "argus_runtime.s10_reference_security_pager_service"]
+    environment:
+      ARGUS_S10_REFERENCE_SECURITY_PAGER_HOST: "0.0.0.0"
+      ARGUS_S10_REFERENCE_SECURITY_PAGER_PORT: "8080"
+      ARGUS_S10_SECURITY_PAGER_AUTH_TOKEN: ${ARGUS_S10_SECURITY_PAGER_AUTH_TOKEN:?ARGUS_S10_SECURITY_PAGER_AUTH_TOKEN is required}
+      ARGUS_S10_SECURITY_PAGER_READ_TOKEN: ${ARGUS_S10_SECURITY_PAGER_READ_TOKEN:?ARGUS_S10_SECURITY_PAGER_READ_TOKEN is required}
+      ARGUS_S10_REFERENCE_SECURITY_PAGER_ENABLE_TEST_CONTROL: ${ARGUS_S10_REFERENCE_SECURITY_PAGER_ENABLE_TEST_CONTROL:-0}
+      ARGUS_S10_REFERENCE_SECURITY_PAGER_HOLD_DELIVERIES: ${ARGUS_S10_REFERENCE_SECURITY_PAGER_HOLD_DELIVERIES:-0}
+    ports:
+      - "127.0.0.1:${ARGUS_M0_S10_SECURITY_PAGER_PORT:-58085}:8080"
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - "python -c \"import json, urllib.request; assert json.load(urllib.request.urlopen('http://127.0.0.1:8080/healthz'))['status'] == 'ok'\""
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
   s10-security-monitor:
     profiles: ["host-security"]
     build:
@@ -166,6 +190,12 @@ services:
       ARGUS_S10_ALLOW_INSECURE_AUDIT_ANCHOR: "1"
       ARGUS_S10_AUDIT_API_WRITE_TOKEN: ${ARGUS_S10_AUDIT_API_WRITE_TOKEN:?ARGUS_S10_AUDIT_API_WRITE_TOKEN is required}
       ARGUS_S10_AUDIT_API_READ_TOKEN: ${ARGUS_S10_AUDIT_API_READ_TOKEN:?ARGUS_S10_AUDIT_API_READ_TOKEN is required}
+      ARGUS_S10_QUARANTINE_REVIEW_TOKEN: ${ARGUS_S10_QUARANTINE_REVIEW_TOKEN:?ARGUS_S10_QUARANTINE_REVIEW_TOKEN is required}
+      ARGUS_S10_FORENSIC_SPOOL_DIR: /var/lib/argus/s10/forensic-spool
+      ARGUS_S10_SECURITY_PAGER_URL: http://s10-reference-security-pager:8080/v1/pages
+      ARGUS_S10_SECURITY_PAGER_AUTH_TOKEN: ${ARGUS_S10_SECURITY_PAGER_AUTH_TOKEN:?ARGUS_S10_SECURITY_PAGER_AUTH_TOKEN is required}
+      ARGUS_S10_ALLOW_INSECURE_SECURITY_PAGER: "1"
+      ARGUS_S10_SECURITY_PAGER_TIMEOUT_S: ${ARGUS_S10_SECURITY_PAGER_TIMEOUT_S:-10.0}
       ARGUS_S10_APPLY_MIGRATIONS: "1"
       ARGUS_S10_MIGRATIONS_DIR: /app/db/s10
       ARGUS_S10_PRICE_TABLE_SIGNER_KEY_ID: argus-m0-price-table
@@ -224,6 +254,8 @@ services:
       s8-writer:
         condition: service_healthy
       s10-reference-model-provider:
+        condition: service_healthy
+      s10-reference-security-pager:
         condition: service_healthy
     healthcheck:
       test:

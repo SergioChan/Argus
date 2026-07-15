@@ -19,8 +19,10 @@ from argus_core import (
     BudgetUsage,
     DockerSandboxOrchestrator,
     DockerSandboxSupervisor,
+    FileForensicCaptureSpool,
     FirecrackerRuntimeLaunchEvidence,
     FirecrackerSandboxSupervisor,
+    ForensicHostCapture,
     HostSecurityEvent,
     InMemoryArtifactStore,
     InMemoryAuditLedger,
@@ -463,6 +465,25 @@ class SecurityMonitorBatteryEvidenceTests(unittest.TestCase):
                 "freeze_completed_elapsed_s": 0.3,
                 "terminate_completed_elapsed_s": 0.4,
             },
+            "quarantine": {
+                "quarantine_id": "quarantine-tc01",
+                "job_id": "s10-t17-tc01-job",
+                "sandbox_id": "sandbox-t17-tc01",
+                "reason": "trust_path_write",
+                "severity": "Sev-1",
+                "snapshot_refs": [
+                    "c4://artifact/rootfs-tc01",
+                    "c4://artifact/scratch-tc01",
+                    "c4://artifact/netlog-tc01",
+                ],
+                "audit_slice_ref": "c4://artifact/audit-tc01",
+                "status": "open",
+                "snapshot_status": "durable",
+                "record_ref": "c4://artifact/quarantine-tc01",
+                "page_status": "delivered",
+                "forensic_spool_pending": False,
+                "forensic_spool_ref": None,
+            },
         }
         events = [
             {
@@ -487,8 +508,16 @@ class SecurityMonitorBatteryEvidenceTests(unittest.TestCase):
                     "reason": "trust_path_write",
                     "state": "QUARANTINED",
                     "security_event_ids": ["security-tc01"],
-                    "snapshot_refs": [],
-                    "forensic_snapshot_status": "pending_s10_t18",
+                    "quarantine_id": "quarantine-tc01",
+                    "snapshot_refs": [
+                        "c4://artifact/rootfs-tc01",
+                        "c4://artifact/scratch-tc01",
+                        "c4://artifact/netlog-tc01",
+                    ],
+                    "audit_slice_ref": "c4://artifact/audit-tc01",
+                    "forensic_snapshot_status": "durable",
+                    "page_status": "delivered",
+                    "forensic_spool_ref": "forensic-spool:" + "a" * 64,
                 },
             },
         ]
@@ -502,6 +531,7 @@ class SecurityMonitorBatteryEvidenceTests(unittest.TestCase):
             expected_path="/opt/argus/trust/verifier/verify.py",
         )
         self.assertEqual(evidence["security_event_id"], "security-tc01")
+        self.assertEqual(evidence["forensic_snapshot_status"], "durable")
 
         duplicate = copy.deepcopy(events)
         duplicate.append(copy.deepcopy(events[0]))
@@ -600,6 +630,19 @@ class SecurityMonitorBatteryEvidenceTests(unittest.TestCase):
         requested_compute = (envelope["cpu_m"] / 1000.0) * envelope["wallclock_s"]
         self.assertLessEqual(requested_compute, caps["max_compute_units"])
         self.assertLessEqual(envelope["wallclock_s"], caps["max_wallclock_s"])
+
+    def test_tc22_identity_uses_one_bounded_budget_for_multiple_generations(self) -> None:
+        identity = self.battery.m0_battery._m0_identity_requests()["s10-t18-tc22"]
+
+        self.assertEqual(identity["job_id"], "s10-t18-tc22-job")
+        self.assertEqual(
+            identity["budget_caps"],
+            {
+                "max_compute_units": 0.31,
+                "max_wallclock_s": 6.2,
+                "max_cost_usd": 1,
+            },
+        )
 
     def test_attack_probe_programs_are_valid_python(self) -> None:
         compile(self.battery._trust_write_probe_program(), "<tc01>", "exec")
@@ -878,9 +921,11 @@ class DockerSecurityMonitorOrderingTests(unittest.TestCase):
         start_index = supervisor.actions.index("docker:start")
         register_index = supervisor.actions.index("monitor:register")
         self.assertLess(register_index, start_index)
-        self.assertEqual(supervisor.actions[start_index + 1 : start_index + 5], [
+        self.assertEqual(supervisor.actions[start_index + 1 : start_index + 7], [
             "monitor:poll",
             "docker:pause",
+            "docker:inspect",
+            "docker:archive",
             "docker:unpause",
             "docker:kill",
         ])
@@ -985,8 +1030,8 @@ class DockerSecurityMonitorOrderingTests(unittest.TestCase):
         assert result.partial_result is not None
         self.assertEqual(result.partial_result.reason, "security_monitor_unavailable")
         self.assertEqual(
-            supervisor.actions[supervisor.actions.index("monitor:poll") + 1 :][:3],
-            ["docker:pause", "docker:unpause", "docker:kill"],
+            supervisor.actions[supervisor.actions.index("monitor:poll") + 1 :][:5],
+            ["docker:pause", "docker:inspect", "docker:archive", "docker:unpause", "docker:kill"],
         )
 
 
@@ -1083,7 +1128,7 @@ class FirecrackerSecurityMonitorOrderingTests(unittest.TestCase):
 
 
 class SecurityViolationOrchestratorTests(unittest.TestCase):
-    def test_trustwrite_is_durable_sev1_quarantine_without_claiming_t18_snapshot(self) -> None:
+    def test_trustwrite_is_durable_sev1_quarantine_with_resolved_t18_snapshot(self) -> None:
         tokens = InMemoryTokenService(signing_key=b"s10-security-violation-orchestrator")
         budget = tokens.mint_budget(
             caps=BudgetCaps(max_compute_units=10, max_wallclock_s=10, max_cost_usd=1),
@@ -1137,9 +1182,112 @@ class SecurityViolationOrchestratorTests(unittest.TestCase):
         self.assertEqual(matching[0].payload["engine"], "falco-modern-ebpf")
         quarantined = audit.query(job_id=request.job_id, event_type="sandbox.quarantined")
         self.assertEqual(len(quarantined), 1)
-        self.assertEqual(quarantined[0].payload["snapshot_refs"], [])
-        self.assertEqual(quarantined[0].payload["forensic_snapshot_status"], "pending_s10_t18")
+        self.assertEqual(len(quarantined[0].payload["snapshot_refs"]), 3)
+        self.assertEqual(quarantined[0].payload["forensic_snapshot_status"], "durable")
+        self.assertIsInstance(quarantined[0].payload["audit_slice_ref"], str)
+        quarantine = orchestrator.quarantine_for_sandbox(result.handle.sandbox_id)
+        self.assertIsNotNone(quarantine)
+        assert quarantine is not None
+        for artifact_ref in (*quarantine.snapshot_refs, quarantine.audit_slice_ref):
+            self.assertIsNotNone(artifact_ref)
+            artifacts.get_artifact(str(artifact_ref))
         self.assertTrue(audit.verify_chain().valid)
+
+    def test_c4_outage_leaves_durable_spool_that_a_restarted_orchestrator_recovers(self) -> None:
+        tokens = InMemoryTokenService(signing_key=b"s10-security-spool-recovery")
+        budget = tokens.mint_budget(
+            caps=BudgetCaps(max_compute_units=10, max_wallclock_s=10, max_cost_usd=1),
+            job_id="job-security-1",
+            root_request_id="root-security-1",
+        )
+        scope = tokens.mint_scope(
+            job_id="job-security-1",
+            scopes=ScopeGrant(sandbox_risk_class="standard"),
+        )
+        bundle = _policy_bundle()
+        trust = InMemoryPolicyBundleTrustStore({bundle.signer_key_id: b"security-policy-key"})
+        policy = InMemoryPolicyService(initial_bundle=bundle, trust_store=trust)
+        audit = InMemoryAuditLedger()
+        artifacts = _ForensicOutageArtifactStore()
+        request = LaunchRequest(
+            job_id="job-security-1",
+            subagent_id="s2-builder",
+            trace_id="trace-security-1",
+            budget_token=budget,
+            scope_token=scope,
+            image="busybox@sha256:" + "b" * 64,
+            entrypoint=("sh",),
+            args=("-c", "true"),
+            env={},
+            env_allowlist=(),
+            requested_envelope=LaunchEnvelope(
+                cpu_m=100,
+                mem_bytes=16 * 1024 * 1024,
+                gpu_count=0,
+                wallclock_s=2,
+                scratch_bytes=1024 * 1024,
+                pids=8,
+            ),
+        )
+
+        with TemporaryDirectory() as temp_dir:
+            first = DockerSandboxOrchestrator(
+                token_service=tokens,
+                quota_ledger=InMemoryQuotaLedger(),
+                audit_ledger=audit,
+                policy_service=policy,
+                artifact_store=artifacts,
+                supervisor=_SecurityEventResultSupervisor(_security_event()),
+                forensic_spool=FileForensicCaptureSpool(temp_dir),
+            )
+            result = first.launch_and_wait(request)
+            pending = first.quarantine_for_sandbox(result.handle.sandbox_id)
+            assert pending is not None
+
+            self.assertEqual(pending.snapshot_status, "pending")
+            self.assertEqual(
+                first.forensic_spool.pending_quarantine_ids(),
+                (pending.quarantine_id,),
+            )
+            event_types = [event.event_type for event in audit.events()]
+            self.assertLess(
+                event_types.index("snapshot.spooled"),
+                event_types.index("quarantine.page_unconfigured"),
+            )
+            self.assertLess(
+                event_types.index("quarantine.page_unconfigured"),
+                event_types.index("snapshot.failed"),
+            )
+
+            artifacts.fail_forensic_writes = False
+            restarted = DockerSandboxOrchestrator(
+                token_service=tokens,
+                quota_ledger=InMemoryQuotaLedger(),
+                audit_ledger=audit,
+                policy_service=policy,
+                artifact_store=artifacts,
+                supervisor=_SecurityEventResultSupervisor(_security_event()),
+                forensic_spool=FileForensicCaptureSpool(temp_dir),
+            )
+            recovered = restarted.retry_quarantine_snapshot(pending.quarantine_id)
+            closed = restarted.quarantine_workflow.close(
+                pending.quarantine_id,
+                reviewer="security-engineer@example.com",
+                disposition="contained",
+            )
+
+            self.assertEqual(recovered.snapshot_status, "durable")
+            self.assertEqual(closed.status, "closed")
+            self.assertEqual(restarted.forensic_spool.pending_quarantine_ids(), ())
+            self.assertEqual(
+                len(
+                    audit.query(
+                        job_id=request.job_id,
+                        event_type="snapshot.recovered",
+                    )
+                ),
+                1,
+            )
 
 
 class _SecurityMonitorServer:
@@ -1441,7 +1589,24 @@ class _SecurityMonitorDockerApiSupervisor(DockerSandboxSupervisor):
             return {}
         if method == "GET" and path.endswith("/json"):
             self.actions.append("docker:inspect")
-            return {"State": {"Running": not self.clean_exit, "ExitCode": 0}}
+            return {
+                "Id": CONTAINER_ID,
+                "Image": "sha256:" + "c" * 64,
+                "Config": {
+                    "Image": self._active_request.image,
+                    "Labels": {
+                        "argus.dev/job-id": self._active_request.job_id,
+                        "argus.dev/sandbox-id": "sandbox-security-1",
+                    },
+                },
+                "HostConfig": {
+                    "ReadonlyRootfs": True,
+                    "Runtime": "runc",
+                    "NetworkMode": "none",
+                    "Tmpfs": {"/tmp": "rw,noexec,nosuid,nodev,size=1048576"},
+                },
+                "State": {"Running": not self.clean_exit, "ExitCode": 0},
+            }
         if method == "POST" and path.endswith("/pause"):
             self.actions.append("docker:pause")
             return {}
@@ -1455,6 +1620,17 @@ class _SecurityMonitorDockerApiSupervisor(DockerSandboxSupervisor):
             self.actions.append("docker:delete")
             return {}
         raise AssertionError(f"unexpected Docker API call: {method} {path}")
+
+    def _docker_api_request_bytes_limited(self, method, path, **kwargs):  # type: ignore[no-untyped-def]
+        del kwargs
+        if method == "GET" and "/archive?path=%2Ftmp" in path:
+            self.actions.append("docker:archive")
+            return b"real-frozen-scratch-tar", False
+        raise AssertionError(f"unexpected Docker byte API call: {method} {path}")
+
+    def run(self, *, request, **kwargs):  # type: ignore[no-untyped-def]
+        self._active_request = request
+        return super().run(request=request, **kwargs)
 
     def _docker_api_logs(self, container_id: str):  # type: ignore[no-untyped-def]
         del container_id
@@ -1487,8 +1663,29 @@ class _SecurityEventResultSupervisor:
         security_event_sink,
         **kwargs,
     ):
-        del request, materialized_env, kwargs
+        forensic_capture_sink = kwargs.get("forensic_capture_sink")
+        del materialized_env, kwargs
         security_event_sink(replace(self.event, sandbox_id=handle.sandbox_id, event_id=""))
+        scratch_archive = b"real-frozen-scratch-tar"
+        if callable(forensic_capture_sink):
+            forensic_capture_sink(
+                ForensicHostCapture(
+                    captured_at="2026-07-15T00:00:00Z",
+                    container_id=CONTAINER_ID,
+                    image_digest=request.image,
+                    rootfs_evidence={
+                        "image_digest": request.image,
+                        "container_image_id": "sha256:" + "c" * 64,
+                        "read_only": True,
+                        "runtime": "runsc-argus",
+                        "network_mode": "none",
+                    },
+                    scratch_archive=scratch_archive,
+                    scratch_archive_hash=hash_bytes(scratch_archive),
+                    network_mode="none",
+                    network_events=(),
+                )
+            )
         return SandboxExecutionResult(
             handle=handle,
             exit_code=137,
@@ -1508,6 +1705,17 @@ class _SecurityEventResultSupervisor:
                 stderr_bytes=0,
             ),
         )
+
+
+class _ForensicOutageArtifactStore(InMemoryArtifactStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.fail_forensic_writes = True
+
+    def create_artifact(self, **kwargs):  # type: ignore[no-untyped-def]
+        if self.fail_forensic_writes and kwargs.get("kind") == "sandbox.forensic.rootfs":
+            raise OSError("simulated C4 outage")
+        return super().create_artifact(**kwargs)
 
 
 class _SecurityMonitorFirecrackerSupervisor(FirecrackerSandboxSupervisor):

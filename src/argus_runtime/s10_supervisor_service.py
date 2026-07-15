@@ -26,12 +26,16 @@ from argus_core import (
     DockerSandboxSupervisor,
     Ed25519KmsTokenSigner,
     ExfilThresholds,
+    FileForensicCaptureSpool,
     FileTokenRevocationStore,
     FirecrackerRuntimeConfig,
     FirecrackerSandboxSupervisor,
     FileSystemArtifactStore,
+    ForensicCaptureSpool,
+    ForensicSnapshotPersistenceError,
     InMemoryArtifactStore,
     InMemoryAuditLedger,
+    InMemoryForensicCaptureSpool,
     InMemoryPolicyBundleTrustStore,
     InMemoryPolicyService,
     InMemoryS10KmsCheckpointSigner,
@@ -45,6 +49,11 @@ from argus_core import (
     PolicyBundleSigner,
     PolicyDeniedError,
     Producer,
+    QuarantineAlreadyClosedError,
+    QuarantineNotFoundError,
+    QuarantineRecord,
+    QuarantineSnapshotPendingError,
+    QuarantineWorkflow,
     PriceTable,
     PriceTableSignatureError,
     PriceTableSigner,
@@ -89,6 +98,76 @@ class AdapterBrokerUpstreamError(RuntimeError):
 
 class ModelBrokerUpstreamError(RuntimeError):
     """Raised when a configured model provider violates the broker contract."""
+
+
+class SecurityPagerDeliveryError(RuntimeError):
+    """Raised when the configured Security Engineer paging endpoint rejects a Sev-1."""
+
+
+class _RejectSecurityPagerRedirects(request.HTTPRedirectHandler):
+    def redirect_request(
+        self,
+        req: request.Request,
+        fp: Any,
+        code: int,
+        msg: str,
+        headers: Any,
+        newurl: str,
+    ) -> None:
+        del req, fp, code, msg, headers, newurl
+        return None
+
+
+@dataclass(frozen=True)
+class HttpSecurityPager:
+    endpoint_url: str
+    auth_token: str = field(repr=False)
+    allow_insecure: bool = False
+    timeout_s: float = 10.0
+
+    def __post_init__(self) -> None:
+        endpoint = parse.urlparse(self.endpoint_url)
+        if endpoint.scheme not in {"http", "https"} or not endpoint.netloc:
+            raise ValueError("security pager endpoint must be an absolute HTTP(S) URL")
+        if endpoint.username is not None or endpoint.password is not None:
+            raise ValueError("security pager endpoint must not contain credentials")
+        if endpoint.query or endpoint.fragment:
+            raise ValueError("security pager endpoint must not contain a query or fragment")
+        if endpoint.scheme != "https" and not self.allow_insecure:
+            raise ValueError("security pager endpoint must use HTTPS")
+        if not self.auth_token or any(char in self.auth_token for char in "\r\n"):
+            raise ValueError("security pager auth token must be a non-empty single-line value")
+        if not math.isfinite(self.timeout_s) or self.timeout_s <= 0:
+            raise ValueError("security pager timeout must be a positive finite number")
+
+    def page(self, payload: Mapping[str, Any]) -> None:
+        required = ("quarantine_id", "job_id", "sandbox_id", "severity", "reason")
+        if any(not isinstance(payload.get(field_name), str) or not payload[field_name] for field_name in required):
+            raise ValueError("security pager payload is incomplete")
+        outbound = request.Request(
+            self.endpoint_url,
+            data=canonical_json_bytes(dict(payload)),
+            method="POST",
+            headers={
+                "Authorization": f"Bearer {self.auth_token}",
+                "Content-Type": "application/json",
+            },
+        )
+        try:
+            opener = request.build_opener(_RejectSecurityPagerRedirects())
+            with opener.open(outbound, timeout=self.timeout_s) as response:
+                if response.status not in {200, 201, 202, 204}:
+                    raise SecurityPagerDeliveryError(
+                        f"security pager returned HTTP {response.status}"
+                    )
+                if len(response.read(64 * 1024 + 1)) > 64 * 1024:
+                    raise SecurityPagerDeliveryError("security pager response exceeded 64 KiB")
+        except error.HTTPError as exc:
+            raise SecurityPagerDeliveryError(
+                f"security pager returned HTTP {exc.code}"
+            ) from exc
+        except OSError as exc:
+            raise SecurityPagerDeliveryError("security pager endpoint is unavailable") from exc
 
 
 @dataclass(frozen=True)
@@ -235,6 +314,9 @@ class S10SupervisorApp:
         audit_api_write_token: str | None = None,
         audit_api_read_token: str | None = None,
         audit_anchor_auth_token: str | None = None,
+        quarantine_review_token: str | None = None,
+        quarantine_page_sink: Any | None = None,
+        forensic_spool: ForensicCaptureSpool | None = None,
     ) -> None:
         self.tokens = token_service or InMemoryTokenService(signing_key=signing_key)
         self.quota = quota_ledger or InMemoryQuotaLedger()
@@ -245,6 +327,9 @@ class S10SupervisorApp:
         self._audit_api_write_token = audit_api_write_token
         self._audit_api_read_token = audit_api_read_token
         self._audit_anchor_auth_token = audit_anchor_auth_token
+        self._quarantine_review_token = quarantine_review_token
+        self._quarantine_page_sink = quarantine_page_sink
+        self.forensic_spool = forensic_spool or InMemoryForensicCaptureSpool()
         self.auth = auth
         self.runtime_identity_mint_policy = runtime_identity_mint_policy
         self._health_token = health_token
@@ -273,6 +358,11 @@ class S10SupervisorApp:
             token_service=self.tokens,
             artifact_store=self.artifacts,
             audit_ledger=self.audit,
+        )
+        self.quarantine_workflow = QuarantineWorkflow(
+            artifact_store=self.artifacts,
+            audit_ledger=self.audit,
+            page_sink=self._quarantine_page_sink,
         )
         self._docker_orchestrator = self._build_docker_orchestrator()
         self.http = JsonHttpApp()
@@ -856,6 +946,9 @@ class S10SupervisorApp:
         self._refresh_artifacts()
         result = self._docker_orchestrator.launch_and_wait(launch)
         payload = asdict(result)
+        quarantine = self._docker_orchestrator.quarantine_for_sandbox(result.handle.sandbox_id)
+        if quarantine is not None:
+            payload["quarantine"] = self._quarantine_response(quarantine)
         halt_telemetry = self._docker_orchestrator.halt_telemetry_for(result.handle.sandbox_id)
         if halt_telemetry is not None:
             payload["halt_telemetry"] = halt_telemetry
@@ -910,6 +1003,8 @@ class S10SupervisorApp:
             supervisor=self._docker_supervisor,
             price_table=self.price_table,
             price_table_trust_store=self.price_table_trust_store,
+            quarantine_workflow=self.quarantine_workflow,
+            forensic_spool=self.forensic_spool,
         )
 
     def _refresh_artifacts(self) -> None:
@@ -919,6 +1014,11 @@ class S10SupervisorApp:
                 token_service=self.tokens,
                 artifact_store=self.artifacts,
                 audit_ledger=self.audit,
+            )
+            self.quarantine_workflow = QuarantineWorkflow(
+                artifact_store=self.artifacts,
+                audit_ledger=self.audit,
+                page_sink=self._quarantine_page_sink,
             )
             self._docker_orchestrator = self._build_docker_orchestrator()
 
@@ -930,6 +1030,27 @@ class S10SupervisorApp:
     def _authenticate_health(self, request: JsonRequest) -> None:
         require_static_bearer_token(request, expected_token=self._health_token, purpose="health")
 
+    def _authenticate_quarantine_reviewer(self, request: JsonRequest) -> None:
+        require_static_bearer_token(
+            request,
+            expected_token=self._quarantine_review_token,
+            purpose="quarantine reviewer",
+        )
+
+    def _quarantine_response(self, record: QuarantineRecord) -> dict[str, Any]:
+        pending_ids = self.forensic_spool.pending_quarantine_ids()
+        spool_pending = record.quarantine_id in pending_ids
+        return {
+            **asdict(record),
+            "page_status": self.quarantine_workflow.page_status(record.quarantine_id),
+            "forensic_spool_pending": spool_pending,
+            "forensic_spool_ref": (
+                self.forensic_spool.spool_ref(record.quarantine_id)
+                if spool_pending
+                else None
+            ),
+        }
+
     def _register_routes(self) -> None:
         @self.http.route("GET", "/healthz")
         def health(request: JsonRequest) -> tuple[int, Any]:
@@ -937,6 +1058,7 @@ class S10SupervisorApp:
                 self._authenticate_health(request)
             except UnauthorizedError as exc:
                 return 401, {"error": "Unauthorized", "message": str(exc)}
+            forensic_spool_pending_ids = self.forensic_spool.pending_quarantine_ids()
             return 200, {
                 "service": "s10-supervisor",
                 "status": "ok",
@@ -975,6 +1097,11 @@ class S10SupervisorApp:
                 ),
                 "egress_sidecar_configured": self._docker_supervisor.egress_sidecar_configured,
                 "security_monitor_configured": self._docker_supervisor.security_monitor_configured,
+                "security_pager_configured": self._quarantine_page_sink is not None,
+                "quarantine_review_api_configured": bool(self._quarantine_review_token),
+                "forensic_spool": self.forensic_spool.kind,
+                "forensic_spool_pending": len(forensic_spool_pending_ids),
+                "forensic_spool_pending_ids": list(forensic_spool_pending_ids),
                 "secrets_broker_configured": bool(self._adapter_targets),
                 "adapter_broker_targets": sorted(self._adapter_targets),
                 "model_broker_configured": bool(self._model_targets),
@@ -985,6 +1112,78 @@ class S10SupervisorApp:
                 ),
                 "audit_events": len(self.audit.events()),
             }
+
+        @self.http.prefix("GET", "/v1/quarantine/")
+        def quarantine_get(request: JsonRequest) -> tuple[int, Any]:
+            try:
+                self._authenticate_quarantine_reviewer(request)
+                quarantine_id = _quarantine_id_from_path(request.path, operation="get")
+                record = self.quarantine_workflow.get(quarantine_id)
+                return 200, self._quarantine_response(record)
+            except UnauthorizedError as exc:
+                return 401, {"error": "Unauthorized", "message": str(exc)}
+            except QuarantineNotFoundError as exc:
+                return 404, {"error": type(exc).__name__, "message": str(exc)}
+            except ForensicSnapshotPersistenceError as exc:
+                return 503, {"error": type(exc).__name__, "message": str(exc)}
+            except ValueError as exc:
+                return 400, {"error": type(exc).__name__, "message": str(exc)}
+
+        @self.http.prefix("POST", "/v1/quarantine/")
+        def quarantine_mutation(request: JsonRequest) -> tuple[int, Any]:
+            try:
+                self._authenticate_quarantine_reviewer(request)
+                if not isinstance(request.body, dict):
+                    return 400, {"error": "json_object_required"}
+                if request.path.endswith("/snapshot:retry"):
+                    quarantine_id = _quarantine_id_from_path(
+                        request.path,
+                        operation="snapshot:retry",
+                    )
+                    if request.body:
+                        raise ValueError("quarantine snapshot retry requires an empty object")
+                    record = self._docker_orchestrator.retry_quarantine_snapshot(
+                        quarantine_id
+                    )
+                    return 200, self._quarantine_response(record)
+                if request.path.endswith("/page:retry"):
+                    quarantine_id = _quarantine_id_from_path(
+                        request.path,
+                        operation="page:retry",
+                    )
+                    if request.body:
+                        raise ValueError("quarantine page retry requires an empty object")
+                    record = self.quarantine_workflow.get(quarantine_id)
+                    page_status = self.quarantine_workflow.notify_security_engineer(
+                        record,
+                        retry_previous_failure=True,
+                    )
+                    if page_status != "delivered":
+                        raise SecurityPagerDeliveryError(
+                            "security page delivery was not confirmed"
+                        )
+                    return 200, self._quarantine_response(record)
+                quarantine_id = _quarantine_id_from_path(request.path, operation="close")
+                if set(request.body) != {"reviewer", "disposition"}:
+                    raise ValueError("quarantine close accepts only reviewer and disposition")
+                record = self.quarantine_workflow.close(
+                    quarantine_id,
+                    reviewer=_required_str(request.body, "reviewer"),
+                    disposition=_required_str(request.body, "disposition"),
+                )
+                return 200, self._quarantine_response(record)
+            except UnauthorizedError as exc:
+                return 401, {"error": "Unauthorized", "message": str(exc)}
+            except QuarantineNotFoundError as exc:
+                return 404, {"error": type(exc).__name__, "message": str(exc)}
+            except (QuarantineAlreadyClosedError, QuarantineSnapshotPendingError) as exc:
+                return 409, {"error": type(exc).__name__, "message": str(exc)}
+            except ForensicSnapshotPersistenceError as exc:
+                return 503, {"error": type(exc).__name__, "message": str(exc)}
+            except SecurityPagerDeliveryError as exc:
+                return 503, {"error": type(exc).__name__, "message": str(exc)}
+            except ValueError as exc:
+                return 400, {"error": type(exc).__name__, "message": str(exc)}
 
         @self.http.route("POST", "/v1/internal/audit-anchor")
         def audit_anchor(request: JsonRequest) -> tuple[int, Any]:
@@ -1457,6 +1656,19 @@ def build_app_from_env() -> S10SupervisorApp:
     verifier_key_auth_token = os.environ.get("ARGUS_S10_VERIFIER_KEY_AUTH_TOKEN")
     adapter_targets = _adapter_targets_from_env()
     model_targets = _model_targets_from_env()
+    security_pager = _security_pager_from_env()
+    quarantine_review_token = os.environ.get("ARGUS_S10_QUARANTINE_REVIEW_TOKEN")
+    forensic_spool_dir = os.environ.get("ARGUS_S10_FORENSIC_SPOOL_DIR")
+    if security_pager is not None and not quarantine_review_token:
+        raise RuntimeError(
+            "ARGUS_S10_QUARANTINE_REVIEW_TOKEN is required when the security pager is configured"
+        )
+    if security_pager is not None and not forensic_spool_dir:
+        raise RuntimeError(
+            "ARGUS_S10_FORENSIC_SPOOL_DIR is required when the security pager is configured"
+        )
+    if forensic_spool_dir and not Path(forensic_spool_dir).is_absolute():
+        raise RuntimeError("ARGUS_S10_FORENSIC_SPOOL_DIR must be an absolute path")
     if verifier_key_provider is not None and not verifier_key_auth_token:
         raise RuntimeError("ARGUS_S10_VERIFIER_KEY_AUTH_TOKEN is required when verifier keys are configured")
     artifact_store_path: str | None = None
@@ -1498,6 +1710,13 @@ def build_app_from_env() -> S10SupervisorApp:
         audit_api_write_token=os.environ.get("ARGUS_S10_AUDIT_API_WRITE_TOKEN"),
         audit_api_read_token=os.environ.get("ARGUS_S10_AUDIT_API_READ_TOKEN"),
         audit_anchor_auth_token=os.environ.get("ARGUS_S10_AUDIT_ANCHOR_AUTH_TOKEN"),
+        quarantine_review_token=quarantine_review_token,
+        quarantine_page_sink=security_pager.page if security_pager is not None else None,
+        forensic_spool=(
+            FileForensicCaptureSpool(forensic_spool_dir)
+            if forensic_spool_dir
+            else InMemoryForensicCaptureSpool()
+        ),
     )
 
 
@@ -1720,6 +1939,30 @@ def _security_monitor_from_env() -> HttpSecurityMonitorClient | None:
     )
     client.health()
     return client
+
+
+def _security_pager_from_env() -> HttpSecurityPager | None:
+    endpoint_url = os.environ.get("ARGUS_S10_SECURITY_PAGER_URL")
+    auth_token = os.environ.get("ARGUS_S10_SECURITY_PAGER_AUTH_TOKEN")
+    if not endpoint_url and not auth_token:
+        return None
+    if not endpoint_url or not auth_token:
+        raise RuntimeError(
+            "ARGUS_S10_SECURITY_PAGER_URL and ARGUS_S10_SECURITY_PAGER_AUTH_TOKEN "
+            "must be configured together"
+        )
+    allow_insecure = os.environ.get("ARGUS_S10_ALLOW_INSECURE_SECURITY_PAGER", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    return HttpSecurityPager(
+        endpoint_url=endpoint_url,
+        auth_token=auth_token,
+        allow_insecure=allow_insecure,
+        timeout_s=_positive_float_env("ARGUS_S10_SECURITY_PAGER_TIMEOUT_S", 10.0),
+    )
 
 
 def _egress_sidecar_runtime_config_from_env() -> EgressSidecarRuntimeConfig | None:
@@ -2215,6 +2458,57 @@ class S8BrokeredArtifactStoreClient:
             raise RuntimeError("S8 audit anchor read returned a non-object response")
         return response_body
 
+    def get_internal_artifact(
+        self,
+        *,
+        artifact_ref: str,
+        job_id: str,
+        representation: str,
+    ) -> dict[str, Any]:
+        if not artifact_ref or not job_id:
+            raise ValueError("internal S8 artifact read requires artifact_ref and job_id")
+        if representation not in {"payload", "record"}:
+            raise ValueError("internal S8 artifact representation must be payload or record")
+        body = {
+            "authorization": {
+                "audience": "store",
+                "scope_id": f"s10-forensic:{job_id}",
+                "scope_job_id": job_id,
+                "capabilities": ["s8.read"],
+            },
+            "artifact_ref": artifact_ref,
+            "representation": representation,
+        }
+        encoded = canonical_json_bytes(body)
+        signature = "hmac-sha256:" + hmac.new(
+            self._broker_write_key,
+            encoded,
+            sha256,
+        ).hexdigest()
+        http_request = request.Request(
+            self._read_endpoint_url,
+            data=encoded,
+            method="POST",
+            headers={
+                "Content-Type": "application/json",
+                "X-Argus-Store-Write-Signature": signature,
+            },
+        )
+        try:
+            with request.urlopen(http_request, timeout=10) as response:
+                response_body = json.loads(response.read().decode("utf-8"))
+        except error.HTTPError as exc:
+            response_body = json.loads(exc.read().decode("utf-8"))
+            _raise_s8_http_error(response_body)
+        if not isinstance(response_body, dict):
+            raise RuntimeError("S8 internal artifact read returned a non-object response")
+        if (
+            response_body.get("artifact_ref") != artifact_ref
+            or response_body.get("representation") != representation
+        ):
+            raise RuntimeError("S8 internal artifact read returned mismatched identity")
+        return response_body
+
     def create_artifact(
         self,
         *,
@@ -2281,6 +2575,28 @@ def _required_str(body: dict[str, Any], field: str) -> str:
     if not isinstance(value, str) or not value:
         raise ValueError(f"{field} is required")
     return value
+
+
+def _quarantine_id_from_path(path: str, *, operation: str) -> str:
+    prefix = "/v1/quarantine/"
+    if not path.startswith(prefix):
+        raise ValueError("invalid quarantine path")
+    suffix = path.removeprefix(prefix)
+    operation_suffix = {
+        "get": "",
+        "close": "/close",
+        "snapshot:retry": "/snapshot:retry",
+        "page:retry": "/page:retry",
+    }.get(operation)
+    if operation_suffix is None:
+        raise ValueError("invalid quarantine operation")
+    if operation_suffix:
+        if not suffix.endswith(operation_suffix):
+            raise ValueError(f"quarantine {operation} path is invalid")
+        suffix = suffix.removesuffix(operation_suffix)
+    if not suffix or "/" in suffix:
+        raise ValueError("quarantine id must be one path segment")
+    return suffix
 
 
 def _optional_query_value(request: JsonRequest, field: str) -> str | None:

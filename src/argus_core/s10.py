@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
 import http.client as http_client
 import hmac
 import ipaddress
@@ -16,6 +18,7 @@ import shlex
 import shutil
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -47,6 +50,8 @@ SIGNATURE_PREFIX = "hmac-sha256:"
 TOKEN_ED25519_SIGNATURE_PREFIX = "ed25519:"
 DOCKER_SANDBOX_USER = "65532:65532"
 PARTIAL_RESULT_LOG_CAPTURE_LIMIT_BYTES = 64 * 1024
+FORENSIC_SCRATCH_ARCHIVE_OVERHEAD_BYTES = 1024 * 1024
+FORENSIC_SCRATCH_ARCHIVE_MAX_BYTES = 128 * 1024 * 1024
 METER_AUDIT_BACKLOG_MAX_ITEMS = 1024
 SECURITY_MONITOR_TERMINAL_DRAIN_ATTEMPTS = 4
 SECURITY_MONITOR_TERMINAL_DRAIN_INTERVAL_S = 0.05
@@ -120,6 +125,26 @@ class SandboxRuntimeUnavailableError(S10Error):
 
 class SecurityMonitorError(SandboxRuntimeUnavailableError):
     """Raised when the host security monitor cannot provide trusted evidence."""
+
+
+class ForensicSnapshotCaptureError(S10Error):
+    """Raised when a frozen sandbox cannot be captured completely."""
+
+
+class ForensicSnapshotPersistenceError(S10Error):
+    """Raised when a complete host capture cannot be committed to C4."""
+
+
+class QuarantineNotFoundError(S10Error):
+    """Raised when a quarantine id has no durable audit-backed record."""
+
+
+class QuarantineSnapshotPendingError(S10Error):
+    """Raised when quarantine closure is attempted before every snapshot is durable."""
+
+
+class QuarantineAlreadyClosedError(S10Error):
+    """Raised when a closed quarantine receives a conflicting second disposition."""
 
 
 @dataclass(frozen=True)
@@ -489,6 +514,417 @@ class SandboxExecutionResult:
     duration_s: float
     budget_usage: BudgetUsage
     partial_result: SandboxPartialResult | None = None
+
+
+@dataclass(frozen=True)
+class ForensicHostCapture:
+    """Host-owned frozen evidence retained only until it is sealed into C4."""
+
+    captured_at: str
+    container_id: str
+    image_digest: str
+    rootfs_evidence: dict[str, Any]
+    scratch_archive: bytes
+    scratch_archive_hash: str
+    network_mode: str
+    network_events: tuple[dict[str, Any], ...]
+    scratch_media_type: str = "application/x-tar"
+
+
+@dataclass(frozen=True)
+class QuarantineRecord:
+    quarantine_id: str
+    job_id: str
+    sandbox_id: str
+    reason: str
+    severity: str
+    snapshot_refs: tuple[str, ...]
+    audit_slice_ref: str | None
+    opened_at: str
+    status: Literal["open", "reviewing", "closed"]
+    snapshot_status: Literal["pending", "durable"]
+    reviewer: str | None = None
+    disposition: str | None = None
+    closed_at: str | None = None
+    record_ref: str = ""
+
+
+class ForensicCaptureSpool(Protocol):
+    kind: str
+
+    def spool_ref(self, quarantine_id: str) -> str: ...
+
+    def put(self, quarantine_id: str, capture: ForensicHostCapture) -> str: ...
+
+    def get(self, quarantine_id: str) -> ForensicHostCapture: ...
+
+    def pending_quarantine_ids(self) -> tuple[str, ...]: ...
+
+    def acknowledge_durable(self, quarantine_id: str) -> None: ...
+
+
+class InMemoryForensicCaptureSpool:
+    """Process-local spool used by tests and non-durable embedded runtimes."""
+
+    kind = "memory"
+
+    def __init__(self) -> None:
+        self._captures: dict[str, ForensicHostCapture] = {}
+        self._lock = threading.RLock()
+
+    def spool_ref(self, quarantine_id: str) -> str:
+        _validate_quarantine_spool_id(quarantine_id)
+        return f"forensic-spool:{sha256(quarantine_id.encode('utf-8')).hexdigest()}"
+
+    def put(self, quarantine_id: str, capture: ForensicHostCapture) -> str:
+        _validate_quarantine_spool_id(quarantine_id)
+        _validate_spooled_capture(capture)
+        with self._lock:
+            existing = self._captures.get(quarantine_id)
+            if existing is not None and existing != capture:
+                raise ForensicSnapshotPersistenceError(
+                    "forensic spool already contains different frozen bytes"
+                )
+            self._captures[quarantine_id] = deepcopy(capture)
+        return self.spool_ref(quarantine_id)
+
+    def get(self, quarantine_id: str) -> ForensicHostCapture:
+        _validate_quarantine_spool_id(quarantine_id)
+        with self._lock:
+            capture = self._captures.get(quarantine_id)
+            if capture is None:
+                raise ForensicSnapshotPersistenceError("forensic spool capture is unavailable")
+            return deepcopy(capture)
+
+    def pending_quarantine_ids(self) -> tuple[str, ...]:
+        with self._lock:
+            return tuple(sorted(self._captures))
+
+    def acknowledge_durable(self, quarantine_id: str) -> None:
+        _validate_quarantine_spool_id(quarantine_id)
+        with self._lock:
+            self._captures.pop(quarantine_id, None)
+
+
+class FileForensicCaptureSpool:
+    """Atomic host-owned spool that preserves frozen evidence across restarts."""
+
+    kind = "filesystem"
+    _METADATA_FILE = "capture.json"
+    _SCRATCH_FILE = "scratch.bin"
+
+    def __init__(self, root: str | os.PathLike[str]) -> None:
+        self._root = Path(root)
+        self._root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        if self._root.is_symlink() or not self._root.is_dir():
+            raise ForensicSnapshotPersistenceError("forensic spool root must be a real directory")
+        os.chmod(self._root, 0o700)
+        self._require_private_directory(self._root)
+        self._lock = threading.RLock()
+        self._remove_stale_acknowledgements()
+
+    def spool_ref(self, quarantine_id: str) -> str:
+        _validate_quarantine_spool_id(quarantine_id)
+        return f"forensic-spool:{self._directory_name(quarantine_id)}"
+
+    def put(self, quarantine_id: str, capture: ForensicHostCapture) -> str:
+        _validate_quarantine_spool_id(quarantine_id)
+        _validate_spooled_capture(capture)
+        target = self._directory(quarantine_id)
+        with self._lock:
+            if target.exists():
+                if self.get(quarantine_id) != capture:
+                    raise ForensicSnapshotPersistenceError(
+                        "forensic spool already contains different frozen bytes"
+                    )
+                return self.spool_ref(quarantine_id)
+            temporary = Path(tempfile.mkdtemp(prefix=".capture-", dir=self._root))
+            os.chmod(temporary, 0o700)
+            try:
+                self._write_file(
+                    temporary / self._SCRATCH_FILE,
+                    capture.scratch_archive,
+                )
+                self._write_file(
+                    temporary / self._METADATA_FILE,
+                    canonical_json_bytes(
+                        {
+                            "schema": "argus.s10.forensic-spool.v1",
+                            "quarantine_id": quarantine_id,
+                            "captured_at": capture.captured_at,
+                            "container_id": capture.container_id,
+                            "image_digest": capture.image_digest,
+                            "rootfs_evidence": capture.rootfs_evidence,
+                            "scratch_archive_hash": capture.scratch_archive_hash,
+                            "scratch_archive_bytes": len(capture.scratch_archive),
+                            "scratch_media_type": capture.scratch_media_type,
+                            "network_mode": capture.network_mode,
+                            "network_events": list(capture.network_events),
+                        }
+                    ),
+                )
+                self._fsync_directory(temporary)
+                os.replace(temporary, target)
+                self._fsync_directory(self._root)
+            except Exception as exc:
+                self._remove_temporary_directory(temporary)
+                if isinstance(exc, ForensicSnapshotPersistenceError):
+                    raise
+                raise ForensicSnapshotPersistenceError(
+                    "forensic capture could not be committed to the host spool"
+                ) from exc
+        return self.spool_ref(quarantine_id)
+
+    def get(self, quarantine_id: str) -> ForensicHostCapture:
+        _validate_quarantine_spool_id(quarantine_id)
+        directory = self._directory(quarantine_id)
+        with self._lock:
+            try:
+                self._require_private_directory(directory)
+                metadata_path = directory / self._METADATA_FILE
+                scratch_path = directory / self._SCRATCH_FILE
+                self._require_private_file(metadata_path)
+                self._require_private_file(scratch_path)
+                metadata_raw = metadata_path.read_bytes()
+                if len(metadata_raw) > 1024 * 1024:
+                    raise ForensicSnapshotPersistenceError(
+                        "forensic spool metadata exceeded 1 MiB"
+                    )
+                metadata = json.loads(metadata_raw.decode("utf-8"))
+                if not isinstance(metadata, dict):
+                    raise ForensicSnapshotPersistenceError(
+                        "forensic spool metadata schema is invalid"
+                    )
+                expected_scratch_bytes = metadata.get("scratch_archive_bytes")
+                if (
+                    isinstance(expected_scratch_bytes, bool)
+                    or not isinstance(expected_scratch_bytes, int)
+                    or expected_scratch_bytes < 1
+                    or expected_scratch_bytes > FORENSIC_SCRATCH_ARCHIVE_MAX_BYTES
+                    or scratch_path.stat().st_size != expected_scratch_bytes
+                ):
+                    raise ForensicSnapshotPersistenceError(
+                        "forensic spool scratch size is invalid"
+                    )
+                scratch = scratch_path.read_bytes()
+            except ForensicSnapshotPersistenceError:
+                raise
+            except Exception as exc:
+                raise ForensicSnapshotPersistenceError(
+                    "forensic spool capture is unavailable"
+                ) from exc
+        if metadata.get("schema") != "argus.s10.forensic-spool.v1":
+            raise ForensicSnapshotPersistenceError("forensic spool metadata schema is invalid")
+        if metadata.get("quarantine_id") != quarantine_id:
+            raise ForensicSnapshotPersistenceError("forensic spool quarantine identity is invalid")
+        rootfs_evidence = metadata.get("rootfs_evidence")
+        network_events = metadata.get("network_events")
+        string_fields = (
+            "captured_at",
+            "container_id",
+            "image_digest",
+            "scratch_archive_hash",
+            "scratch_media_type",
+            "network_mode",
+        )
+        if (
+            not isinstance(rootfs_evidence, dict)
+            or not isinstance(network_events, list)
+            or any(
+                not isinstance(metadata.get(field), str) or not metadata[field]
+                for field in string_fields
+            )
+        ):
+            raise ForensicSnapshotPersistenceError("forensic spool metadata is incomplete")
+        capture = ForensicHostCapture(
+            captured_at=metadata["captured_at"],
+            container_id=metadata["container_id"],
+            image_digest=metadata["image_digest"],
+            rootfs_evidence=rootfs_evidence,
+            scratch_archive=scratch,
+            scratch_archive_hash=metadata["scratch_archive_hash"],
+            network_mode=metadata["network_mode"],
+            network_events=tuple(network_events),
+            scratch_media_type=metadata["scratch_media_type"],
+        )
+        _validate_spooled_capture(capture)
+        return capture
+
+    def pending_quarantine_ids(self) -> tuple[str, ...]:
+        quarantine_ids: list[str] = []
+        with self._lock:
+            for directory in sorted(self._root.iterdir(), key=lambda path: path.name):
+                if directory.name.startswith((".capture-", ".durable-")):
+                    continue
+                self._require_private_directory(directory)
+                metadata_path = directory / self._METADATA_FILE
+                scratch_path = directory / self._SCRATCH_FILE
+                self._require_private_file(metadata_path)
+                self._require_private_file(scratch_path)
+                try:
+                    if metadata_path.stat().st_size > 1024 * 1024:
+                        raise ForensicSnapshotPersistenceError(
+                            "forensic spool metadata exceeded 1 MiB"
+                        )
+                    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+                    scratch_size = scratch_path.stat().st_size
+                except ForensicSnapshotPersistenceError:
+                    raise
+                except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+                    raise ForensicSnapshotPersistenceError(
+                        "forensic spool metadata is unreadable"
+                    ) from exc
+                quarantine_id = metadata.get("quarantine_id") if isinstance(metadata, dict) else None
+                if not isinstance(quarantine_id, str):
+                    raise ForensicSnapshotPersistenceError(
+                        "forensic spool metadata omitted quarantine_id"
+                    )
+                if directory.name != self._directory_name(quarantine_id):
+                    raise ForensicSnapshotPersistenceError(
+                        "forensic spool directory identity is invalid"
+                    )
+                if (
+                    metadata.get("schema") != "argus.s10.forensic-spool.v1"
+                    or isinstance(metadata.get("scratch_archive_bytes"), bool)
+                    or not isinstance(metadata.get("scratch_archive_bytes"), int)
+                    or metadata["scratch_archive_bytes"] < 1
+                    or metadata["scratch_archive_bytes"] > FORENSIC_SCRATCH_ARCHIVE_MAX_BYTES
+                    or scratch_size != metadata["scratch_archive_bytes"]
+                ):
+                    raise ForensicSnapshotPersistenceError(
+                        "forensic spool scratch size is invalid"
+                    )
+                quarantine_ids.append(quarantine_id)
+        return tuple(sorted(quarantine_ids))
+
+    def acknowledge_durable(self, quarantine_id: str) -> None:
+        _validate_quarantine_spool_id(quarantine_id)
+        directory = self._directory(quarantine_id)
+        acknowledged = self._root / f".durable-{directory.name}"
+        with self._lock:
+            if not directory.exists():
+                self._remove_acknowledged_directory(acknowledged)
+                return
+            self.get(quarantine_id)
+            try:
+                os.replace(directory, acknowledged)
+                self._fsync_directory(self._root)
+            except OSError as exc:
+                raise ForensicSnapshotPersistenceError(
+                    "durable forensic spool capture could not be acknowledged"
+                ) from exc
+            self._remove_acknowledged_directory(acknowledged)
+
+    def _directory(self, quarantine_id: str) -> Path:
+        return self._root / self._directory_name(quarantine_id)
+
+    @staticmethod
+    def _directory_name(quarantine_id: str) -> str:
+        return sha256(quarantine_id.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _write_file(path: Path, payload: bytes) -> None:
+        with path.open("xb") as handle:
+            os.chmod(path, 0o600)
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+
+    @staticmethod
+    def _fsync_directory(path: Path) -> None:
+        descriptor = os.open(path, os.O_RDONLY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+
+    @staticmethod
+    def _remove_temporary_directory(path: Path) -> None:
+        if not path.exists():
+            return
+        for child in path.iterdir():
+            child.unlink(missing_ok=True)
+        path.rmdir()
+
+    def _remove_stale_acknowledgements(self) -> None:
+        for directory in self._root.iterdir():
+            if not directory.name.startswith(".durable-"):
+                continue
+            try:
+                self._require_private_directory(directory)
+                self._remove_temporary_directory(directory)
+            except (OSError, ForensicSnapshotPersistenceError) as exc:
+                raise ForensicSnapshotPersistenceError(
+                    "stale durable forensic spool acknowledgement is unsafe"
+                ) from exc
+
+    def _remove_acknowledged_directory(self, directory: Path) -> None:
+        if not directory.exists():
+            return
+        self._require_private_directory(directory)
+        try:
+            self._remove_temporary_directory(directory)
+        except OSError:
+            # The atomic rename already removed the capture from the pending set.
+            return
+
+    @staticmethod
+    def _require_private_directory(path: Path) -> None:
+        try:
+            metadata = path.lstat()
+        except OSError as exc:
+            raise ForensicSnapshotPersistenceError("forensic spool directory is unavailable") from exc
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or stat.S_IMODE(metadata.st_mode) & 0o077
+            or metadata.st_uid != os.geteuid()
+        ):
+            raise ForensicSnapshotPersistenceError("forensic spool directory permissions are unsafe")
+
+    @staticmethod
+    def _require_private_file(path: Path) -> None:
+        try:
+            metadata = path.lstat()
+        except OSError as exc:
+            raise ForensicSnapshotPersistenceError("forensic spool file is unavailable") from exc
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or stat.S_IMODE(metadata.st_mode) & 0o077
+            or metadata.st_uid != os.geteuid()
+            or metadata.st_nlink != 1
+        ):
+            raise ForensicSnapshotPersistenceError("forensic spool file permissions are unsafe")
+
+
+def _validate_quarantine_spool_id(quarantine_id: str) -> None:
+    if (
+        not isinstance(quarantine_id, str)
+        or not quarantine_id
+        or len(quarantine_id.encode("utf-8")) > 512
+        or any(ord(char) < 32 for char in quarantine_id)
+    ):
+        raise ValueError("forensic spool quarantine_id is invalid")
+
+
+def _validate_spooled_capture(capture: ForensicHostCapture) -> None:
+    if not isinstance(capture, ForensicHostCapture):
+        raise ForensicSnapshotPersistenceError("forensic spool requires a host capture")
+    if not capture.captured_at or not capture.container_id or not capture.network_mode:
+        raise ForensicSnapshotPersistenceError("forensic spool capture identity is incomplete")
+    if not _is_digest_pinned_image(capture.image_digest):
+        raise ForensicSnapshotPersistenceError("forensic spool image is not digest-pinned")
+    if capture.rootfs_evidence.get("read_only") is not True:
+        raise ForensicSnapshotPersistenceError("forensic spool rootfs evidence is not read-only")
+    if capture.rootfs_evidence.get("image_digest") != capture.image_digest:
+        raise ForensicSnapshotPersistenceError("forensic spool rootfs digest is invalid")
+    if (
+        not capture.scratch_archive
+        or len(capture.scratch_archive) > FORENSIC_SCRATCH_ARCHIVE_MAX_BYTES
+        or hash_bytes(capture.scratch_archive) != capture.scratch_archive_hash
+    ):
+        raise ForensicSnapshotPersistenceError("forensic spool scratch bytes are invalid")
+    if any(not isinstance(event, dict) for event in capture.network_events):
+        raise ForensicSnapshotPersistenceError("forensic spool network events are invalid")
 
 
 SecurityMonitorRuntimeKind = Literal["container", "host_process"]
@@ -1579,6 +2015,7 @@ class FirecrackerSandboxSupervisor:
         runtime_evidence_sink: Callable[[RuntimeLaunchEvidence], None] | None = None,
         security_monitor: SecurityMonitor | None = None,
         security_event_sink: Callable[[HostSecurityEvent], None] | None = None,
+        forensic_capture_sink: Callable[[ForensicHostCapture], None] | None = None,
     ) -> SandboxExecutionResult:
         if policy_bundle is None:
             raise SandboxRuntimeUnavailableError("Firecracker launch requires its pinned policy bundle")
@@ -1708,6 +2145,7 @@ class FirecrackerSandboxSupervisor:
                     meter_sample_sink=meter_sample_sink,
                     runtime_halt_probe=combined_runtime_halt_probe,
                     halt_telemetry_sink=halt_telemetry_sink,
+                    forensic_capture_sink=forensic_capture_sink,
                 )
                 if security_monitor is not None and security_registered and not pending_security_events:
                     terminal_security_halt: _RuntimeHaltSignal | None = None
@@ -2136,6 +2574,7 @@ class FirecrackerSandboxSupervisor:
         meter_sample_sink: Callable[[ResourceMeterSample], None] | None,
         runtime_halt_probe: Callable[[], _RuntimeHaltSignal | tuple[str, tuple[str, ...]] | None] | None,
         halt_telemetry_sink: Callable[[SandboxHaltTelemetry], None] | None,
+        forensic_capture_sink: Callable[[ForensicHostCapture], None] | None = None,
     ) -> SandboxExecutionResult:
         started_at = time.monotonic()
         next_sample_at = started_at
@@ -2167,6 +2606,7 @@ class FirecrackerSandboxSupervisor:
                     revocation_acknowledged_at=acknowledged_at,
                     last_sample=last_sample,
                     sample_seq=sample_seq,
+                    forensic_capture_sink=forensic_capture_sink,
                 )
             if now >= next_sample_at:
                 sample_seq += 1
@@ -2200,6 +2640,7 @@ class FirecrackerSandboxSupervisor:
                         halt_telemetry_sink=halt_telemetry_sink,
                         last_sample=sample,
                         sample_seq=sample_seq,
+                        forensic_capture_sink=forensic_capture_sink,
                     )
                 next_sample_at = time.monotonic() + self._meter_interval_s
             time.sleep(min(self._meter_interval_s / 4, 0.05))
@@ -2294,6 +2735,7 @@ class FirecrackerSandboxSupervisor:
         last_sample: ResourceMeterSample | None,
         sample_seq: int,
         revocation_acknowledged_at: float | None = None,
+        forensic_capture_sink: Callable[[ForensicHostCapture], None] | None = None,
     ) -> SandboxExecutionResult:
         detected_at = time.monotonic()
         freeze_at: float | None = None
@@ -2309,6 +2751,45 @@ class FirecrackerSandboxSupervisor:
             capture_error = f"freeze_failed:{exc}"
         stdout, stdout_truncated = self._read_bounded_file(resources.serial_path)
         stderr, stderr_truncated = self._read_bounded_file(resources.log_path)
+        if (
+            freeze_succeeded
+            and reason in {"escape_attempt", "security_monitor_unavailable", "trust_path_write"}
+            and forensic_capture_sink is not None
+        ):
+            try:
+                scratch_size = resources.scratch_path.stat().st_size
+                if scratch_size <= 0 or scratch_size > FORENSIC_SCRATCH_ARCHIVE_MAX_BYTES:
+                    raise ForensicSnapshotCaptureError(
+                        "frozen Firecracker scratch image exceeds its bounded capture limit"
+                    )
+                scratch_archive = resources.scratch_path.read_bytes()
+                if len(scratch_archive) != scratch_size:
+                    raise ForensicSnapshotCaptureError(
+                        "frozen Firecracker scratch image changed during capture"
+                    )
+                forensic_capture_sink(
+                    ForensicHostCapture(
+                        captured_at=_s10_utc_now_iso(),
+                        container_id=handle.sandbox_id,
+                        image_digest=request.image,
+                        rootfs_evidence={
+                            "image_digest": request.image,
+                            "rootfs_image_hash": self._config.rootfs_image_hash,
+                            "kernel_image_hash": self._config.kernel_image_hash,
+                            "read_only": True,
+                            "runtime": f"firecracker@{self._config.expected_version}",
+                            "network_mode": "none",
+                        },
+                        scratch_archive=scratch_archive,
+                        scratch_archive_hash=hash_bytes(scratch_archive),
+                        network_mode="none",
+                        network_events=(),
+                        scratch_media_type="application/vnd.argus.firecracker.ext4",
+                    )
+                )
+            except (OSError, ForensicSnapshotCaptureError) as exc:
+                message = f"forensic_capture_failed:{type(exc).__name__}:{exc}"
+                capture_error = message if capture_error is None else f"{capture_error};{message}"
         try:
             if freeze_succeeded:
                 self._unfreeze_microvm(handle.sandbox_id)
@@ -4349,6 +4830,750 @@ class InMemoryAuditLedger:
         return f"{BLAKE3_PREFIX}{'0' * 64}"
 
 
+class QuarantineWorkflow:
+    """Append-only quarantine state backed by C4 records and the S10 audit chain."""
+
+    _STATE_EVENT_TYPES = frozenset(
+        {"quarantine.open", "quarantine.snapshot_durable", "quarantine.closed"}
+    )
+    _SNAPSHOT_COMPONENTS = ("rootfs", "scratch", "netlog")
+
+    def __init__(
+        self,
+        *,
+        artifact_store: Any,
+        audit_ledger: Any,
+        page_sink: Callable[[Mapping[str, Any]], None] | None = None,
+    ) -> None:
+        self._artifact_store = artifact_store
+        self._audit_ledger = audit_ledger
+        self._page_sink = page_sink
+        self._lock = threading.RLock()
+
+    def open(
+        self,
+        *,
+        job_id: str,
+        sandbox_id: str,
+        reason: str,
+        severity: str,
+        launch_provenance_ref: str,
+        partial_result_ref: str,
+        security_event_ids: tuple[str, ...] = (),
+        notify_security_engineer: bool = True,
+    ) -> QuarantineRecord:
+        for label, value in (
+            ("job_id", job_id),
+            ("sandbox_id", sandbox_id),
+            ("reason", reason),
+            ("severity", severity),
+            ("launch_provenance_ref", launch_provenance_ref),
+            ("partial_result_ref", partial_result_ref),
+        ):
+            if not isinstance(value, str) or not value:
+                raise ValueError(f"quarantine {label} is required")
+        if severity.lower() not in {"sev1", "sev-1"}:
+            raise ValueError("forensic quarantine requires Sev-1 severity")
+        if any(not isinstance(event_id, str) or not event_id for event_id in security_event_ids):
+            raise ValueError("quarantine security event ids must be non-empty strings")
+        with self._lock:
+            existing = self.latest_for_sandbox(sandbox_id)
+            if existing is not None:
+                if existing.job_id != job_id:
+                    raise ValueError("sandbox quarantine job_id changed")
+                return existing
+            record = QuarantineRecord(
+                quarantine_id=str(uuid4()),
+                job_id=job_id,
+                sandbox_id=sandbox_id,
+                reason=reason,
+                severity="Sev-1",
+                snapshot_refs=(),
+                audit_slice_ref=None,
+                opened_at=_s10_utc_now_iso(),
+                status="open",
+                snapshot_status="pending",
+            )
+            committed = self._commit_record(
+                record,
+                input_refs=(launch_provenance_ref, partial_result_ref),
+                transition="open",
+            )
+            self._audit_ledger.append(
+                "quarantine.open",
+                {
+                    "quarantine_id": committed.quarantine_id,
+                    "job_id": committed.job_id,
+                    "sandbox_id": committed.sandbox_id,
+                    "reason": committed.reason,
+                    "severity": committed.severity,
+                    "snapshot_status": committed.snapshot_status,
+                    "record_ref": committed.record_ref,
+                    "security_event_ids": list(security_event_ids),
+                },
+            )
+        if notify_security_engineer:
+            self.notify_security_engineer(committed)
+        return committed
+
+    def notify_security_engineer(
+        self,
+        record: QuarantineRecord,
+        *,
+        retry_previous_failure: bool = False,
+    ) -> str:
+        current = self.get(record.quarantine_id)
+        if current.record_ref != record.record_ref:
+            raise ForensicSnapshotPersistenceError(
+                "quarantine page request does not reference the current record"
+            )
+        current_status = self.page_status(record.quarantine_id)
+        if current_status == "delivered":
+            return current_status
+        if current_status != "pending" and not retry_previous_failure:
+            return current_status
+        self._page_security_engineer(current)
+        return self.page_status(record.quarantine_id)
+
+    def persist_snapshot(
+        self,
+        quarantine_id: str,
+        capture: ForensicHostCapture,
+    ) -> QuarantineRecord:
+        pending = self.get(quarantine_id)
+        if pending.snapshot_status == "durable":
+            self._verify_snapshot_refs(pending)
+            return pending
+        if pending.status == "closed":
+            raise QuarantineAlreadyClosedError("closed quarantine cannot accept a new snapshot")
+        self._validate_capture(pending, capture)
+        base_input_refs = tuple(
+            ref
+            for ref in self._record_input_refs(pending.record_ref, job_id=pending.job_id)
+            if isinstance(ref, str) and ref
+        ) + (pending.record_ref,)
+        try:
+            rootfs = self._artifact_store.create_artifact(
+                kind="sandbox.forensic.rootfs",
+                payload={
+                    "schema": "argus.s10.forensic-snapshot.v1",
+                    "component": "rootfs",
+                    "quarantine_id": pending.quarantine_id,
+                    "job_id": pending.job_id,
+                    "sandbox_id": pending.sandbox_id,
+                    "captured_at": capture.captured_at,
+                    "image_digest": capture.image_digest,
+                    "evidence_hash": hash_json(capture.rootfs_evidence),
+                    "evidence": deepcopy(capture.rootfs_evidence),
+                },
+                producer=self._producer(pending),
+                lineage=self._lineage(pending, input_refs=base_input_refs, component="rootfs"),
+            )
+            scratch = self._artifact_store.create_artifact(
+                kind="sandbox.forensic.scratch",
+                payload={
+                    "schema": "argus.s10.forensic-snapshot.v1",
+                    "component": "scratch",
+                    "quarantine_id": pending.quarantine_id,
+                    "job_id": pending.job_id,
+                    "sandbox_id": pending.sandbox_id,
+                    "captured_at": capture.captured_at,
+                    "archive_encoding": "base64",
+                    "archive_format": capture.scratch_media_type,
+                    "archive_bytes": len(capture.scratch_archive),
+                    "archive_hash": capture.scratch_archive_hash,
+                    "archive_b64": base64.b64encode(capture.scratch_archive).decode("ascii"),
+                },
+                producer=self._producer(pending),
+                lineage=self._lineage(pending, input_refs=base_input_refs, component="scratch"),
+            )
+            netlog = self._artifact_store.create_artifact(
+                kind="sandbox.forensic.netlog",
+                payload={
+                    "schema": "argus.s10.forensic-snapshot.v1",
+                    "component": "netlog",
+                    "quarantine_id": pending.quarantine_id,
+                    "job_id": pending.job_id,
+                    "sandbox_id": pending.sandbox_id,
+                    "captured_at": capture.captured_at,
+                    "network_mode": capture.network_mode,
+                    "event_count": len(capture.network_events),
+                    "events_hash": hash_json(list(capture.network_events)),
+                    "events": deepcopy(list(capture.network_events)),
+                },
+                producer=self._producer(pending),
+                lineage=self._lineage(pending, input_refs=base_input_refs, component="netlog"),
+            )
+            audit_slice = self._persist_audit_slice(
+                pending,
+                input_refs=base_input_refs
+                + (rootfs.artifact_ref, scratch.artifact_ref, netlog.artifact_ref),
+            )
+            durable = replace(
+                pending,
+                snapshot_refs=(rootfs.artifact_ref, scratch.artifact_ref, netlog.artifact_ref),
+                audit_slice_ref=audit_slice.artifact_ref,
+                snapshot_status="durable",
+                record_ref="",
+            )
+            committed = self._commit_record(
+                durable,
+                input_refs=(pending.record_ref, *durable.snapshot_refs, audit_slice.artifact_ref),
+                transition="snapshot-durable",
+            )
+            self._verify_snapshot_refs(committed)
+            self._audit_ledger.append(
+                "snapshot.captured",
+                {
+                    "quarantine_id": committed.quarantine_id,
+                    "job_id": committed.job_id,
+                    "sandbox_id": committed.sandbox_id,
+                    "snapshot_refs": list(committed.snapshot_refs),
+                    "audit_slice_ref": committed.audit_slice_ref,
+                    "snapshot_status": committed.snapshot_status,
+                },
+            )
+            self._audit_ledger.append(
+                "quarantine.snapshot_durable",
+                {
+                    "quarantine_id": committed.quarantine_id,
+                    "job_id": committed.job_id,
+                    "sandbox_id": committed.sandbox_id,
+                    "snapshot_refs": list(committed.snapshot_refs),
+                    "audit_slice_ref": committed.audit_slice_ref,
+                    "snapshot_status": committed.snapshot_status,
+                    "record_ref": committed.record_ref,
+                },
+            )
+            return committed
+        except Exception as exc:
+            try:
+                self._audit_ledger.append(
+                    "snapshot.failed",
+                    {
+                        "quarantine_id": pending.quarantine_id,
+                        "job_id": pending.job_id,
+                        "sandbox_id": pending.sandbox_id,
+                        "snapshot_status": "pending",
+                        "error_type": type(exc).__name__,
+                    },
+                )
+            except Exception as audit_exc:
+                exc.add_note(
+                    f"snapshot failure audit append failed: {type(audit_exc).__name__}: {audit_exc}"
+                )
+            if isinstance(exc, ForensicSnapshotPersistenceError):
+                raise
+            raise ForensicSnapshotPersistenceError("forensic snapshot did not become durable") from exc
+
+    def close(
+        self,
+        quarantine_id: str,
+        *,
+        reviewer: str,
+        disposition: str,
+    ) -> QuarantineRecord:
+        if not isinstance(reviewer, str) or not reviewer.strip():
+            raise ValueError("quarantine reviewer is required")
+        if not isinstance(disposition, str) or not disposition.strip():
+            raise ValueError("quarantine disposition is required")
+        with self._lock:
+            current = self.get(quarantine_id)
+            if current.status == "closed":
+                if current.reviewer == reviewer and current.disposition == disposition:
+                    return current
+                raise QuarantineAlreadyClosedError("quarantine already has a different disposition")
+            if current.snapshot_status != "durable":
+                raise QuarantineSnapshotPendingError(
+                    "quarantine cannot close until every forensic snapshot is durable"
+                )
+            try:
+                self._verify_snapshot_refs(current)
+            except ForensicSnapshotPersistenceError as exc:
+                raise QuarantineSnapshotPendingError(
+                    "quarantine cannot close while a forensic snapshot ref is unavailable"
+                ) from exc
+            closed = replace(
+                current,
+                status="closed",
+                reviewer=reviewer.strip(),
+                disposition=disposition.strip(),
+                closed_at=_s10_utc_now_iso(),
+                record_ref="",
+            )
+            committed = self._commit_record(
+                closed,
+                input_refs=(current.record_ref, *current.snapshot_refs, current.audit_slice_ref or ""),
+                transition="closed",
+            )
+            self._audit_ledger.append(
+                "quarantine.closed",
+                {
+                    "quarantine_id": committed.quarantine_id,
+                    "job_id": committed.job_id,
+                    "sandbox_id": committed.sandbox_id,
+                    "snapshot_refs": list(committed.snapshot_refs),
+                    "audit_slice_ref": committed.audit_slice_ref,
+                    "reviewer": committed.reviewer,
+                    "disposition": committed.disposition,
+                    "record_ref": committed.record_ref,
+                },
+            )
+            return committed
+
+    def get(self, quarantine_id: str) -> QuarantineRecord:
+        if not isinstance(quarantine_id, str) or not quarantine_id:
+            raise QuarantineNotFoundError("quarantine id is required")
+        latest_event: AuditEvent | None = None
+        for event in self._audit_ledger.events():
+            if (
+                event.event_type in self._STATE_EVENT_TYPES
+                and event.payload.get("quarantine_id") == quarantine_id
+                and isinstance(event.payload.get("record_ref"), str)
+            ):
+                latest_event = event
+        if latest_event is None:
+            raise QuarantineNotFoundError(f"quarantine not found: {quarantine_id}")
+        record_ref = str(latest_event.payload["record_ref"])
+        job_id = str(latest_event.payload.get("job_id") or "")
+        payload = self._load_payload(record_ref, job_id=job_id)
+        return self._record_from_payload(payload, record_ref=record_ref)
+
+    def latest_for_sandbox(self, sandbox_id: str) -> QuarantineRecord | None:
+        latest_id: str | None = None
+        for event in self._audit_ledger.events():
+            if event.event_type not in self._STATE_EVENT_TYPES:
+                continue
+            if event.payload.get("sandbox_id") != sandbox_id:
+                continue
+            quarantine_id = event.payload.get("quarantine_id")
+            if isinstance(quarantine_id, str) and quarantine_id:
+                latest_id = quarantine_id
+        return self.get(latest_id) if latest_id is not None else None
+
+    def page_status(self, quarantine_id: str) -> str:
+        matching = [
+            event.event_type
+            for event in self._audit_ledger.events()
+            if event.payload.get("quarantine_id") == quarantine_id
+            and event.event_type in {"quarantine.page_delivered", "quarantine.page_failed", "quarantine.page_unconfigured"}
+        ]
+        if not matching:
+            return "pending"
+        return matching[-1].removeprefix("quarantine.page_")
+
+    def _page_security_engineer(self, record: QuarantineRecord) -> None:
+        payload = {
+            "schema": "argus.s10.security-page.v1",
+            "quarantine_id": record.quarantine_id,
+            "job_id": record.job_id,
+            "sandbox_id": record.sandbox_id,
+            "severity": record.severity,
+            "reason": record.reason,
+            "record_ref": record.record_ref,
+            "opened_at": record.opened_at,
+        }
+        if self._page_sink is None:
+            self._audit_ledger.append("quarantine.page_unconfigured", payload)
+            return
+        try:
+            self._page_sink(payload)
+        except Exception as exc:
+            self._audit_ledger.append(
+                "quarantine.page_failed",
+                {**payload, "error_type": type(exc).__name__},
+            )
+            return
+        self._audit_ledger.append("quarantine.page_delivered", payload)
+
+    def _persist_audit_slice(
+        self,
+        record: QuarantineRecord,
+        *,
+        input_refs: tuple[str, ...],
+    ) -> ArtifactRecord:
+        all_events = self._audit_ledger.events()
+        relevant_events = tuple(
+            event
+            for event in all_events
+            if event.payload.get("job_id") == record.job_id
+            and event.payload.get("sandbox_id") in {None, record.sandbox_id}
+        )
+        if not relevant_events:
+            raise ForensicSnapshotPersistenceError("quarantine audit slice is empty")
+        from_sequence = relevant_events[0].sequence
+        to_sequence = relevant_events[-1].sequence
+        events = tuple(
+            event
+            for event in all_events
+            if from_sequence <= event.sequence <= to_sequence
+        )
+        verification = self._audit_ledger.verify_chain(
+            from_sequence=from_sequence,
+            to_sequence=to_sequence,
+        )
+        if not verification.valid:
+            raise ForensicSnapshotPersistenceError("quarantine audit slice failed chain verification")
+        payload = {
+            "schema": "argus.s10.forensic-audit-slice.v1",
+            "component": "audit_slice",
+            "quarantine_id": record.quarantine_id,
+            "job_id": record.job_id,
+            "sandbox_id": record.sandbox_id,
+            "from_sequence": events[0].sequence,
+            "to_sequence": events[-1].sequence,
+            "relevant_event_sequences": [event.sequence for event in relevant_events],
+            "chain_verification": {
+                "intact": verification.valid,
+                "break_sequence": verification.break_sequence,
+                "anchor_mismatch": verification.anchor_mismatch,
+                "reason": verification.reason,
+            },
+            "events": [
+                {
+                    "sequence": event.sequence,
+                    "event_type": event.event_type,
+                    "payload": deepcopy(event.payload),
+                    "previous_hash": event.previous_hash,
+                    "event_hash": event.event_hash,
+                }
+                for event in events
+            ],
+        }
+        return self._artifact_store.create_artifact(
+            kind="sandbox.forensic.audit_slice",
+            payload=payload,
+            producer=self._producer(record),
+            lineage=self._lineage(record, input_refs=input_refs, component="audit-slice"),
+        )
+
+    def _commit_record(
+        self,
+        record: QuarantineRecord,
+        *,
+        input_refs: tuple[str, ...],
+        transition: str,
+    ) -> QuarantineRecord:
+        record_payload = asdict(replace(record, record_ref=""))
+        record_payload.pop("record_ref", None)
+        record_payload["snapshot_refs"] = list(record.snapshot_refs)
+        artifact = self._artifact_store.create_artifact(
+            kind="sandbox.quarantine_record",
+            payload={"schema": "argus.s10.quarantine-record.v1", **record_payload},
+            producer=self._producer(record),
+            lineage=Lineage(
+                input_refs=tuple(dict.fromkeys(ref for ref in input_refs if ref)),
+                code_ref="git:project-argus/s10-quarantine-workflow",
+                environment_digest=hash_json(
+                    {
+                        "schema": "argus.s10.quarantine-record-environment.v1",
+                        "transition": transition,
+                    }
+                ),
+                seeds=(record.quarantine_id,),
+                job_id=record.job_id,
+            ),
+        )
+        return replace(record, record_ref=artifact.artifact_ref)
+
+    @staticmethod
+    def _producer(record: QuarantineRecord) -> Producer:
+        return Producer(
+            subsystem="S10",
+            version="1",
+            actor_id="s10-forensic-snapshotter",
+            job_id=record.job_id,
+        )
+
+    @staticmethod
+    def _lineage(
+        record: QuarantineRecord,
+        *,
+        input_refs: tuple[str, ...],
+        component: str,
+    ) -> Lineage:
+        return Lineage(
+            input_refs=tuple(dict.fromkeys(ref for ref in input_refs if ref)),
+            code_ref="git:project-argus/s10-forensic-snapshotter",
+            environment_digest=hash_json(
+                {
+                    "schema": "argus.s10.forensic-snapshot-environment.v1",
+                    "component": component,
+                }
+            ),
+            seeds=(record.quarantine_id,),
+            actor_id="s10-forensic-snapshotter",
+            job_id=record.job_id,
+        )
+
+    def _record_input_refs(self, record_ref: str, *, job_id: str) -> tuple[str, ...]:
+        metadata = self._load_record(record_ref, job_id=job_id)
+        self._validate_artifact_record(
+            metadata,
+            job_id=job_id,
+            kind="sandbox.quarantine_record",
+        )
+        lineage = metadata.get("lineage")
+        refs = lineage.get("input_refs") if isinstance(lineage, dict) else None
+        if not isinstance(refs, (list, tuple)):
+            raise ForensicSnapshotPersistenceError("quarantine record lineage is unavailable")
+        return tuple(str(ref) for ref in refs)
+
+    def _verify_snapshot_refs(self, record: QuarantineRecord) -> None:
+        if len(record.snapshot_refs) != len(self._SNAPSHOT_COMPONENTS) or not record.audit_slice_ref:
+            raise QuarantineSnapshotPendingError(
+                "quarantine cannot close until every forensic snapshot is durable"
+            )
+        seen: list[str] = []
+        for expected_component, ref in zip(
+            self._SNAPSHOT_COMPONENTS,
+            record.snapshot_refs,
+            strict=True,
+        ):
+            metadata = self._load_record(ref, job_id=record.job_id)
+            self._validate_artifact_record(
+                metadata,
+                job_id=record.job_id,
+                kind=f"sandbox.forensic.{expected_component}",
+            )
+            payload = self._load_payload(ref, job_id=record.job_id)
+            self._validate_component_identity(record, payload)
+            component = payload.get("component")
+            if component not in self._SNAPSHOT_COMPONENTS:
+                raise QuarantineSnapshotPendingError("quarantine snapshot component is invalid")
+            seen.append(str(component))
+            if component == "rootfs":
+                evidence = payload.get("evidence")
+                if (
+                    not isinstance(evidence, dict)
+                    or evidence.get("read_only") is not True
+                    or evidence.get("image_digest") != payload.get("image_digest")
+                    or hash_json(evidence) != payload.get("evidence_hash")
+                ):
+                    raise QuarantineSnapshotPendingError("rootfs snapshot evidence is not durable")
+            elif component == "scratch":
+                try:
+                    archive = base64.b64decode(str(payload.get("archive_b64") or ""), validate=True)
+                except (ValueError, binascii.Error) as exc:
+                    raise QuarantineSnapshotPendingError("scratch snapshot encoding is invalid") from exc
+                if (
+                    not archive
+                    or len(archive) != payload.get("archive_bytes")
+                    or hash_bytes(archive) != payload.get("archive_hash")
+                ):
+                    raise QuarantineSnapshotPendingError("scratch snapshot evidence is not durable")
+            elif component == "netlog":
+                events = payload.get("events")
+                if (
+                    not isinstance(events, list)
+                    or len(events) != payload.get("event_count")
+                    or hash_json(events) != payload.get("events_hash")
+                ):
+                    raise QuarantineSnapshotPendingError("network snapshot evidence is not durable")
+        if tuple(seen) != self._SNAPSHOT_COMPONENTS:
+            raise QuarantineSnapshotPendingError("quarantine snapshot component set is incomplete")
+        audit_metadata = self._load_record(record.audit_slice_ref, job_id=record.job_id)
+        self._validate_artifact_record(
+            audit_metadata,
+            job_id=record.job_id,
+            kind="sandbox.forensic.audit_slice",
+        )
+        audit_payload = self._load_payload(record.audit_slice_ref, job_id=record.job_id)
+        self._validate_component_identity(record, audit_payload)
+        verification = audit_payload.get("chain_verification")
+        if (
+            audit_payload.get("component") != "audit_slice"
+            or not isinstance(audit_payload.get("events"), list)
+            or not isinstance(verification, dict)
+            or verification.get("intact") is not True
+        ):
+            raise QuarantineSnapshotPendingError("quarantine audit slice is not durable")
+
+    @staticmethod
+    def _validate_component_identity(record: QuarantineRecord, payload: Mapping[str, Any]) -> None:
+        if (
+            payload.get("quarantine_id") != record.quarantine_id
+            or payload.get("job_id") != record.job_id
+            or payload.get("sandbox_id") != record.sandbox_id
+        ):
+            raise QuarantineSnapshotPendingError("quarantine snapshot identity mismatch")
+
+    @staticmethod
+    def _validate_artifact_record(
+        metadata: Mapping[str, Any],
+        *,
+        job_id: str,
+        kind: str,
+    ) -> None:
+        producer = metadata.get("producer")
+        lineage = metadata.get("lineage")
+        if (
+            metadata.get("kind") != kind
+            or not isinstance(producer, dict)
+            or producer.get("job_id") != job_id
+            or not isinstance(lineage, dict)
+            or lineage.get("job_id") != job_id
+        ):
+            raise QuarantineSnapshotPendingError(
+                "quarantine snapshot C4 record identity is invalid"
+            )
+
+    @staticmethod
+    def _validate_capture(record: QuarantineRecord, capture: ForensicHostCapture) -> None:
+        if not capture.captured_at or not capture.container_id:
+            raise ForensicSnapshotCaptureError("forensic host capture identity is incomplete")
+        if not _is_digest_pinned_image(capture.image_digest):
+            raise ForensicSnapshotCaptureError("forensic rootfs image is not digest-pinned")
+        if capture.rootfs_evidence.get("read_only") is not True:
+            raise ForensicSnapshotCaptureError("forensic rootfs was not read-only at capture")
+        if capture.rootfs_evidence.get("image_digest") != capture.image_digest:
+            raise ForensicSnapshotCaptureError("forensic rootfs digest differs from the admitted image")
+        if not capture.scratch_archive:
+            raise ForensicSnapshotCaptureError("forensic scratch archive is empty")
+        if hash_bytes(capture.scratch_archive) != capture.scratch_archive_hash:
+            raise ForensicSnapshotCaptureError("forensic scratch archive hash mismatch")
+        if not capture.network_mode:
+            raise ForensicSnapshotCaptureError("forensic network mode is missing")
+        for event in capture.network_events:
+            if not isinstance(event, dict):
+                raise ForensicSnapshotCaptureError("forensic network log contains a non-object event")
+            payload = event.get("payload")
+            if isinstance(payload, dict):
+                if payload.get("job_id") not in {None, record.job_id}:
+                    raise ForensicSnapshotCaptureError("forensic network event job_id mismatch")
+                if payload.get("sandbox_id") not in {None, record.sandbox_id}:
+                    raise ForensicSnapshotCaptureError("forensic network event sandbox_id mismatch")
+
+    def _load_payload(self, artifact_ref: str, *, job_id: str) -> dict[str, Any]:
+        try:
+            if hasattr(self._artifact_store, "get_artifact"):
+                raw = self._artifact_store.get_artifact(artifact_ref)
+                payload = json.loads(raw.decode("utf-8"))
+            elif hasattr(self._artifact_store, "get_internal_artifact"):
+                response = self._artifact_store.get_internal_artifact(
+                    artifact_ref=artifact_ref,
+                    job_id=job_id,
+                    representation="payload",
+                )
+                payload = response.get("payload") if isinstance(response, dict) else None
+            else:
+                raise ForensicSnapshotPersistenceError("C4 artifact store has no trusted read path")
+        except ForensicSnapshotPersistenceError:
+            raise
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ForensicSnapshotPersistenceError("C4 artifact payload is invalid") from exc
+        except Exception as exc:
+            raise ForensicSnapshotPersistenceError("C4 artifact payload is unavailable") from exc
+        if not isinstance(payload, dict):
+            raise ForensicSnapshotPersistenceError("C4 artifact payload is not an object")
+        return payload
+
+    def _load_record(self, artifact_ref: str, *, job_id: str) -> dict[str, Any]:
+        try:
+            if hasattr(self._artifact_store, "get_artifact_record"):
+                return asdict(self._artifact_store.get_artifact_record(artifact_ref))
+            if hasattr(self._artifact_store, "get_internal_artifact"):
+                response = self._artifact_store.get_internal_artifact(
+                    artifact_ref=artifact_ref,
+                    job_id=job_id,
+                    representation="record",
+                )
+                record = response.get("record") if isinstance(response, dict) else None
+                if isinstance(record, dict):
+                    return record
+        except ForensicSnapshotPersistenceError:
+            raise
+        except Exception as exc:
+            raise ForensicSnapshotPersistenceError("C4 artifact record is unavailable") from exc
+        raise ForensicSnapshotPersistenceError("C4 artifact record is unavailable")
+
+    @staticmethod
+    def _record_from_payload(payload: Mapping[str, Any], *, record_ref: str) -> QuarantineRecord:
+        if payload.get("schema") != "argus.s10.quarantine-record.v1":
+            raise ForensicSnapshotPersistenceError("quarantine record schema is invalid")
+        required_fields = (
+            "quarantine_id",
+            "job_id",
+            "sandbox_id",
+            "reason",
+            "severity",
+            "opened_at",
+            "status",
+            "snapshot_status",
+        )
+        if any(
+            not isinstance(payload.get(field_name), str) or not payload[field_name]
+            for field_name in required_fields
+        ):
+            raise ForensicSnapshotPersistenceError("quarantine record identity is incomplete")
+        snapshot_refs = payload.get("snapshot_refs")
+        if not isinstance(snapshot_refs, (list, tuple)):
+            raise ForensicSnapshotPersistenceError("quarantine snapshot refs are invalid")
+        try:
+            record = QuarantineRecord(
+                quarantine_id=str(payload["quarantine_id"]),
+                job_id=str(payload["job_id"]),
+                sandbox_id=str(payload["sandbox_id"]),
+                reason=str(payload["reason"]),
+                severity=str(payload["severity"]),
+                snapshot_refs=tuple(snapshot_refs),
+                audit_slice_ref=(
+                    str(payload["audit_slice_ref"])
+                    if isinstance(payload.get("audit_slice_ref"), str)
+                    else None
+                ),
+                opened_at=str(payload["opened_at"]),
+                status=str(payload["status"]),  # type: ignore[arg-type]
+                snapshot_status=str(payload["snapshot_status"]),  # type: ignore[arg-type]
+                reviewer=str(payload["reviewer"]) if isinstance(payload.get("reviewer"), str) else None,
+                disposition=(
+                    str(payload["disposition"])
+                    if isinstance(payload.get("disposition"), str)
+                    else None
+                ),
+                closed_at=str(payload["closed_at"]) if isinstance(payload.get("closed_at"), str) else None,
+                record_ref=record_ref,
+            )
+        except KeyError as exc:
+            raise ForensicSnapshotPersistenceError("quarantine record is incomplete") from exc
+        required_strings = (
+            record.quarantine_id,
+            record.job_id,
+            record.sandbox_id,
+            record.reason,
+            record.severity,
+            record.opened_at,
+            record.record_ref,
+        )
+        if any(not value for value in required_strings):
+            raise ForensicSnapshotPersistenceError("quarantine record identity is incomplete")
+        if record.severity != "Sev-1":
+            raise ForensicSnapshotPersistenceError("quarantine record severity is invalid")
+        if record.status not in {"open", "reviewing", "closed"}:
+            raise ForensicSnapshotPersistenceError("quarantine record status is invalid")
+        if record.snapshot_status not in {"pending", "durable"}:
+            raise ForensicSnapshotPersistenceError("quarantine snapshot status is invalid")
+        if any(not isinstance(ref, str) or not ref for ref in record.snapshot_refs):
+            raise ForensicSnapshotPersistenceError("quarantine snapshot refs are invalid")
+        if len(set(record.snapshot_refs)) != len(record.snapshot_refs):
+            raise ForensicSnapshotPersistenceError("quarantine snapshot refs contain duplicates")
+        if record.status == "closed":
+            if (
+                record.snapshot_status != "durable"
+                or not record.reviewer
+                or not record.disposition
+                or not record.closed_at
+            ):
+                raise ForensicSnapshotPersistenceError("closed quarantine record is incomplete")
+        elif any((record.reviewer, record.disposition, record.closed_at)):
+            raise ForensicSnapshotPersistenceError("open quarantine record contains closure fields")
+        return record
+
+
+def _s10_utc_now_iso() -> str:
+    return datetime.now(UTC).isoformat().replace("+00:00", "Z")
+
+
 class PolicyBundleSigner:
     """Signs S10 policy bundles for deterministic admission decisions."""
 
@@ -4955,6 +6180,7 @@ class DockerSandboxSupervisor:
         runtime_evidence_sink: Callable[[RuntimeLaunchEvidence], None] | None = None,
         egress_audit_sink: Callable[[str, dict[str, Any]], None] | None = None,
         security_event_sink: Callable[[HostSecurityEvent], None] | None = None,
+        forensic_capture_sink: Callable[[ForensicHostCapture], None] | None = None,
     ) -> SandboxExecutionResult:
         if not _is_digest_pinned_image(request.image):
             raise PolicyDeniedError("image must be digest-pinned")
@@ -4974,6 +6200,7 @@ class DockerSandboxSupervisor:
                 runtime_evidence_sink=runtime_evidence_sink,
                 security_monitor=self._security_monitor,
                 security_event_sink=security_event_sink,
+                forensic_capture_sink=forensic_capture_sink,
             )
         security_spec = self.materialize_security_spec(handle, policy_bundle)
         egress_manifest = self._materialize_egress_manifest(handle, request, policy_bundle)
@@ -4992,6 +6219,7 @@ class DockerSandboxSupervisor:
                     egress_manifest=egress_manifest,
                     egress_audit_sink=egress_audit_sink,
                     security_event_sink=security_event_sink,
+                    forensic_capture_sink=forensic_capture_sink,
                 )
             except SecurityMonitorError:
                 raise
@@ -5156,6 +6384,7 @@ class DockerSandboxSupervisor:
         egress_manifest: EgressProxyManifest | None = None,
         egress_audit_sink: Callable[[str, dict[str, Any]], None] | None = None,
         security_event_sink: Callable[[HostSecurityEvent], None] | None = None,
+        forensic_capture_sink: Callable[[ForensicHostCapture], None] | None = None,
     ) -> SandboxExecutionResult:
         container_name = f"argus-{handle.sandbox_id.replace('-', '')[:24]}"
         envelope = request.requested_envelope
@@ -5166,6 +6395,7 @@ class DockerSandboxSupervisor:
         security_cursor = 0
         seen_security_event_ids: set[str] = set()
         pending_security_events: list[HostSecurityEvent] = []
+        frozen_host_captures: list[ForensicHostCapture] = []
         started_at = time.monotonic()
 
         def probe_egress_halt() -> _RuntimeHaltSignal | None:
@@ -5359,6 +6589,7 @@ class DockerSandboxSupervisor:
                     else None
                 ),
                 halt_telemetry_sink=halt_telemetry_sink,
+                forensic_capture_sink=frozen_host_captures.append,
             )
             if self._security_monitor is not None and security_registered and not pending_security_events:
                 terminal_security_halt: _RuntimeHaltSignal | None = None
@@ -5376,6 +6607,36 @@ class DockerSandboxSupervisor:
             if security_event_sink is not None:
                 for event in pending_security_events:
                     security_event_sink(event)
+            if (
+                partial_result is not None
+                and partial_result.reason in {"escape_attempt", "security_monitor_unavailable", "trust_path_write"}
+                and frozen_host_captures
+            ):
+                if len(frozen_host_captures) != 1:
+                    raise ForensicSnapshotCaptureError(
+                        "security halt produced multiple frozen host captures"
+                    )
+                if sidecar_id is not None and egress_manifest is not None:
+                    self._drain_egress_sidecar_events(
+                        sidecar_id=sidecar_id,
+                        manifest=egress_manifest,
+                        sink=egress_audit_sink,
+                        seen_events=seen_egress_events,
+                    )
+                capture = replace(
+                    frozen_host_captures[0],
+                    network_mode=(
+                        f"egress-proxy:{egress_manifest.manifest_hash}"
+                        if egress_manifest is not None
+                        else "none"
+                    ),
+                    network_events=tuple(
+                        {"event_type": event_type, "payload": deepcopy(payload)}
+                        for event_type, payload in seen_egress_events
+                    ),
+                )
+                if forensic_capture_sink is not None:
+                    forensic_capture_sink(capture)
             if partial_result is None:
                 log_capture = self._docker_api_logs(container_id)
                 stdout, stderr = log_capture.stdout, log_capture.stderr
@@ -5871,6 +7132,7 @@ class DockerSandboxSupervisor:
         runtime_halt_probe: Callable[[], _RuntimeHaltSignal | tuple[str, tuple[str, ...]] | None] | None = None,
         pre_state_halt_probe: Callable[[], _RuntimeHaltSignal | tuple[str, tuple[str, ...]] | None] | None = None,
         halt_telemetry_sink: Callable[[SandboxHaltTelemetry], None] | None = None,
+        forensic_capture_sink: Callable[[ForensicHostCapture], None] | None = None,
     ) -> tuple[int | None, bool, str, BudgetUsage, SandboxPartialResult | None]:
         envelope = request.requested_envelope
         sample_seq = 0
@@ -5923,6 +7185,7 @@ class DockerSandboxSupervisor:
                 meter_sample_sink=meter_sample_sink,
                 halt_telemetry_sink=halt_telemetry_sink,
                 revocation_acknowledged_at=revocation_acknowledged_at,
+                forensic_capture_sink=forensic_capture_sink,
             )
 
         while True:
@@ -5951,6 +7214,7 @@ class DockerSandboxSupervisor:
                     sample_seq=sample_seq,
                     meter_sample_sink=meter_sample_sink,
                     halt_telemetry_sink=halt_telemetry_sink,
+                    forensic_capture_sink=forensic_capture_sink,
                 )
 
             pre_state_halt = pre_state_halt_probe() if pre_state_halt_probe is not None else None
@@ -6021,6 +7285,7 @@ class DockerSandboxSupervisor:
                         sample_seq=sample_seq,
                         meter_sample_sink=meter_sample_sink,
                         halt_telemetry_sink=halt_telemetry_sink,
+                        forensic_capture_sink=forensic_capture_sink,
                     )
                 emit(sample)
                 next_sample_at = time.monotonic() + self._meter_interval_s
@@ -6043,6 +7308,7 @@ class DockerSandboxSupervisor:
         meter_sample_sink: Callable[[ResourceMeterSample], None] | None,
         halt_telemetry_sink: Callable[[SandboxHaltTelemetry], None] | None = None,
         revocation_acknowledged_at: float | None = None,
+        forensic_capture_sink: Callable[[ForensicHostCapture], None] | None = None,
     ) -> tuple[int | None, bool, str, BudgetUsage, SandboxPartialResult]:
         halt_detected_at = time.monotonic()
         freeze_completed_at: float | None = None
@@ -6076,6 +7342,22 @@ class DockerSandboxSupervisor:
         except (SandboxRuntimeUnavailableError, TimeoutError) as exc:
             message = f"capture_failed:{type(exc).__name__}:{exc}"
             capture_error = message if capture_error is None else f"{capture_error};{message}"
+
+        if (
+            freeze_succeeded
+            and reason in {"escape_attempt", "security_monitor_unavailable", "trust_path_write"}
+            and forensic_capture_sink is not None
+        ):
+            try:
+                forensic_capture_sink(
+                    self._capture_forensic_host_state(
+                        container_id=container_id,
+                        request=request,
+                    )
+                )
+            except (ForensicSnapshotCaptureError, SandboxRuntimeUnavailableError, TimeoutError) as exc:
+                message = f"forensic_capture_failed:{type(exc).__name__}:{exc}"
+                capture_error = message if capture_error is None else f"{capture_error};{message}"
 
         if freeze_succeeded:
             try:
@@ -6153,6 +7435,74 @@ class DockerSandboxSupervisor:
             logs_truncated=logs_truncated,
         )
         return None, True, f"argus meter halted container: {reason}", final_usage, partial_result
+
+    def _capture_forensic_host_state(
+        self,
+        *,
+        container_id: str,
+        request: LaunchRequest,
+    ) -> ForensicHostCapture:
+        inspected = self._docker_api_request(
+            "GET",
+            f"/containers/{container_id}/json",
+            expected=(200,),
+            timeout=2,
+        )
+        config = inspected.get("Config")
+        host_config = inspected.get("HostConfig")
+        labels = config.get("Labels") if isinstance(config, dict) else None
+        if inspected.get("Id") != container_id:
+            raise ForensicSnapshotCaptureError("frozen rootfs container identity is invalid")
+        if not isinstance(config, dict) or config.get("Image") != request.image:
+            raise ForensicSnapshotCaptureError(
+                "frozen rootfs image differs from the admitted digest"
+            )
+        if not isinstance(labels, dict) or labels.get("argus.dev/job-id") != request.job_id:
+            raise ForensicSnapshotCaptureError("frozen rootfs job identity is invalid")
+        if not isinstance(host_config, dict) or host_config.get("ReadonlyRootfs") is not True:
+            raise ForensicSnapshotCaptureError("frozen rootfs is not read-only")
+        container_image_id = inspected.get("Image")
+        if not isinstance(container_image_id, str) or not container_image_id.startswith("sha256:"):
+            raise ForensicSnapshotCaptureError("frozen rootfs image id is invalid")
+        archive_limit = min(
+            max(
+                request.requested_envelope.scratch_bytes
+                + FORENSIC_SCRATCH_ARCHIVE_OVERHEAD_BYTES,
+                FORENSIC_SCRATCH_ARCHIVE_OVERHEAD_BYTES,
+            ),
+            FORENSIC_SCRATCH_ARCHIVE_MAX_BYTES,
+        )
+        scratch_archive, truncated = self._docker_api_request_bytes_limited(
+            "GET",
+            f"/containers/{container_id}/archive?path=%2Ftmp",
+            expected=(200,),
+            timeout=5,
+            max_bytes=archive_limit,
+        )
+        if truncated:
+            raise ForensicSnapshotCaptureError(
+                "frozen scratch archive exceeded its bounded capture limit"
+            )
+        if not scratch_archive:
+            raise ForensicSnapshotCaptureError("frozen scratch archive is empty")
+        rootfs_evidence = {
+            "image_digest": request.image,
+            "container_image_id": container_image_id,
+            "read_only": True,
+            "runtime": str(host_config.get("Runtime") or "runc"),
+            "network_mode": str(host_config.get("NetworkMode") or "none"),
+            "tmpfs": deepcopy(host_config.get("Tmpfs") or {}),
+        }
+        return ForensicHostCapture(
+            captured_at=_s10_utc_now_iso(),
+            container_id=container_id,
+            image_digest=request.image,
+            rootfs_evidence=rootfs_evidence,
+            scratch_archive=scratch_archive,
+            scratch_archive_hash=hash_bytes(scratch_archive),
+            network_mode=rootfs_evidence["network_mode"],
+            network_events=(),
+        )
 
     def _docker_api_resource_sample(
         self,
@@ -6822,6 +8172,8 @@ class DockerSandboxOrchestrator(InMemorySandboxOrchestrator):
         price_table_trust_store: PriceTableTrustStore | None = None,
         price_table_gpu_model: str = "default",
         price_table_model_id: str = "default",
+        quarantine_workflow: QuarantineWorkflow | None = None,
+        forensic_spool: ForensicCaptureSpool | None = None,
     ) -> None:
         if artifact_store is None:
             raise PolicyDeniedError("artifact_store is required for Docker launch provenance")
@@ -6841,6 +8193,11 @@ class DockerSandboxOrchestrator(InMemorySandboxOrchestrator):
         self._price_table_gpu_model = price_table_gpu_model
         self._price_table_model_id = price_table_model_id
         self._halt_telemetry_by_sandbox: dict[str, SandboxHaltTelemetry] = {}
+        self._quarantine_workflow = quarantine_workflow or QuarantineWorkflow(
+            artifact_store=artifact_store,
+            audit_ledger=audit_ledger,
+        )
+        self._forensic_spool = forensic_spool or InMemoryForensicCaptureSpool()
 
     def _run_supervisor(self, **kwargs: Any) -> SandboxExecutionResult:
         parameters = inspect.signature(self._supervisor.run).parameters
@@ -6862,6 +8219,7 @@ class DockerSandboxOrchestrator(InMemorySandboxOrchestrator):
         halt_telemetry_items: list[SandboxHaltTelemetry] = []
         runtime_evidence_items: list[RuntimeLaunchEvidence] = []
         security_events: list[HostSecurityEvent] = []
+        forensic_captures: list[ForensicHostCapture] = []
         meter_halt_recorded = False
         token_revocation_halt_recorded = False
 
@@ -7070,6 +8428,7 @@ class DockerSandboxOrchestrator(InMemorySandboxOrchestrator):
                 runtime_evidence_sink=record_runtime_evidence,
                 egress_audit_sink=record_egress_event,
                 security_event_sink=record_security_event,
+                forensic_capture_sink=forensic_captures.append,
             )
         except Exception as exc:
             runtime_error = exc
@@ -7179,6 +8538,96 @@ class DockerSandboxOrchestrator(InMemorySandboxOrchestrator):
             },
         )
         if security_halted:
+            if partial_result_ref is None or final_handle.launch_provenance_ref is None:
+                self._record_runtime_failure(
+                    handle,
+                    request,
+                    reserved_usage,
+                    ForensicSnapshotPersistenceError(
+                        "security quarantine requires launch and partial-result C4 records"
+                    ),
+                )
+                raise ForensicSnapshotPersistenceError(
+                    "security quarantine requires launch and partial-result C4 records"
+                )
+            quarantine = self._quarantine_workflow.open(
+                job_id=request.job_id,
+                sandbox_id=handle.sandbox_id,
+                reason=security_halt_reason,
+                severity="Sev-1",
+                launch_provenance_ref=final_handle.launch_provenance_ref,
+                partial_result_ref=partial_result_ref,
+                security_event_ids=tuple(event.event_id for event in security_events),
+                notify_security_engineer=False,
+            )
+            snapshot_error: str | None = None
+            forensic_spool_ref: str | None = None
+            if len(forensic_captures) == 1:
+                try:
+                    forensic_spool_ref = self._forensic_spool.put(
+                        quarantine.quarantine_id, forensic_captures[0]
+                    )
+                    self._audit_ledger.append(
+                        "snapshot.spooled",
+                        {
+                            "quarantine_id": quarantine.quarantine_id,
+                            "job_id": request.job_id,
+                            "sandbox_id": handle.sandbox_id,
+                            "snapshot_status": "pending",
+                            "forensic_spool_ref": forensic_spool_ref,
+                            "forensic_spool_kind": self._forensic_spool.kind,
+                        },
+                    )
+                except ForensicSnapshotPersistenceError as exc:
+                    snapshot_error = f"{type(exc).__name__}:{exc}"
+                    self._audit_ledger.append(
+                        "snapshot.failed",
+                        {
+                            "quarantine_id": quarantine.quarantine_id,
+                            "job_id": request.job_id,
+                            "sandbox_id": handle.sandbox_id,
+                            "snapshot_status": "pending",
+                            "error_type": type(exc).__name__,
+                        },
+                    )
+            else:
+                snapshot_error = (
+                    "ForensicSnapshotCaptureError:"
+                    f"expected one frozen host capture, received {len(forensic_captures)}"
+                )
+                self._audit_ledger.append(
+                    "snapshot.failed",
+                    {
+                        "quarantine_id": quarantine.quarantine_id,
+                        "job_id": request.job_id,
+                        "sandbox_id": handle.sandbox_id,
+                        "snapshot_status": "pending",
+                        "error_type": "ForensicSnapshotCaptureError",
+                    },
+                )
+            self._quarantine_workflow.notify_security_engineer(quarantine)
+            if forensic_spool_ref is not None:
+                try:
+                    quarantine = self._quarantine_workflow.persist_snapshot(
+                        quarantine.quarantine_id,
+                        forensic_captures[0],
+                    )
+                    self._forensic_spool.acknowledge_durable(quarantine.quarantine_id)
+                except (ForensicSnapshotCaptureError, ForensicSnapshotPersistenceError) as exc:
+                    snapshot_error = f"{type(exc).__name__}:{exc}"
+                    quarantine = self._quarantine_workflow.get(quarantine.quarantine_id)
+                    if quarantine.snapshot_status == "durable":
+                        self._audit_ledger.append(
+                            "snapshot.spool_ack_failed",
+                            {
+                                "quarantine_id": quarantine.quarantine_id,
+                                "job_id": request.job_id,
+                                "sandbox_id": handle.sandbox_id,
+                                "snapshot_status": quarantine.snapshot_status,
+                                "forensic_spool_ref": forensic_spool_ref,
+                                "error_type": type(exc).__name__,
+                            },
+                        )
             self._audit_ledger.append(
                 "sandbox.quarantined",
                 {
@@ -7187,8 +8636,15 @@ class DockerSandboxOrchestrator(InMemorySandboxOrchestrator):
                     "reason": security_halt_reason,
                     "state": final_handle.state,
                     "security_event_ids": [event.event_id for event in security_events],
-                    "snapshot_refs": [],
-                    "forensic_snapshot_status": "pending_s10_t18",
+                    "quarantine_id": quarantine.quarantine_id,
+                    "snapshot_refs": list(quarantine.snapshot_refs),
+                    "audit_slice_ref": quarantine.audit_slice_ref,
+                    "forensic_snapshot_status": quarantine.snapshot_status,
+                    "forensic_spool_ref": forensic_spool_ref,
+                    "page_status": self._quarantine_workflow.page_status(
+                        quarantine.quarantine_id
+                    ),
+                    "snapshot_error": snapshot_error,
                 },
             )
         try:
@@ -7236,6 +8692,41 @@ class DockerSandboxOrchestrator(InMemorySandboxOrchestrator):
             halt_telemetry=halt_telemetry,
         )
         return replace(result, handle=final_handle)
+
+    @property
+    def quarantine_workflow(self) -> QuarantineWorkflow:
+        return self._quarantine_workflow
+
+    @property
+    def forensic_spool(self) -> ForensicCaptureSpool:
+        return self._forensic_spool
+
+    def retry_quarantine_snapshot(self, quarantine_id: str) -> QuarantineRecord:
+        current = self._quarantine_workflow.get(quarantine_id)
+        self._quarantine_workflow.notify_security_engineer(
+            current,
+            retry_previous_failure=True,
+        )
+        capture = self._forensic_spool.get(quarantine_id)
+        forensic_spool_ref = self._forensic_spool.spool_ref(quarantine_id)
+        record = self._quarantine_workflow.persist_snapshot(quarantine_id, capture)
+        self._forensic_spool.acknowledge_durable(quarantine_id)
+        self._audit_ledger.append(
+            "snapshot.recovered",
+            {
+                "quarantine_id": record.quarantine_id,
+                "job_id": record.job_id,
+                "sandbox_id": record.sandbox_id,
+                "snapshot_status": record.snapshot_status,
+                "snapshot_refs": list(record.snapshot_refs),
+                "audit_slice_ref": record.audit_slice_ref,
+                "forensic_spool_ref": forensic_spool_ref,
+            },
+        )
+        return record
+
+    def quarantine_for_sandbox(self, sandbox_id: str) -> QuarantineRecord | None:
+        return self._quarantine_workflow.latest_for_sandbox(sandbox_id)
 
     def _runtime_halt_probe(
         self,

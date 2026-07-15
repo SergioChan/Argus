@@ -2424,6 +2424,72 @@ class ArgusM0RuntimeServiceTests(unittest.TestCase):
         self.assertEqual(payload["mig_instance_count"], 0)
         self.assertFalse(payload["dcgm_metric_sampler_enabled"])
         self.assertEqual(payload["dcgm_metric_fields"], ["1001", "1004", "1005"])
+        self.assertEqual(payload["forensic_spool"], "memory")
+        self.assertEqual(payload["forensic_spool_pending"], 0)
+        self.assertEqual(payload["forensic_spool_pending_ids"], [])
+
+    def test_s10_env_build_requires_complete_pager_and_quarantine_review_configuration(self) -> None:
+        base_env = {
+            "ARGUS_S10_SIGNING_KEY": "test-s10-signing-key",
+            "ARGUS_RUNTIME_BOOTSTRAP_TOKEN": BOOTSTRAP_TOKEN,
+            "ARGUS_RUNTIME_IDENTITY_SIGNING_KEY": IDENTITY_SIGNING_KEY.decode("utf-8"),
+            "ARGUS_RUNTIME_IDENTITY_MINT_POLICY_JSON": _runtime_identity_mint_policy_json(),
+            "ARGUS_M0_HEALTH_TOKEN": HEALTH_TOKEN,
+            "ARGUS_S10_CHECKPOINT_SIGNING_KEY": CHECKPOINT_SIGNING_KEY,
+            "ARGUS_S10_CHECKPOINT_SIGNER_AUTH_TOKEN": CHECKPOINT_SIGNER_AUTH_TOKEN,
+            "ARGUS_S10_POLICY_SIGNING_KEY": POLICY_SIGNING_KEY,
+            "ARGUS_S10_SECURITY_PAGER_URL": "http://pager.internal/v1/pages",
+        }
+        with patch.dict(os.environ, base_env, clear=True):
+            with self.assertRaisesRegex(RuntimeError, "must be configured together"):
+                build_s10_app_from_env()
+        configured_pager = {
+            **base_env,
+            "ARGUS_S10_SECURITY_PAGER_AUTH_TOKEN": "pager-delivery-token",
+            "ARGUS_S10_ALLOW_INSECURE_SECURITY_PAGER": "1",
+        }
+        with patch.dict(os.environ, configured_pager, clear=True):
+            with self.assertRaisesRegex(RuntimeError, "ARGUS_S10_QUARANTINE_REVIEW_TOKEN"):
+                build_s10_app_from_env()
+        with patch.dict(
+            os.environ,
+            {
+                **configured_pager,
+                "ARGUS_S10_QUARANTINE_REVIEW_TOKEN": "quarantine-review-token",
+            },
+            clear=True,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "ARGUS_S10_FORENSIC_SPOOL_DIR"):
+                build_s10_app_from_env()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with patch.dict(
+                os.environ,
+                {
+                    **configured_pager,
+                    "ARGUS_S10_QUARANTINE_REVIEW_TOKEN": "quarantine-review-token",
+                    "ARGUS_S10_FORENSIC_SPOOL_DIR": temp_dir,
+                },
+                clear=True,
+            ):
+                app = build_s10_app_from_env()
+                status, health = app.http.handle(
+                    JsonRequest(
+                        method="GET",
+                        path="/healthz",
+                        query={},
+                        body=None,
+                        headers=_auth_headers(HEALTH_TOKEN),
+                    )
+                )
+
+        self.assertEqual(app._quarantine_review_token, "quarantine-review-token")
+        self.assertIsNotNone(app._quarantine_page_sink)
+        self.assertEqual(status, 200)
+        self.assertTrue(health["security_pager_configured"])
+        self.assertTrue(health["quarantine_review_api_configured"])
+        self.assertEqual(health["forensic_spool"], "filesystem")
+        self.assertEqual(health["forensic_spool_pending"], 0)
+        self.assertEqual(health["forensic_spool_pending_ids"], [])
 
     def test_s10_env_build_uses_meter_gap_config_and_rejects_invalid_values(self) -> None:
         base_env = {
@@ -3048,6 +3114,9 @@ class ArgusM0ComposeTests(unittest.TestCase):
                 "ARGUS_S10_AUDIT_ANCHOR_AUTH_TOKEN": "s10-audit-anchor-token",
                 "ARGUS_S10_AUDIT_API_WRITE_TOKEN": "s10-audit-write-token",
                 "ARGUS_S10_AUDIT_API_READ_TOKEN": "s10-audit-read-token",
+                "ARGUS_S10_QUARANTINE_REVIEW_TOKEN": "s10-quarantine-review-token",
+                "ARGUS_S10_SECURITY_PAGER_AUTH_TOKEN": "s10-security-pager-delivery-token",
+                "ARGUS_S10_SECURITY_PAGER_READ_TOKEN": "s10-security-pager-read-token",
                 "ARGUS_S3_REFERENCE_REFEREE_SIGNER_SECRET": S3_REFERENCE_REFEREE_SIGNING_KEY,
                 "ARGUS_S1_REFERENCE_DEMO_ACCESS_TOKEN": "s1-reference-token",
                 "ARGUS_S1_REFERENCE_DEMO_PILOT_ACCESS_TOKEN": "m1-pilot-access-token",
@@ -3098,6 +3167,7 @@ class ArgusM0ComposeTests(unittest.TestCase):
                 "s8-writer",
                 "s10-supervisor",
                 "s10-reference-model-provider",
+                "s10-reference-security-pager",
                 "s1-reference-demo",
                 "s2-reference-builder",
                 "s3-reference-referee",
@@ -3113,6 +3183,10 @@ class ArgusM0ComposeTests(unittest.TestCase):
         self.assertEqual(
             services["s10-reference-model-provider"]["command"],
             ["python", "-m", "argus_runtime.s10_reference_model_provider_service"],
+        )
+        self.assertEqual(
+            services["s10-reference-security-pager"]["command"],
+            ["python", "-m", "argus_runtime.s10_reference_security_pager_service"],
         )
         self.assertEqual(
             services["s1-reference-demo"]["command"],
@@ -3177,6 +3251,42 @@ class ArgusM0ComposeTests(unittest.TestCase):
         self.assertEqual(services["s8-writer"]["environment"]["ARGUS_S8_MINIO_BUCKET"], "argus-s8-objects")
         self.assertNotIn("ARGUS_S8_DATA_DIR", services["s8-writer"]["environment"])
         self.assertEqual(services["s10-supervisor"]["environment"]["ARGUS_S10_HOST"], "0.0.0.0")
+        self.assertEqual(
+            set(services["s10-reference-security-pager"]["networks"]),
+            {"argus-services"},
+        )
+        self.assertEqual(
+            services["s10-supervisor"]["environment"]["ARGUS_S10_SECURITY_PAGER_URL"],
+            "http://s10-reference-security-pager:8080/v1/pages",
+        )
+        self.assertEqual(
+            services["s10-supervisor"]["environment"]["ARGUS_S10_QUARANTINE_REVIEW_TOKEN"],
+            "s10-quarantine-review-token",
+        )
+        self.assertEqual(
+            services["s10-supervisor"]["environment"]["ARGUS_S10_FORENSIC_SPOOL_DIR"],
+            "/var/lib/argus/s10/forensic-spool",
+        )
+        self.assertTrue(
+            any(
+                volume.get("type") == "volume"
+                and volume.get("target") == "/var/lib/argus/s10"
+                for volume in services["s10-supervisor"]["volumes"]
+            )
+        )
+        self.assertEqual(
+            services["s10-reference-security-pager"]["environment"][
+                "ARGUS_S10_SECURITY_PAGER_READ_TOKEN"
+            ],
+            "s10-security-pager-read-token",
+        )
+        self.assertTrue(services["s10-reference-security-pager"]["ports"])
+        self.assertTrue(
+            all(
+                port.get("host_ip") == "127.0.0.1"
+                for port in services["s10-reference-security-pager"]["ports"]
+            )
+        )
         self.assertEqual(services["s1-reference-demo"]["environment"]["ARGUS_S1_REFERENCE_DEMO_HOST"], "0.0.0.0")
         self.assertEqual(services["s1-reference-demo"]["environment"]["ARGUS_S1_REFERENCE_DEMO_PORT"], "8080")
         self.assertEqual(

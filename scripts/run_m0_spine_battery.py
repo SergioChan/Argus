@@ -70,6 +70,7 @@ M1_REFERENCE_RUNTIME_SERVICES = (
     "s8-writer",
     "s10-supervisor",
     "s10-reference-model-provider",
+    "s10-reference-security-pager",
     "s1-reference-demo",
     "s2-reference-builder",
     "s3-reference-referee",
@@ -611,6 +612,9 @@ def _m0_runtime_secrets() -> dict[str, str]:
         "s10_audit_anchor_auth_token": f"argus-s10-audit-anchor-{uuid4().hex}",
         "s10_audit_api_write_token": f"argus-s10-audit-write-{uuid4().hex}",
         "s10_audit_api_read_token": f"argus-s10-audit-read-{uuid4().hex}",
+        "s10_quarantine_review_token": f"argus-s10-quarantine-review-{uuid4().hex}",
+        "s10_security_pager_delivery_token": f"argus-s10-pager-delivery-{uuid4().hex}",
+        "s10_security_pager_read_token": f"argus-s10-pager-read-{uuid4().hex}",
         "s10_price_table_signing_key": f"argus-s10-price-table-key-{uuid4().hex}",
         "s8_broker_write_key": f"argus-s8-broker-key-{uuid4().hex}",
         "s10_gw_spectrum_broker_credential": f"argus-s10-gw-broker-{uuid4().hex}",
@@ -750,6 +754,17 @@ def _m0_identity_requests() -> dict[str, dict[str, Any]]:
             "budget_caps": {"max_compute_units": 20, "max_wallclock_s": 20, "max_cost_usd": 1},
             "scopes": {"sandbox_risk_class": "standard"},
         },
+        "s10-t18-tc22": {
+            "caller_id": "s10-t18-tc22",
+            "job_id": "s10-t18-tc22-job",
+            "root_request_id": "s10-t18-tc22-root",
+            "budget_caps": {
+                "max_compute_units": 0.31,
+                "max_wallclock_s": 6.2,
+                "max_cost_usd": 1,
+            },
+            "scopes": {"sandbox_risk_class": "standard"},
+        },
         "verify": {
             "caller_id": "m0-verifier",
             "job_id": "m0-verifier-job",
@@ -866,6 +881,11 @@ def _compose_environment(
         "ARGUS_S10_AUDIT_ANCHOR_AUTH_TOKEN": runtime_secrets["s10_audit_anchor_auth_token"],
         "ARGUS_S10_AUDIT_API_WRITE_TOKEN": runtime_secrets["s10_audit_api_write_token"],
         "ARGUS_S10_AUDIT_API_READ_TOKEN": runtime_secrets["s10_audit_api_read_token"],
+        "ARGUS_S10_QUARANTINE_REVIEW_TOKEN": runtime_secrets["s10_quarantine_review_token"],
+        "ARGUS_S10_SECURITY_PAGER_AUTH_TOKEN": runtime_secrets[
+            "s10_security_pager_delivery_token"
+        ],
+        "ARGUS_S10_SECURITY_PAGER_READ_TOKEN": runtime_secrets["s10_security_pager_read_token"],
         "ARGUS_S10_C3_VERIFIER_KEYS_JSON": json.dumps(
             {
                 M0_C3_VERIFIER_KEY_ID: runtime_secrets["c3_verifier_signing_key"],
